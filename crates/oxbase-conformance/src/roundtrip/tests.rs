@@ -7,9 +7,10 @@ use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::Arc;
 
-use oxbase_dialect::compare::{DefaultRules, RulesComparator, diff_tables};
+use oxbase_dialect::compare::{CompareRules, DefaultRules, RulesComparator, diff_tables};
 use oxbase_dialect::{
-    AnsiQuoting, Capabilities, DdlContext, DdlGenerator, DesignerCapabilities, Quoting, Support,
+    AnsiQuoting, Capabilities, Comparator, DdlContext, DdlGenerator, DesignerCapabilities, Quoting,
+    Support,
 };
 use oxbase_driver::CancellationToken;
 use oxbase_services::{ProvidedSecrets, SessionHandle};
@@ -20,7 +21,7 @@ use oxbase_types::{
 };
 use pretty_assertions::assert_eq;
 
-use super::cells::{base_table, child_of, with_child};
+use super::cells::{base_table, child_of, may_skip, with_child};
 use super::*;
 use crate::matrix::plan_engine_in;
 
@@ -40,6 +41,58 @@ fn tokens_are_ten_base36_chars_with_readable_seconds() {
     assert_ne!(fresh, new_token());
     assert_eq!(token_secs("short"), None);
     assert_eq!(token_secs("ABCDEFGHIJ"), None);
+}
+
+#[test]
+fn token_ages_survive_the_wrap_of_the_seconds_field() {
+    assert_eq!(SECS_WRAP, 36u64.pow(u32::try_from(SECS_DIGITS).unwrap()));
+    // The seconds field wraps on 2038-12-24.
+    let wrap = SECS_WRAP;
+    let now = wrap + 100;
+    // Made 50 s ago, after the wrap: young, not ~69 years old.
+    assert_eq!(token_age(&token(wrap + 50, 1), now), Some(50));
+    // Made before the wrap.
+    assert_eq!(token_age(&token(wrap - 10, 1), now), Some(110));
+    // From another machine whose clock is ahead: never stale.
+    assert_eq!(token_age(&token(now + 30, 1), now), None);
+    assert_eq!(token_age(&token(1_000, 1), 4_600), Some(3_600));
+    assert_eq!(token_age("short", now), None);
+}
+
+#[test]
+fn gate_options_never_let_skipping_pass_the_required_gate() {
+    let mut opts = crate::runner::RunOptions::default();
+    let plain = GateOptions::for_run(&opts, false).unwrap();
+    assert!(!plain.skipped_ok);
+    opts.skip_roundtrip = true;
+    assert!(GateOptions::for_run(&opts, false).unwrap().skipped_ok);
+    let err = GateOptions::for_run(&opts, true).unwrap_err();
+    assert!(err.contains("both set"), "{err}");
+    opts.skip_roundtrip = false;
+    opts.allow_missing = true;
+    let required = GateOptions::for_run(&opts, true).unwrap();
+    assert!(required.skipped_ok && required.require_m3, "{required:?}");
+}
+
+#[test]
+fn only_the_contract_s_exceptions_may_be_skipped() {
+    let v = |s: &str| ServerVersion::parse(s).unwrap();
+    assert!(may_skip(
+        Engine::Sqlite,
+        &v("3.45.1"),
+        "change table comment"
+    ));
+    assert!(may_skip(Engine::Sqlite, &v("3.45.1"), "set column comment"));
+    assert!(!may_skip(Engine::Sqlite, &v("3.45.1"), "rename column"));
+    assert!(!may_skip(
+        Engine::Postgres,
+        &v("16.2"),
+        "set column comment"
+    ));
+    assert!(may_skip(Engine::MySql, &v("8.0.15"), "drop check"));
+    assert!(!may_skip(Engine::MySql, &v("8.0.16"), "drop check"));
+    assert!(!may_skip(Engine::MySql, &v("8.4.0"), "rename table"));
+    assert!(!may_skip(Engine::MariaDb, &v("11.4.2"), "change check"));
 }
 
 #[test]
@@ -121,6 +174,7 @@ fn with_child_adds_replaces_and_removes() {
     };
     let added = with_child(&t, ObjectKind::Column, None, Some(&col));
     assert_eq!(added.columns.len(), 5);
+    assert_eq!(added.columns[3].name, "order");
     assert_eq!(added.columns[4].name, "extra");
     let mut renamed = col.clone();
     if let ObjectDef::Column { column, .. } = &mut renamed {
@@ -335,11 +389,16 @@ async fn run_script_follows_phases_captures_and_checks() {
 // --- the whole round trip with a toy SQLite generator --------------------------------------
 
 /// Test-only SQLite DDL: `CREATE TABLE` from the definition, table renames in place, and
-/// every other change as drop + create of the (empty) scratch table. No comments.
+/// every other change as a rebuild that copies the rows (create a new table, copy, drop the
+/// old one, rename). No comments.
 #[derive(Debug, Clone, Copy, Default)]
 struct ToyDdl {
     /// Leaves column defaults out of `CREATE TABLE`: a broken generator.
     drop_defaults: bool,
+    /// Rebuilds without copying the rows: a broken generator.
+    lose_rows: bool,
+    /// Says `Unsupported` for column renames.
+    refuse_column_rename: bool,
 }
 
 const Q: AnsiQuoting = AnsiQuoting;
@@ -431,39 +490,86 @@ impl ToyDdl {
             ))
             .described(format!("Create table {}", t.obj.name)),
         );
-        for ix in &t.indexes {
-            let r = ObjectRef::new(ObjectKind::Index, ix.name.clone())
-                .in_catalog(t.obj.catalog.as_deref());
-            let cols: Vec<String> = ix.columns.iter().map(|c| c.name.clone()).collect();
-            script.push_step(
-                ScriptStep::new(format!(
-                    "CREATE {}INDEX {} ON {} ({})",
-                    if ix.unique { "UNIQUE " } else { "" },
-                    Q.qualify(&r),
-                    Q.quote_ident(&t.obj.name),
-                    idents(&cols)
-                ))
-                .described(format!("Create index {}", ix.name)),
-            );
-        }
+        script.extend(index_steps(t));
         Ok(script)
     }
 
-    fn rebuild(self, old: &TableDef, new: &TableDef) -> Result<Script> {
-        let mut s = Script::new();
+    /// Rebuilds `old` as `new`: the rows are copied (`renamed` = a column's old and new name).
+    fn rebuild(
+        self,
+        old: &TableDef,
+        new: &TableDef,
+        renamed: Option<(&str, &str)>,
+    ) -> Result<Script> {
+        let mut tmp = new.clone();
+        tmp.obj.name = format!("{}__toy_new", old.obj.name);
+        tmp.indexes.clear();
+        let mut s: Script = self
+            .create_table(&tmp)?
+            .steps
+            .into_iter()
+            .map(ScriptStep::destructive)
+            .collect();
+        let (mut to, mut from) = (Vec::new(), Vec::new());
+        for c in &new.columns {
+            let source = match renamed {
+                Some((was, now)) if now == c.name => was,
+                _ => c.name.as_str(),
+            };
+            if old.column(source).is_some() {
+                to.push(c.name.clone());
+                from.push(source.to_owned());
+            }
+        }
+        if !self.lose_rows && !to.is_empty() {
+            s.push_step(
+                ScriptStep::new(format!(
+                    "INSERT INTO {} ({}) SELECT {} FROM {}",
+                    Q.qualify(&tmp.obj),
+                    idents(&to),
+                    idents(&from),
+                    Q.qualify(&old.obj)
+                ))
+                .destructive(),
+            );
+        }
         s.push_step(
             ScriptStep::new(format!("DROP TABLE {}", Q.qualify(&old.obj)))
                 .destructive()
                 .described("Toy rebuild: drop"),
         );
-        s.extend(
-            self.create_table(new)?
-                .steps
-                .into_iter()
-                .map(ScriptStep::destructive),
+        s.push_step(
+            ScriptStep::new(format!(
+                "ALTER TABLE {} RENAME TO {}",
+                Q.qualify(&tmp.obj),
+                Q.quote_ident(&new.obj.name)
+            ))
+            .destructive(),
         );
+        s.extend(index_steps(new).into_iter().map(ScriptStep::destructive));
         Ok(s)
     }
+}
+
+/// `CREATE INDEX` of every index of `t`.
+fn index_steps(t: &TableDef) -> Vec<ScriptStep> {
+    let mut out = Vec::new();
+    for ix in &t.indexes {
+        let r =
+            ObjectRef::new(ObjectKind::Index, ix.name.clone()).in_catalog(t.obj.catalog.as_deref());
+        let cols: Vec<String> = ix.columns.iter().map(|c| c.name.clone()).collect();
+        out.push(
+            ScriptStep::new(format!(
+                "CREATE {}INDEX {} ON {} ({})",
+                if ix.unique { "UNIQUE " } else { "" },
+                Q.qualify(&r),
+                Q.quote_ident(&t.obj.name),
+                idents(&cols)
+            ))
+            .described(format!("Create index {}", ix.name)),
+        );
+    }
+    out
 }
 
 fn owning(ctx: &DdlContext<'_>) -> Result<TableDef> {
@@ -478,7 +584,7 @@ impl DdlGenerator for ToyDdl {
             ObjectDef::Table(t) => self.create_table(t),
             child => {
                 let t = owning(ctx)?;
-                self.rebuild(&t, &with_child(&t, child.kind(), None, Some(child)))
+                self.rebuild(&t, &with_child(&t, child.kind(), None, Some(child)), None)
             }
         }
     }
@@ -496,12 +602,24 @@ impl DdlGenerator for ToyDdl {
                 cur.obj.clone_from(&b.obj);
             }
             if !diff_tables(&cur, b, &DefaultRules).is_empty() {
-                s.append(self.rebuild(&cur, b)?);
+                s.append(self.rebuild(&cur, b, None)?);
             }
             return Ok(s);
         }
         let t = owning(ctx)?;
-        self.rebuild(&t, &with_child(&t, new.kind(), Some(old.name()), Some(new)))
+        let renamed = if new.kind() == ObjectKind::Column && old.name() != new.name() {
+            Some((old.name(), new.name()))
+        } else {
+            None
+        };
+        if renamed.is_some() && self.refuse_column_rename {
+            return Err(Error::unsupported("toy: column renames"));
+        }
+        self.rebuild(
+            &t,
+            &with_child(&t, new.kind(), Some(old.name()), Some(new)),
+            renamed,
+        )
     }
 
     fn drop_object(&self, r: &ObjectRef, ctx: &DdlContext<'_>) -> Result<Script> {
@@ -511,7 +629,7 @@ impl DdlGenerator for ToyDdl {
             return Ok(s);
         }
         let t = owning(ctx)?;
-        self.rebuild(&t, &with_child(&t, r.kind, Some(&r.name), None))
+        self.rebuild(&t, &with_child(&t, r.kind, Some(&r.name), None), None)
     }
 }
 
@@ -572,18 +690,42 @@ fn toy_caps() -> DesignerCapabilities {
 /// `oxbase_services::default_dialects` with the toy generator, the default comparator rules
 /// and `designer` for SQLite.
 fn toy_registry(ddl: ToyDdl, designer: DesignerCapabilities) -> DialectRegistry {
+    toy_registry_with(ddl, designer, Arc::new(RulesComparator(DefaultRules)))
+}
+
+/// [`toy_registry`] with `cmp` as the comparator of every designer kind.
+fn toy_registry_with(
+    ddl: ToyDdl,
+    designer: DesignerCapabilities,
+    cmp: Arc<dyn Comparator>,
+) -> DialectRegistry {
     let mut reg = adapter::registry();
     let inner = reg.capabilities(Engine::Sqlite).unwrap();
     reg.register_capabilities(Engine::Sqlite, Arc::new(ToyCaps { inner, designer }));
     for kind in DESIGNER_KINDS {
         reg.register_ddl(Engine::Sqlite, kind, Arc::new(ddl));
-        reg.register_comparator(
-            Engine::Sqlite,
-            kind,
-            Arc::new(RulesComparator(DefaultRules)),
-        );
+        reg.register_comparator(Engine::Sqlite, kind, cmp.clone());
     }
     reg
+}
+
+/// Rules that call every two expressions (defaults, checks) the same: a comparator that
+/// cannot see default or check changes.
+struct BlindRules;
+
+impl CompareRules for BlindRules {
+    fn same_expression(&self, _old: &str, _new: &str) -> bool {
+        true
+    }
+}
+
+/// Rules that call every two foreign-key targets the same.
+struct AnyTargetRules;
+
+impl CompareRules for AnyTargetRules {
+    fn same_table_ref(&self, _old: &ObjectRef, _new: &ObjectRef) -> bool {
+        true
+    }
 }
 
 fn find(out: &[RtOutcome], kind: ObjectKind, check: Check) -> &RtOutcome {
@@ -604,7 +746,9 @@ fn toy_sqlite_round_trip_passes_every_cell_and_cleans_up() {
     }
     let table = &find(&out, ObjectKind::Table, Check::Roundtrip).detail;
     assert_eq!(
-        table, "create table, rename table, drop table",
+        table,
+        "create table, rename table, drop table [skipped, allowed on sqlite: change table \
+         comment]",
         "comments are skipped on SQLite"
     );
     let caps = &find(&out, ObjectKind::Table, Check::Capabilities).detail;
@@ -616,8 +760,8 @@ fn toy_sqlite_round_trip_passes_every_cell_and_cleans_up() {
     let column = &find(&out, ObjectKind::Column, Check::Roundtrip).detail;
     assert!(
         column.ends_with(
-            "add column, change column type, set column NOT NULL, set column default, rename \
-             column, drop column"
+            "add column, set column NOT NULL, set column default, change column type, rename \
+             column, drop column [skipped, allowed on sqlite: set column comment]"
         ),
         "{column}"
     );
@@ -683,6 +827,113 @@ fn a_broken_generator_fails_the_round_trip_and_still_cleans_up() {
         "{index:#?}"
     );
     assert!(!scratch_dir(&engines[0]).exists());
+}
+
+#[test]
+fn a_comparator_blind_to_a_property_fails_the_round_trip() {
+    let (fx, engines) = sqlite_fixture("lite_blind");
+    let reg = toy_registry_with(
+        ToyDdl::default(),
+        toy_caps(),
+        Arc::new(RulesComparator(BlindRules)),
+    );
+    let out = run_all(&fx, &engines, &[true], &reg);
+    for kind in DESIGNER_KINDS {
+        let rt = find(&out, kind, Check::Roundtrip);
+        assert_eq!(rt.status, CellStatus::Fail, "{rt:#?}");
+        assert!(
+            rt.detail
+                .contains("cannot see these changes of the fetched table: qty default 0 -> 1"),
+            "{rt:#?}"
+        );
+    }
+    assert!(!scratch_dir(&engines[0]).exists());
+
+    let (fx, engines) = sqlite_fixture("lite_anytarget");
+    let reg = toy_registry_with(
+        ToyDdl::default(),
+        toy_caps(),
+        Arc::new(RulesComparator(AnyTargetRules)),
+    );
+    let out = run_all(&fx, &engines, &[true], &reg);
+    let fk = find(&out, ObjectKind::ForeignKey, Check::Roundtrip);
+    assert_eq!(fk.status, CellStatus::Fail, "{fk:#?}");
+    assert!(
+        fk.detail
+            .starts_with("add foreign key: the foreign key comparator cannot see"),
+        "{fk:#?}"
+    );
+    let column = find(&out, ObjectKind::Column, Check::Roundtrip);
+    assert_eq!(column.status, CellStatus::Pass, "{column:#?}");
+}
+
+#[test]
+fn a_rebuild_that_loses_rows_fails_the_round_trip() {
+    let (fx, engines) = sqlite_fixture("lite_lossy");
+    let reg = toy_registry(
+        ToyDdl {
+            lose_rows: true,
+            ..ToyDdl::default()
+        },
+        toy_caps(),
+    );
+    let out = run_all(&fx, &engines, &[true], &reg);
+    for kind in [
+        ObjectKind::Column,
+        ObjectKind::Index,
+        ObjectKind::ForeignKey,
+        ObjectKind::Check,
+    ] {
+        let rt = find(&out, kind, Check::Roundtrip);
+        assert_eq!(rt.status, CellStatus::Fail, "{rt:#?}");
+        assert!(
+            rt.detail
+                .contains("holds 0 row(s) afterwards, expected the 1 row inserted before"),
+            "{rt:#?}"
+        );
+    }
+    // Table renames do not rebuild, so the row stays.
+    let table = find(&out, ObjectKind::Table, Check::Roundtrip);
+    assert_eq!(table.status, CellStatus::Pass, "{table:#?}");
+}
+
+#[test]
+fn a_required_change_both_sides_skip_leaves_the_cell_pending() {
+    let (fx, engines) = sqlite_fixture("lite_norename");
+    let mut designer = toy_caps();
+    designer.rename_column = Support::Unsupported;
+    let reg = toy_registry(
+        ToyDdl {
+            refuse_column_rename: true,
+            ..ToyDdl::default()
+        },
+        designer,
+    );
+    let out = run_all(&fx, &engines, &[true], &reg);
+    let rt = find(&out, ObjectKind::Column, Check::Roundtrip);
+    assert_eq!(rt.status, CellStatus::Pending, "{rt:#?}");
+    assert!(
+        rt.detail.starts_with(
+            "pending (the generator and the capabilities both call [rename column] unsupported"
+        ),
+        "{rt:#?}"
+    );
+    let caps = find(&out, ObjectKind::Column, Check::Capabilities);
+    assert_eq!(caps.status, CellStatus::Pass, "{caps:#?}");
+
+    let mut cells = plan_engine_in(&reg, "lite_norename", Engine::Sqlite);
+    apply(&mut cells, &out);
+    let required = GateOptions {
+        skipped_ok: false,
+        require_m3: true,
+    };
+    let problems = gate(&cells, &fx, &engines, &reg, required);
+    assert!(
+        problems
+            .iter()
+            .any(|p| p.starts_with("lite_norename column roundtrip: pending")),
+        "{problems:#?}"
+    );
 }
 
 #[test]

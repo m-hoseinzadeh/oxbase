@@ -16,7 +16,7 @@ use oxbase_types::{
     Result, Script, ServerVersion, StepPhase, TableDef, Value,
 };
 
-use super::exec::{exec, run_script};
+use super::exec::{exec, first_text, run_script};
 use crate::matrix::CellStatus;
 
 /// Table comment set at create time (when the engine has table comments): a quote, a
@@ -30,7 +30,17 @@ pub const COLUMN_COMMENT: &str = "Note: it's a \\ column, na\u{ef}ve";
 pub const DEFAULT_TEXT: &str = "it's \u{fc}";
 /// The column the column cell adds, then renames to [`RENAMED_COLUMN`].
 pub const EXTRA_COLUMN: &str = "c_extra";
-pub const RENAMED_COLUMN: &str = "c_renamed";
+/// A reserved word with an embedded double quote and non-ASCII text, so quoting identifiers is
+/// part of the round trip (generate, run, fetch and compare).
+pub const RENAMED_COLUMN: &str = "sel\"ect_\u{fc}";
+/// A column of the base table named with a reserved word.
+pub const ORDER_COLUMN: &str = "order";
+/// Values of the row every cell keeps in the table it alters: a quote, a backslash and
+/// non-ASCII text (always bound, never in the SQL text).
+pub const ROW_CODE: &str = "it's a \\ row, \u{e9}";
+pub const ROW_ORDER: &str = "o\"rder \u{fc}";
+/// The value the column cell puts in the added column before making it NOT NULL.
+pub const ROW_EXTRA: &str = "kept \u{ef}";
 /// Check expressions before and after the alter (`qty` is a column of the base table).
 pub const CHECK_EXPRESSION: &str = "qty >= 0";
 pub const CHECK_EXPRESSION_CHANGED: &str = "qty >= 1";
@@ -94,6 +104,8 @@ pub(crate) async fn run(env: Arc<Env>, kind: ObjectKind) -> CellReport {
         agree: Vec::new(),
         disagree: Vec::new(),
         done: Vec::new(),
+        skipped: Vec::new(),
+        row: Vec::new(),
     };
     let result = match kind {
         ObjectKind::Table => run.table().await,
@@ -150,6 +162,12 @@ struct Run<'a> {
     disagree: Vec<String>,
     /// The round-trip steps that passed, in order.
     done: Vec<String>,
+    /// The changes skipped because the generator and the capabilities both call them
+    /// unsupported, in order.
+    skipped: Vec<String>,
+    /// The row the table under change must still hold (column, value); empty before it is
+    /// inserted and after the table is dropped.
+    row: Vec<(String, Value)>,
 }
 
 /// One change of the column cell, applied to the fetched column.
@@ -308,8 +326,8 @@ pub(crate) fn with_child(
 }
 
 /// The base table every cell starts from: `id bigint NOT NULL` (primary key),
-/// `code varchar(40) NOT NULL`, `qty bigint DEFAULT 0`, `note text`. Neutral types without a
-/// native spelling, so each engine's generator picks its own.
+/// `code varchar(40) NOT NULL`, `qty bigint DEFAULT 0`, `"order" text` (a reserved word).
+/// Neutral types without a native spelling, so each engine's generator picks its own.
 pub(crate) fn base_table(table: ObjectRef) -> TableDef {
     let mut qty = ColumnDef::new("qty", DataType::INT64);
     qty.default = Some("0".to_owned());
@@ -318,13 +336,68 @@ pub(crate) fn base_table(table: ObjectRef) -> TableDef {
         ColumnDef::new("id", DataType::INT64).not_null(),
         ColumnDef::new("code", DataType::VarChar { length: Some(40) }).not_null(),
         qty,
-        ColumnDef::new("note", DataType::Text),
+        ColumnDef::new(ORDER_COLUMN, DataType::Text),
     ];
     t.primary_key = Some(PrimaryKeyDef {
         name: None,
         columns: vec!["id".to_owned()],
     });
     t
+}
+
+/// The row inserted into every base table right after it is created (column, value).
+pub(crate) fn base_row() -> Vec<(String, Value)> {
+    vec![
+        ("id".to_owned(), Value::Int(1)),
+        ("code".to_owned(), Value::Text(ROW_CODE.to_owned())),
+        ("qty".to_owned(), Value::Int(5)),
+        (ORDER_COLUMN.to_owned(), Value::Text(ROW_ORDER.to_owned())),
+    ]
+}
+
+/// Whether the contract lets `engine` at `version` leave `op` unsupported (the generator and the
+/// capabilities both say so): SQLite has no comments; MySQL before 8.0.16 and MariaDB before
+/// 10.2 parse checks but do not keep them. Any other skipped operation leaves the round trip
+/// pending (`docs/m3-contracts.md` §3.3 requires it), which the required gate rejects.
+pub(crate) fn may_skip(engine: Engine, version: &ServerVersion, op: &str) -> bool {
+    const CHECK_OPS: [&str; 3] = ["add check", "change check", "drop check"];
+    match engine {
+        Engine::Sqlite => matches!(op, "change table comment" | "set column comment"),
+        Engine::MySql => !version.at_least_patch(8, 0, 16) && CHECK_OPS.contains(&op),
+        Engine::MariaDb => version.before(10, 2) && CHECK_OPS.contains(&op),
+        _ => false,
+    }
+}
+
+/// A change to a fetched table that the `Table` comparator must report: the properties whose
+/// comparison the engine's `CompareRules` decide (type, default). `false` when the table has
+/// no such column.
+type Probe = (&'static str, fn(&mut TableDef) -> bool);
+
+const TABLE_PROBES: [Probe; 2] = [
+    ("code varchar(40) -> varchar(41)", widen_code),
+    ("qty default 0 -> 1", change_qty_default),
+];
+
+fn widen_code(t: &mut TableDef) -> bool {
+    let Some(c) = t.columns.iter_mut().find(|c| c.name == "code") else {
+        return false;
+    };
+    c.data_type = DataType::VarChar { length: Some(41) };
+    c.native_type = if c.native_type.contains("40") {
+        c.native_type.replace("40", "41")
+    } else {
+        String::new()
+    };
+    true
+}
+
+fn change_qty_default(t: &mut TableDef) -> bool {
+    let Some(c) = t.columns.iter_mut().find(|c| c.name == "qty") else {
+        return false;
+    };
+    c.default = Some("1".to_owned());
+    true
 }
 
 impl Run<'_> {
@@ -344,10 +417,31 @@ impl Run<'_> {
         } else {
             self.done.join(", ")
         };
+        let (engine, version) = (self.env.engine, &self.env.version);
+        let (allowed, required): (Vec<&str>, Vec<&str>) = self
+            .skipped
+            .iter()
+            .map(String::as_str)
+            .partition(|op| may_skip(engine, version, op));
         let roundtrip = match result {
-            Ok(None) => (CellStatus::Pass, done),
-            Ok(Some(why)) => (CellStatus::NotApplicable, why.clone()),
             Err(e) => (CellStatus::Fail, format!("{e} (passed before: {done})")),
+            Ok(_) if !required.is_empty() => (
+                CellStatus::Pending,
+                format!(
+                    "pending (the generator and the capabilities both call [{}] unsupported, \
+                     but docs/m3-contracts.md \u{a7}3.3 requires it on {engine}; passed: {done})",
+                    required.join(", ")
+                ),
+            ),
+            Ok(None) if allowed.is_empty() => (CellStatus::Pass, done),
+            Ok(None) => (
+                CellStatus::Pass,
+                format!(
+                    "{done} [skipped, allowed on {engine}: {}]",
+                    allowed.join(", ")
+                ),
+            ),
+            Ok(Some(why)) => (CellStatus::NotApplicable, why.clone()),
         };
         let capabilities = if self.disagree.is_empty() && result.is_err() {
             (
@@ -399,6 +493,7 @@ impl Run<'_> {
             Err(Error::Unsupported { message }) if !support.is_supported() => {
                 self.agree
                     .push(format!("{op}: unsupported in both ({message})"));
+                self.skipped.push(op.to_owned());
                 Ok(Gen::Skipped)
             }
             Err(e @ Error::Unsupported { .. }) => Err(format!(
@@ -515,6 +610,13 @@ impl Run<'_> {
         );
         let seen = cmp.diff(&b, &a);
         let meant = cmp.diff(&b, &i);
+        if meant.is_empty() {
+            return Err(format!(
+                "{op}: the table comparator finds no difference between the table before and \
+                 the intended one, so it cannot tell whether the server applied the change \
+                 (CompareRules blind to it?)"
+            ));
+        }
         if change_keys(&seen) == change_keys(&meant) {
             Ok(())
         } else {
@@ -523,6 +625,127 @@ impl Run<'_> {
                 list(&seen),
                 list(&meant)
             ))
+        }
+    }
+
+    /// The `Table` comparator reports each of [`TABLE_PROBES`] on the table as fetched after
+    /// create: a comparator blind to a property would let every step that checks it pass.
+    fn sensitive(&self, fetched: &TableDef, op: &str) -> Step<()> {
+        let cmp = self.roles.table_cmp.as_ref();
+        let base = ObjectDef::Table(fetched.clone());
+        let blind: Vec<&str> = TABLE_PROBES
+            .iter()
+            .filter(|(_, change)| {
+                let mut t = fetched.clone();
+                change(&mut t) && cmp.diff(&base, &ObjectDef::Table(t)).is_empty()
+            })
+            .map(|(what, _)| *what)
+            .collect();
+        if blind.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "{op}: the table comparator cannot see these changes of the fetched table: {} \
+                 (CompareRules too lenient)",
+                blind.join(", ")
+            ))
+        }
+    }
+
+    /// The text of the first value `sql` returns (a `COUNT(*)`).
+    async fn count(&self, sql: &str, params: &[Value], op: &str) -> Step<String> {
+        let out = exec(self.conn.as_ref(), sql, params, &self.env.cancel)
+            .await
+            .map_err(|e| format!("{op}: {sql}: {e}"))?;
+        first_text(&out).ok_or_else(|| format!("{op}: {sql} returned no count"))
+    }
+
+    /// Inserts `values` (column, value; all bound) into `table`.
+    async fn insert(&self, table: &ObjectRef, values: &[(String, Value)], op: &str) -> Step<()> {
+        let q = self.env.quoting.as_ref();
+        let cols: Vec<String> = values.iter().map(|(c, _)| q.quote_ident(c)).collect();
+        let marks: Vec<String> = (1..=values.len()).map(|i| q.placeholder(i)).collect();
+        let sql = format!(
+            "INSERT INTO {} ({}) VALUES ({})",
+            q.qualify(table),
+            cols.join(", "),
+            marks.join(", ")
+        );
+        let params: Vec<Value> = values.iter().map(|(_, v)| v.clone()).collect();
+        exec(self.conn.as_ref(), &sql, &params, &self.env.cancel)
+            .await
+            .map(|_| ())
+            .map_err(|e| format!("{op}: {sql}: {e}"))
+    }
+
+    /// Inserts [`base_row`] (plus `extra`) into the table under change and checks it is there.
+    async fn seed(&mut self, table: &ObjectRef, extra: &[(String, Value)]) -> Step<()> {
+        let op = format!("insert a row into {}", table.name);
+        let mut row = base_row();
+        row.extend_from_slice(extra);
+        self.insert(table, &row, &op).await?;
+        self.row = row;
+        self.check_row(table, &op).await
+    }
+
+    /// `table` still holds exactly the one row, with the values of [`Run::row`] (compared with
+    /// bound parameters): a rebuild or a `MODIFY` / `CHANGE` must not lose or change rows.
+    async fn check_row(&self, table: &ObjectRef, op: &str) -> Step<()> {
+        if self.row.is_empty() {
+            return Ok(());
+        }
+        let q = self.env.quoting.as_ref();
+        let all = self
+            .count(
+                &format!("SELECT COUNT(*) FROM {}", q.qualify(table)),
+                &[],
+                op,
+            )
+            .await?;
+        if all != "1" {
+            return Err(format!(
+                "{op}: {} holds {all} row(s) afterwards, expected the 1 row inserted before",
+                table.name
+            ));
+        }
+        let cond: Vec<String> = self
+            .row
+            .iter()
+            .enumerate()
+            .map(|(i, (c, _))| format!("{} = {}", q.quote_ident(c), q.placeholder(i + 1)))
+            .collect();
+        let sql = format!(
+            "SELECT COUNT(*) FROM {} WHERE {}",
+            q.qualify(table),
+            cond.join(" AND ")
+        );
+        let params: Vec<Value> = self.row.iter().map(|(_, v)| v.clone()).collect();
+        if self.count(&sql, &params, op).await? == "1" {
+            Ok(())
+        } else {
+            let cols: Vec<&str> = self.row.iter().map(|(c, _)| c.as_str()).collect();
+            Err(format!(
+                "{op}: the row inserted before no longer has the same values in {}",
+                cols.join(", ")
+            ))
+        }
+    }
+
+    /// Follows a column rename or drop in [`Run::row`].
+    fn row_follows(&mut self, old: Option<&ObjectDef>, new: Option<&ObjectDef>) {
+        let Some(ObjectDef::Column { column: before, .. }) = old else {
+            return;
+        };
+        match new {
+            Some(ObjectDef::Column { column: after, .. }) => {
+                for (c, _) in &mut self.row {
+                    if *c == before.name {
+                        c.clone_from(&after.name);
+                    }
+                }
+            }
+            None => self.row.retain(|(c, _)| *c != before.name),
+            Some(_) => {}
         }
     }
 
@@ -544,6 +767,7 @@ impl Run<'_> {
             &ObjectDef::Table(fetched.clone()),
             op,
         )?;
+        self.sensitive(&fetched, op)?;
         if !self.listed(&def.obj.name, op).await? {
             return Err(format!("{op}: {} is not listed after create", def.obj));
         }
@@ -593,6 +817,7 @@ impl Run<'_> {
             self.expect_gone(self.roles.tables.as_ref(), &cur.obj, op)
                 .await?;
         }
+        self.check_row(&new.obj, op).await?;
         self.done.push(op.to_owned());
         Ok(Some(after))
     }
@@ -623,7 +848,18 @@ impl Run<'_> {
         if script.is_empty() {
             return Err(format!("{op}: the generator produced an empty script"));
         }
+        if let (Some(o), Some(n)) = (old, new)
+            && self.roles.cmp.diff(o, n).is_empty()
+        {
+            return Err(format!(
+                "{op}: the {} comparator finds no difference between the old and the intended \
+                 definition, so it cannot tell whether the server applied the change \
+                 (CompareRules blind to it?)",
+                o.kind()
+            ));
+        }
         self.run_ddl(op, &script).await?;
+        self.row_follows(old, new);
         if let Some(n) = new {
             let fetched = self
                 .load(self.roles.fetch.as_ref(), &n.object_ref(), op)
@@ -646,6 +882,7 @@ impl Run<'_> {
             &format!("{op} (whole table)"),
         )?;
         self.change_only(table, &after, &intended, op)?;
+        self.check_row(&table.obj, op).await?;
         self.done.push(op.to_owned());
         Ok(Some(after))
     }
@@ -665,6 +902,7 @@ impl Run<'_> {
                     .to_owned(),
             ));
         };
+        self.seed(&cur.obj, &[]).await?;
 
         let mut renamed = cur.clone();
         renamed.obj = self.table_ref(1);
@@ -708,6 +946,7 @@ impl Run<'_> {
             .drop_object(&cur.obj, &self.ctx().with_table(&cur));
         if let Gen::Run(script) = self.generated(op, flag(self.env.caps.drop_table), made)? {
             self.run_ddl(op, &script).await?;
+            self.row.clear();
             self.expect_gone(self.roles.tables.as_ref(), &cur.obj, op)
                 .await?;
             if self.listed(&cur.obj.name, op).await? {
@@ -769,9 +1008,12 @@ impl Run<'_> {
         Ok(!self.listed(&def.obj.name, op).await?)
     }
 
-    /// add a column → type → NOT NULL → literal default → comment → rename → drop.
+    /// add a column (then fill it in the row) → NOT NULL → literal default → comment → type
+    /// (after the default and the comment, so a `MODIFY` must carry them) → rename to
+    /// [`RENAMED_COLUMN`] → drop.
     async fn column(&mut self) -> Outcome {
         let mut cur = self.base(&base_table(self.table_ref(0))).await?;
+        self.seed(&cur.obj, &[]).await?;
         let caps = self.env.caps.clone();
         let table = cur.obj.clone();
         let added = ObjectDef::Column {
@@ -789,12 +1031,9 @@ impl Run<'_> {
         };
         cur = after;
         let mut name = EXTRA_COLUMN.to_owned();
+        self.fill(&table, &name).await?;
 
         let changes: [(&str, Support, ColumnChange); 4] = [
-            ("change column type", caps.alter_column_type, |c, _| {
-                c.data_type = DataType::VarChar { length: Some(80) };
-                c.native_type = String::new();
-            }),
             (
                 "set column NOT NULL",
                 caps.alter_column_nullability,
@@ -807,6 +1046,10 @@ impl Run<'_> {
             }),
             ("set column comment", caps.column_comment, |c, _| {
                 c.comment = Some(COLUMN_COMMENT.to_owned());
+            }),
+            ("change column type", caps.alter_column_type, |c, _| {
+                c.data_type = DataType::VarChar { length: Some(80) };
+                c.native_type = String::new();
             }),
         ];
         for (op, support, change) in changes {
@@ -859,9 +1102,34 @@ impl Run<'_> {
         Ok(None)
     }
 
+    /// Sets the added column `name` of the row to [`ROW_EXTRA`] (bound), so making it NOT NULL
+    /// keeps the row, and the later steps check the value is kept.
+    async fn fill(&mut self, table: &ObjectRef, name: &str) -> Step<()> {
+        let op = format!("fill column {name}");
+        let q = self.env.quoting.as_ref();
+        let sql = format!(
+            "UPDATE {} SET {} = {}",
+            q.qualify(table),
+            q.quote_ident(name),
+            q.placeholder(1)
+        );
+        exec(
+            self.conn.as_ref(),
+            &sql,
+            &[Value::Text(ROW_EXTRA.to_owned())],
+            &self.env.cancel,
+        )
+        .await
+        .map_err(|e| format!("{op}: {sql}: {e}"))?;
+        self.row
+            .push((name.to_owned(), Value::Text(ROW_EXTRA.to_owned())));
+        self.check_row(table, &op).await
+    }
+
     /// add an index on `code` → make it unique on `(code, qty)` → drop.
     async fn index(&mut self) -> Outcome {
         let mut cur = self.base(&base_table(self.table_ref(0))).await?;
+        self.seed(&cur.obj, &[]).await?;
         let caps = self.env.caps.clone();
         let name = format!("{}_ix", self.env.names[0]);
         let added = ObjectDef::Index {
@@ -916,6 +1184,26 @@ impl Run<'_> {
         Ok(None)
     }
 
+    /// The foreign-key comparator reports a different referenced table (`same_table_ref` is a
+    /// `CompareRules` hook a lenient engine could get wrong).
+    fn fk_sensitive(&self, table: &TableDef, name: &str) -> Step<()> {
+        let op = "add foreign key";
+        let fetched = child_of(table, ObjectKind::ForeignKey, name)
+            .ok_or_else(|| format!("{op}: foreign key {name} is not in the fetched table"))?;
+        let mut other = fetched.clone();
+        if let ObjectDef::ForeignKey { foreign_key, .. } = &mut other {
+            foreign_key.ref_table.name.push_str("_other");
+        }
+        if self.roles.cmp.diff(&fetched, &other).is_empty() {
+            Err(format!(
+                "{op}: the foreign key comparator cannot see a different referenced table \
+                 (CompareRules::same_table_ref too lenient)"
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
     /// Notes whether `action` is one of the capabilities' `fkActions`.
     fn note_action(&mut self, action: FkAction) {
         if self.env.caps.fk_actions.contains(&action) {
@@ -939,6 +1227,12 @@ impl Run<'_> {
             columns: vec!["id".to_owned()],
         });
         let parent = self.base(&parent).await?;
+        self.insert(
+            &parent.obj,
+            &[("id".to_owned(), Value::Int(1))],
+            "insert a row into the referenced table",
+        )
+        .await?;
 
         let mut child = base_table(self.table_ref(0));
         child
@@ -955,6 +1249,8 @@ impl Run<'_> {
             extras: Extras::default(),
         });
         let mut cur = self.base(&child).await?;
+        self.seed(&cur.obj, &[("ref_id".to_owned(), Value::Int(1))])
+            .await?;
 
         let name = format!("{}_fk", self.env.names[0]);
         let pick = |wanted: &[FkAction], not: FkAction| -> FkAction {
@@ -1001,6 +1297,7 @@ impl Run<'_> {
             ));
         };
         cur = after;
+        self.fk_sensitive(&cur, &name)?;
 
         let op = "change foreign key";
         let old = child_of(&cur, ObjectKind::ForeignKey, &name)
@@ -1039,6 +1336,7 @@ impl Run<'_> {
     /// add a check → probe enforcement → change its expression → drop.
     async fn check(&mut self) -> Outcome {
         let mut cur = self.base(&base_table(self.table_ref(0))).await?;
+        self.seed(&cur.obj, &[]).await?;
         let caps = self.env.caps.clone();
         let name = format!("{}_ck", self.env.names[0]);
         let added = ObjectDef::Check {
@@ -1090,34 +1388,25 @@ impl Run<'_> {
         Ok(None)
     }
 
-    /// `checksEnforced` against the server: insert a row that violates the check (values bound,
-    /// identifiers quoted); it must fail exactly when checks are enforced. The row is deleted
-    /// again when it got in.
+    /// `checksEnforced` against the server: a valid row (`qty` = 5) must go in (a control, so a
+    /// bind or type error is not taken for enforcement), then a row that violates the check
+    /// (`qty` = -1) must fail exactly when checks are enforced. Values bound, identifiers
+    /// quoted; both probe rows are deleted again, the seeded row stays.
     async fn probe_enforced(&mut self, table: &ObjectRef) -> Step<()> {
-        let q = self.env.quoting.as_ref();
-        let sql = format!(
-            "INSERT INTO {} ({}, {}, {}) VALUES ({}, {}, {})",
-            q.qualify(table),
-            q.quote_ident("id"),
-            q.quote_ident("code"),
-            q.quote_ident("qty"),
-            q.placeholder(1),
-            q.placeholder(2),
-            q.placeholder(3)
-        );
-        let params = [
-            Value::Int(1),
-            Value::Text("probe".to_owned()),
-            Value::Int(-1),
-        ];
-        let inserted = exec(self.conn.as_ref(), &sql, &params, &self.env.cancel)
-            .await
-            .is_ok();
+        let op = "check enforcement probe";
+        let probe = |id: i64, qty: i64| {
+            vec![
+                ("id".to_owned(), Value::Int(id)),
+                ("code".to_owned(), Value::Text(format!("probe {id}"))),
+                ("qty".to_owned(), Value::Int(qty)),
+            ]
+        };
+        self.insert(table, &probe(2, 5), &format!("{op} (valid control row)"))
+            .await?;
+        self.delete(table, 2, op).await?;
+        let inserted = self.insert(table, &probe(3, -1), op).await.is_ok();
         if inserted {
-            let delete = format!("DELETE FROM {}", q.qualify(table));
-            exec(self.conn.as_ref(), &delete, &[], &self.env.cancel)
-                .await
-                .map_err(|e| format!("check enforcement probe: {delete}: {e}"))?;
+            self.delete(table, 3, op).await?;
         }
         let enforced = !inserted;
         if enforced == self.env.caps.checks_enforced {
@@ -1130,6 +1419,26 @@ impl Run<'_> {
                 if inserted { "accepted" } else { "rejected" }
             ));
         }
-        Ok(())
+        self.check_row(table, op).await
+    }
+
+    /// Deletes the probe row `id` (bound).
+    async fn delete(&self, table: &ObjectRef, id: i64, op: &str) -> Step<()> {
+        let q = self.env.quoting.as_ref();
+        let sql = format!(
+            "DELETE FROM {} WHERE {} = {}",
+            q.qualify(table),
+            q.quote_ident("id"),
+            q.placeholder(1)
+        );
+        exec(
+            self.conn.as_ref(),
+            &sql,
+            &[Value::Int(id)],
+            &self.env.cancel,
+        )
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("{op}: {sql}: {e}"))
     }
 }

@@ -10,19 +10,30 @@
 //! 1. **create**: the kind's `DdlGenerator::create` (child kinds on a base table that the
 //!    `Table` generator created and the round trip verified first) → run → fetch with the M2
 //!    `Fetcher` → the kind's `Comparator` finds no difference to the definition the script was
-//!    generated from, and neither does the `Table` comparator for the whole table;
-//! 2. **alter**: a representative change (table: rename and comment; column: type, NOT NULL,
-//!    literal default, comment, rename; index: columns and uniqueness; foreign key: delete
-//!    action; check: expression) → run → fetch → no difference to the intended definition,
-//!    and the difference between the table before and after is exactly the intended change
-//!    (same objects, properties and kinds of change);
+//!    generated from, and neither does the `Table` comparator for the whole table. The base
+//!    table has a reserved-word column (`order`) and gets one row (values bound; a quote, a
+//!    backslash and non-ASCII text);
+//! 2. **alter**: a representative change (table: rename and comment; column: NOT NULL, literal
+//!    default, comment, then type, so a `MODIFY` must keep the default and the comment, then a
+//!    rename to a reserved word with an embedded quote and non-ASCII text; index: columns and
+//!    uniqueness; foreign key: delete action; check: expression) → run → fetch → no difference
+//!    to the intended definition, and the difference between the table before and after is
+//!    exactly the intended change (same objects, properties and kinds of change), and the row
+//!    is still there with the same values;
 //! 3. **drop** → run → fetch says `NotFound` (tables: also no longer listed).
+//!
+//! The comparators must not be blind to what they check: the intended change of every alter
+//! must be a non-empty difference (for the `Table` comparator, and for the kind's on a child
+//! change), and right after create the `Table` comparator must report a changed type and a
+//! changed default of the fetched table, the `ForeignKey` one a changed referenced table.
 //!
 //! Scripts run with the semantics of the `oxbase_types::script` module docs ([`run_script`]),
 //! in one transaction when the engine has transactional DDL and the script is atomic.
 //!
-//! A change both the designer capabilities and the generator call unsupported (comments on
-//! SQLite) is skipped and noted. The cell's scratch tables are dropped afterwards whatever
+//! A change both the designer capabilities and the generator call unsupported is skipped and
+//! noted. Only the contract's exceptions may be skipped (comments on SQLite; checks on MySQL
+//! before 8.0.16 and MariaDB before 10.2); any other skip leaves the round trip pending, which
+//! the required gate rejects. The cell's scratch tables are dropped afterwards whatever
 //! happened (`DROP TABLE IF EXISTS`, child before parent, also after a failure, a timeout or a
 //! panic), and the cell fails if one is still listed. Leftovers of killed runs whose token is
 //! older than `stale_after_secs` are dropped when an engine's run starts.
@@ -72,6 +83,7 @@ use crate::adapter;
 use crate::connect::{Ctx, millis};
 use crate::fixtures::{Fixtures, M3EngineSeed, ResolvedEngine};
 use crate::matrix::{Cell, CellStatus, Check, driver_milestone};
+use crate::runner::RunOptions;
 
 /// The engines whose round trip M3 delivers (`docs/m3-contracts.md` §12).
 pub const M3_ENGINES: [Engine; 4] = [
@@ -89,6 +101,9 @@ pub const DEFAULT_STALE_AFTER_SECS: u64 = 3600;
 pub const TOKEN_LEN: usize = 10;
 const SECS_DIGITS: usize = 6;
 const PID_DIGITS: usize = 4;
+/// The seconds field of a token holds unix seconds modulo this (36^6 s, about 69 years; it
+/// wraps on 2038-12-24 and again in 2107), so ages are computed modulo it too ([`token_age`]).
+pub const SECS_WRAP: u64 = 36u64.pow(6);
 
 /// The environment variable that makes every M3 cell on the M3 engines required.
 pub const REQUIRE_ENV: &str = "OXBASE_CONFORMANCE_REQUIRE_M3_ROUNDTRIP";
@@ -224,12 +239,24 @@ fn base36(mut n: u64, width: usize) -> String {
     String::from_utf8(out).unwrap_or_default()
 }
 
-/// The unix seconds a token was made at.
+/// The unix seconds a token was made at, modulo [`SECS_WRAP`].
 pub fn token_secs(token: &str) -> Option<u64> {
     if !is_token(token) {
         return None;
     }
     u64::from_str_radix(&token[..SECS_DIGITS], 36).ok()
+}
+
+/// How far in the future a token may be (another machine's clock) and still be read as such.
+const FUTURE_SLACK_SECS: u64 = 86_400;
+
+/// How many seconds before `now` (unix seconds) `token` was made, modulo [`SECS_WRAP`] so the
+/// wrap of the seconds field does not make fresh tokens look old. A token from up to a day in
+/// the future (another machine's clock) is `None`: never stale.
+pub fn token_age(token: &str, now: u64) -> Option<u64> {
+    let secs = token_secs(token)?;
+    let age = (now % SECS_WRAP + SECS_WRAP - secs) % SECS_WRAP;
+    (age < SECS_WRAP - FUTURE_SLACK_SECS).then_some(age)
 }
 
 fn is_token(s: &str) -> bool {
@@ -720,8 +747,8 @@ async fn drop_stale(
         .map(|s| &s.obj)
         .filter(|r| {
             scratch_token(&r.name, prefix)
-                .and_then(token_secs)
-                .is_some_and(|secs| now.saturating_sub(secs) > stale_after)
+                .and_then(|t| token_age(t, now))
+                .is_some_and(|age| age > stale_after)
         })
         .collect();
     // In reverse name order, referencing tables (`<prefix>foreign_key_*`) come before the
@@ -763,7 +790,8 @@ pub fn apply(cells: &mut [Cell], outcomes: &[RtOutcome]) {
 /// [`gate`] options.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct GateOptions {
-    /// Skipped cells are fine (`OXBASE_CONFORMANCE_ALLOW_MISSING` or `..._SKIP_ROUNDTRIP`).
+    /// Skipped cells are fine (`OXBASE_CONFORMANCE_ALLOW_MISSING`, or `..._SKIP_ROUNDTRIP`
+    /// without `require_m3`; see [`GateOptions::for_run`]).
     pub skipped_ok: bool,
     /// Every `roundtrip` and `capabilities` cell of [`DESIGNER_KINDS`] on every [`M3_ENGINES`]
     /// fixture must pass, every M3 engine must have no `missing_designer_roles`, and the
@@ -772,6 +800,22 @@ pub struct GateOptions {
 }
 
 impl GateOptions {
+    /// The options of a run with `opts`: unreachable fixtures (`allow_missing`) may leave
+    /// cells skipped; `OXBASE_CONFORMANCE_SKIP_ROUNDTRIP` may too, but not when `require_m3`
+    /// (both set is an error, so the required gate cannot be passed by skipping every cell).
+    pub fn for_run(opts: &RunOptions, require_m3: bool) -> std::result::Result<Self, String> {
+        if require_m3 && opts.skip_roundtrip {
+            return Err(format!(
+                "{REQUIRE_ENV} and OXBASE_CONFORMANCE_SKIP_ROUNDTRIP are both set: the required \
+                 round-trip cells cannot be skipped"
+            ));
+        }
+        Ok(Self {
+            skipped_ok: opts.allow_missing || opts.skip_roundtrip,
+            require_m3,
+        })
+    }
+
     /// `require_m3` from [`REQUIRE_ENV`].
     pub fn require_m3_from_env() -> bool {
         std::env::var(REQUIRE_ENV).is_ok_and(|v| {
