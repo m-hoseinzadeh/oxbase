@@ -83,6 +83,10 @@ pub const COLUMN: PropId = PropId::from_static("column");
 pub const HIDDEN: PropId = PropId::from_static("hidden");
 /// Table extra: the module of a virtual table (`fts5`, `rtree`, ...).
 pub const MODULE: PropId = PropId::from_static("module");
+/// Table and index extra: clauses of the stored `CREATE` text the object model cannot hold
+/// (`ON CONFLICT`, `COLLATE` on a key), so re-creating the object from its definition would drop
+/// them (text). The DDL generator refuses to re-create such an object, and comparisons skip it.
+pub const REBUILD_LOSES: PropId = PropId::from_static("rebuild_loses");
 /// Listing extra: a foreign key or check declared without a name, listed under a synthetic one
 /// (bool).
 pub const UNNAMED: PropId = PropId::from_static("unnamed");
@@ -160,6 +164,7 @@ const ALWAYS: &[PropId] = &[
     COLUMN,
     HIDDEN,
     MODULE,
+    REBUILD_LOSES,
 ];
 
 impl Capabilities for SqliteCapabilities {

@@ -606,6 +606,200 @@ async fn rebuild_keeps_the_autoincrement_counter_and_renamed_triggers_work() {
     );
 }
 
+#[tokio::test]
+async fn rebuild_copies_values_without_casting_them() {
+    let c = memory().await;
+    let c = c.as_ref();
+    run(
+        c,
+        "CREATE TABLE s (id INTEGER PRIMARY KEY, at TEXT, bin BLOB, n REAL);
+         INSERT INTO s VALUES (1, '2024-05-01 10:00:00', X'00FF41', 1.5), (2, '2024-06-01', X'', 2.0);",
+    )
+    .await;
+    let old = load_table(c, "s").await;
+    let mut new = old.clone();
+    new.columns[1].native_type = "DATETIME".into();
+    new.columns[1].data_type = DataType::Timestamp { precision: None };
+    new.columns[2].native_type = "TEXT".into();
+    new.columns[2].data_type = DataType::Text;
+    new.columns[3].native_type = "INTEGER".into();
+    new.columns[3].data_type = DataType::INT64;
+    alter(c, &old, &new, &[]).await.unwrap();
+    assert_same(&new, &load_table(c, "s").await);
+    // Affinity converts only where nothing is lost: the dates stay text, the blobs blobs, 1.5
+    // stays a real, while 2.0 becomes an integer.
+    assert_eq!(
+        query(
+            c,
+            "SELECT at, typeof(at), hex(bin), typeof(bin), typeof(n) FROM s ORDER BY id"
+        )
+        .await,
+        [
+            some(&["2024-05-01 10:00:00", "text", "00FF41", "blob", "real"]),
+            some(&["2024-06-01", "text", "", "blob", "integer"]),
+        ]
+    );
+
+    // A STRICT table refuses a value it cannot convert, and the rebuild rolls back.
+    run(
+        c,
+        "CREATE TABLE st (id INTEGER PRIMARY KEY, n TEXT) STRICT;
+         INSERT INTO st VALUES (1, '12'), (2, 'x');",
+    )
+    .await;
+    let old = load_table(c, "st").await;
+    let mut new = old.clone();
+    new.columns[1].native_type = "INTEGER".into();
+    new.columns[1].data_type = DataType::INT64;
+    assert!(alter(c, &old, &new, &[]).await.is_err());
+    assert_same(&old, &load_table(c, "st").await);
+    run(c, "DELETE FROM st WHERE id = 2").await;
+    alter(c, &old, &new, &[]).await.unwrap();
+    assert_eq!(
+        query(c, "SELECT n, typeof(n) FROM st").await,
+        [some(&["12", "integer"])]
+    );
+}
+
+#[tokio::test]
+async fn rebuild_with_renames_lets_sqlite_rewrite_triggers_and_views() {
+    let c = memory().await;
+    let c = c.as_ref();
+    run(
+        c,
+        "PRAGMA foreign_keys = ON;
+         CREATE TABLE log (qty INTEGER);
+         CREATE TABLE t (id INTEGER PRIMARY KEY, qty INTEGER);
+         CREATE TABLE ch (id INTEGER PRIMARY KEY, t_id INTEGER REFERENCES t (id));
+         CREATE TRIGGER t_ins AFTER INSERT ON t BEGIN
+             INSERT INTO log (qty) VALUES (NEW.qty);
+         END;
+         CREATE VIEW t_view AS SELECT id, qty FROM t;
+         INSERT INTO t VALUES (1, 5);
+         INSERT INTO ch VALUES (1, 1);",
+    )
+    .await;
+    let old = load_table(c, "t").await;
+    let mut new = old.clone();
+    new.obj.name = "t2".into();
+    new.columns[1].name = "amount".into();
+    new.columns[1].native_type = "REAL".into();
+    new.columns[1].data_type = DataType::FLOAT64;
+    // The new check uses the new name; the rebuild writes it with the old one first.
+    new.checks.push(check("t_amount_chk", "amount >= 0"));
+    let renames = [
+        Rename::new(ObjectKind::Table, "t", "t2"),
+        Rename::new(ObjectKind::Column, "qty", "amount"),
+    ];
+    alter(c, &old, &new, &renames).await.unwrap();
+    assert!(table_gone(c, "t").await);
+    let fetched = load_table(c, "t2").await;
+    let names: Vec<&str> = fetched
+        .columns
+        .iter()
+        .map(|col| col.name.as_str())
+        .collect();
+    assert_eq!(names, ["id", "amount"]);
+    assert_eq!(fetched.columns[1].native_type, "REAL");
+    // The trigger still writes the column of `log` named qty, and reads NEW.amount.
+    run(c, "INSERT INTO t2 (id, amount) VALUES (2, 7)").await;
+    assert_eq!(
+        query(c, "SELECT qty FROM log ORDER BY rowid").await,
+        [some(&["5"]), some(&["7"])]
+    );
+    assert_eq!(
+        query(c, "SELECT * FROM t_view ORDER BY id").await,
+        [some(&["1", "5"]), some(&["2", "7"])]
+    );
+    assert!(
+        exec_on(c, "INSERT INTO t2 (id, amount) VALUES (3, -1)", &[])
+            .await
+            .is_err()
+    );
+    // The child's foreign key follows the table rename.
+    assert!(
+        exec_on(c, "INSERT INTO ch VALUES (2, 99)", &[])
+            .await
+            .is_err()
+    );
+    run(c, "INSERT INTO ch VALUES (3, 2)").await;
+    assert_eq!(scalar(c, "PRAGMA foreign_keys").await, Some("1".to_owned()));
+    assert_eq!(
+        scalar(c, "PRAGMA legacy_alter_table").await,
+        Some("0".to_owned())
+    );
+}
+
+#[tokio::test]
+async fn rebuild_refuses_what_it_cannot_re_create() {
+    let c = memory().await;
+    let c = c.as_ref();
+    run(
+        c,
+        "PRAGMA foreign_keys = ON;
+         CREATE TABLE t (id INTEGER PRIMARY KEY, note TEXT);
+         CREATE TABLE seen (id INTEGER);
+         CREATE TRIGGER t_ins AFTER INSERT ON t BEGIN INSERT INTO seen VALUES (NEW.id); END;
+         INSERT INTO t VALUES (1, 'a');",
+    )
+    .await;
+    // A caller that passes no triggers: the script stops before dropping the table.
+    let old = load_table(c, "t").await;
+    let mut new = old.clone();
+    new.columns[1].nullable = false;
+    let version = c.server_version().clone();
+    let script = ddl(ObjectKind::Table)
+        .alter(
+            &ObjectDef::Table(old.clone()),
+            &ObjectDef::Table(new.clone()),
+            &DdlContext::new(&version).with_table(&old),
+        )
+        .unwrap();
+    let err = apply(c, &script).await.unwrap_err();
+    assert!(err.to_string().contains("trigger"), "{err}");
+    assert_eq!(triggers_of(c, "t").await.len(), 1);
+    assert_same(&old, &load_table(c, "t").await);
+    // With the triggers it works.
+    alter(c, &old, &new, &[]).await.unwrap();
+    assert_eq!(triggers_of(c, "t").await.len(), 1);
+
+    // Clauses the model cannot hold are noted and a rebuild is refused.
+    run(
+        c,
+        "CREATE TABLE oc (id INTEGER PRIMARY KEY, a TEXT NOT NULL ON CONFLICT REPLACE DEFAULT 'x',
+                          b TEXT, UNIQUE (b COLLATE NOCASE));
+         CREATE TABLE ix (id INTEGER PRIMARY KEY, b TEXT);
+         CREATE INDEX ix_b ON ix (b COLLATE NOCASE);",
+    )
+    .await;
+    for name in ["oc", "ix"] {
+        let old = load_table(c, name).await;
+        let mut new = old.clone();
+        new.columns[1].native_type = "VARCHAR(5)".into();
+        new.columns[1].data_type = DataType::VarChar { length: Some(5) };
+        let err = alter(c, &old, &new, &[]).await.unwrap_err();
+        assert_eq!(err.category(), ErrorCategory::Unsupported, "{err}");
+        // The note is not a difference.
+        assert_same(&old, &load_table(c, name).await);
+    }
+
+    // A parent-side change that breaks a child's foreign key rolls back.
+    run(
+        c,
+        "CREATE TABLE p (id INTEGER PRIMARY KEY, k TEXT UNIQUE);
+         CREATE TABLE pc (k TEXT REFERENCES p (k));
+         INSERT INTO p VALUES (1, 'a');
+         INSERT INTO pc VALUES ('a');",
+    )
+    .await;
+    let old = load_table(c, "p").await;
+    let mut new = old.clone();
+    new.indexes.retain(|i| !i.is_constraint);
+    assert!(alter(c, &old, &new, &[]).await.is_err());
+    assert_same(&old, &load_table(c, "p").await);
+    assert_eq!(scalar(c, "PRAGMA foreign_keys").await, Some("1".to_owned()));
+}
+
 // --- live: the fixture ---------------------------------------------------------------------
 
 #[tokio::test]

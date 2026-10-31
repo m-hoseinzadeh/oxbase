@@ -14,12 +14,13 @@
 //! - **Foreign-key targets**: SQLite names are case-insensitive and a foreign key never leaves
 //!   its database, so a missing database on one side matches.
 //! - **Extras** not compared: [`COLUMN`] (where a check was declared), [`UNNAMED`] and
-//!   [`HIDDEN`] (listing facts) and the primary-key mark of an index.
+//!   [`HIDDEN`] (listing facts), [`REBUILD_LOSES`] (a note on the stored text) and the
+//!   primary-key mark of an index.
 
 use oxbase_dialect::compare::{CompareRules, normalize_ws};
 use oxbase_types::{ColumnDef, ObjectKind, ObjectRef, PropId, props};
 
-use super::{COLUMN, HIDDEN, UNNAMED};
+use super::{COLUMN, HIDDEN, REBUILD_LOSES, UNNAMED};
 
 /// The SQLite comparison rules. See the module docs.
 #[derive(Debug, Clone, Copy, Default)]
@@ -134,7 +135,8 @@ impl CompareRules for SqliteRules {
     }
 
     fn compare_extra(&self, kind: ObjectKind, prop: &PropId) -> bool {
-        let listing_only = *prop == COLUMN || *prop == UNNAMED || *prop == HIDDEN;
+        let listing_only =
+            *prop == COLUMN || *prop == UNNAMED || *prop == HIDDEN || *prop == REBUILD_LOSES;
         let pk_index = kind == ObjectKind::Index && *prop == props::PRIMARY_KEY;
         !(listing_only || pk_index)
     }

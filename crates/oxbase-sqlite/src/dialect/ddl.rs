@@ -24,59 +24,73 @@
 //! prepare  PRAGMA foreign_keys                        capture "fk"
 //! prepare  PRAGMA foreign_keys = OFF                  (no-op inside a transaction)
 //! prepare  PRAGMA legacy_alter_table                  capture "legacy_alter"
-//! main     renames (RENAME TO / RENAME COLUMN), when the design renamed things
-//! main     CREATE TABLE "<db>"."<name>__oxbase_new" (the new definition)
-//! main     INSERT INTO "<db>"."<name>__oxbase_new" (kept columns) SELECT ... FROM "<db>"."<name>"
+//! main     SELECT name FROM sqlite_master ...         expect no rows: a trigger on the table
+//!                                                     that DdlContext::triggers does not list
+//! main     CREATE TABLE "<db>"."<old>__oxbase_new" (the new definition, old names)
+//! main     INSERT INTO "<db>"."<old>__oxbase_new" (kept columns) SELECT ... FROM "<db>"."<old>"
 //! main     (AUTOINCREMENT tables: carry the sqlite_sequence value over)
-//! main     DROP TABLE "<db>"."<name>"
+//! main     DROP TABLE "<db>"."<old>"
 //! main     PRAGMA legacy_alter_table = ON             (views on the table are not re-checked)
-//! main     ALTER TABLE "<db>"."<name>__oxbase_new" RENAME TO "<name>"
+//! main     ALTER TABLE "<db>"."<old>__oxbase_new" RENAME TO "<old>"
 //! main     CREATE INDEX ... (every index of the new definition)
-//! main     CREATE TRIGGER ... (every trigger of DdlContext::triggers, from its definition)
-//! main     PRAGMA "<db>".foreign_key_check("<name>")  expect no rows, only if fk = "1"
+//! main     CREATE TRIGGER ... (every trigger of DdlContext::triggers, its definition unchanged)
+//! main     PRAGMA legacy_alter_table = OFF            only when the design renames something
+//! main     ALTER TABLE ... RENAME TO / RENAME COLUMN  the design's renames, natively
+//! main     SELECT * FROM pragma_foreign_key_check(NULL, '<db>') WHERE table or parent is the
+//!          table                                      expect no rows, only if fk = "1"
 //! finally  PRAGMA foreign_keys = ON                   only if fk = "1"
-//! finally  PRAGMA legacy_alter_table = OFF            only if legacy_alter = "0"
+//! finally  PRAGMA legacy_alter_table = OFF / ON       back to the captured value
 //! ```
 //!
 //! Every main step of a rebuild is destructive. The main steps run in one transaction, so a
-//! failure (a type that does not convert, a row breaking a new check, a foreign-key violation)
-//! leaves the original table untouched. Foreign keys are off during the copy, so dropping the
-//! old table neither cascades nor fails; enforcement is restored only if it was on. Views that
+//! failure (a value a `STRICT` column refuses, a row breaking a new check, a foreign-key
+//! violation, a trigger the script was not given) leaves the original table untouched. Foreign
+//! keys are off during the copy, so dropping the old table neither cascades nor fails;
+//! enforcement is restored only if it was on, and the check covers both the table's own foreign
+//! keys and those of the tables that reference it (before 3.16: only its own). Views that
 //! reference the table are not dropped (SQLite keeps them when the table is dropped) and work
-//! again once the new table has the old name: `legacy_alter_table` is on for that rename only so
-//! SQLite does not re-check those views while the table is briefly missing. Kept columns are
-//! copied (with `CAST(col AS <new type>)` when the type changed), new columns get their default,
-//! dropped columns are not copied, the rowid is kept for rowid tables, and generated columns
-//! are computed again.
+//! again once the new table has the old name: `legacy_alter_table` is on for that rename so
+//! SQLite does not re-check those views while the table is briefly missing.
 //!
-//! **Renames** run first and natively (they also rewrite views, triggers and foreign keys that
-//! use the old names); a rebuild then re-creates the table's triggers from the definitions it
-//! was given, with the renamed table and column names replaced (the script carries a warning
-//! asking to review them). Before 3.25 a column rename is done by the rebuild's copy instead.
+//! Kept columns are copied **as they are**, never with `CAST`: the new column's type affinity
+//! converts a value only where nothing is lost (`'2024-05-01 10:00:00'` stays text in a
+//! `DATETIME` column, a blob stays a blob in a `TEXT` one), while `CAST(x AS DATETIME)` would keep
+//! only the number prefix. New columns get their default, dropped columns are not copied, the
+//! rowid is kept for rowid tables, and generated columns are computed again.
+//!
+//! **Renames.** In place, the renames run first. A rebuild creates the new table under the
+//! table's current name and the columns' current names (expressions of the new definition are
+//! rewritten to those names), re-creates the triggers from their unchanged definitions, and
+//! only then runs the renames natively, so SQLite itself rewrites the triggers, views and
+//! foreign keys that use the old names. Before 3.25 a column rename is done by the rebuild's
+//! copy instead, and is refused when a trigger uses the column.
 //!
 //! # Limits
 //!
 //! - **`UNIQUE` constraints** are re-declared by a rebuild (in their original order, so their
 //!   `sqlite_autoindex_<table>_<n>` names stay), but cannot be added under a name: SQLite names
 //!   them itself. Use a unique index ([`Error::Unsupported`] otherwise).
-//! - **Index collations** are not in the model: a rebuild re-creates `col COLLATE x` keys
-//!   without their collation.
+//! - **Clauses outside the model** (`ON CONFLICT`, `COLLATE` on an index or `PRIMARY KEY` /
+//!   `UNIQUE` key) are noted by the fetcher in [`REBUILD_LOSES`]; re-creating such a table or
+//!   index is [`Error::Unsupported`] rather than silently dropping them.
 //! - Comments, identity columns, index prefix lengths and virtual tables are
 //!   [`Error::Unsupported`]. Foreign keys cannot leave the table's database.
 //! - Child cells (`Column`, `ForeignKey`, `Check`, and `Index` on a `UNIQUE` constraint) need
-//!   the table as it is now ([`DdlContext::table`]): they change it with a table `alter`.
+//!   the table as it is now ([`DdlContext::table`]): they change it with a table `alter`. A
+//!   rebuild also needs every trigger of the table in [`DdlContext::triggers`]; the script
+//!   stops (and changes nothing) when the table has one it was not given.
 
-use oxbase_dialect::compare::{CompareRules, diff_indexes, diff_tables};
+use oxbase_dialect::compare::{diff_indexes, diff_tables};
 use oxbase_dialect::{AnsiQuoting, DdlContext, DdlGenerator, Quoting};
 use oxbase_types::{
     CheckDef, ColumnDef, DataType, DiffKind, Error, Extras, FkAction, ForeignKeyDef, IndexDef,
     ObjectDef, ObjectKind, ObjectRef, PrimaryKeyDef, PropId, PropertyDiff, Rename, Result, Script,
-    ScriptStep, ServerVersion, StepPhase, TableDef, Value, props,
+    ScriptStep, ServerVersion, StepPhase, TableDef, TriggerDef, Value, props,
 };
 
 use super::compare::{SqliteRules, strip_outer_parens};
 use super::parse;
-use super::{AUTOINCREMENT, MODULE};
+use super::{AUTOINCREMENT, MODULE, REBUILD_LOSES};
 
 /// Suffix of the table a rebuild creates next to the old one (`<name>__oxbase_new`).
 pub const REBUILD_SUFFIX: &str = "__oxbase_new";
@@ -666,6 +680,7 @@ fn fk_sql(fk: &ForeignKeyDef) -> String {
 
 /// `CREATE TABLE "<schema>"."<name>" (...)` for `t`.
 fn create_table_sql(t: &TableDef, schema: &str, name: &str) -> Result<String> {
+    refuse_lossy(&t.extras, &format!("table {}", t.obj.name))?;
     let inline = auto_column(t).map(|c| c.name.as_str());
     let mut items = Vec::with_capacity(t.columns.len() + t.checks.len() + t.foreign_keys.len());
     for c in &t.columns {
@@ -715,7 +730,8 @@ fn create_table_sql(t: &TableDef, schema: &str, name: &str) -> Result<String> {
 }
 
 /// `CREATE [UNIQUE] INDEX "<schema>"."<index>" ON "<table>" (...) [WHERE ...]`.
-fn create_index_sql(schema: &str, table: &str, idx: &IndexDef) -> String {
+fn create_index_sql(schema: &str, table: &str, idx: &IndexDef) -> Result<String> {
+    refuse_lossy(&idx.extras, &format!("index {}", idx.name))?;
     let mut sql = format!(
         "CREATE {}INDEX {} ON {} ({})",
         if idx.unique { "UNIQUE " } else { "" },
@@ -732,14 +748,14 @@ fn create_index_sql(schema: &str, table: &str, idx: &IndexDef) -> String {
         sql.push_str(" WHERE ");
         sql.push_str(predicate);
     }
-    sql
+    Ok(sql)
 }
 
-fn create_index_step(schema: &str, table: &str, idx: &IndexDef) -> ScriptStep {
-    step(
-        create_index_sql(schema, table, idx),
+fn create_index_step(schema: &str, table: &str, idx: &IndexDef) -> Result<ScriptStep> {
+    Ok(step(
+        create_index_sql(schema, table, idx)?,
         format!("Create index {} on {table}", idx.name),
-    )
+    ))
 }
 
 fn drop_index_step(schema: &str, name: &str) -> ScriptStep {
@@ -762,7 +778,7 @@ fn create_table(t: &TableDef, ctx: &DdlContext<'_>) -> Result<Script> {
         format!("Create table {name}"),
     ));
     for idx in t.indexes.iter().filter(|i| !i.is_constraint) {
-        script.push_step(create_index_step(schema, name, idx));
+        script.push_step(create_index_step(schema, name, idx)?);
     }
     Ok(script)
 }
@@ -1005,7 +1021,13 @@ fn classify(
 }
 
 /// Why `name` (a column of `current`) cannot be dropped with `DROP COLUMN`, if it cannot.
-fn drop_blocker(current: &TableDef, name: &str, ctx: &DdlContext<'_>) -> Option<String> {
+/// Views and other tables' foreign keys are not known here; SQLite refuses the drop then.
+fn drop_blocker(
+    current: &TableDef,
+    new: &TableDef,
+    name: &str,
+    ctx: &DdlContext<'_>,
+) -> Option<String> {
     if !ctx.version.at_least(3, 35) {
         return Some("DROP COLUMN needs SQLite 3.35".to_owned());
     }
@@ -1037,6 +1059,13 @@ fn drop_blocker(current: &TableDef, name: &str, ctx: &DdlContext<'_>) -> Option<
         "a generated column uses it"
     } else if current.checks.iter().any(|c| uses(c.expression.as_str())) {
         "a check uses it"
+    } else if new.indexes.iter().any(|i| {
+        i.predicate.as_deref().is_some_and(uses)
+            || i.columns
+                .iter()
+                .any(|p| p.is_expression && uses(p.name.as_str()))
+    }) {
+        "an index expression or predicate uses it"
     } else if ctx
         .triggers
         .iter()
@@ -1095,6 +1124,24 @@ fn added_at_end(current: &TableDef, new: &TableDef) -> bool {
     kept[first_added..].iter().all(|k| !k)
 }
 
+/// Checks that the column renames can run one after the other: no rename may take a name
+/// another column still has at that point (a swap needs a temporary name).
+fn check_rename_sequence(old: &TableDef, r: &Renames) -> Result<()> {
+    let mut names: Vec<String> = old.columns.iter().map(|c| c.name.clone()).collect();
+    for (from, to) in &r.columns {
+        if !same_name(from, to) && names.iter().any(|n| same_name(n, to)) {
+            return Err(Error::unsupported(format!(
+                "cannot rename column {from} to {to} while another column has that name; \
+                 rename through a temporary name in a separate change"
+            )));
+        }
+        if let Some(n) = names.iter_mut().find(|n| same_name(n, from)) {
+            to.clone_into(n);
+        }
+    }
+    Ok(())
+}
+
 fn alter_table(old: &TableDef, new: &TableDef, ctx: &DdlContext<'_>) -> Result<Script> {
     if is_virtual(old) {
         return Err(Error::unsupported(format!(
@@ -1115,13 +1162,15 @@ fn alter_table(old: &TableDef, new: &TableDef, ctx: &DdlContext<'_>) -> Result<S
     let mut plan = Plan::default();
     classify(&mut plan, &current, new, &renames, &diffs);
     let native_column_renames = ctx.version.at_least(3, 25);
-    if !renames.columns.is_empty() && !native_column_renames {
+    if native_column_renames {
+        check_rename_sequence(old, &renames)?;
+    } else if !renames.columns.is_empty() {
         plan.rebuild
             .push("RENAME COLUMN needs SQLite 3.25".to_owned());
     }
     if plan.rebuild.is_empty() {
         for name in &plan.drop_columns {
-            if let Some(why) = drop_blocker(&current, name, ctx) {
+            if let Some(why) = drop_blocker(&current, new, name, ctx) {
                 plan.rebuild.push(why);
             }
         }
@@ -1137,59 +1186,27 @@ fn alter_table(old: &TableDef, new: &TableDef, ctx: &DdlContext<'_>) -> Result<S
     }
 
     let mut script = Script::new();
-    let rebuild = !plan.rebuild.is_empty();
-    if rebuild {
-        push_rebuild_prepare(&mut script);
-    }
-    // Renames first, natively.
-    let mut name_now = old.obj.name.clone();
-    if let Some((from, to)) = &renames.table {
-        script.push_step(step(
-            format!(
-                "ALTER TABLE {} RENAME TO {}",
-                qualified(schema, from),
-                ident(to)
-            ),
-            format!("Rename table {from} to {to}"),
-        ));
-        name_now.clone_from(to);
-    }
-    if native_column_renames {
-        for (from, to) in &renames.columns {
-            script.push_step(step(
-                format!(
-                    "ALTER TABLE {} RENAME COLUMN {} TO {}",
-                    qualified(schema, &name_now),
-                    ident(from),
-                    ident(to)
-                ),
-                format!("Rename column {from} to {to}"),
-            ));
-        }
-    }
-    if rebuild {
-        let source = |column: &str| -> String {
-            if native_column_renames {
-                column.to_owned()
-            } else {
-                renames
-                    .columns
-                    .iter()
-                    .find(|(_, to)| to == column)
-                    .map_or_else(|| column.to_owned(), |(from, _)| from.clone())
-            }
-        };
-        let rebuild_ctx = Rebuild {
+    if !plan.rebuild.is_empty() {
+        let rebuild = Rebuild {
             schema,
             old,
             current: &current,
             new,
             renames: &renames,
-            source: &source,
+            native_column_renames,
             ctx,
         };
-        push_rebuild(&mut script, &rebuild_ctx, &plan.rebuild)?;
+        push_rebuild(&mut script, &rebuild, &plan.rebuild)?;
         return Ok(script);
+    }
+    // In place: renames first, natively.
+    let mut name_now = old.obj.name.clone();
+    if let Some((from, to)) = &renames.table {
+        script.push_step(rename_table_step(schema, from, to));
+        name_now.clone_from(to);
+    }
+    for (from, to) in &renames.columns {
+        script.push_step(rename_column_step(schema, &name_now, from, to));
     }
     for name in &plan.drop_indexes {
         script.push_step(drop_index_step(schema, name));
@@ -1206,6 +1223,10 @@ fn alter_table(old: &TableDef, new: &TableDef, ctx: &DdlContext<'_>) -> Result<S
             )
             .destructive(),
         );
+        script.warn(format!(
+            "SQLite refuses to drop column {name} when a view or another table's foreign key \
+             uses it; the script then stops and changes nothing"
+        ));
     }
     for name in &plan.add_columns {
         if let Some(c) = new.column(name) {
@@ -1221,10 +1242,33 @@ fn alter_table(old: &TableDef, new: &TableDef, ctx: &DdlContext<'_>) -> Result<S
     }
     for name in &plan.create_indexes {
         if let Some(idx) = new.indexes.iter().find(|i| i.name == *name) {
-            script.push_step(create_index_step(schema, &name_now, idx));
+            script.push_step(create_index_step(schema, &name_now, idx)?);
         }
     }
     Ok(script)
+}
+
+fn rename_table_step(schema: &str, from: &str, to: &str) -> ScriptStep {
+    step(
+        format!(
+            "ALTER TABLE {} RENAME TO {}",
+            qualified(schema, from),
+            ident(to)
+        ),
+        format!("Rename table {from} to {to}"),
+    )
+}
+
+fn rename_column_step(schema: &str, table: &str, from: &str, to: &str) -> ScriptStep {
+    step(
+        format!(
+            "ALTER TABLE {} RENAME COLUMN {} TO {}",
+            qualified(schema, table),
+            ident(from),
+            ident(to)
+        ),
+        format!("Rename column {from} to {to}"),
+    )
 }
 
 // --- the rebuild ---------------------------------------------------------------------------
@@ -1265,9 +1309,95 @@ struct Rebuild<'a> {
     current: &'a TableDef,
     new: &'a TableDef,
     renames: &'a Renames,
-    /// The name a column of `new` that `current` has is read from in the copy.
-    source: &'a dyn Fn(&str) -> String,
+    /// SQLite 3.25+: column renames run natively after the rebuild.
+    native_column_renames: bool,
     ctx: &'a DdlContext<'a>,
+}
+
+/// `name` with `pairs` (`(from, to)`) applied.
+fn mapped(pairs: &[(String, String)], name: &str) -> Option<String> {
+    pairs
+        .iter()
+        .find(|(from, _)| from == name)
+        .map(|(_, to)| to.clone())
+}
+
+/// The definition a rebuild creates: `new` under the table's current name and, when the column
+/// renames run natively after the rebuild, under the columns' current names, with expressions
+/// (checks, generated columns, index keys and predicates) using the names the built table has.
+/// The renames then run natively, so SQLite itself rewrites the triggers, views and foreign keys
+/// that use the old names.
+fn rebuild_def(r: &Rebuild<'_>) -> Result<TableDef> {
+    let old_name = r.old.obj.name.as_str();
+    let new_name = r.new.obj.name.as_str();
+    let backward: Vec<(String, String)> = r
+        .renames
+        .columns
+        .iter()
+        .map(|(from, to)| (to.clone(), from.clone()))
+        .collect();
+    // Column names in `new` → names in the built table, and the same for expressions (which
+    // may still use the old names when the column renames are done by the copy).
+    let none: &[(String, String)] = &[];
+    let (columns, expressions) = if r.native_column_renames {
+        (backward.as_slice(), backward.as_slice())
+    } else {
+        (none, r.renames.columns.as_slice())
+    };
+    let rename = |name: &mut String| {
+        if let Some(to) = mapped(columns, name) {
+            *name = to;
+        }
+    };
+    let expr = |text: &str| parse::rename_columns(text, expressions, &ident);
+    let mut out = r.new.clone();
+    old_name.clone_into(&mut out.obj.name);
+    for c in &mut out.columns {
+        rename(&mut c.name);
+        if let Some(g) = &mut c.generated {
+            g.expression = expr(&g.expression);
+        }
+    }
+    if let Some(pk) = &mut out.primary_key {
+        pk.columns.iter_mut().for_each(rename);
+    }
+    for idx in &mut out.indexes {
+        for part in &mut idx.columns {
+            if part.is_expression {
+                part.name = expr(&part.name);
+            } else {
+                rename(&mut part.name);
+            }
+        }
+        if let Some(p) = &mut idx.predicate {
+            *p = expr(p);
+        }
+    }
+    for fk in &mut out.foreign_keys {
+        fk.columns.iter_mut().for_each(rename);
+        let own =
+            same_name(&fk.ref_table.name, new_name) || same_name(&fk.ref_table.name, old_name);
+        if own {
+            old_name.clone_into(&mut fk.ref_table.name);
+            fk.ref_columns.iter_mut().for_each(rename);
+        }
+    }
+    for check in &mut out.checks {
+        check.expression = expr(&check.expression);
+    }
+    for (pos, c) in out.columns.iter().enumerate() {
+        if out.columns[..pos]
+            .iter()
+            .any(|o| same_name(&o.name, &c.name))
+        {
+            return Err(Error::unsupported(format!(
+                "the rebuild of {old_name} renames columns natively afterwards, so a new column \
+                 cannot take the name {} a renamed column had; make the two changes separately",
+                c.name
+            )));
+        }
+    }
+    Ok(out)
 }
 
 /// The first rowid name no column of `a` or `b` takes.
@@ -1280,36 +1410,40 @@ fn free_rowid_name(a: &TableDef, b: &TableDef) -> Option<&'static str> {
     })
 }
 
-/// The column list and the `SELECT` list that copy the rows of the old table.
-fn copy_lists(r: &Rebuild<'_>) -> Result<(Vec<String>, Vec<String>)> {
+/// The column list and the `SELECT` list that copy the rows of the old table into `build`.
+///
+/// Values are copied as they are: the new columns' type affinity converts them where that loses
+/// nothing (a `STRICT` table refuses a value it cannot convert). A `CAST` would not be safe:
+/// `CAST('2024-05-01 10:00:00' AS DATETIME)` keeps only the number prefix (2024), and
+/// `CAST(blob AS TEXT)` mangles binary data.
+fn copy_lists(r: &Rebuild<'_>, build: &TableDef) -> Result<(Vec<String>, Vec<String>)> {
     let mut targets = Vec::new();
     let mut sources = Vec::new();
     let mut alias_copied = false;
-    for c in &r.new.columns {
-        if c.generated.is_some() {
+    for (c, built) in r.new.columns.iter().zip(&build.columns) {
+        if c.generated.is_some() || r.current.column(&c.name).is_none() {
             continue;
         }
-        let Some(before) = r.current.column(&c.name) else {
-            continue;
-        };
-        targets.push(ident(&c.name));
-        let from = ident(&(r.source)(&c.name));
-        let ty = type_sql(c, is_plain_int_pk(r.new, c))?;
-        if ty.is_empty() || SqliteRules.same_type(before, c) {
-            sources.push(from);
-        } else {
-            sources.push(format!("CAST({from} AS {ty})"));
-        }
-        if auto_column(r.new).is_some_and(|a| a.name == c.name)
-            || (is_rowid_alias_type(&ty) && matches!(pk_columns(r.new), [only] if *only == c.name))
+        let source = r
+            .renames
+            .columns
+            .iter()
+            .find(|(_, to)| *to == c.name)
+            .map_or(c.name.as_str(), |(from, _)| from.as_str());
+        targets.push(ident(&built.name));
+        sources.push(ident(source));
+        let ty = type_sql(built, is_plain_int_pk(build, built))?;
+        if auto_column(build).is_some_and(|a| a.name == built.name)
+            || (is_rowid_alias_type(&ty)
+                && matches!(pk_columns(build), [only] if *only == built.name))
         {
             alias_copied = true;
         }
     }
     if !alias_copied
-        && !without_rowid(r.current)
-        && !without_rowid(r.new)
-        && let Some(rowid) = free_rowid_name(r.current, r.new)
+        && !without_rowid(r.old)
+        && !without_rowid(build)
+        && let Some(rowid) = free_rowid_name(r.old, build)
     {
         targets.insert(0, rowid.to_owned());
         sources.insert(0, rowid.to_owned());
@@ -1321,19 +1455,95 @@ fn is_rowid_alias_type(ty: &str) -> bool {
     same_name(ty.trim(), "INTEGER")
 }
 
+/// A step that fails when the table has a trigger the script was not given, so the rebuild
+/// never drops a trigger it does not re-create (`DdlContext::triggers` must list them all).
+fn trigger_guard(schema: &str, table: &str, triggers: &[TriggerDef]) -> ScriptStep {
+    let mut sql = format!(
+        "SELECT name FROM {}.sqlite_master WHERE type = 'trigger' AND lower(tbl_name) = {}",
+        ident(schema),
+        literal(&table.to_ascii_lowercase())
+    );
+    if !triggers.is_empty() {
+        let names: Vec<String> = triggers
+            .iter()
+            .map(|t| literal(&t.obj.name.to_ascii_lowercase()))
+            .collect();
+        sql = format!("{sql} AND lower(name) NOT IN ({})", names.join(", "));
+    }
+    step(
+        sql,
+        format!(
+            "Check that the script re-creates every trigger on {table} (rows: triggers the \
+             rebuild would drop)"
+        ),
+    )
+    .expect_no_rows()
+    .destructive()
+}
+
+/// The foreign-key check after a rebuild: violations where the table is the child or the parent
+/// (3.16+: over the whole database, so a changed parent key is caught too).
+fn fk_check_sql(schema: &str, table: &str, v: &ServerVersion) -> String {
+    if v.at_least(3, 16) {
+        let name = literal(table);
+        format!(
+            "SELECT * FROM pragma_foreign_key_check(NULL, {}) WHERE \"table\" = {name} COLLATE \
+             NOCASE OR parent = {name} COLLATE NOCASE",
+            literal(schema)
+        )
+    } else {
+        format!(
+            "PRAGMA {}.foreign_key_check({})",
+            ident(schema),
+            ident(table)
+        )
+    }
+}
+
+/// [`Error::Unsupported`] when `extras` note clauses re-creating the object would drop.
+fn refuse_lossy(extras: &Extras, what: &str) -> Result<()> {
+    match extras.get(&REBUILD_LOSES) {
+        Some(Value::Text(clauses)) => Err(Error::unsupported(format!(
+            "{what} has {clauses}, which the table designer cannot re-create; change it with SQL"
+        ))),
+        _ => Ok(()),
+    }
+}
+
 fn push_rebuild(script: &mut Script, r: &Rebuild<'_>, reasons: &[String]) -> Result<()> {
     let schema = r.schema;
-    let name = r.new.obj.name.as_str();
+    let name = r.old.obj.name.as_str();
+    let final_name = r.new.obj.name.as_str();
+    refuse_lossy(&r.old.extras, &format!("table {name}"))?;
+    let build = rebuild_def(r)?;
+    if !r.native_column_renames {
+        for trigger in r.ctx.triggers {
+            let uses_renamed = trigger.definition.as_deref().is_some_and(|d| {
+                r.renames
+                    .columns
+                    .iter()
+                    .any(|(from, _)| parse::mentions_identifier(d, from))
+            });
+            if uses_renamed {
+                return Err(Error::unsupported(format!(
+                    "trigger {} uses a renamed column; renaming it needs SQLite 3.25",
+                    trigger.obj.name
+                )));
+            }
+        }
+    }
     let tmp = format!("{name}{REBUILD_SUFFIX}");
     let table = qualified(schema, name);
     let temp_table = qualified(schema, &tmp);
     let main = |sql: String, description: String| step(sql, description).destructive();
 
+    push_rebuild_prepare(script);
+    script.push_step(trigger_guard(schema, name, r.ctx.triggers));
     script.push_step(main(
-        create_table_sql(r.new, schema, &tmp)?,
+        create_table_sql(&build, schema, &tmp)?,
         format!("Rebuild {name}: create the new table"),
     ));
-    let (targets, sources) = copy_lists(r)?;
+    let (targets, sources) = copy_lists(r, &build)?;
     if targets.is_empty() {
         script.warn(format!(
             "{name} keeps none of its columns: the rebuild does not copy its rows"
@@ -1349,7 +1559,7 @@ fn push_rebuild(script: &mut Script, r: &Rebuild<'_>, reasons: &[String]) -> Res
         ));
     }
     let keeps_sequence = auto_column(r.current).is_some_and(|c| flag(&c.extras, &AUTOINCREMENT))
-        && auto_column(r.new).is_some_and(|c| flag(&c.extras, &AUTOINCREMENT));
+        && auto_column(&build).is_some_and(|c| flag(&c.extras, &AUTOINCREMENT));
     if keeps_sequence {
         let seq = qualified(schema, "sqlite_sequence");
         let (old_lit, tmp_lit) = (literal(name), literal(&tmp));
@@ -1378,18 +1588,34 @@ fn push_rebuild(script: &mut Script, r: &Rebuild<'_>, reasons: &[String]) -> Res
         format!("ALTER TABLE {temp_table} RENAME TO {}", ident(name)),
         format!("Rebuild {name}: give the new table its name"),
     ));
-    for idx in r.new.indexes.iter().filter(|i| !i.is_constraint) {
-        script.push_step(create_index_step(schema, name, idx).destructive());
+    for idx in build.indexes.iter().filter(|i| !i.is_constraint) {
+        script.push_step(create_index_step(schema, name, idx)?.destructive());
     }
     push_triggers(script, r)?;
+    // The renames, natively, now that the table is complete again: SQLite rewrites the views,
+    // triggers and foreign keys that use the old names.
+    let none: &[(String, String)] = &[];
+    let column_renames = if r.native_column_renames {
+        r.renames.columns.as_slice()
+    } else {
+        none
+    };
+    if r.renames.table.is_some() || !column_renames.is_empty() {
+        script.push_step(main(
+            "PRAGMA legacy_alter_table = OFF".to_owned(),
+            "Let the renames rewrite the views and triggers that use the old names".to_owned(),
+        ));
+        if r.renames.table.is_some() {
+            script.push_step(rename_table_step(schema, name, final_name).destructive());
+        }
+        for (from, to) in column_renames {
+            script.push_step(rename_column_step(schema, final_name, from, to).destructive());
+        }
+    }
     script.push_step(
         main(
-            format!(
-                "PRAGMA {}.foreign_key_check({})",
-                ident(schema),
-                ident(name)
-            ),
-            format!("Check the foreign keys of {name}"),
+            fk_check_sql(schema, final_name, r.ctx.version),
+            format!("Check the foreign keys of {final_name} and of the tables that reference it"),
         )
         .expect_no_rows()
         .only_if(FK_CAPTURE, "1"),
@@ -1406,21 +1632,30 @@ fn push_rebuild(script: &mut Script, r: &Rebuild<'_>, reasons: &[String]) -> Res
                 .described("Restore the legacy_alter_table setting")
                 .in_phase(StepPhase::Finally)
                 .only_if(LEGACY_CAPTURE, "0"),
+        )
+        .push_step(
+            ScriptStep::new("PRAGMA legacy_alter_table = ON")
+                .described("Restore the legacy_alter_table setting")
+                .in_phase(StepPhase::Finally)
+                .only_if(LEGACY_CAPTURE, "1"),
         );
     script.warn(format!(
         "{name} is rebuilt ({}): its rows are copied into a new table, then its indexes and \
          triggers are re-created. Views on it are kept.",
         reasons.join(", ")
     ));
+    if !r.native_column_renames && !r.renames.columns.is_empty() {
+        script.warn(format!(
+            "before SQLite 3.25 the rebuild renames columns of {name} by copying them: views \
+             that use the old column names stop working"
+        ));
+    }
     Ok(())
 }
 
+/// Re-creates the triggers of `DdlContext::triggers` from their definitions, unchanged: the
+/// rebuilt table still has the names they use, and the renames that follow rewrite them.
 fn push_triggers(script: &mut Script, r: &Rebuild<'_>) -> Result<()> {
-    let table_rename = r
-        .renames
-        .table
-        .as_ref()
-        .map(|(from, to)| (from.as_str(), to.as_str()));
     let attached = !same_name(r.schema, "main") && !same_name(r.schema, "temp");
     for trigger in r.ctx.triggers {
         let name = &trigger.obj.name;
@@ -1435,16 +1670,6 @@ fn push_triggers(script: &mut Script, r: &Rebuild<'_>) -> Result<()> {
             .trim_end_matches(';')
             .trim_end()
             .to_owned();
-        let renamed_any = table_rename.is_some() || !r.renames.columns.is_empty();
-        if renamed_any
-            && let Some(rewritten) =
-                parse::rename_in_trigger(&sql, table_rename, &r.renames.columns, &ident)
-        {
-            sql = rewritten;
-            script.warn(format!(
-                "trigger {name} is re-created with the renamed names replaced; review it"
-            ));
-        }
         if attached && !flag(&trigger.extras, &props::TEMPORARY) {
             sql = parse::qualify_trigger_name(&sql, &ident(r.schema));
         }
@@ -1544,7 +1769,7 @@ impl DdlGenerator for SqliteDdl {
                         .collect();
                     check_index(&owner, index, ctx.version)?;
                     let mut script = Script::new();
-                    script.push_step(create_index_step(schema_of(table), &table.name, index));
+                    script.push_step(create_index_step(schema_of(table), &table.name, index)?);
                     return Ok(script);
                 }
                 let cur = current_table(ctx, table, ObjectKind::Index)?;
@@ -1608,7 +1833,7 @@ impl DdlGenerator for SqliteDdl {
                 check_index(&owner, b, ctx.version)?;
                 let schema = schema_of(table);
                 script.push_step(drop_index_step(schema, &a.name));
-                script.push_step(create_index_step(schema, &table.name, b));
+                script.push_step(create_index_step(schema, &table.name, b)?);
                 Ok(script)
             }
             (
@@ -1742,7 +1967,7 @@ impl DdlGenerator for SqliteDdl {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oxbase_types::{GeneratedColumn, IdentityDef, IndexColumn, TriggerDef};
+    use oxbase_types::{GeneratedColumn, IdentityDef, IndexColumn};
 
     fn v(text: &str) -> ServerVersion {
         text.parse().unwrap()
@@ -1990,6 +2215,7 @@ mod tests {
         let ctx = DdlContext::new(&version)
             .with_table(&old)
             .with_triggers(&triggers);
+        let new_def = new.clone();
         let script = SqliteDdl
             .alter(&ObjectDef::Table(old.clone()), &ObjectDef::Table(new), &ctx)
             .unwrap();
@@ -1999,20 +2225,24 @@ mod tests {
                 "PRAGMA foreign_keys",
                 "PRAGMA foreign_keys = OFF",
                 "PRAGMA legacy_alter_table",
+                "SELECT name FROM \"main\".sqlite_master WHERE type = 'trigger' AND \
+                 lower(tbl_name) = 't' AND lower(name) NOT IN ('t_trg')",
                 "CREATE TABLE \"main\".\"t__oxbase_new\" (\n    \
                  \"id\" INTEGER PRIMARY KEY NOT NULL,\n    \
                  \"qty\" REAL DEFAULT (1),\n    \
                  CONSTRAINT \"t_qty_chk\" CHECK (qty >= 0)\n)",
                 "INSERT INTO \"main\".\"t__oxbase_new\" (\"id\", \"qty\") SELECT \"id\", \
-                 CAST(\"qty\" AS REAL) FROM \"main\".\"t\"",
+                 \"qty\" FROM \"main\".\"t\"",
                 "DROP TABLE \"main\".\"t\"",
                 "PRAGMA legacy_alter_table = ON",
                 "ALTER TABLE \"main\".\"t__oxbase_new\" RENAME TO \"t\"",
                 "CREATE INDEX \"main\".\"t_qty\" ON \"t\" (\"qty\")",
                 "CREATE TRIGGER t_trg AFTER INSERT ON t BEGIN SELECT 1; END",
-                "PRAGMA \"main\".foreign_key_check(\"t\")",
+                "SELECT * FROM pragma_foreign_key_check(NULL, 'main') WHERE \"table\" = 't' \
+                 COLLATE NOCASE OR parent = 't' COLLATE NOCASE",
                 "PRAGMA foreign_keys = ON",
                 "PRAGMA legacy_alter_table = OFF",
+                "PRAGMA legacy_alter_table = ON",
             ]
         );
         let ordered: Vec<&ScriptStep> = script.ordered().collect();
@@ -2020,18 +2250,35 @@ mod tests {
         assert_eq!(ordered[2].capture.as_deref(), Some("legacy_alter"));
         assert!(ordered[..3].iter().all(|s| s.phase == StepPhase::Prepare));
         assert!(
-            ordered[3..11]
+            ordered[3..12]
                 .iter()
                 .all(|s| s.phase == StepPhase::Main && s.destructive)
         );
-        let check = ordered[10];
+        assert_eq!(ordered[3].check, oxbase_types::StepCheck::ExpectNoRows);
+        let check = ordered[11];
         assert_eq!(check.check, oxbase_types::StepCheck::ExpectNoRows);
         assert_eq!(check.only_if.as_ref().map(|c| c.equals.as_str()), Some("1"));
-        assert!(ordered[11..].iter().all(|s| s.phase == StepPhase::Finally));
+        assert!(ordered[12..].iter().all(|s| s.phase == StepPhase::Finally));
         assert_eq!(
-            ordered[12].only_if.as_ref().map(|c| c.equals.as_str()),
+            ordered[13].only_if.as_ref().map(|c| c.equals.as_str()),
             Some("0")
         );
+        assert_eq!(
+            ordered[14].only_if.as_ref().map(|c| c.equals.as_str()),
+            Some("1")
+        );
+        // Before 3.16 the check covers the table only.
+        let old_lib = v("3.15.0");
+        let script = SqliteDdl
+            .alter(
+                &ObjectDef::Table(old.clone()),
+                &ObjectDef::Table(new_def.clone()),
+                &DdlContext::new(&old_lib)
+                    .with_table(&old)
+                    .with_triggers(&triggers),
+            )
+            .unwrap();
+        assert!(sqls(&script).contains(&"PRAGMA \"main\".foreign_key_check(\"t\")"));
         assert!(script.is_atomic() && script.is_destructive());
         assert!(script.warnings.iter().any(|w| w.contains("rebuilt")));
 
@@ -2050,7 +2297,7 @@ mod tests {
     }
 
     #[test]
-    fn rebuild_after_renames_rewrites_triggers_and_keeps_rowids() {
+    fn rebuild_renames_natively_after_the_copy_and_keeps_rowids() {
         let mut old = base();
         old.primary_key = None;
         old.columns[0].auto_increment = false;
@@ -2061,13 +2308,18 @@ mod tests {
         new.indexes[0].columns[0].name = "amount".into();
         new.columns[2].nullable = false;
         new.columns[2].default = Some("''".into());
+        new.checks.push(CheckDef {
+            name: Some("u_chk".into()),
+            expression: "amount >= 0 AND note <> 'amount'".into(),
+            extras: Extras::new(),
+        });
         let renames = [
             Rename::new(ObjectKind::Table, "t", "u"),
             Rename::new(ObjectKind::Column, "qty", "amount"),
         ];
-        let triggers = [trigger(
-            "CREATE TRIGGER t_trg AFTER UPDATE OF qty ON t BEGIN UPDATE t SET note = 'x'; END",
-        )];
+        let definition = "CREATE TRIGGER t_trg AFTER UPDATE OF qty ON t BEGIN INSERT INTO log(qty) VALUES \
+             (NEW.qty); END";
+        let triggers = [trigger(definition)];
         let version = v("3.51.0");
         let ctx = DdlContext::new(&version)
             .with_renames(&renames)
@@ -2080,37 +2332,126 @@ mod tests {
             )
             .unwrap();
         let all = sqls(&script);
-        assert_eq!(all[3], "ALTER TABLE \"aux\".\"t\" RENAME TO \"u\"");
-        assert_eq!(
-            all[4],
-            "ALTER TABLE \"aux\".\"u\" RENAME COLUMN \"qty\" TO \"amount\""
-        );
-        assert!(all.contains(
-            &"INSERT INTO \"aux\".\"u__oxbase_new\" (rowid, \"id\", \"amount\", \"note\") \
-              SELECT rowid, \"id\", \"amount\", \"note\" FROM \"aux\".\"u\""
-        ));
-        assert!(all.contains(
-            &"CREATE TRIGGER \"aux\".t_trg AFTER UPDATE OF \"amount\" ON \"u\" BEGIN UPDATE \
-              \"u\" SET note = 'x'; END"
-        ));
-        assert!(all.contains(&"PRAGMA \"aux\".foreign_key_check(\"u\")"));
-        assert!(script.warnings.iter().any(|w| w.contains("review")));
-        assert!(!script.steps[3].destructive && !script.steps[4].destructive);
+        let tail = [
+            "SELECT name FROM \"aux\".sqlite_master WHERE type = 'trigger' AND lower(tbl_name) \
+             = 't' AND lower(name) NOT IN ('t_trg')",
+            "CREATE TABLE \"aux\".\"t__oxbase_new\" (\n    \"id\" INTEGER NOT NULL,\n    \
+             \"qty\" INTEGER DEFAULT (1),\n    \"note\" TEXT NOT NULL DEFAULT (''),\n    \
+             CONSTRAINT \"u_chk\" CHECK (\"qty\" >= 0 AND note <> 'amount')\n)",
+            "INSERT INTO \"aux\".\"t__oxbase_new\" (rowid, \"id\", \"qty\", \"note\") \
+             SELECT rowid, \"id\", \"qty\", \"note\" FROM \"aux\".\"t\"",
+            "DROP TABLE \"aux\".\"t\"",
+            "PRAGMA legacy_alter_table = ON",
+            "ALTER TABLE \"aux\".\"t__oxbase_new\" RENAME TO \"t\"",
+            "CREATE INDEX \"aux\".\"t_qty\" ON \"t\" (\"qty\")",
+            // The trigger comes back unchanged; the renames below rewrite it.
+            "CREATE TRIGGER \"aux\".t_trg AFTER UPDATE OF qty ON t BEGIN INSERT INTO log(qty) \
+             VALUES (NEW.qty); END",
+            "PRAGMA legacy_alter_table = OFF",
+            "ALTER TABLE \"aux\".\"t\" RENAME TO \"u\"",
+            "ALTER TABLE \"aux\".\"u\" RENAME COLUMN \"qty\" TO \"amount\"",
+            "SELECT * FROM pragma_foreign_key_check(NULL, 'aux') WHERE \"table\" = 'u' COLLATE \
+             NOCASE OR parent = 'u' COLLATE NOCASE",
+        ];
+        assert_eq!(all[3..all.len() - 3], tail);
 
-        // Before 3.25 the column rename is done by the copy.
+        // Before 3.25 the column rename is done by the copy, and refused when a trigger uses
+        // the column.
         let old_lib = v("3.24.0");
         let ctx = DdlContext::new(&old_lib)
             .with_renames(&renames)
             .with_triggers(&triggers);
+        let refused = SqliteDdl
+            .alter(
+                &ObjectDef::Table(old.clone()),
+                &ObjectDef::Table(new.clone()),
+                &ctx,
+            )
+            .unwrap_err();
+        assert_eq!(refused.category(), oxbase_types::ErrorCategory::Unsupported);
+        let ctx = DdlContext::new(&old_lib).with_renames(&renames);
         let script = SqliteDdl
             .alter(&ObjectDef::Table(old), &ObjectDef::Table(new), &ctx)
             .unwrap();
         let all = sqls(&script);
         assert!(!all.iter().any(|s| s.contains("RENAME COLUMN")));
         assert!(all.contains(
-            &"INSERT INTO \"aux\".\"u__oxbase_new\" (rowid, \"id\", \"amount\", \"note\") \
-              SELECT rowid, \"id\", \"qty\", \"note\" FROM \"aux\".\"u\""
+            &"INSERT INTO \"aux\".\"t__oxbase_new\" (rowid, \"id\", \"amount\", \"note\") \
+              SELECT rowid, \"id\", \"qty\", \"note\" FROM \"aux\".\"t\""
         ));
+        assert!(
+            all.iter()
+                .any(|s| s.contains("CHECK (amount >= 0 AND note <> 'amount')"))
+        );
+        assert!(all.contains(&"ALTER TABLE \"aux\".\"t\" RENAME TO \"u\""));
+        assert!(script.warnings.iter().any(|w| w.contains("3.25")));
+    }
+
+    #[test]
+    fn rebuild_refusals() {
+        let version = v("3.51.0");
+        let ctx = DdlContext::new(&version);
+        let alter = |old: &TableDef, new: &TableDef| {
+            SqliteDdl.alter(
+                &ObjectDef::Table(old.clone()),
+                &ObjectDef::Table(new.clone()),
+                &ctx,
+            )
+        };
+        // Clauses outside the model: a rebuild is refused, an in-place change is not.
+        let mut lossy = base();
+        lossy.extras.insert(REBUILD_LOSES, "an ON CONFLICT clause");
+        let mut retyped = lossy.clone();
+        retyped.columns[2].native_type = "BLOB".into();
+        retyped.columns[2].data_type = DataType::Binary { length: None };
+        let err = alter(&lossy, &retyped).unwrap_err();
+        assert_eq!(err.category(), oxbase_types::ErrorCategory::Unsupported);
+        assert!(err.to_string().contains("ON CONFLICT"), "{err}");
+        let mut added = lossy.clone();
+        added.columns.push(col("extra", "TEXT"));
+        assert!(alter(&lossy, &added).is_ok());
+        let mut collated = base();
+        collated.indexes[0]
+            .extras
+            .insert(REBUILD_LOSES, "a COLLATE on an index key");
+        let mut retyped = collated.clone();
+        retyped.columns[2].native_type = "BLOB".into();
+        retyped.columns[2].data_type = DataType::Binary { length: None };
+        assert!(alter(&collated, &retyped).is_err());
+
+        // Swapping two column names needs a temporary name.
+        let mut swapped = base();
+        swapped.columns[1].name = "note".into();
+        swapped.columns[2].name = "qty".into();
+        swapped.indexes[0].columns[0].name = "note".into();
+        let renames = [
+            Rename::new(ObjectKind::Column, "qty", "note"),
+            Rename::new(ObjectKind::Column, "note", "qty"),
+        ];
+        let err = SqliteDdl
+            .alter(
+                &ObjectDef::Table(base()),
+                &ObjectDef::Table(swapped),
+                &DdlContext::new(&version).with_renames(&renames),
+            )
+            .unwrap_err();
+        assert_eq!(err.category(), oxbase_types::ErrorCategory::Unsupported);
+
+        // A column used by an index expression is dropped by a rebuild.
+        let mut indexed = base();
+        let mut by_expr = index("t_lower", &["lower(note)"]);
+        by_expr.columns[0].is_expression = true;
+        indexed.indexes.push(by_expr);
+        let mut dropped = indexed.clone();
+        dropped.columns.remove(2);
+        dropped.indexes.retain(|i| i.name != "t_lower");
+        let mut kept = dropped.clone();
+        kept.indexes.push(indexed.indexes[1].clone());
+        let script = alter(&indexed, &dropped).unwrap();
+        assert!(sqls(&script).iter().any(|s| s.contains("DROP COLUMN")));
+        assert!(script.warnings.iter().any(|w| w.contains("view")));
+        let script = alter(&indexed, &kept).unwrap();
+        assert!(sqls(&script).contains(&"PRAGMA foreign_keys = OFF"));
     }
 
     #[test]

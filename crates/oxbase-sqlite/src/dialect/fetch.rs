@@ -39,7 +39,7 @@ use super::catalog::{
 };
 use super::parse::{self, ParsedEvent, ParsedIndex, ParsedTable, ParsedTiming};
 use super::types;
-use super::{AUTOINCREMENT, COLUMN, HIDDEN, MODULE, UNNAMED};
+use super::{AUTOINCREMENT, COLUMN, HIDDEN, MODULE, REBUILD_LOSES, UNNAMED};
 
 /// The database (SQLite schema name) `r` lives in: its catalog, or `main`.
 fn schema_of(r: &ObjectRef) -> &str {
@@ -251,6 +251,9 @@ fn index_def(row: &IndexRow, keys: &[IndexKeyRow], parsed: &ParsedIndex) -> Inde
     let mut extras = Extras::new();
     if row.origin == "pk" {
         extras.insert(props::PRIMARY_KEY, true);
+    }
+    if parsed.collated {
+        extras.insert(REBUILD_LOSES, "a COLLATE on an index key");
     }
     IndexDef {
         name: row.name.clone(),
@@ -465,6 +468,9 @@ fn table_extras(schema: &str, flags: Option<&TableFlags>, parsed: &ParsedTable) 
     }
     if parsed.strict || flags.is_some_and(|f| f.strict) {
         e.insert(props::STRICT, true);
+    }
+    if !parsed.lossy.is_empty() {
+        e.insert(REBUILD_LOSES, parsed.lossy.join(", "));
     }
     if is_temp(schema) {
         e.insert(props::TEMPORARY, true);

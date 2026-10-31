@@ -180,6 +180,11 @@ impl Lexed<'_> {
         unquote(self.text(i))
     }
 
+    /// `true` when a token in `from..to` is the bare word `kw`.
+    fn has_word(&self, from: usize, to: usize, kw: &str) -> bool {
+        (from..to.min(self.toks.len())).any(|i| self.is(i, kw))
+    }
+
     /// Index of the `)` matching the `(` at `open`, or the token count when unterminated.
     fn close_of(&self, open: usize) -> usize {
         let mut depth = 0usize;
@@ -305,6 +310,9 @@ pub(crate) struct ParsedTable {
     pub strict: bool,
     /// `CREATE VIRTUAL TABLE ... USING <module>`.
     pub module: Option<String>,
+    /// Clauses the object model cannot hold, so re-creating the table from its definition would
+    /// drop them: `ON CONFLICT` clauses and `COLLATE` on a `PRIMARY KEY` / `UNIQUE` key.
+    pub lossy: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -366,6 +374,9 @@ pub(crate) fn parse_create_table(sql: &str) -> ParsedTable {
         } else if lx.is_name(a) {
             column_def(&lx, a, b, &mut out);
         }
+    }
+    if (i + 1..close).any(|k| lx.is(k, "ON") && lx.is(k + 1, "CONFLICT")) {
+        out.lossy.push("an ON CONFLICT clause".to_owned());
     }
     // Table options: `WITHOUT ROWID`, `STRICT`, comma separated.
     i = close + 1;
@@ -469,9 +480,25 @@ fn table_constraints(lx: &Lexed<'_>, a: usize, b: usize, out: &mut ParsedTable) 
         if lx.is(i, "CONSTRAINT") {
             pending = lx.is_name(i + 1).then(|| lx.name(i + 1));
             i += 2;
-        } else if lx.is(i, "PRIMARY") {
-            out.pk_name = pending.take();
-            i += 1;
+        } else if lx.is_any(i, &["PRIMARY", "UNIQUE"]) {
+            if lx.is(i, "PRIMARY") {
+                out.pk_name = pending.take();
+            } else {
+                pending = None;
+            }
+            let open = if lx.is(i + 1, "KEY") { i + 2 } else { i + 1 };
+            if lx.kind(open) == Some(Tok::LParen) {
+                let close = lx.close_of(open);
+                if lx.has_word(open, close, "COLLATE") {
+                    let what = "a COLLATE on a PRIMARY KEY or UNIQUE key".to_owned();
+                    if !out.lossy.contains(&what) {
+                        out.lossy.push(what);
+                    }
+                }
+                i = close + 1;
+            } else {
+                i += 1;
+            }
         } else if lx.is(i, "CHECK") && lx.kind(i + 1) == Some(Tok::LParen) {
             let (expr, next) = lx.group(i + 1);
             out.checks.push(ParsedCheck {
@@ -546,6 +573,8 @@ pub(crate) struct ParsedIndex {
     pub parts: Vec<String>,
     /// The partial-index predicate after `WHERE`.
     pub predicate: Option<String>,
+    /// A key part carries `COLLATE x`, which the object model cannot hold.
+    pub collated: bool,
 }
 
 /// Reads a stored `CREATE [UNIQUE] INDEX` statement.
@@ -570,6 +599,7 @@ pub(crate) fn parse_create_index(sql: &str) -> ParsedIndex {
             if end > a + 1 && lx.is_any(end - 1, &["ASC", "DESC"]) {
                 end -= 1;
             } else if end > a + 2 && lx.is(end - 2, "COLLATE") {
+                out.collated = true;
                 end -= 2;
             } else {
                 break;
@@ -754,54 +784,41 @@ pub(crate) fn mentions_identifier(sql: &str, ident: &str) -> bool {
     })
 }
 
-/// A stored `CREATE TRIGGER` statement with renamed objects replaced, for re-creating the trigger
-/// after a table rebuild whose script renamed the table or columns first (the rename rewrote the
-/// stored text on the server, but the rebuild re-creates the trigger from the text loaded
-/// before).
-///
-/// Every bare or quoted identifier (not the trigger's own name, not a string literal) equal to an
-/// old name (ASCII case-insensitive) becomes `quote(new)`: a name followed by `.` is a table
-/// qualifier and only matches `table`; other names match `columns` first, then `table`. `None`
-/// when nothing was replaced.
-pub(crate) fn rename_in_trigger(
-    sql: &str,
-    table: Option<(&str, &str)>,
-    columns: &[(String, String)],
+/// `expr` (an expression over one table's columns: a check, a generated column, an index key or
+/// predicate) with column names replaced by `pairs` (`(from, to)`, ASCII case-insensitive, all at
+/// once, so a swap works). A bare or quoted word counts as a column unless it is followed by `(`
+/// (a function) or `.` (a table qualifier) or follows `COLLATE`; string literals never count.
+/// Replaced names are written with `quote`.
+pub(crate) fn rename_columns(
+    expr: &str,
+    pairs: &[(String, String)],
     quote: &dyn Fn(&str) -> String,
-) -> Option<String> {
-    let lx = lex(sql);
-    let name_at = lx.after_create("TRIGGER")?;
-    let name_end = lx.skip_name(name_at);
+) -> String {
+    if pairs.is_empty() {
+        return expr.to_owned();
+    }
+    let lx = lex(expr);
     let mut edits: Vec<(usize, usize, String)> = Vec::new();
     for (i, tok) in lx.toks.iter().enumerate() {
-        if (name_at..name_end).contains(&i) || !matches!(tok.kind, Tok::Word | Tok::Quoted) {
+        if !matches!(tok.kind, Tok::Word | Tok::Quoted)
+            || matches!(lx.kind(i + 1), Some(Tok::LParen | Tok::Dot))
+            || (i > 0 && lx.is(i - 1, "COLLATE"))
+        {
             continue;
         }
         let value = lx.name(i);
-        let table_new = table
-            .filter(|(old, _)| old.eq_ignore_ascii_case(&value))
-            .map(|(_, new)| new);
-        let new = if lx.kind(i + 1) == Some(Tok::Dot) {
-            table_new
-        } else {
-            columns
-                .iter()
-                .find(|(old, _)| old.eq_ignore_ascii_case(&value))
-                .map(|(_, new)| new.as_str())
-                .or(table_new)
-        };
-        if let Some(new) = new {
-            edits.push((tok.start, tok.end, quote(new)));
+        if let Some((_, to)) = pairs
+            .iter()
+            .find(|(from, _)| from.eq_ignore_ascii_case(&value))
+        {
+            edits.push((tok.start, tok.end, quote(to)));
         }
     }
-    if edits.is_empty() {
-        return None;
-    }
-    let mut out = sql.to_owned();
+    let mut out = expr.to_owned();
     for (start, end, text) in edits.into_iter().rev() {
         out.replace_range(start..end, &text);
     }
-    Some(out)
+    out
 }
 
 /// A stored `CREATE TRIGGER` statement with its name qualified by `schema` (already quoted), so
@@ -1037,6 +1054,29 @@ mod tests {
         let plain = parse_create_index("CREATE INDEX m2_child_parent_idx ON m2_child (parent_id)");
         assert_eq!(plain.parts, ["parent_id"]);
         assert_eq!(plain.predicate, None);
+        assert!(i.collated);
+        assert!(!plain.collated);
+    }
+
+    #[test]
+    fn m3_notes_clauses_the_model_cannot_hold() {
+        let plain = parse_create_table(
+            "CREATE TABLE t (a TEXT COLLATE NOCASE UNIQUE, b INT REFERENCES p ON DELETE CASCADE, \
+             PRIMARY KEY (a), UNIQUE (b))",
+        );
+        assert_eq!(plain.lossy, Vec::<String>::new());
+        let t = parse_create_table(
+            "CREATE TABLE t (a TEXT NOT NULL ON CONFLICT IGNORE, b TEXT, \
+             CONSTRAINT k UNIQUE (b COLLATE NOCASE), PRIMARY KEY (a COLLATE BINARY))",
+        );
+        assert_eq!(
+            t.lossy,
+            [
+                "a COLLATE on a PRIMARY KEY or UNIQUE key",
+                "an ON CONFLICT clause"
+            ]
+        );
+        assert_eq!(t.pk_name, None);
     }
 
     #[test]
@@ -1106,25 +1146,21 @@ mod tests {
         assert!(!mentions_identifier("quantity > 0", "qty"));
 
         let quote = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
-        let sql = "CREATE TRIGGER qty AFTER UPDATE OF qty ON t BEGIN \
-                   UPDATE t SET note = 'qty' WHERE t.qty = NEW.qty; END";
-        let out = rename_in_trigger(
-            sql,
-            Some(("t", "u")),
-            &[("qty".to_owned(), "amount".to_owned())],
-            &quote,
-        )
-        .unwrap();
+        let pairs = [
+            ("qty".to_owned(), "amount".to_owned()),
+            ("a".to_owned(), "b".to_owned()),
+            ("b".to_owned(), "a".to_owned()),
+        ];
         assert_eq!(
-            out,
-            "CREATE TRIGGER qty AFTER UPDATE OF \"amount\" ON \"u\" BEGIN \
-             UPDATE \"u\" SET note = 'qty' WHERE \"u\".\"amount\" = NEW.\"amount\"; END"
+            rename_columns(
+                "qty > 0 AND [QTY] <> 'qty' AND qty(x) AND t.qty AND a < b AND c COLLATE a",
+                &pairs,
+                &quote
+            ),
+            "\"amount\" > 0 AND \"amount\" <> 'qty' AND qty(x) AND t.\"amount\" AND \"b\" < \"a\" \
+             AND c COLLATE a"
         );
-        assert_eq!(rename_in_trigger(sql, None, &[], &quote), None);
-        assert_eq!(
-            rename_in_trigger("CREATE TABLE t (a)", Some(("t", "u")), &[], &quote),
-            None
-        );
+        assert_eq!(rename_columns("x > 0", &[], &quote), "x > 0");
 
         assert_eq!(
             qualify_trigger_name(
