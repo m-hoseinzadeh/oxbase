@@ -741,6 +741,83 @@ pub(crate) fn parse_create_trigger(sql: &str) -> Option<ParsedTrigger> {
     })
 }
 
+// --- M3: rewriting stored text for the table rebuild ---------------------------------------
+
+/// `true` when `sql` names `ident`: a bare word or a quoted identifier equal to it (ASCII
+/// case-insensitive, as SQLite compares names). String literals do not count. Used to decide
+/// whether a column is referenced by an expression or a trigger (a conservative, lexical test).
+pub(crate) fn mentions_identifier(sql: &str, ident: &str) -> bool {
+    let lx = lex(sql);
+    (0..lx.toks.len()).any(|i| {
+        matches!(lx.kind(i), Some(Tok::Word | Tok::Quoted))
+            && lx.name(i).eq_ignore_ascii_case(ident)
+    })
+}
+
+/// A stored `CREATE TRIGGER` statement with renamed objects replaced, for re-creating the trigger
+/// after a table rebuild whose script renamed the table or columns first (the rename rewrote the
+/// stored text on the server, but the rebuild re-creates the trigger from the text loaded
+/// before).
+///
+/// Every bare or quoted identifier (not the trigger's own name, not a string literal) equal to an
+/// old name (ASCII case-insensitive) becomes `quote(new)`: a name followed by `.` is a table
+/// qualifier and only matches `table`; other names match `columns` first, then `table`. `None`
+/// when nothing was replaced.
+pub(crate) fn rename_in_trigger(
+    sql: &str,
+    table: Option<(&str, &str)>,
+    columns: &[(String, String)],
+    quote: &dyn Fn(&str) -> String,
+) -> Option<String> {
+    let lx = lex(sql);
+    let name_at = lx.after_create("TRIGGER")?;
+    let name_end = lx.skip_name(name_at);
+    let mut edits: Vec<(usize, usize, String)> = Vec::new();
+    for (i, tok) in lx.toks.iter().enumerate() {
+        if (name_at..name_end).contains(&i) || !matches!(tok.kind, Tok::Word | Tok::Quoted) {
+            continue;
+        }
+        let value = lx.name(i);
+        let table_new = table
+            .filter(|(old, _)| old.eq_ignore_ascii_case(&value))
+            .map(|(_, new)| new);
+        let new = if lx.kind(i + 1) == Some(Tok::Dot) {
+            table_new
+        } else {
+            columns
+                .iter()
+                .find(|(old, _)| old.eq_ignore_ascii_case(&value))
+                .map(|(_, new)| new.as_str())
+                .or(table_new)
+        };
+        if let Some(new) = new {
+            edits.push((tok.start, tok.end, quote(new)));
+        }
+    }
+    if edits.is_empty() {
+        return None;
+    }
+    let mut out = sql.to_owned();
+    for (start, end, text) in edits.into_iter().rev() {
+        out.replace_range(start..end, &text);
+    }
+    Some(out)
+}
+
+/// A stored `CREATE TRIGGER` statement with its name qualified by `schema` (already quoted), so
+/// it is re-created in that attached database; unchanged when the name is already qualified or
+/// the text is not a `CREATE TRIGGER`.
+pub(crate) fn qualify_trigger_name(sql: &str, schema: &str) -> String {
+    let lx = lex(sql);
+    match lx.after_create("TRIGGER") {
+        Some(name_at) if lx.kind(name_at + 1) != Some(Tok::Dot) && name_at < lx.toks.len() => {
+            let at = lx.toks[name_at].start;
+            format!("{}{schema}.{}", &sql[..at], &sql[at..])
+        }
+        _ => sql.to_owned(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1019,5 +1096,45 @@ mod tests {
         assert_eq!(t.table_schema.as_deref(), Some("main"));
         assert_eq!(t.condition.as_deref(), Some("NEW.begin > 0 AND (begin)"));
         assert_eq!(t.body, "BEGIN SELECT NEW.begin; END");
+    }
+
+    #[test]
+    fn m3_identifier_helpers() {
+        assert!(mentions_identifier("qty >= 0 AND \"Note\" <> ''", "note"));
+        assert!(mentions_identifier("[qty] > 1", "QTY"));
+        assert!(!mentions_identifier("'qty' = x", "qty"));
+        assert!(!mentions_identifier("quantity > 0", "qty"));
+
+        let quote = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
+        let sql = "CREATE TRIGGER qty AFTER UPDATE OF qty ON t BEGIN \
+                   UPDATE t SET note = 'qty' WHERE t.qty = NEW.qty; END";
+        let out = rename_in_trigger(
+            sql,
+            Some(("t", "u")),
+            &[("qty".to_owned(), "amount".to_owned())],
+            &quote,
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            "CREATE TRIGGER qty AFTER UPDATE OF \"amount\" ON \"u\" BEGIN \
+             UPDATE \"u\" SET note = 'qty' WHERE \"u\".\"amount\" = NEW.\"amount\"; END"
+        );
+        assert_eq!(rename_in_trigger(sql, None, &[], &quote), None);
+        assert_eq!(
+            rename_in_trigger("CREATE TABLE t (a)", Some(("t", "u")), &[], &quote),
+            None
+        );
+
+        assert_eq!(
+            qualify_trigger_name(
+                "CREATE TRIGGER tr AFTER INSERT ON t BEGIN SELECT 1; END",
+                "\"aux\""
+            ),
+            "CREATE TRIGGER \"aux\".tr AFTER INSERT ON t BEGIN SELECT 1; END"
+        );
+        let qualified = "CREATE TRIGGER IF NOT EXISTS x.tr AFTER INSERT ON t BEGIN SELECT 1; END";
+        assert_eq!(qualify_trigger_name(qualified, "\"aux\""), qualified);
+        assert_eq!(qualify_trigger_name("SELECT 1", "\"aux\""), "SELECT 1");
     }
 }
