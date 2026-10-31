@@ -543,7 +543,7 @@ mod tests {
                     .chars()
                     .take_while(char::is_ascii_digit)
                     .collect();
-                assert!(!digits.is_empty(), "bare $ in {sql}");
+                assert_ne!(digits, "", "bare $ in {sql}");
                 out.push(digits.parse().unwrap());
             }
         }

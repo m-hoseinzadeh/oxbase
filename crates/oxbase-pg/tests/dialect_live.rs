@@ -212,7 +212,7 @@ async fn lists_databases_schemas_and_every_seeded_object() {
     assert_eq!(names(&views), [f.name("view")]);
     let matview_name = f.m2["postgres"]["matview"].as_str().unwrap().to_owned();
     let mviews = list(&*conn, ObjectKind::MatView, &schema).await;
-    assert_eq!(names(&mviews), [matview_name.clone()]);
+    assert_eq!(names(&mviews), [matview_name.as_str()]);
     assert_eq!(
         mviews[0].extras.get(&props::POPULATED),
         Some(&Value::Bool(true))
@@ -308,7 +308,7 @@ async fn loads_tables_with_columns_keys_and_constraints() {
     assert!(unique.unique && unique.is_constraint);
     assert_eq!(unique.columns.len(), 1);
     assert_eq!(unique.columns[0].name, "code");
-    assert!(parent.foreign_keys.is_empty());
+    assert_eq!(parent.foreign_keys.len(), 0, "{:?}", parent.foreign_keys);
     assert_eq!(parent.checks.len(), 1);
     let check = &parent.checks[0];
     assert_eq!(check.name.as_deref(), Some(f.name("check_parent").as_str()));
@@ -453,7 +453,7 @@ async fn lists_and_loads_table_children() {
     assert_eq!(trg.timing, TriggerTiming::Before);
     assert_eq!(trg.events, [TriggerEvent::Insert]);
     assert_eq!(trg.level, TriggerLevel::Row);
-    assert!(trg.update_columns.is_empty());
+    assert_eq!(trg.update_columns, Vec::<String>::new());
     assert!(trg.condition.is_none());
     assert!(trg.enabled);
     let trg_fn = f.m2["postgres"]["trigger_function"].as_str().unwrap();
@@ -493,7 +493,10 @@ async fn lists_and_loads_table_children() {
         names(&list(&*conn, ObjectKind::Column, &view).await),
         ["id", "qty", "code"]
     );
-    assert!(list(&*conn, ObjectKind::Trigger, &view).await.is_empty());
+    assert_eq!(
+        names(&list(&*conn, ObjectKind::Trigger, &view).await),
+        Vec::<String>::new()
+    );
     let mview = f.schema_ref().child(
         ObjectKind::MatView,
         f.m2["postgres"]["matview"].as_str().unwrap(),
@@ -618,7 +621,7 @@ async fn loads_views_routines_and_sequences() {
     assert_eq!(r.obj.signature.as_deref(), Some(""));
     assert_eq!(r.returns.as_deref(), Some("trigger"));
     assert_eq!(r.language.as_deref(), Some("plpgsql"));
-    assert!(r.args.is_empty());
+    assert_eq!(r.args.len(), 0, "{:?}", r.args);
 
     let procedures = list(&*conn, ObjectKind::Procedure, &schema).await;
     let proc_ref = procedures[0].obj.clone();
@@ -774,7 +777,7 @@ async fn cancelled_missing_and_misplaced_requests_fail_cleanly() {
     assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
 
     // The session still works.
-    assert!(!list(&*conn, ObjectKind::Table, &schema).await.is_empty());
+    assert_ne!(list(&*conn, ObjectKind::Table, &schema).await.len(), 0);
     conn.close().await.unwrap();
 }
 
@@ -792,7 +795,7 @@ async fn another_database_is_read_through_its_own_session() {
     let public = find(&schemas, "public").obj.clone();
     assert_eq!(public.catalog.as_deref(), Some(f.other_database.as_str()));
     let tables = list(&*conn, ObjectKind::Table, &public).await;
-    assert_eq!(names(&tables), [f.other_table.clone()]);
+    assert_eq!(names(&tables), [f.other_table.as_str()]);
     let ObjectDef::Table(t) = load(&*conn, &tables[0].obj).await else {
         panic!("not a table");
     };
