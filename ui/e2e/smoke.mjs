@@ -1039,20 +1039,31 @@ async function editCell() {
     );
 
     // 4. Edit the test row's `code` cell in the grid's overlay editor.
-    const cell = await waitViewCell(view, "code", code, `the "code" cell of the test row`);
+    await waitViewCell(view, "code", code, `the "code" cell of the test row`);
     const input = await waitFor(
       "the cell editor",
       async () => {
-        const found = await wd.executeElement(
-          "const e = document.querySelector('[data-testid=cell-editor]');" +
-            "return e ? e.querySelector('textarea.value-input, input.value-input') : null;",
+        const editor = await wd.execute(
+          "const e = document.querySelector('[data-testid=cell-editor]'); if (!e) return null;" +
+            "return e.querySelector('textarea.value-input, input.value-input') ? 'ready' : 'loading';",
         );
-        if (found) return found;
-        // A click on the accessibility cell selects it and sends Enter (opens the editor).
-        await wd.execute("arguments[0].focus(); arguments[0].click();", cell).catch(() => {});
+        if (editor === "ready") {
+          return wd.executeElement(
+            "return document.querySelector('[data-testid=cell-editor]')" +
+              ".querySelector('textarea.value-input, input.value-input');",
+          );
+        }
+        if (editor === "loading") return null;
+        // Focusing the accessibility cell selects it; a click on it then sends Enter, which
+        // opens the overlay editor on the selected cell. The cell is looked up again each
+        // time: the accessibility table is rebuilt when the selection changes.
+        const cell = await viewCell(view, "code", code);
+        if (cell) {
+          await wd.execute("arguments[0].focus(); arguments[0].click();", cell).catch(() => {});
+        }
         return null;
       },
-      { timeoutMs: 15_000, intervalMs: 1_000 },
+      { timeoutMs: 20_000, intervalMs: 1_000 },
     );
     // The editor starts from the stored text (loaded with row_get_form): wait for it, then
     // replace it.
