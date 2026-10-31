@@ -1,6 +1,8 @@
 //! Scheduled events (`information_schema.EVENTS`). Not part of the M2 tree layout; listed and
 //! loaded (as a [`GenericDef`]) for callers that ask for them.
 
+use std::fmt::Write as _;
+
 use async_trait::async_trait;
 use oxbase_dialect::Fetcher;
 use oxbase_driver::{CancellationToken, Connection};
@@ -93,7 +95,7 @@ fn event_text(name: &str, row: &Row, body: &str) -> String {
         ident(name)
     );
     if row.string(2).eq_ignore_ascii_case("ONE TIME") {
-        out.push_str(&format!("AT {}", literal(&row.string(3))));
+        let _ = write!(out, "AT {}", literal(&row.string(3)));
     } else {
         let value = row.string(4);
         let value = if !value.is_empty() && value.chars().all(|c| c.is_ascii_digit()) {
@@ -101,12 +103,12 @@ fn event_text(name: &str, row: &Row, body: &str) -> String {
         } else {
             literal(&value)
         };
-        out.push_str(&format!("EVERY {value} {}", row.string(5)));
+        let _ = write!(out, "EVERY {value} {}", row.string(5));
         if let Some(starts) = row.non_empty(6) {
-            out.push_str(&format!(" STARTS {}", literal(&starts)));
+            let _ = write!(out, " STARTS {}", literal(&starts));
         }
         if let Some(ends) = row.non_empty(7) {
-            out.push_str(&format!(" ENDS {}", literal(&ends)));
+            let _ = write!(out, " ENDS {}", literal(&ends));
         }
     }
     out.push_str(" ON COMPLETION ");
@@ -118,7 +120,7 @@ fn event_text(name: &str, row: &Row, body: &str) -> String {
         _ => " DISABLE ON SLAVE",
     });
     if let Some(comment) = row.non_empty(10) {
-        out.push_str(&format!(" COMMENT {}", literal(&comment)));
+        let _ = write!(out, " COMMENT {}", literal(&comment));
     }
     out.push_str(" DO ");
     out.push_str(body);

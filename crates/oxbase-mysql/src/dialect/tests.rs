@@ -204,7 +204,7 @@ async fn fetchers_bind_every_name() {
                 .list(&c, &parent, CancellationToken::new())
                 .await
                 .unwrap_or_else(|e| panic!("{engine}/{kind} list: {e}"));
-            assert!(listed.is_empty());
+            assert_empty(&listed, "listed");
             let err = fetcher
                 .load(&c, &obj, CancellationToken::new())
                 .await
@@ -249,7 +249,7 @@ async fn cancelled_tokens_run_nothing() {
             assert!(err.is_cancelled(), "{engine}/{kind} list: {err}");
             let err = fetcher.load(&c, &obj, cancel.clone()).await.unwrap_err();
             assert!(err.is_cancelled(), "{engine}/{kind} load: {err}");
-            assert!(c.calls().is_empty(), "{engine}/{kind} ran a query");
+            assert_empty(&c.calls(), &format!("{engine}/{kind} ran a query"));
         }
     }
 }
@@ -261,14 +261,14 @@ async fn old_servers_skip_what_they_lack() {
     let c = Recorder::new(Engine::MySql, "8.0.15");
     let (parent, _) = refs(ObjectKind::Check);
     let fetcher = reg.fetcher(Engine::MySql, ObjectKind::Check).unwrap();
-    assert!(
-        fetcher
+    assert_empty(
+        &fetcher
             .list(&c, &parent, CancellationToken::new())
             .await
-            .unwrap()
-            .is_empty()
+            .unwrap(),
+        "fetcher .list(&c, &parent, CancellationToken::new()) .await .unwrap()",
     );
-    assert!(c.calls().is_empty());
+    assert_empty(&c.calls(), "c.calls()");
     // MariaDB before 11.5 lists sequences but cannot read their options without the name in SQL.
     let c = Recorder::new(Engine::MariaDb, "10.11.6-MariaDB");
     let (_, obj) = refs(ObjectKind::Sequence);
@@ -278,4 +278,15 @@ async fn old_servers_skip_what_they_lack() {
         .await
         .unwrap_err();
     assert!(matches!(err, Error::Unsupported { .. }), "{err}");
+}
+
+/// Fails with the first element when `v` is not empty.
+#[track_caller]
+fn assert_empty<T: std::fmt::Debug>(v: &[T], what: &str) {
+    if let Some(first) = v.first() {
+        panic!(
+            "{what}: expected nothing, got {} item(s), first {first:?}",
+            v.len()
+        );
+    }
 }

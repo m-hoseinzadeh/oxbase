@@ -259,7 +259,7 @@ async fn tables(key: &'static str) {
         .find(|k| k.name.as_deref() == Some(t.name("check_parent").as_str()))
         .expect("parent check");
     assert!(check.expression.contains("code"), "{}", check.expression);
-    assert!(p.foreign_keys.is_empty());
+    assert_empty(&p.foreign_keys, "m2_parent foreign keys");
     assert!(p.extras.contains(&props::COLLATION));
 
     // m2_child
@@ -375,8 +375,11 @@ async fn json_columns(key: &'static str) {
         // MariaDB: JSON is LONGTEXT plus an automatic json_valid check, which is not listed.
         assert_eq!(col.data_type, DataType::Json { binary: false });
         assert_eq!(col.native_type.to_lowercase(), "longtext");
-        assert!(doc.checks.is_empty(), "{:?}", doc.checks);
-        assert!(t.list(ObjectKind::Check, &doc_table).await.is_empty());
+        assert_empty(&doc.checks, "m2_doc checks");
+        assert_empty(
+            &t.list(ObjectKind::Check, &doc_table).await,
+            "m2_doc check listing",
+        );
     } else {
         assert_eq!(col.data_type, DataType::Json { binary: true });
         assert_eq!(col.native_type.to_lowercase(), "json");
@@ -423,7 +426,7 @@ async fn views(key: &'static str) {
         ObjectKind::Check,
         ObjectKind::Trigger,
     ] {
-        assert!(t.list(kind, &v.obj).await.is_empty(), "{kind}");
+        assert_empty(&t.list(kind, &v.obj).await, &kind.to_string());
     }
     let err = t
         .load_err(&t.database().child(ObjectKind::View, "m2_no_such_view"))
@@ -540,10 +543,9 @@ async fn triggers(key: &'static str) {
         )
         .await;
     assert!(matches!(err, Error::NotFound { .. }), "{err}");
-    assert!(
-        t.list(ObjectKind::Trigger, &t.table("m2_parent"))
-            .await
-            .is_empty()
+    assert_empty(
+        &t.list(ObjectKind::Trigger, &t.table("m2_parent")).await,
+        "t.list(ObjectKind::Trigger, &t.table(\"m2_parent\")) .await",
     );
 }
 
@@ -559,8 +561,12 @@ async fn sequences(key: &'static str) {
     assert!(supported);
     let name = t.name("sequence");
     let list = t.list(ObjectKind::Sequence, &t.database()).await;
-    assert_eq!(names(&list), [name.as_str()]);
-    let ObjectDef::Sequence(def) = t.load(&list[0].obj).await else {
+    assert_sorted(&list);
+    // 01-schema.sql has order_no_seq too.
+    assert!(names(&list).contains(&"order_no_seq"));
+    let seq = find(&list, &name);
+    assert!(!seq.system);
+    let ObjectDef::Sequence(def) = t.load(&seq.obj).await else {
         panic!("not a sequence");
     };
     assert_eq!(
@@ -662,7 +668,10 @@ async fn cancel_and_bound_names(key: &'static str) {
         assert!(matches!(err, Error::NotFound { .. }), "{name}: {err}");
     }
     let tricky = ObjectRef::database("oxbase_test' OR '1'='1");
-    assert!(t.list(ObjectKind::Table, &tricky).await.is_empty());
+    assert_empty(
+        &t.list(ObjectKind::Table, &tricky).await,
+        "tables of a tricky name",
+    );
 
     // A ref without a catalog means the session's database.
     let bare = ObjectRef::table(None, None, "m2_parent");
@@ -712,3 +721,14 @@ live!(
     system_objects,
     cancel_and_bound_names,
 );
+
+/// Fails with the first element when `v` is not empty.
+#[track_caller]
+fn assert_empty<T: std::fmt::Debug>(v: &[T], what: &str) {
+    if let Some(first) = v.first() {
+        panic!(
+            "{what}: expected nothing, got {} item(s), first {first:?}",
+            v.len()
+        );
+    }
+}
