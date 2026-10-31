@@ -855,10 +855,10 @@ async fn apply(tx: &dyn Tx, plan: &DmlPlan) -> (u64, Option<ResultSet>) {
             CancellationToken::new(),
         )
         .await
-        .unwrap_or_else(|e| panic!("{}: {e}", plan.write.sql)),
+        .unwrap_or_else(|e| panic!("{e}\n{}", plan.write.sql)),
     )
     .await
-    .unwrap_or_else(|e| panic!("{}: {e}", plan.write.sql));
+    .unwrap_or_else(|e| panic!("{e}\n{}", plan.write.sql));
     if plan.returning {
         let rs = out.result_sets.into_iter().next().expect("RETURNING rows");
         return (u64::try_from(rs.num_rows()).unwrap(), Some(rs));

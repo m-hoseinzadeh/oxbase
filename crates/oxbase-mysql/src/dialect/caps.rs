@@ -85,6 +85,15 @@ pub(crate) fn designer(mariadb: bool, v: &ServerVersion) -> DesignerCapabilities
          its columns (InnoDB creates one named after the constraint when there is none)."
             .to_owned(),
     );
+    notes.push(if mariadb {
+        "Foreign key names are unique per database, check names per table; a check without a \
+         name is named by the server. The primary key is always named PRIMARY."
+            .to_owned()
+    } else {
+        "Foreign key and check names are unique per database; a check without a name is named \
+         <table>_chk_<n> by the server. The primary key is always named PRIMARY."
+            .to_owned()
+    });
     DesignerCapabilities {
         transactional_ddl: false,
         create_table: true,
@@ -183,5 +192,12 @@ mod tests {
         assert!(maria.checks_enforced && maria.descending_indexes);
         assert!(!maria.expression_indexes && !maria.identity);
         assert!(maria.notes[0].starts_with("MariaDB"));
+        assert!(
+            maria
+                .notes
+                .iter()
+                .any(|n| n.contains("check names per table"))
+        );
+        assert!(caps.notes.iter().any(|n| n.contains("unique per database")));
     }
 }
