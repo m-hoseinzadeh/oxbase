@@ -6,8 +6,17 @@
 //! literal defaults arrive already quoted by the designer or are quoted here with
 //! [`Quoting::quote_str`]; expressions (defaults, checks, generated columns, index keys and
 //! predicates, `PARTITION BY`) are inserted as they are after
-//! [`check_expression`](oxbase_dialect::sql::check_expression), and native type names after a
-//! stricter check (no clauses hidden in a type).
+//! [`check_expression`](oxbase_dialect::sql::check_expression) and a check that they are one
+//! expression (no `,` outside parentheses), and native type names after a stricter check (no
+//! clauses hidden in a type). String literals with a backslash (in comments, defaults and other
+//! expressions) are written as escape strings (`E'...'`), so a script means the same whatever
+//! the session's `standard_conforming_strings` is.
+//!
+//! Indexes keep what the fetcher reports beyond keys and predicate when they are dropped and
+//! created again: per-key operator classes and collations, storage parameters (`WITH`), the
+//! tablespace and the deferrability of a `UNIQUE` constraint. An index whose operator classes
+//! have parameters cannot be written and is `Unsupported`. Changed flags are found by comparing
+//! with PostgreSQL's defaults filled in (`compare::normalize_def`).
 //!
 //! # Version notes
 //!
@@ -19,7 +28,8 @@
 //!
 //! In order: schema move and renames (table, columns, indexes, constraints, primary key name);
 //! drops of foreign keys, checks and indexes that go or change, and of the primary key when it
-//! changes; column drops, changes and adds; the primary key; new or changed indexes, checks and
+//! changes (a foreign key of the table to itself that references a dropped key is dropped and
+//! added again; foreign keys of other tables get a warning); column drops, changes and adds; the primary key; new or changed indexes, checks and
 //! foreign keys (`VALIDATE CONSTRAINT` when only `NOT VALID` went away, `ALTER CONSTRAINT` when
 //! only deferrability changed); table storage options; comments. PostgreSQL cannot reorder
 //! columns: kept columns must stay in order and new columns go at the end, else the alter is
@@ -49,9 +59,13 @@ use oxbase_types::{
     ScriptStep, ServerVersion, TableDef, Value, props,
 };
 
-use super::compare::{PgRules, canonical_type, column_type_key, is_serial_type};
+use super::compare::{
+    PgRules, canonical_type, column_type_key, is_serial_type, normalize_check, normalize_fk,
+    normalize_index,
+};
 use super::fetch::{
-    EXCLUSION, MATCH_TYPE, NO_INHERIT, NOT_ENFORCED, NOT_VALID, NULLS_FIRST, NULLS_NOT_DISTINCT,
+    EXCLUSION, INDEX_OPTIONS, KEY_COLLATIONS, MATCH_TYPE, NO_INHERIT, NOT_ENFORCED, NOT_VALID,
+    NULLS_FIRST, NULLS_NOT_DISTINCT, OPCLASS_OPTIONS, OPCLASSES,
 };
 use super::sql::at_least;
 
@@ -128,7 +142,7 @@ impl DdlGenerator for PgDdl {
                     s.push_step(rename_index_step(table, &before.name, &after.name));
                     cur.name.clone_from(&after.name);
                 }
-                if !diff_indexes(table, &cur, after, &PgRules).is_empty() {
+                if index_changed(table, &cur, after) {
                     s.push_step(drop_index_step(table, &cur)?);
                     s.push_step(index_step(v, table, after)?);
                 }
@@ -151,7 +165,7 @@ impl DdlGenerator for PgDdl {
                     cur.name = Some(to.clone());
                 }
                 let mut adds = Vec::new();
-                change_fk(v, table, &cur, after, &mut s, &mut adds)?;
+                change_fk(v, table, &cur, after, false, &mut s, &mut adds)?;
                 s.extend(adds);
             }
             (
@@ -199,6 +213,9 @@ impl DdlGenerator for PgDdl {
                 .described(format!("Drop column {}", r.name))
                 .destructive()
             }
+            // A UNIQUE / EXCLUDE constraint's index is dropped as a constraint; that needs the
+            // table in `ctx.table` (without it the index is dropped with `DROP INDEX`, which the
+            // server refuses for a constraint's index).
             ObjectKind::Index => {
                 let table = owner(r)?;
                 let known = ctx
@@ -261,8 +278,15 @@ fn ident(name: &str) -> String {
     PgQuoting.quote_ident(name)
 }
 
+/// A string literal. Text with a backslash is written as an escape string (`E'a\\b'`), which
+/// reads the same whatever `standard_conforming_strings` is; other text through
+/// [`Quoting::quote_str`].
 fn literal(text: &str) -> String {
-    PgQuoting.quote_str(text)
+    if text.contains('\\') {
+        format!("E'{}'", text.replace('\\', "\\\\").replace('\'', "''"))
+    } else {
+        PgQuoting.quote_str(text)
+    }
 }
 
 /// `"schema"."table"` (a PostgreSQL session never names its database).
@@ -287,15 +311,142 @@ fn column_list(columns: &[String]) -> String {
         .join(", ")
 }
 
-/// `text` after [`check_expression`], or `InvalidInput` naming `what`.
-fn checked<'t>(what: &str, text: &'t str) -> Result<&'t str> {
-    match check_expression(&PgQuoting, text) {
-        Ok(()) => Ok(text.trim()),
-        Err(Error::InvalidInput { message }) => {
-            Err(Error::invalid_input(format!("{what}: {message}")))
+/// `text` after [`check_expression`] and [`one_expression`], or `InvalidInput` naming `what`.
+fn checked(what: &str, text: &str) -> Result<String> {
+    let named = |e: Error| match e {
+        Error::InvalidInput { message } => Error::invalid_input(format!("{what}: {message}")),
+        other => other,
+    };
+    check_expression(&PgQuoting, text).map_err(named)?;
+    one_expression(text.trim()).map_err(named)
+}
+
+/// `true` for characters that continue an identifier or keyword.
+fn is_ident_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_' || c == '$'
+}
+
+/// End (exclusive) of the quoted text starting at `start` (a `'` or `"`), with doubled quotes
+/// inside and, for escape strings, backslash escapes.
+fn quoted_end(chars: &[char], start: usize, backslashes: bool) -> Result<usize> {
+    let q = chars[start];
+    let mut i = start + 1;
+    while i < chars.len() {
+        let c = chars[i];
+        if backslashes && c == '\\' {
+            i += 2;
+        } else if c == q {
+            if chars.get(i + 1) == Some(&q) {
+                i += 2;
+            } else {
+                return Ok(i + 1);
+            }
+        } else {
+            i += 1;
         }
-        Err(other) => Err(other),
     }
+    Err(Error::invalid_input("unterminated quoted text"))
+}
+
+/// End (exclusive) of the dollar-quoted string starting at `start`, if one starts there.
+fn dollar_end(chars: &[char], start: usize) -> Option<usize> {
+    let mut j = start + 1;
+    while j < chars.len() && (chars[j].is_alphanumeric() || chars[j] == '_') {
+        j += 1;
+    }
+    if chars.get(j) != Some(&'$') || chars.get(start + 1).is_some_and(char::is_ascii_digit) {
+        return None;
+    }
+    let tag = &chars[start..=j];
+    (j + 1..chars.len())
+        .find(|&k| chars[k..].starts_with(tag))
+        .map(|k| k + tag.len())
+}
+
+/// Checks that an expression (already through [`check_expression`]) is one expression, and
+/// makes its string literals independent of `standard_conforming_strings`:
+///
+/// - a `,` outside parentheses and brackets is refused (a default such as `0, "x" text` would
+///   add a column to `CREATE TABLE`);
+/// - a plain string literal with a backslash is rewritten as an escape string with the
+///   backslash doubled: with `standard_conforming_strings = off` the server would read the
+///   backslash as an escape, so a literal the lexical check sees as one string (a backslash
+///   followed by a doubled quote and `; DROP ...`) would end early there.
+///   Escape strings, dollar quotes, bit strings and identifiers read the same either way;
+///   `N'...'` with a backslash is refused.
+fn one_expression(text: &str) -> Result<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len() + 8);
+    let mut depth = 0usize;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        let prev = i.checked_sub(1).map(|k| chars[k]);
+        let prefix_start = |len: usize| i <= len || !is_ident_char(chars[i - len - 1]);
+        match c {
+            '\'' => {
+                // `E'...'`, `B'...'`, `X'...'`, `N'...'` and `U&'...'` prefixes.
+                let prefix = match prev {
+                    Some('e' | 'E') if prefix_start(1) => Some('e'),
+                    Some('b' | 'B' | 'x' | 'X') if prefix_start(1) => Some('b'),
+                    Some('n' | 'N') if prefix_start(1) => Some('n'),
+                    Some('&') if i >= 2 && matches!(chars[i - 2], 'u' | 'U') && prefix_start(2) => {
+                        Some('u')
+                    }
+                    _ => None,
+                };
+                let end = quoted_end(&chars, i, prefix == Some('e'))?;
+                let body: String = chars[i + 1..end - 1].iter().collect();
+                match prefix {
+                    None if body.contains('\\') => {
+                        if prev.is_some_and(is_ident_char) {
+                            out.push(' ');
+                        }
+                        out.push_str("E'");
+                        out.push_str(&body.replace('\\', "\\\\"));
+                        out.push('\'');
+                    }
+                    Some('n') if body.contains('\\') => {
+                        return Err(Error::invalid_input(
+                            "write a national string literal with a backslash as E'...'",
+                        ));
+                    }
+                    _ => out.extend(&chars[i..end]),
+                }
+                i = end;
+            }
+            '"' => {
+                let end = quoted_end(&chars, i, false)?;
+                out.extend(&chars[i..end]);
+                i = end;
+            }
+            '$' if prev.is_none_or(|p| !is_ident_char(p)) => {
+                let end = dollar_end(&chars, i).unwrap_or(i + 1);
+                out.extend(&chars[i..end]);
+                i = end;
+            }
+            '(' | '[' => {
+                depth += 1;
+                out.push(c);
+                i += 1;
+            }
+            ')' | ']' => {
+                depth = depth.saturating_sub(1);
+                out.push(c);
+                i += 1;
+            }
+            ',' if depth == 0 => {
+                return Err(Error::invalid_input(
+                    "a ',' outside parentheses (only one expression is allowed)",
+                ));
+            }
+            _ => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Words that start a column clause and so must not appear in a type name.
@@ -318,7 +469,7 @@ const CLAUSE_WORDS: [&str; 13] = [
 /// A native type name as written by the user or the catalog, checked so that it cannot carry
 /// another clause: one expression ([`check_expression`]), no `,` or operator outside
 /// parentheses, no string literal, and no clause keyword (`NOT NULL`, `DEFAULT`, ...).
-pub(crate) fn checked_type<'t>(column: &str, native: &'t str) -> Result<&'t str> {
+pub(crate) fn checked_type(column: &str, native: &str) -> Result<String> {
     let what = format!("type of column {column}");
     let text = checked(&what, native)?;
     let bad = |why: &str| Err(Error::invalid_input(format!("{what}: {why} in '{text}'")));
@@ -460,7 +611,7 @@ pub(crate) fn neutral_type(t: &DataType) -> Result<String> {
                 "an enum column needs the name of a PostgreSQL enum type as its native type",
             ));
         }
-        DataType::Other { name } => checked_type("?", name)?.to_owned(),
+        DataType::Other { name } => checked_type("?", name)?,
     })
 }
 
@@ -469,7 +620,7 @@ fn type_sql(c: &ColumnDef) -> Result<String> {
     if c.native_type.trim().is_empty() {
         neutral_type(&c.data_type)
     } else {
-        checked_type(&c.name, &c.native_type).map(str::to_owned)
+        checked_type(&c.name, &c.native_type)
     }
 }
 
@@ -526,11 +677,13 @@ fn is_widening(old: &str, new: &str) -> bool {
         return from <= to;
     }
     // Decimal digits an integer type needs.
-    let int_digits = |t: &str| match t {
-        "smallint" => Some(5),
-        "integer" => Some(10),
-        "bigint" => Some(19),
-        _ => None,
+    let int_digits = |t: &str| -> Option<u32> {
+        match t {
+            "smallint" => Some(5),
+            "integer" => Some(10),
+            "bigint" => Some(19),
+            _ => None,
+        }
     };
     if old == "real" && new == "double precision" {
         return true;
@@ -554,13 +707,16 @@ fn is_widening(old: &str, new: &str) -> bool {
         }
     }
     // numeric(p, s) -> numeric(p2, s2) keeps every value when it has as many digits on both
-    // sides of the point (p2 - s2 >= p - s, written without subtraction).
+    // sides of the point (p2 - s2 >= p - s, written without subtraction; in u64, so typed
+    // modifiers near u32::MAX cannot overflow).
     let from_numeric = args(old, "numeric").or_else(|| int_digits(old).map(|p| vec![p]));
     if let (Some(from), Some(to)) = (from_numeric, args(new, "numeric")) {
         return match (from.as_slice(), to.as_slice()) {
             (_, []) => true,
-            ([p, s], [p2, s2]) => s2 >= s && p2 + s >= p + s2,
-            ([p], [p2, s2]) => *p2 >= p + s2,
+            ([p, s], [p2, s2]) => {
+                s2 >= s && u64::from(*p2) + u64::from(*s) >= u64::from(*p) + u64::from(*s2)
+            }
+            ([p], [p2, s2]) => u64::from(*p2) >= u64::from(*p) + u64::from(*s2),
             ([p], [p2]) => p2 >= p,
             _ => false,
         };
@@ -628,7 +784,7 @@ fn column_sql(v: &ServerVersion, c: &ColumnDef) -> Result<String> {
     let mut s = format!("{} {ty}", ident(&c.name));
     if let Some(collation) = &c.collation {
         s.push_str(" COLLATE ");
-        s.push_str(&ident(collation));
+        s.push_str(&qualified_name(collation));
     }
     if let Some(generated) = &c.generated {
         if c.identity.is_some() || c.auto_increment || c.default.is_some() {
@@ -682,7 +838,7 @@ fn column_sql(v: &ServerVersion, c: &ColumnDef) -> Result<String> {
     {
         let expr = checked(&format!("default of column {}", c.name), default)?;
         s.push_str(" DEFAULT ");
-        s.push_str(expr);
+        s.push_str(&expr);
     }
     Ok(s)
 }
@@ -709,24 +865,145 @@ fn pk_sql(pk: &PrimaryKeyDef) -> Result<String> {
     ))
 }
 
+/// `true` when `text` is `"schema"."name"`: two double-quoted parts and nothing else.
+fn is_quoted_pair(text: &str) -> bool {
+    let chars: Vec<char> = text.chars().collect();
+    let mut parts = 0;
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] != '"' {
+            return false;
+        }
+        match quoted_end(&chars, i, false) {
+            Ok(end) if end > i + 2 => i = end,
+            _ => return false,
+        }
+        parts += 1;
+        if i < chars.len() {
+            if chars[i] != '.' || i + 1 == chars.len() {
+                return false;
+            }
+            i += 1;
+        }
+    }
+    parts == 2
+}
+
+/// A collation or operator class name as the fetcher reports it: `"schema"."name"` as it is,
+/// anything else as one quoted identifier.
+fn qualified_name(text: &str) -> String {
+    if is_quoted_pair(text) {
+        text.to_owned()
+    } else {
+        ident(text)
+    }
+}
+
+/// A per-key JSON array extra of names (`opclasses`, `key_collations`): one entry per key,
+/// `None` for the default.
+fn per_key_names(idx: &IndexDef, prop: &PropId) -> Result<Vec<Option<String>>> {
+    let Some(items) = json_array(&idx.extras, prop)? else {
+        return Ok(vec![None; idx.columns.len()]);
+    };
+    if items.len() > idx.columns.len() {
+        return Err(Error::invalid_input(format!(
+            "index {}: '{prop}' has more entries than the index has keys",
+            idx.name
+        )));
+    }
+    let mut out = Vec::with_capacity(idx.columns.len());
+    for k in 0..idx.columns.len() {
+        out.push(match items.get(k) {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::String(name)) if name.trim().is_empty() => None,
+            Some(serde_json::Value::String(name)) => Some(name.clone()),
+            Some(_) => {
+                return Err(Error::invalid_input(format!(
+                    "index {}: '{prop}' must be a JSON array of names and nulls",
+                    idx.name
+                )));
+            }
+        });
+    }
+    Ok(out)
+}
+
+/// `WITH (name = 'value', ...)` of an index's `index_options` (`name=value` texts), if any.
+fn index_options_sql(idx: &IndexDef) -> Result<Option<String>> {
+    let Some(items) = json_array(&idx.extras, &INDEX_OPTIONS)? else {
+        return Ok(None);
+    };
+    let mut options = Vec::new();
+    for item in items {
+        let parsed = item.as_str().and_then(|o| o.split_once('='));
+        let Some((name, value)) = parsed.filter(|(name, _)| {
+            let name = name.trim();
+            name.starts_with(|c: char| c.is_ascii_lowercase() || c == '_')
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        }) else {
+            return Err(Error::invalid_input(format!(
+                "index {}: index_options must be 'name=value' texts with a lowercase name",
+                idx.name
+            )));
+        };
+        options.push(format!("{} = {}", name.trim(), literal(value.trim())));
+    }
+    Ok((!options.is_empty()).then(|| format!("WITH ({})", options.join(", "))))
+}
+
+/// Refuses an index whose operator classes have parameters (the designer cannot write them).
+fn refuse_opclass_options(idx: &IndexDef) -> Result<()> {
+    if flag(&idx.extras, &OPCLASS_OPTIONS) {
+        return Err(Error::unsupported(format!(
+            "index {}: operator class parameters cannot be recreated by the designer; change \
+             this index with SQL",
+            idx.name
+        )));
+    }
+    Ok(())
+}
+
+/// `DEFERRABLE [INITIALLY DEFERRED]` / `NOT DEFERRABLE` of a constraint's extras.
+fn deferrable_clause(extras: &Extras, explicit: bool) -> Option<&'static str> {
+    let deferred = flag(extras, &props::INITIALLY_DEFERRED);
+    let deferrable = deferred || flag(extras, &props::DEFERRABLE);
+    match (deferrable, deferred, explicit) {
+        (true, true, _) => Some("DEFERRABLE INITIALLY DEFERRED"),
+        (true, false, false) => Some("DEFERRABLE"),
+        (true, false, true) => Some("DEFERRABLE INITIALLY IMMEDIATE"),
+        (false, _, true) => Some("NOT DEFERRABLE"),
+        (false, _, false) => None,
+    }
+}
+
 /// `UNIQUE (...)` or `EXCLUDE ...` of an index that is a declared constraint.
 fn unique_constraint_sql(v: &ServerVersion, idx: &IndexDef) -> Result<String> {
     let prefix = constraint_prefix(Some(idx.name.as_str()));
     if let Some(exclusion) = text_extra(&idx.extras, &EXCLUSION) {
+        // `pg_get_constraintdef` already carries the index parameters and deferrability.
         let text = checked(&format!("exclusion constraint {}", idx.name), exclusion)?;
         return Ok(format!("{prefix}{text}"));
     }
+    refuse_opclass_options(idx)?;
     let plain = idx
         .columns
         .iter()
         .all(|c| !c.is_expression && !c.descending)
         && idx.predicate.is_none()
-        && json_array(&idx.extras, &NULLS_FIRST)?.is_none()
+        && json_array(&idx.extras, &NULLS_FIRST)?
+            .is_none_or(|flags| flags.iter().all(|f| f.as_bool() != Some(true)))
+        && per_key_names(idx, &OPCLASSES)?.iter().all(Option::is_none)
+        && per_key_names(idx, &KEY_COLLATIONS)?
+            .iter()
+            .all(Option::is_none)
         && text_extra(&idx.extras, &props::INDEX_METHOD).is_none_or(|m| m == "btree");
     if !idx.unique || !plain {
         return Err(Error::invalid_input(format!(
             "index {}: a UNIQUE constraint covers plain ascending columns only (no expressions, \
-             predicate or other method); make it a unique index instead",
+             predicate, operator class, collation or other method); make it a unique index \
+             instead",
             idx.name
         )));
     }
@@ -748,6 +1025,18 @@ fn unique_constraint_sql(v: &ServerVersion, idx: &IndexDef) -> Result<String> {
         need(v, 11, "INCLUDE columns")?;
         let _ = write!(s, " INCLUDE ({})", column_list(&include));
     }
+    if let Some(with) = index_options_sql(idx)? {
+        s.push(' ');
+        s.push_str(&with);
+    }
+    if let Some(space) = text_extra(&idx.extras, &props::TABLESPACE) {
+        s.push_str(" USING INDEX TABLESPACE ");
+        s.push_str(&ident(space));
+    }
+    if let Some(clause) = deferrable_clause(&idx.extras, false) {
+        s.push(' ');
+        s.push_str(clause);
+    }
     Ok(s)
 }
 
@@ -759,7 +1048,16 @@ fn create_index_sql(v: &ServerVersion, table: &ObjectRef, idx: &IndexDef) -> Res
             idx.name
         )));
     }
+    refuse_opclass_options(idx)?;
+    if flag(&idx.extras, &props::DEFERRABLE) || flag(&idx.extras, &props::INITIALLY_DEFERRED) {
+        return Err(Error::invalid_input(format!(
+            "index {}: only a UNIQUE constraint can be deferrable",
+            idx.name
+        )));
+    }
     let nulls_first = json_array(&idx.extras, &NULLS_FIRST)?;
+    let opclasses = per_key_names(idx, &OPCLASSES)?;
+    let collations = per_key_names(idx, &KEY_COLLATIONS)?;
     let mut keys = Vec::new();
     for (pos, part) in idx.columns.iter().enumerate() {
         if part.length.is_some() {
@@ -776,6 +1074,14 @@ fn create_index_sql(v: &ServerVersion, table: &ObjectRef, idx: &IndexDef) -> Res
         } else {
             ident(&part.name)
         };
+        if let Some(collation) = &collations[pos] {
+            key.push_str(" COLLATE ");
+            key.push_str(&qualified_name(collation));
+        }
+        if let Some(opclass) = &opclasses[pos] {
+            key.push(' ');
+            key.push_str(&qualified_name(opclass));
+        }
         if part.descending {
             key.push_str(" DESC");
         }
@@ -813,10 +1119,18 @@ fn create_index_sql(v: &ServerVersion, table: &ObjectRef, idx: &IndexDef) -> Res
         need(v, 15, "NULLS NOT DISTINCT")?;
         s.push_str(" NULLS NOT DISTINCT");
     }
+    if let Some(with) = index_options_sql(idx)? {
+        s.push(' ');
+        s.push_str(&with);
+    }
+    if let Some(space) = text_extra(&idx.extras, &props::TABLESPACE) {
+        s.push_str(" TABLESPACE ");
+        s.push_str(&ident(space));
+    }
     if let Some(predicate) = &idx.predicate {
         let expr = checked(&format!("predicate of index {}", idx.name), predicate)?;
         s.push_str(" WHERE ");
-        s.push_str(expr);
+        s.push_str(&expr);
     }
     Ok(s)
 }
@@ -849,6 +1163,7 @@ fn drop_index_step(table: &ObjectRef, idx: &IndexDef) -> Result<ScriptStep> {
     } else {
         ScriptStep::new(format!("DROP INDEX {}", index_sql(table, &idx.name)))
             .described(format!("Drop index {}", idx.name))
+            .destructive()
     })
 }
 
@@ -875,19 +1190,6 @@ fn fk_action_sql(action: FkAction) -> Option<&'static str> {
         FkAction::Cascade => Some("CASCADE"),
         FkAction::SetNull => Some("SET NULL"),
         FkAction::SetDefault => Some("SET DEFAULT"),
-    }
-}
-
-/// `DEFERRABLE [INITIALLY DEFERRED]` / `NOT DEFERRABLE` of a foreign key.
-fn deferrable_sql(fk: &ForeignKeyDef, explicit: bool) -> Option<&'static str> {
-    let deferred = flag(&fk.extras, &props::INITIALLY_DEFERRED);
-    let deferrable = deferred || flag(&fk.extras, &props::DEFERRABLE);
-    match (deferrable, deferred, explicit) {
-        (true, true, _) => Some("DEFERRABLE INITIALLY DEFERRED"),
-        (true, false, false) => Some("DEFERRABLE"),
-        (true, false, true) => Some("DEFERRABLE INITIALLY IMMEDIATE"),
-        (false, _, true) => Some("NOT DEFERRABLE"),
-        (false, _, false) => None,
     }
 }
 
@@ -936,7 +1238,7 @@ fn fk_sql(v: &ServerVersion, table: &ObjectRef, fk: &ForeignKeyDef) -> Result<St
         s.push_str(" ON DELETE ");
         s.push_str(action);
     }
-    if let Some(deferrable) = deferrable_sql(fk, false) {
+    if let Some(deferrable) = deferrable_clause(&fk.extras, false) {
         s.push(' ');
         s.push_str(deferrable);
     }
@@ -1111,7 +1413,7 @@ fn create_table(v: &ServerVersion, t: &TableDef) -> Result<Script> {
     if let Some(partition) = text_extra(&t.extras, &props::PARTITION_BY) {
         let text = checked("PARTITION BY", partition)?;
         sql.push_str(" PARTITION BY ");
-        sql.push_str(text);
+        sql.push_str(&text);
     }
     if let Some(space) = text_extra(&t.extras, &props::TABLESPACE) {
         sql.push_str(" TABLESPACE ");
@@ -1142,14 +1444,21 @@ fn create_table(v: &ServerVersion, t: &TableDef) -> Result<Script> {
 // --- alter table ----------------------------------------------------------------------------
 
 /// Renames to run for one kind, through temporary names when they overlap (`a → b`, `b → a`).
-fn rename_plan(pairs: &[(String, String)]) -> Vec<(String, String)> {
+/// Temporary names avoid every name in `taken`.
+fn rename_plan(pairs: &[(String, String)], taken: &HashSet<String>) -> Vec<(String, String)> {
     let olds: HashSet<&str> = pairs.iter().map(|(old, _)| old.as_str()).collect();
     if !pairs.iter().any(|(_, new)| olds.contains(new.as_str())) {
         return pairs.to_vec();
     }
-    let temp: Vec<String> = (0..pairs.len())
-        .map(|k| format!("__oxbase_rename_{k}"))
-        .collect();
+    let mut temp: Vec<String> = Vec::with_capacity(pairs.len());
+    let mut n = 0usize;
+    while temp.len() < pairs.len() {
+        let name = format!("__oxbase_rename_{n}");
+        n += 1;
+        if !taken.contains(&name) {
+            temp.push(name);
+        }
+    }
     let mut out: Vec<(String, String)> = pairs
         .iter()
         .zip(&temp)
@@ -1269,23 +1578,41 @@ fn classify(diffs: &[PropertyDiff], after: &Extras) -> ConstraintChange {
     }
 }
 
+/// Whether index `a` and `b` differ, with PostgreSQL defaults filled in on both sides.
+fn index_changed(table: &ObjectRef, a: &IndexDef, b: &IndexDef) -> bool {
+    let (mut a, mut b) = (a.clone(), b.clone());
+    normalize_index(&mut a);
+    normalize_index(&mut b);
+    !diff_indexes(table, &a, &b, &PgRules).is_empty()
+}
+
 /// Steps for a matched foreign key `cur` → `new`. A recreate pushes the drop to `script` and
-/// the add to `adds` (run later, after column changes).
+/// the add to `adds` (run later, after column changes). `force` recreates it even when it did
+/// not change (the key it references is dropped and added again).
 fn change_fk(
     v: &ServerVersion,
     table: &ObjectRef,
     cur: &ForeignKeyDef,
     new: &ForeignKeyDef,
+    force: bool,
     script: &mut Script,
     adds: &mut Vec<ScriptStep>,
 ) -> Result<()> {
-    let diffs = diff_foreign_keys(table, cur, new, &PgRules);
+    let (mut a, mut b) = (cur.clone(), new.clone());
+    normalize_fk(&mut a);
+    normalize_fk(&mut b);
+    let diffs = diff_foreign_keys(table, &a, &b, &PgRules);
     let name = || {
         cur.name
             .clone()
             .ok_or_else(|| Error::invalid_input("an unnamed foreign key cannot be changed"))
     };
-    match classify(&diffs, &new.extras) {
+    let change = if force {
+        ConstraintChange::Recreate
+    } else {
+        classify(&diffs, &b.extras)
+    };
+    match change {
         ConstraintChange::None => {}
         ConstraintChange::Validate => adds.push(validate_step(table, &name()?)),
         ConstraintChange::Deferrable => {
@@ -1295,7 +1622,7 @@ fn change_fk(
                     "ALTER TABLE {} ALTER CONSTRAINT {} {}",
                     table_sql(table),
                     ident(&name),
-                    deferrable_sql(new, true).unwrap_or("NOT DEFERRABLE")
+                    deferrable_clause(&new.extras, true).unwrap_or("NOT DEFERRABLE")
                 ))
                 .described(format!("Change deferrability of foreign key {name}")),
             );
@@ -1321,13 +1648,16 @@ fn change_check(
     script: &mut Script,
     adds: &mut Vec<ScriptStep>,
 ) -> Result<()> {
-    let diffs = diff_checks(table, cur, new, &PgRules);
+    let (mut a, mut b) = (cur.clone(), new.clone());
+    normalize_check(&mut a);
+    normalize_check(&mut b);
+    let diffs = diff_checks(table, &a, &b, &PgRules);
     let name = || {
         cur.name
             .clone()
             .ok_or_else(|| Error::invalid_input("an unnamed check cannot be changed"))
     };
-    match classify(&diffs, &new.extras) {
+    match classify(&diffs, &b.extras) {
         ConstraintChange::None => {}
         ConstraintChange::Validate => adds.push(validate_step(table, &name()?)),
         ConstraintChange::Deferrable | ConstraintChange::Recreate => {
@@ -1336,6 +1666,15 @@ fn change_check(
         }
     }
     Ok(())
+}
+
+/// `true` when `a` and `b` name the same columns, in any order.
+fn same_columns(a: &[String], b: &[String]) -> bool {
+    let mut a: Vec<&str> = a.iter().map(String::as_str).collect();
+    let mut b: Vec<&str> = b.iter().map(String::as_str).collect();
+    a.sort_unstable();
+    b.sort_unstable();
+    a == b
 }
 
 fn same_fk_content(old: &ForeignKeyDef, new: &ForeignKeyDef) -> bool {
@@ -1354,12 +1693,27 @@ fn rename_column_refs(names: &mut [String], columns: &[(String, String)]) {
 
 /// Emits the schema move and every rename, returning `old` as it is after them (so it can be
 /// compared with `new` item by item).
+/// Every column, index and constraint name of `old` and `new` (temporary rename names avoid
+/// them).
+fn taken_names(old: &TableDef, new: &TableDef) -> HashSet<String> {
+    let mut taken = HashSet::new();
+    for t in [old, new] {
+        taken.extend(t.columns.iter().map(|c| c.name.clone()));
+        taken.extend(t.indexes.iter().map(|i| i.name.clone()));
+        taken.extend(t.foreign_keys.iter().filter_map(|f| f.name.clone()));
+        taken.extend(t.checks.iter().filter_map(|c| c.name.clone()));
+        taken.extend(t.primary_key.as_ref().and_then(|pk| pk.name.clone()));
+    }
+    taken
+}
+
 fn apply_renames(
     old: &TableDef,
     new: &TableDef,
     ctx: &DdlContext<'_>,
     s: &mut Script,
 ) -> Result<TableDef> {
+    let taken = taken_names(old, new);
     let mut cur = old.clone();
     let mut at = old.obj.clone();
     if old.obj.schema != new.obj.schema {
@@ -1406,7 +1760,7 @@ fn apply_renames(
     cur.obj.clone_from(table);
 
     let columns = renames_of(ctx, ObjectKind::Column, |n| old.column(n).is_some())?;
-    for (from, to) in rename_plan(&columns) {
+    for (from, to) in rename_plan(&columns, &taken) {
         s.push_step(rename_column_step(table, &from, &to));
     }
     for col in &mut cur.columns {
@@ -1434,7 +1788,7 @@ fn apply_renames(
     let indexes = renames_of(ctx, ObjectKind::Index, |n| {
         old.indexes.iter().any(|i| i.name == n)
     })?;
-    for (from, to) in rename_plan(&indexes) {
+    for (from, to) in rename_plan(&indexes, &taken) {
         s.push_step(rename_index_step(table, &from, &to));
     }
     for idx in &mut cur.indexes {
@@ -1453,7 +1807,7 @@ fn apply_renames(
     })?;
     let mut constraints = fks.clone();
     constraints.extend(checks.iter().cloned());
-    for (from, to) in rename_plan(&constraints) {
+    for (from, to) in rename_plan(&constraints, &taken) {
         s.push_step(rename_constraint_step(table, &from, &to));
     }
     for fk in &mut cur.foreign_keys {
@@ -1492,7 +1846,84 @@ fn alter_table(
     let mut check_adds = Vec::new();
     let mut fk_adds = Vec::new();
 
-    // Drops of foreign keys, checks and indexes that go or change.
+    // Indexes that go or change and a changed primary key are decided first: a foreign key of
+    // the table to itself that references one of them must be dropped before it and added
+    // again after it.
+    let mut index_drops: Vec<&IndexDef> = cur
+        .indexes
+        .iter()
+        .filter(|idx| !new.indexes.iter().any(|i| i.name == idx.name))
+        .collect();
+    for idx in &new.indexes {
+        match cur
+            .indexes
+            .iter()
+            .find(|i| i.name == idx.name && !i.name.is_empty())
+        {
+            None => index_adds.push(index_step(v, table, idx)?),
+            Some(before) => {
+                if index_changed(table, before, idx) {
+                    index_drops.push(before);
+                    index_adds.push(index_step(v, table, idx)?);
+                }
+            }
+        }
+    }
+    let pk_changed = !same_pk(cur.primary_key.as_ref(), new.primary_key.as_ref());
+    let pk_drop = match &cur.primary_key {
+        Some(pk) if pk_changed => Some(pk.name.clone().ok_or_else(|| {
+            Error::invalid_input(format!(
+                "the primary key of table {} has no name; reload the table before changing it",
+                old.obj.name
+            ))
+        })?),
+        _ => None,
+    };
+    // Column lists of the keys that are dropped: a changed primary key, unique indexes.
+    let old_pk: Vec<String> = cur
+        .primary_key
+        .as_ref()
+        .map(|pk| pk.columns.clone())
+        .unwrap_or_default();
+    let mut dropped_keys: Vec<Vec<String>> = Vec::new();
+    let mut referenced: Vec<&str> = Vec::new();
+    if let Some(name) = &pk_drop {
+        dropped_keys.push(old_pk.clone());
+        referenced.push(name);
+    }
+    for idx in index_drops.iter().copied() {
+        if idx.unique && idx.predicate.is_none() && idx.columns.iter().all(|c| !c.is_expression) {
+            dropped_keys.push(idx.columns.iter().map(|c| c.name.clone()).collect());
+            if idx.is_constraint {
+                referenced.push(&idx.name);
+            }
+        }
+    }
+    if !referenced.is_empty() {
+        s.warn(format!(
+            "{} {} dropped and added again: PostgreSQL refuses this while foreign keys of other \
+             tables reference {}; drop those foreign keys first.",
+            referenced.join(", "),
+            if referenced.len() == 1 { "is" } else { "are" },
+            if referenced.len() == 1 { "it" } else { "them" },
+        ));
+    }
+    let depends_on_dropped = |fk: &ForeignKeyDef| {
+        let self_ref = fk.ref_table.name == table.name
+            && fk
+                .ref_table
+                .schema
+                .as_deref()
+                .is_none_or(|schema| Some(schema) == table.schema.as_deref());
+        let refs = if fk.ref_columns.is_empty() {
+            &old_pk
+        } else {
+            &fk.ref_columns
+        };
+        self_ref && dropped_keys.iter().any(|key| same_columns(key, refs))
+    };
+
+    // Drops of foreign keys, checks and indexes that go or change, then of the primary key.
     let fk_match = pair_items(
         &cur.foreign_keys,
         &new.foreign_keys,
@@ -1510,7 +1941,11 @@ fn alter_table(
     for (fk, found) in new.foreign_keys.iter().zip(&fk_match) {
         match found {
             None => fk_adds.push(add_fk_step(v, table, fk)?),
-            Some(k) => change_fk(v, table, &cur.foreign_keys[*k], fk, &mut s, &mut fk_adds)?,
+            Some(k) => {
+                let before = &cur.foreign_keys[*k];
+                let force = depends_on_dropped(before);
+                change_fk(v, table, before, fk, force, &mut s, &mut fk_adds)?;
+            }
         }
     }
     let check_match = pair_items(
@@ -1533,33 +1968,11 @@ fn alter_table(
             Some(k) => change_check(v, table, &cur.checks[*k], check, &mut s, &mut check_adds)?,
         }
     }
-    for idx in &cur.indexes {
-        if !new.indexes.iter().any(|i| i.name == idx.name) {
-            s.push_step(drop_index_step(table, idx)?);
-        }
+    for idx in &index_drops {
+        s.push_step(drop_index_step(table, idx)?);
     }
-    for idx in &new.indexes {
-        match cur
-            .indexes
-            .iter()
-            .find(|i| i.name == idx.name && !i.name.is_empty())
-        {
-            None => index_adds.push(index_step(v, table, idx)?),
-            Some(before) => {
-                if !diff_indexes(table, before, idx, &PgRules).is_empty() {
-                    s.push_step(drop_index_step(table, before)?);
-                    index_adds.push(index_step(v, table, idx)?);
-                }
-            }
-        }
-    }
-    let pk_changed = !same_pk(cur.primary_key.as_ref(), new.primary_key.as_ref());
-    if pk_changed && let Some(pk) = &cur.primary_key {
-        let name = pk
-            .name
-            .clone()
-            .unwrap_or_else(|| format!("{}_pkey", old.obj.name));
-        s.push_step(drop_constraint_step(table, ObjectKind::Table, &name));
+    if let Some(name) = &pk_drop {
+        s.push_step(drop_constraint_step(table, ObjectKind::Table, name));
     }
 
     // Columns: drops, changes, adds.
@@ -1645,12 +2058,26 @@ fn alter_table(
     Ok(s)
 }
 
-/// `UNLOGGED`, tablespace and owner changes; other table extras cannot change.
+/// A table extra that says something: not absent, `null` or `false`.
+fn set_extra<'e>(extras: &'e Extras, prop: &PropId) -> Option<&'e Value> {
+    extras
+        .get(prop)
+        .filter(|v| !matches!(v, Value::Null | Value::Bool(false)))
+}
+
+/// `UNLOGGED` (absent counts as logged), tablespace (absent counts as the default one) and owner
+/// changes; partitioning, the table type and `TEMPORARY` cannot change.
 fn table_options(cur: &TableDef, new: &TableDef, table: &ObjectRef, s: &mut Script) -> Result<()> {
     let name = table_sql(table);
-    if let Some(unlogged) = new.extras.get(&props::UNLOGGED).and_then(Value::as_bool)
-        && unlogged != flag(&cur.extras, &props::UNLOGGED)
-    {
+    for prop in [props::PARTITION_BY, props::TABLE_TYPE, props::TEMPORARY] {
+        if set_extra(&cur.extras, &prop) != set_extra(&new.extras, &prop) {
+            return Err(Error::unsupported(format!(
+                "PostgreSQL cannot change '{prop}' of an existing table"
+            )));
+        }
+    }
+    let unlogged = flag(&new.extras, &props::UNLOGGED);
+    if unlogged != flag(&cur.extras, &props::UNLOGGED) {
         s.push_step(
             ScriptStep::new(format!(
                 "ALTER TABLE {name} SET {}",
@@ -1663,15 +2090,17 @@ fn table_options(cur: &TableDef, new: &TableDef, table: &ObjectRef, s: &mut Scri
             }),
         );
     }
-    if let Some(space) = text_extra(&new.extras, &props::TABLESPACE)
-        && Some(space) != text_extra(&cur.extras, &props::TABLESPACE)
-    {
+    let space = text_extra(&new.extras, &props::TABLESPACE);
+    if space != text_extra(&cur.extras, &props::TABLESPACE) {
         s.push_step(
             ScriptStep::new(format!(
                 "ALTER TABLE {name} SET TABLESPACE {}",
-                ident(space)
+                space.map_or_else(|| "pg_default".to_owned(), ident)
             ))
-            .described(format!("Move the table to tablespace {space}")),
+            .described(format!(
+                "Move the table to tablespace {}",
+                space.unwrap_or("pg_default")
+            )),
         );
     }
     if let (Some(before), Some(after)) = (
@@ -1684,16 +2113,62 @@ fn table_options(cur: &TableDef, new: &TableDef, table: &ObjectRef, s: &mut Scri
                 .described(format!("Change the owner to {after}")),
         );
     }
-    for prop in [props::PARTITION_BY, props::TABLE_TYPE, props::TEMPORARY] {
-        if let (Some(before), Some(after)) = (cur.extras.get(&prop), new.extras.get(&prop))
-            && before != after
-        {
-            return Err(Error::unsupported(format!(
-                "PostgreSQL cannot change '{prop}' of an existing table"
-            )));
+    Ok(())
+}
+
+/// The sequence a `serial` column's default draws from (`nextval('m3.t_id_seq'::regclass)`),
+/// quoted for SQL; `None` when the default does not name one in a form read here.
+fn serial_sequence(default: Option<&str>) -> Option<String> {
+    let text = default?.trim();
+    let rest = text
+        .get(..8)
+        .filter(|p| p.eq_ignore_ascii_case("nextval("))
+        .map(|_| text[8..].trim_start())?;
+    let chars: Vec<char> = rest.chars().collect();
+    if chars.first() != Some(&'\'') {
+        return None;
+    }
+    let end = quoted_end(&chars, 0, false).ok()?;
+    let name: String = chars[1..end - 1]
+        .iter()
+        .collect::<String>()
+        .replace("''", "'");
+    // `schema.name`, each part bare (already folded by the server) or double-quoted.
+    let chars: Vec<char> = name.chars().collect();
+    let mut parts = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '"' {
+            let end = quoted_end(&chars, i, false).ok()?;
+            parts.push(
+                chars[i + 1..end - 1]
+                    .iter()
+                    .collect::<String>()
+                    .replace("\"\"", "\""),
+            );
+            i = end;
+        } else {
+            let start = i;
+            while i < chars.len() && chars[i] != '.' {
+                i += 1;
+            }
+            let part: String = chars[start..i].iter().collect();
+            if part.is_empty() || !part.chars().all(is_ident_char) {
+                return None;
+            }
+            parts.push(part);
+        }
+        if i < chars.len() {
+            if chars[i] != '.' {
+                return None;
+            }
+            i += 1;
         }
     }
-    Ok(())
+    if parts.is_empty() || parts.len() > 2 {
+        return None;
+    }
+    Some(parts.iter().map(|p| ident(p)).collect::<Vec<_>>().join("."))
 }
 
 /// The steps that turn column `cur` into `new` (same name), in the order of the module docs.
@@ -1712,7 +2187,7 @@ fn column_changes(
         ident(name)
     );
     let type_changed = !rules.same_type(cur, new);
-    let collation_changed = new.collation.is_some() && new.collation != cur.collation;
+    let collation_changed = new.collation != cur.collation;
     let default_changed = !rules.same_default(cur, new);
     let (cur_serial, new_serial) = (is_serial(cur), is_serial(new));
     if new_serial && !cur_serial {
@@ -1759,9 +2234,11 @@ fn column_changes(
         _ => {}
     }
     if cur.identity.is_some() && new.identity.is_none() {
+        // The identity's sequence goes with it.
         s.push_step(
             ScriptStep::new(format!("{at} DROP IDENTITY"))
-                .described(format!("Drop the identity of column {name}")),
+                .described(format!("Drop the identity of column {name}"))
+                .destructive(),
         );
     }
     let had_default = cur.default.is_some() && cur.generated.is_none() && cur.identity.is_none();
@@ -1776,9 +2253,15 @@ fn column_changes(
     if type_changed || collation_changed {
         let ty = alter_type_sql(new)?;
         let mut sql = format!("{at} TYPE {ty}");
-        if let Some(collation) = &new.collation {
-            sql.push_str(" COLLATE ");
-            sql.push_str(&ident(collation));
+        match &new.collation {
+            Some(collation) => {
+                sql.push_str(" COLLATE ");
+                sql.push_str(&qualified_name(collation));
+            }
+            // Back to the type's default collation (the column had one, so the type is
+            // collatable). With a type change the new type's default applies anyway.
+            None if !type_changed => sql.push_str(" COLLATE pg_catalog.\"default\""),
+            None => {}
         }
         if type_changed && new.generated.is_none() {
             let _ = write!(sql, " USING {}::{ty}", ident(name));
@@ -1788,10 +2271,35 @@ fn column_changes(
         } else {
             format!("Change the collation of column {name}")
         });
-        if type_changed && !is_widening(&column_type_key(cur), &column_type_key(new)) {
+        let narrowing = type_changed && !is_widening(&column_type_key(cur), &column_type_key(new));
+        if narrowing {
             step = step.destructive();
         }
         s.push_step(step);
+        // A serial column's sequence has a type of its own (10+): it must follow, or nextval
+        // fails past the old type's maximum.
+        let int_type = matches!(
+            column_type_key(new).as_str(),
+            "smallint" | "integer" | "bigint"
+        );
+        if type_changed && cur_serial && new_serial && int_type {
+            match serial_sequence(cur.default.as_deref()) {
+                Some(seq) if at_least(v, 10) => {
+                    let mut step = ScriptStep::new(format!("ALTER SEQUENCE {seq} AS {ty}"))
+                        .described(format!("Change the type of the sequence of column {name}"));
+                    if narrowing {
+                        step = step.destructive();
+                    }
+                    s.push_step(step);
+                }
+                _ => {
+                    s.warn(format!(
+                        "The sequence of column {name} keeps its type; change it with ALTER \
+                         SEQUENCE ... AS {ty}."
+                    ));
+                }
+            }
+        }
     }
     if cur.nullable != new.nullable {
         s.push_step(if new.nullable {
@@ -1880,6 +2388,7 @@ fn column_changes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use oxbase_dialect::Comparator;
     use oxbase_types::{GeneratedColumn, IndexColumn, Rename};
 
     fn v18() -> ServerVersion {
@@ -2004,7 +2513,7 @@ mod tests {
             [
                 "CREATE TABLE \"m3\".\"order\" (\n    \
                  \"id\" integer GENERATED BY DEFAULT AS IDENTITY NOT NULL,\n    \
-                 \"na\"\"me\" varchar(20) NOT NULL DEFAULT 'it''s a \\ path ü',\n    \
+                 \"na\"\"me\" varchar(20) NOT NULL DEFAULT E'it''s a \\\\ path ü',\n    \
                  \"select\" integer NOT NULL DEFAULT 0,\n    \
                  \"naïve\" text COLLATE \"C\",\n    \
                  \"total\" numeric(12,2) GENERATED ALWAYS AS (\"select\" * 2) STORED,\n    \
@@ -2016,7 +2525,7 @@ mod tests {
                  INCLUDE (\"total\") WHERE \"select\" > 0",
                 "ALTER TABLE \"m3\".\"order\" ADD CONSTRAINT \"order_parent_fk\" FOREIGN KEY \
                  (\"select\") REFERENCES \"m3\".\"parent\" (\"id\") ON DELETE CASCADE DEFERRABLE",
-                "COMMENT ON TABLE \"m3\".\"order\" IS 'O''Reilly \\ orders 🚀'",
+                "COMMENT ON TABLE \"m3\".\"order\" IS E'O''Reilly \\\\ orders 🚀'",
                 "COMMENT ON COLUMN \"m3\".\"order\".\"na\"\"me\" IS 'Kunde''s \"code\" – ü'",
             ]
         );
@@ -2142,14 +2651,41 @@ mod tests {
             t.columns.push(col("c", good));
             assert!(create(&ObjectDef::Table(t)).is_ok(), "{good}");
         }
-        let mut t = TableDef::new(table_ref("t"));
-        let mut c = col("c", "integer");
-        c.default = Some("1; DROP TABLE x".into());
-        t.columns.push(c);
-        assert!(matches!(
-            create(&ObjectDef::Table(t)),
-            Err(Error::InvalidInput { .. })
-        ));
+        // Defaults, generation expressions and checks are one expression each: no `;`, no
+        // top-level `,` (which would add a column), no unbalanced parentheses.
+        for bad in [
+            "1; DROP TABLE x",
+            "0, \"x\" text",
+            "1) , \"x\" text CHECK (true",
+        ] {
+            let mut t = TableDef::new(table_ref("t"));
+            let mut c = col("c", "integer");
+            c.default = Some(bad.into());
+            t.columns.push(c);
+            let e = create(&ObjectDef::Table(t)).unwrap_err();
+            assert!(matches!(e, Error::InvalidInput { .. }), "{bad}: {e}");
+            let mut t = TableDef::new(table_ref("t"));
+            let mut g = col("g", "integer");
+            g.generated = Some(GeneratedColumn {
+                expression: bad.into(),
+                stored: true,
+            });
+            t.columns.push(g);
+            assert!(create(&ObjectDef::Table(t)).is_err(), "{bad}");
+        }
+        for good in [
+            "ARRAY[1, 2]",
+            "coalesce(1, 2)",
+            "'a,b'",
+            "$$a, b$$",
+            "\"a,b\" + 1",
+        ] {
+            let mut t = TableDef::new(table_ref("t"));
+            let mut c = col("c", "text");
+            c.default = Some(good.into());
+            t.columns.push(c);
+            assert!(create(&ObjectDef::Table(t)).is_ok(), "{good}");
+        }
         assert!(matches!(
             PgDdl.create(
                 &ObjectDef::View(oxbase_types::ViewDef {
@@ -2226,10 +2762,11 @@ mod tests {
         ];
         assert_eq!(sqls(&s), expected);
         assert!(s.is_atomic());
-        // The FK drop is destructive; the widening type change is not.
+        // The FK and index drops are destructive; the widening type change is not.
         let destructive: Vec<bool> = s.steps.iter().map(|st| st.destructive).collect();
-        assert_eq!(destructive.iter().filter(|d| **d).count(), 1);
+        assert_eq!(destructive.iter().filter(|d| **d).count(), 2);
         assert!(s.steps[4].destructive);
+        assert!(s.steps[5].destructive);
 
         // Nothing changed: empty script; the new definition as fetched compares equal.
         assert!(alter_with(&old, &old, &[]).unwrap().is_empty());
@@ -2326,9 +2863,34 @@ mod tests {
             [
                 format!("{at} DROP DEFAULT"),
                 format!("{at} TYPE bigint USING \"c\"::bigint"),
+                "ALTER SEQUENCE \"m3\".\"t_c_seq\" AS bigint".to_owned(),
                 format!("{at} SET DEFAULT nextval('m3.t_c_seq'::regclass)"),
             ]
         );
+        assert!(!s.is_destructive());
+        // Back to integer: the sequence follows, and both steps are destructive.
+        let s = alter(&wider, &serial).unwrap();
+        assert!(s.steps[1].destructive && s.steps[2].destructive, "{s}");
+        // Quoted sequence names are read and quoted again; unreadable ones leave a warning.
+        let mut quoted = serial.clone();
+        quoted.default = Some("nextval('\"M3\".\"T c\"\"seq\"'::regclass)".into());
+        let mut quoted_wider = quoted.clone();
+        quoted_wider.native_type = "bigint".into();
+        let s = alter(&quoted, &quoted_wider).unwrap();
+        assert_eq!(
+            s.steps[2].sql,
+            "ALTER SEQUENCE \"M3\".\"T c\"\"seq\" AS bigint"
+        );
+        let mut odd = serial.clone();
+        odd.default = Some("nextval(some_function())".into());
+        let mut odd_wider = odd.clone();
+        odd_wider.native_type = "bigint".into();
+        let s = alter(&odd, &odd_wider).unwrap();
+        assert!(!s.steps.iter().any(|st| st.sql.contains("SEQUENCE")), "{s}");
+        assert_eq!(s.warnings.len(), 1, "{s}");
+        // Dropping an identity drops its sequence: destructive.
+        let s = alter(&ident_col, &plain).unwrap();
+        assert!(s.steps[0].destructive);
         // Making a plain column serial or generated is not supported.
         let mut to_serial = plain.clone().not_null();
         to_serial.auto_increment = true;
@@ -2467,6 +3029,515 @@ mod tests {
             ]
         );
         assert!(s.steps[0].destructive);
+        // A primary key without a name cannot be dropped: no guessing `<table>_pkey`.
+        let e = alter_with(&keyed, &rekeyed, &[]).unwrap_err();
+        assert!(matches!(e, Error::InvalidInput { .. }), "{e}");
+
+        // Temporary names avoid names the table already has.
+        let mut old = TableDef::new(table_ref("t"));
+        for name in ["a", "b", "__oxbase_rename_0", "__oxbase_rename_2"] {
+            old.columns.push(col(name, "integer"));
+        }
+        let mut new = old.clone();
+        new.columns[0].name = "b".into();
+        new.columns[1].name = "a".into();
+        let s = alter_with(&old, &new, &renames).unwrap();
+        assert_eq!(
+            sqls(&s),
+            [
+                "ALTER TABLE \"m3\".\"t\" RENAME COLUMN \"a\" TO \"__oxbase_rename_1\"",
+                "ALTER TABLE \"m3\".\"t\" RENAME COLUMN \"b\" TO \"__oxbase_rename_3\"",
+                "ALTER TABLE \"m3\".\"t\" RENAME COLUMN \"__oxbase_rename_1\" TO \"b\"",
+                "ALTER TABLE \"m3\".\"t\" RENAME COLUMN \"__oxbase_rename_3\" TO \"a\"",
+            ]
+        );
+    }
+
+    #[test]
+    fn primary_key_change_recreates_self_references() {
+        let mut old = TableDef::new(table_ref("t"));
+        for name in ["a", "b", "c"] {
+            old.columns.push(col(name, "integer").not_null());
+        }
+        old.primary_key = Some(PrimaryKeyDef {
+            name: Some("t_pkey".into()),
+            columns: vec!["a".into()],
+        });
+        old.foreign_keys.push(ForeignKeyDef {
+            name: Some("t_c_fk".into()),
+            columns: vec!["c".into()],
+            ref_table: ObjectRef::table(Some("oxbase_test"), Some("m3"), "t"),
+            ref_columns: vec!["a".into()],
+            on_delete: FkAction::NoAction,
+            on_update: FkAction::NoAction,
+            extras: Extras::new(),
+        });
+        // The key moves to b; a stays unique so the (unchanged) foreign key still fits.
+        let mut new = old.clone();
+        new.primary_key = Some(PrimaryKeyDef {
+            name: Some("t_pkey".into()),
+            columns: vec!["b".into()],
+        });
+        new.indexes.push(IndexDef {
+            name: "t_a_key".into(),
+            columns: vec![IndexColumn::column("a")],
+            unique: true,
+            is_constraint: true,
+            predicate: None,
+            extras: Extras::new(),
+        });
+        let s = alter_with(&old, &new, &[]).unwrap();
+        let t = "\"m3\".\"t\"";
+        assert_eq!(
+            sqls(&s),
+            [
+                format!("ALTER TABLE {t} DROP CONSTRAINT \"t_c_fk\""),
+                format!("ALTER TABLE {t} DROP CONSTRAINT \"t_pkey\""),
+                format!("ALTER TABLE {t} ADD CONSTRAINT \"t_pkey\" PRIMARY KEY (\"b\")"),
+                format!("ALTER TABLE {t} ADD CONSTRAINT \"t_a_key\" UNIQUE (\"a\")"),
+                format!(
+                    "ALTER TABLE {t} ADD CONSTRAINT \"t_c_fk\" FOREIGN KEY (\"c\") REFERENCES \
+                     {t} (\"a\")"
+                ),
+            ]
+        );
+        assert_eq!(s.warnings.len(), 1, "other tables' foreign keys: {s}");
+        // A foreign key to another table is left alone.
+        let mut other = old.clone();
+        other.foreign_keys[0].ref_table = ObjectRef::table(None, Some("m3"), "p");
+        let mut other_new = new.clone();
+        other_new.foreign_keys[0].ref_table = ObjectRef::table(None, Some("m3"), "p");
+        let s = alter_with(&other, &other_new, &[]).unwrap();
+        assert!(!s.steps.iter().any(|st| st.sql.contains("t_c_fk")), "{s}");
+        // A recreated unique constraint that the table's own foreign key references.
+        let mut keyed = new.clone();
+        keyed.foreign_keys[0].name = Some("t_c_fk".into());
+        let mut changed = keyed.clone();
+        changed.indexes[0].extras.insert(
+            INDEX_OPTIONS,
+            Value::Json(serde_json::json!(["fillfactor=80"])),
+        );
+        let s = alter_with(&keyed, &changed, &[]).unwrap();
+        assert_eq!(
+            sqls(&s),
+            [
+                format!("ALTER TABLE {t} DROP CONSTRAINT \"t_c_fk\""),
+                format!("ALTER TABLE {t} DROP CONSTRAINT \"t_a_key\""),
+                format!(
+                    "ALTER TABLE {t} ADD CONSTRAINT \"t_a_key\" UNIQUE (\"a\") WITH (fillfactor \
+                     = '80')"
+                ),
+                format!(
+                    "ALTER TABLE {t} ADD CONSTRAINT \"t_c_fk\" FOREIGN KEY (\"c\") REFERENCES \
+                     {t} (\"a\")"
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn index_parameters_are_kept_when_an_index_is_recreated() {
+        let table = table_ref("t");
+        let idx = IndexDef {
+            name: "t_name_idx".into(),
+            columns: vec![IndexColumn::column("name"), IndexColumn::column("n")],
+            unique: false,
+            is_constraint: false,
+            predicate: None,
+            extras: Extras::new()
+                .with(props::INDEX_METHOD, "btree")
+                .with(
+                    OPCLASSES,
+                    Value::Json(serde_json::json!(["text_pattern_ops", null])),
+                )
+                .with(
+                    KEY_COLLATIONS,
+                    Value::Json(serde_json::json!(["\"public\".\"my coll\""])),
+                )
+                .with(
+                    INDEX_OPTIONS,
+                    Value::Json(serde_json::json!(["fillfactor=70"])),
+                )
+                .with(props::TABLESPACE, "fast"),
+        };
+        let def = |i: &IndexDef| ObjectDef::Index {
+            table: table.clone(),
+            index: i.clone(),
+        };
+        let expected = "CREATE INDEX \"t_name_idx\" ON \"m3\".\"t\" USING \"btree\" (\"name\" \
+                        COLLATE \"public\".\"my coll\" \"text_pattern_ops\", \"n\") WITH (fillfactor = \
+                        '70') TABLESPACE \"fast\"";
+        assert_eq!(sqls(&create(&def(&idx)).unwrap()), [expected]);
+        // Only the predicate changes: the recreated index keeps everything else.
+        let mut partial = idx.clone();
+        partial.predicate = Some("n > 0".into());
+        let s = PgDdl
+            .alter(&def(&idx), &def(&partial), &DdlContext::new(&v18()))
+            .unwrap();
+        assert_eq!(
+            sqls(&s),
+            [
+                "DROP INDEX \"m3\".\"t_name_idx\"".to_owned(),
+                format!("{expected} WHERE n > 0"),
+            ]
+        );
+        assert!(s.steps[0].destructive);
+        // Operator class parameters cannot be written: the index cannot be recreated.
+        let mut with_params = idx.clone();
+        with_params.extras.insert(OPCLASS_OPTIONS, true);
+        assert!(matches!(
+            create(&def(&with_params)),
+            Err(Error::Unsupported { .. })
+        ));
+        assert!(matches!(
+            PgDdl.alter(
+                &def(&with_params),
+                &def(&{
+                    let mut p = with_params.clone();
+                    p.predicate = Some("n > 0".into());
+                    p
+                }),
+                &DdlContext::new(&v18())
+            ),
+            Err(Error::Unsupported { .. })
+        ));
+        // Bad entries are refused.
+        for (prop, value) in [
+            (OPCLASSES, serde_json::json!(["a", "b", "c"])),
+            (OPCLASSES, serde_json::json!([1])),
+            (INDEX_OPTIONS, serde_json::json!(["fill factor=1"])),
+            (INDEX_OPTIONS, serde_json::json!(["novalue"])),
+        ] {
+            let mut bad = idx.clone();
+            bad.extras.insert(prop.clone(), Value::Json(value));
+            let e = create(&def(&bad)).unwrap_err();
+            assert!(matches!(e, Error::InvalidInput { .. }), "{prop}: {e}");
+        }
+        let mut deferrable = idx.clone();
+        deferrable.extras.insert(props::DEFERRABLE, true);
+        assert!(create(&def(&deferrable)).is_err());
+
+        // A UNIQUE constraint keeps its storage parameters, tablespace and deferrability.
+        let uq = IndexDef {
+            name: "t_code_key".into(),
+            columns: vec![IndexColumn::column("code")],
+            unique: true,
+            is_constraint: true,
+            predicate: None,
+            extras: Extras::new()
+                .with(props::INDEX_METHOD, "btree")
+                .with(
+                    INDEX_OPTIONS,
+                    Value::Json(serde_json::json!(["fillfactor=80"])),
+                )
+                .with(props::TABLESPACE, "fast")
+                .with(props::DEFERRABLE, true)
+                .with(props::INITIALLY_DEFERRED, true),
+        };
+        assert_eq!(
+            sqls(&create(&def(&uq)).unwrap()),
+            [
+                "ALTER TABLE \"m3\".\"t\" ADD CONSTRAINT \"t_code_key\" UNIQUE (\"code\") WITH \
+                 (fillfactor = '80') USING INDEX TABLESPACE \"fast\" DEFERRABLE INITIALLY DEFERRED"
+            ]
+        );
+        let mut immediate = uq.clone();
+        immediate.extras.insert(props::INITIALLY_DEFERRED, false);
+        let s = PgDdl
+            .alter(&def(&uq), &def(&immediate), &DdlContext::new(&v18()))
+            .unwrap();
+        assert_eq!(s.len(), 2, "{s}");
+        assert!(s.steps[1].sql.ends_with("\"fast\" DEFERRABLE"), "{s}");
+        let mut opclass = uq.clone();
+        opclass.extras.insert(
+            OPCLASSES,
+            Value::Json(serde_json::json!(["text_pattern_ops"])),
+        );
+        assert!(matches!(
+            create(&def(&opclass)),
+            Err(Error::InvalidInput { .. })
+        ));
+    }
+
+    /// Fetched objects whose flags are absent (as the M2 fetcher reported them) or at their
+    /// default: turning one flag on alone must produce a step.
+    #[test]
+    fn each_designer_flag_alone_changes_the_script() {
+        let table = table_ref("t");
+        let ctx_v = v18();
+        let ctx = DdlContext::new(&ctx_v);
+        let idx = IndexDef {
+            name: "t_i".into(),
+            columns: vec![IndexColumn::column("a")],
+            unique: true,
+            is_constraint: false,
+            predicate: None,
+            extras: Extras::new().with(props::INDEX_METHOD, "btree"),
+        };
+        let mut defaults = idx.clone();
+        defaults.extras.insert(NULLS_NOT_DISTINCT, false);
+        defaults
+            .extras
+            .insert(props::INCLUDE_COLUMNS, Value::Json(serde_json::json!([])));
+        let index = |i: &IndexDef| ObjectDef::Index {
+            table: table.clone(),
+            index: i.clone(),
+        };
+        for (prop, value, sql) in [
+            (NULLS_NOT_DISTINCT, Value::Bool(true), "NULLS NOT DISTINCT"),
+            (
+                props::INCLUDE_COLUMNS,
+                Value::Json(serde_json::json!(["b"])),
+                "INCLUDE (\"b\")",
+            ),
+            (
+                NULLS_FIRST,
+                Value::Json(serde_json::json!([true])),
+                "NULLS FIRST",
+            ),
+            (
+                OPCLASSES,
+                Value::Json(serde_json::json!(["text_pattern_ops"])),
+                "\"text_pattern_ops\"",
+            ),
+            (
+                KEY_COLLATIONS,
+                Value::Json(serde_json::json!(["C"])),
+                "COLLATE \"C\"",
+            ),
+            (
+                INDEX_OPTIONS,
+                Value::Json(serde_json::json!(["fillfactor=50"])),
+                "WITH (fillfactor = '50')",
+            ),
+            (
+                props::TABLESPACE,
+                Value::Text("fast".into()),
+                "TABLESPACE \"fast\"",
+            ),
+        ] {
+            for before in [&idx, &defaults] {
+                let mut after = before.clone();
+                after.extras.insert(prop.clone(), value.clone());
+                let s = PgDdl.alter(&index(before), &index(&after), &ctx).unwrap();
+                assert_eq!(s.len(), 2, "{prop}: {s}");
+                assert!(s.steps[1].sql.contains(sql), "{prop}: {s}");
+                // And the comparator sees it.
+                let diffs = super::super::PgComparator.diff(&index(before), &index(&after));
+                assert_eq!(diffs.len(), 1, "{prop}: {diffs:?}");
+            }
+        }
+        // Restating a default is no change.
+        let mut restated = idx.clone();
+        restated
+            .extras
+            .insert(NULLS_FIRST, Value::Json(serde_json::json!([false])));
+        assert!(
+            PgDdl
+                .alter(&index(&idx), &index(&restated), &ctx)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            PgDdl
+                .alter(&index(&idx), &index(&defaults), &ctx)
+                .unwrap()
+                .is_empty()
+        );
+
+        let check = CheckDef {
+            name: Some("t_chk".into()),
+            expression: "a > 0".into(),
+            extras: Extras::new(),
+        };
+        let check_def = |c: &CheckDef| ObjectDef::Check {
+            table: table.clone(),
+            check: c.clone(),
+        };
+        let mut no_inherit = check.clone();
+        no_inherit.extras.insert(NO_INHERIT, true);
+        let s = PgDdl
+            .alter(&check_def(&check), &check_def(&no_inherit), &ctx)
+            .unwrap();
+        assert_eq!(s.len(), 2, "{s}");
+        assert!(s.steps[1].sql.ends_with("NO INHERIT"), "{s}");
+
+        let fk = ForeignKeyDef {
+            name: Some("t_fk".into()),
+            columns: vec!["a".into()],
+            ref_table: ObjectRef::table(None, Some("m3"), "p"),
+            ref_columns: vec!["id".into()],
+            on_delete: FkAction::NoAction,
+            on_update: FkAction::NoAction,
+            extras: Extras::new(),
+        };
+        let fk_def = |f: &ForeignKeyDef| ObjectDef::ForeignKey {
+            table: table.clone(),
+            foreign_key: f.clone(),
+        };
+        let mut full = fk.clone();
+        full.extras.insert(MATCH_TYPE, "full");
+        let s = PgDdl.alter(&fk_def(&fk), &fk_def(&full), &ctx).unwrap();
+        assert_eq!(s.len(), 2, "{s}");
+        assert!(s.steps[1].sql.contains("MATCH FULL"), "{s}");
+        let mut deferrable = fk.clone();
+        deferrable.extras.insert(props::DEFERRABLE, true);
+        let s = PgDdl
+            .alter(&fk_def(&fk), &fk_def(&deferrable), &ctx)
+            .unwrap();
+        assert_eq!(
+            sqls(&s),
+            ["ALTER TABLE \"m3\".\"t\" ALTER CONSTRAINT \"t_fk\" DEFERRABLE INITIALLY IMMEDIATE"]
+        );
+        let mut simple = fk.clone();
+        simple.extras.insert(MATCH_TYPE, "simple");
+        assert!(
+            PgDdl
+                .alter(&fk_def(&fk), &fk_def(&simple), &ctx)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn literals_read_the_same_without_standard_conforming_strings() {
+        assert_eq!(literal("it's"), "'it''s'");
+        assert_eq!(literal("a\\b"), "E'a\\\\b'");
+        // A comment that would end the literal early when backslashes escape.
+        assert_eq!(
+            literal("x\\'; DROP TABLE t; --"),
+            "E'x\\\\''; DROP TABLE t; --'"
+        );
+        let expr = |text: &str| checked("default", text);
+        assert_eq!(expr("'a\\b' || 'c'").unwrap(), "E'a\\\\b' || 'c'");
+        // One literal for the lexical check, two statements without standard strings.
+        assert_eq!(
+            expr("'\\'' ; DROP TABLE t; --'").unwrap(),
+            "E'\\\\'' ; DROP TABLE t; --'"
+        );
+        assert_eq!(expr("date'2020\\01'").unwrap(), "date E'2020\\\\01'");
+        for same in [
+            "E'a\\\\b'",
+            "B'0101'",
+            "X'1F'",
+            "$$a\\b$$",
+            "$t$a\\'b$t$",
+            "\"a\\b\" + 1",
+            "U&'d\\0061t'",
+            "'plain'",
+        ] {
+            assert_eq!(expr(same).unwrap(), same);
+        }
+        assert!(matches!(expr("N'a\\b'"), Err(Error::InvalidInput { .. })));
+        // Literal defaults written through the script come out as escape strings.
+        let mut c = col("c", "text");
+        c.default = Some(PgQuoting.quote_str("C:\\path"));
+        let s = create(&ObjectDef::Column {
+            table: table_ref("t"),
+            column: c,
+        })
+        .unwrap();
+        assert_eq!(
+            sqls(&s),
+            ["ALTER TABLE \"m3\".\"t\" ADD COLUMN \"c\" text DEFAULT E'C:\\\\path'"]
+        );
+    }
+
+    #[test]
+    fn widening_survives_huge_modifiers() {
+        let max = u32::MAX;
+        assert!(!is_widening(
+            "numeric(10,2)",
+            &format!("numeric({max},{max})")
+        ));
+        assert!(is_widening(
+            &format!("numeric({max},0)"),
+            &format!("numeric({max},0)")
+        ));
+        assert!(!is_widening(
+            &format!("numeric({max},{max})"),
+            "numeric(10,2)"
+        ));
+        // Too large for a modifier: not known to widen, so destructive.
+        assert!(!is_widening("numeric(10,2)", "numeric(99999999999,2)"));
+    }
+
+    #[test]
+    fn collation_and_table_option_removals() {
+        let table = table_ref("t");
+        let alter = |a: &ColumnDef, b: &ColumnDef| {
+            PgDdl.alter(
+                &ObjectDef::Column {
+                    table: table.clone(),
+                    column: a.clone(),
+                },
+                &ObjectDef::Column {
+                    table: table.clone(),
+                    column: b.clone(),
+                },
+                &DdlContext::new(&v18()),
+            )
+        };
+        let mut c = col("c", "text");
+        c.collation = Some("C".into());
+        let plain = col("c", "text");
+        assert_eq!(
+            sqls(&alter(&c, &plain).unwrap()),
+            [
+                "ALTER TABLE \"m3\".\"t\" ALTER COLUMN \"c\" TYPE text COLLATE pg_catalog.\"default\""
+            ]
+        );
+        // With a type change the new type's default collation applies.
+        let s = alter(&c, &col("c", "integer")).unwrap();
+        assert!(!s.steps.iter().any(|st| st.sql.contains("COLLATE")), "{s}");
+        // A collation outside the search path, as the fetcher reports it.
+        let mut qualified = plain.clone();
+        qualified.collation = Some("\"other\".\"my \"\"coll\"".into());
+        assert_eq!(
+            sqls(&alter(&plain, &qualified).unwrap()),
+            [
+                "ALTER TABLE \"m3\".\"t\" ALTER COLUMN \"c\" TYPE text COLLATE \"other\".\"my \"\"coll\""
+            ]
+        );
+        // Not a "schema"."name" pair: one quoted name.
+        for (text, sql) in [
+            ("en_US.utf8", "\"en_US.utf8\""),
+            ("\"a\".\"b\".\"c\"", "\"\"\"a\"\".\"\"b\"\".\"\"c\"\"\""),
+            ("\"a\"", "\"\"\"a\"\"\""),
+        ] {
+            assert_eq!(qualified_name(text), sql, "{text}");
+        }
+
+        let mut old = TableDef::new(table.clone());
+        old.columns.push(col("a", "integer"));
+        old.extras.insert(props::TABLESPACE, "fast");
+        old.extras.insert(props::UNLOGGED, true);
+        let mut new = old.clone();
+        new.extras = Extras::new();
+        assert_eq!(
+            sqls(&alter_with(&old, &new, &[]).unwrap()),
+            [
+                "ALTER TABLE \"m3\".\"t\" SET LOGGED",
+                "ALTER TABLE \"m3\".\"t\" SET TABLESPACE pg_default",
+            ]
+        );
+        for (prop, value) in [
+            (props::PARTITION_BY, Value::Text("RANGE (a)".into())),
+            (props::TABLE_TYPE, Value::Text("partitioned".into())),
+            (props::TEMPORARY, Value::Bool(true)),
+        ] {
+            let mut with = TableDef::new(table.clone());
+            with.columns.push(col("a", "integer"));
+            with.extras.insert(prop.clone(), value);
+            let mut without = with.clone();
+            without.extras = Extras::new();
+            for (a, b) in [(&with, &without), (&without, &with)] {
+                assert!(
+                    matches!(alter_with(a, b, &[]), Err(Error::Unsupported { .. })),
+                    "{prop}"
+                );
+            }
+        }
     }
 
     #[test]

@@ -28,7 +28,9 @@ use oxbase_driver::{
     TlsOptions, collect,
 };
 use oxbase_pg::PgDriver;
-use oxbase_pg::dialect::NOT_VALID;
+use oxbase_pg::dialect::{
+    INDEX_OPTIONS, KEY_COLLATIONS, MATCH_TYPE, NO_INHERIT, NOT_VALID, NULLS_NOT_DISTINCT, OPCLASSES,
+};
 use oxbase_types::{
     CheckDef, ColumnDef, ColumnValue, DataType, Engine, Error, Extras, FkAction, ForeignKeyDef,
     GeneratedColumn, IdentityDef, IndexColumn, IndexDef, KeyKind, ObjectDef, ObjectKind, ObjectRef,
@@ -378,6 +380,17 @@ fn quote(text: &str) -> String {
     PgQuoting.quote_str(text)
 }
 
+/// Extra `prop` of a fetched index, foreign key or check.
+fn index_extra(def: &ObjectDef, prop: &oxbase_types::PropId) -> Option<Value> {
+    let extras = match def {
+        ObjectDef::Index { index, .. } => &index.extras,
+        ObjectDef::ForeignKey { foreign_key, .. } => &foreign_key.extras,
+        ObjectDef::Check { check, .. } => &check.extras,
+        other => panic!("no extras here: {other:?}"),
+    };
+    extras.get(prop).cloned()
+}
+
 // --- round trips ----------------------------------------------------------------------------
 
 #[tokio::test]
@@ -627,6 +640,50 @@ async fn column_round_trip_create_alter_drop() {
             apply(c, &script).await;
             assert_same(&source, &load(c, &n_ref).await, &script);
 
+            // A serial column widened to bigint: its sequence follows (else nextval fails past
+            // 2^31 - 1).
+            let mut serial = col("s", "integer").not_null();
+            serial.auto_increment = true;
+            let serial_def = ObjectDef::Column {
+                table: table.clone(),
+                column: serial,
+            };
+            apply(c, &ddl_create(&serial_def, &v, None)).await;
+            let s_ref = table.child(ObjectKind::Column, "s");
+            let before = load(c, &s_ref).await;
+            let ObjectDef::Column {
+                column: mut wide, ..
+            } = before.clone()
+            else {
+                unreachable!()
+            };
+            "bigint".clone_into(&mut wide.native_type);
+            let source = ObjectDef::Column {
+                table: table.clone(),
+                column: wide,
+            };
+            let script = ddl_alter(&before, &source, &v, None, &[]);
+            assert!(
+                script
+                    .steps
+                    .iter()
+                    .any(|st| st.sql.starts_with("ALTER SEQUENCE")),
+                "{script}"
+            );
+            assert!(!script.is_destructive(), "{script}");
+            apply(c, &script).await;
+            assert_same(&source, &load(c, &s_ref).await, &script);
+            let seq_type = texts(
+                &run(
+                    c,
+                    "SELECT pg_catalog.format_type(s.seqtypid, NULL) FROM pg_catalog.pg_sequence s \
+                     WHERE s.seqrelid = pg_catalog.pg_get_serial_sequence($1, 's')::regclass",
+                    &[Value::Text(format!("{}.{name}", f.schema))],
+                )
+                .await,
+            );
+            assert_eq!(seq_type, [[Some("bigint".to_owned())]]);
+
             let script = ddl_drop(&renamed, &v, None);
             assert!(script.is_destructive());
             apply(c, &script).await;
@@ -683,9 +740,7 @@ async fn index_round_trip_create_alter_drop() {
             // Renamed, unique, NULLS NOT DISTINCT, no predicate.
             let mut unique = index(&format!("{name}_uidx"), vec![IndexColumn::column("code")]);
             unique.unique = true;
-            unique
-                .extras
-                .insert(oxbase_pg::dialect::NULLS_NOT_DISTINCT, true);
+            unique.extras.insert(NULLS_NOT_DISTINCT, true);
             let source = ObjectDef::Index {
                 table: table.clone(),
                 index: unique.clone(),
@@ -695,10 +750,16 @@ async fn index_round_trip_create_alter_drop() {
             let uidx_ref = table.child(ObjectKind::Index, format!("{name}_uidx"));
             let fetched = load(c, &uidx_ref).await;
             assert_same(&source, &fetched, &script);
+            // The flag is really there (not only "not compared").
+            assert_eq!(
+                index_extra(&fetched, &NULLS_NOT_DISTINCT),
+                Some(Value::Bool(true))
+            );
             assert_gone(c, &idx_ref).await;
 
-            // The same as a declared UNIQUE constraint.
+            // The same as a declared, deferrable UNIQUE constraint.
             unique.is_constraint = true;
+            unique.extras.insert(props::DEFERRABLE, true);
             let source = ObjectDef::Index {
                 table: table.clone(),
                 index: unique,
@@ -707,6 +768,72 @@ async fn index_round_trip_create_alter_drop() {
             apply(c, &script).await;
             let fetched = load(c, &uidx_ref).await;
             assert_same(&source, &fetched, &script);
+            assert_eq!(
+                index_extra(&fetched, &props::DEFERRABLE),
+                Some(Value::Bool(true))
+            );
+
+            // Operator class, key collation and storage parameters: kept when only the
+            // predicate changes (the index is dropped and created again).
+            let mut pattern = index(
+                &format!("{name}_pat"),
+                vec![IndexColumn::column("code"), IndexColumn::column("code")],
+            );
+            pattern.extras.insert(
+                OPCLASSES,
+                Value::Json(serde_json::json!([null, "varchar_pattern_ops"])),
+            );
+            pattern
+                .extras
+                .insert(KEY_COLLATIONS, Value::Json(serde_json::json!(["C"])));
+            pattern.extras.insert(
+                INDEX_OPTIONS,
+                Value::Json(serde_json::json!(["fillfactor=70"])),
+            );
+            let source = ObjectDef::Index {
+                table: table.clone(),
+                index: pattern,
+            };
+            let script = ddl_create(&source, &v, None);
+            apply(c, &script).await;
+            let pat_ref = table.child(ObjectKind::Index, format!("{name}_pat"));
+            let fetched = load(c, &pat_ref).await;
+            assert_same(&source, &fetched, &script);
+            let kept = |def: &ObjectDef| {
+                assert_eq!(
+                    index_extra(def, &OPCLASSES),
+                    Some(Value::Json(serde_json::json!([
+                        null,
+                        "varchar_pattern_ops"
+                    ])))
+                );
+                assert_eq!(
+                    index_extra(def, &KEY_COLLATIONS),
+                    Some(Value::Json(serde_json::json!(["C", null])))
+                );
+                assert_eq!(
+                    index_extra(def, &INDEX_OPTIONS),
+                    Some(Value::Json(serde_json::json!(["fillfactor=70"])))
+                );
+            };
+            kept(&fetched);
+            let ObjectDef::Index {
+                index: mut partial, ..
+            } = fetched.clone()
+            else {
+                unreachable!()
+            };
+            partial.predicate = Some("qty > 0".into());
+            let source = ObjectDef::Index {
+                table: table.clone(),
+                index: partial,
+            };
+            let script = ddl_alter(&fetched, &source, &v, None, &[]);
+            assert_eq!(script.len(), 2, "{script}");
+            apply(c, &script).await;
+            let fetched = load(c, &pat_ref).await;
+            assert_same(&source, &fetched, &script);
+            kept(&fetched);
 
             let current = load_table(c, &table).await;
             let script = ddl_drop(&uidx_ref, &v, Some(&current));
@@ -769,9 +896,7 @@ async fn foreign_key_round_trip_create_alter_drop() {
                 ref_columns: vec!["a".into(), "b".into()],
                 on_delete: FkAction::NoAction,
                 on_update: FkAction::Cascade,
-                extras: Extras::new()
-                    .with(oxbase_pg::dialect::MATCH_TYPE, "full")
-                    .with(NOT_VALID, true),
+                extras: Extras::new().with(MATCH_TYPE, "full").with(NOT_VALID, true),
             };
             let def = |fk: &ForeignKeyDef| ObjectDef::ForeignKey {
                 table: table.clone(),
@@ -782,6 +907,11 @@ async fn foreign_key_round_trip_create_alter_drop() {
             let fk_ref = table.child(ObjectKind::ForeignKey, format!("{name}_fk"));
             let mut fetched = load(c, &fk_ref).await;
             assert_same(&def(&fk), &fetched, &script);
+            assert_eq!(
+                index_extra(&fetched, &MATCH_TYPE),
+                Some(Value::Text("full".into()))
+            );
+            assert_eq!(index_extra(&fetched, &NOT_VALID), Some(Value::Bool(true)));
 
             // Validate, then make deferrable, then rename and change the action.
             let mut validated = fk.clone();
@@ -858,17 +988,145 @@ async fn check_round_trip_create_alter_drop() {
             let mut changed = check.clone();
             changed.name = Some(format!("{name}_chk2"));
             changed.expression = "qty > 0".into();
-            changed.extras.insert(oxbase_pg::dialect::NO_INHERIT, true);
+            changed.extras.insert(NO_INHERIT, true);
             let script = ddl_alter(&fetched, &def(&changed), &v, None, &[]);
             apply(c, &script).await;
             let chk2_ref = table.child(ObjectKind::Check, format!("{name}_chk2"));
             let fetched = load(c, &chk2_ref).await;
             assert_same(&def(&changed), &fetched, &script);
+            assert_eq!(index_extra(&fetched, &NO_INHERIT), Some(Value::Bool(true)));
             assert_gone(c, &chk_ref).await;
+
+            // NO INHERIT alone, on the fetched check: dropped and added again without it.
+            let mut inherit = changed.clone();
+            inherit.extras.insert(NO_INHERIT, false);
+            let script = ddl_alter(&fetched, &def(&inherit), &v, None, &[]);
+            assert_eq!(script.len(), 2, "{script}");
+            apply(c, &script).await;
+            let fetched = load(c, &chk2_ref).await;
+            assert_same(&def(&inherit), &fetched, &script);
+            assert_eq!(index_extra(&fetched, &NO_INHERIT), Some(Value::Bool(false)));
 
             let script = ddl_drop(&chk2_ref, &v, None);
             apply(c, &script).await;
             assert_gone(c, &chk2_ref).await;
+        }),
+    )
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "needs the postgres fixture"]
+async fn primary_key_change_with_a_self_reference() {
+    let f = fixture();
+    let conn = connect(&f).await;
+    let c = &*conn;
+    let v = c.server_version().clone();
+    let name = format!("{}_k", f.scratch("table", &token()));
+    guarded(
+        c,
+        &f,
+        std::slice::from_ref(&name),
+        Box::pin(async {
+            let table = f.table_ref(&name);
+            let mut def = simple_table(
+                table.clone(),
+                vec![
+                    col("a", "integer").not_null(),
+                    col("b", "integer").not_null(),
+                    col("c", "integer"),
+                ],
+            );
+            def.primary_key = Some(PrimaryKeyDef {
+                name: Some(format!("{name}_pk")),
+                columns: vec!["a".into()],
+            });
+            def.foreign_keys.push(ForeignKeyDef {
+                name: Some(format!("{name}_c_fk")),
+                columns: vec!["c".into()],
+                ref_table: ObjectRef::table(None, Some(&f.schema), name.as_str()),
+                ref_columns: vec!["a".into()],
+                on_delete: FkAction::NoAction,
+                on_update: FkAction::NoAction,
+                extras: Extras::new(),
+            });
+            let source = ObjectDef::Table(def);
+            let script = ddl_create(&source, &v, None);
+            apply(c, &script).await;
+            let old = load_table(c, &table).await;
+
+            // The key moves to b; a keeps a UNIQUE constraint for the foreign key, which must be
+            // dropped before the old key and added again after the new one.
+            let mut new = old.clone();
+            new.primary_key = Some(PrimaryKeyDef {
+                name: Some(format!("{name}_pk")),
+                columns: vec!["b".into()],
+            });
+            let mut a_key = index(&format!("{name}_a_key"), vec![IndexColumn::column("a")]);
+            a_key.unique = true;
+            a_key.is_constraint = true;
+            new.indexes.push(a_key);
+            let source = ObjectDef::Table(new);
+            let script = ddl_alter(&ObjectDef::Table(old.clone()), &source, &v, Some(&old), &[]);
+            assert!(script.steps[0].sql.contains("_c_fk"), "{script}");
+            apply(c, &script).await;
+            let fetched = load(c, &table).await;
+            assert_same(&source, &fetched, &script);
+            let again = ddl_alter(&fetched, &source, &v, None, &[]);
+            assert!(again.is_empty(), "{again}");
+        }),
+    )
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "needs the postgres fixture"]
+async fn scripts_read_the_same_with_standard_conforming_strings_off() {
+    let f = fixture();
+    let conn = connect(&f).await;
+    let c = &*conn;
+    let v = c.server_version().clone();
+    let name = format!("{}_s", f.scratch("table", &token()));
+    let injected = format!("{name}_x");
+    let tables = [name.clone(), injected.clone()];
+    guarded(
+        c,
+        &f,
+        &tables,
+        Box::pin(async {
+            let table = f.table_ref(&name);
+            let target =
+                PgQuoting.qualify(&ObjectRef::table(None, Some(&f.schema), injected.as_str()));
+            // Text that ends a plain literal early when backslashes escape quotes.
+            let tricky = format!("x\\'; CREATE TABLE {target} (); --");
+            let mut note = col("note", "text");
+            note.default = Some(quote(&tricky));
+            note.comment = Some(tricky.clone());
+            let mut def = simple_table(table.clone(), vec![col("id", "integer").not_null(), note]);
+            def.comment = Some(tricky.clone());
+            def.checks.push(CheckDef {
+                name: Some(format!("{name}_chk")),
+                expression: format!("note <> {}", quote(&tricky)),
+                extras: Extras::new(),
+            });
+            let source = ObjectDef::Table(def);
+            let script = ddl_create(&source, &v, None);
+            run(c, "SET standard_conforming_strings = off", &[]).await;
+            let applied = AssertUnwindSafe(Box::pin(apply(c, &script)))
+                .catch_unwind()
+                .await;
+            run(c, "RESET standard_conforming_strings", &[]).await;
+            if let Err(panic) = applied {
+                std::panic::resume_unwind(panic);
+            }
+            let fetched = load(c, &table).await;
+            assert_same(&source, &fetched, &script);
+            let ObjectDef::Table(t) = &fetched else {
+                unreachable!()
+            };
+            assert_eq!(t.comment.as_deref(), Some(tricky.as_str()));
+            assert_eq!(t.columns[1].comment.as_deref(), Some(tricky.as_str()));
+            assert_gone(c, &f.table_ref(&injected)).await;
         }),
     )
     .await;
@@ -1172,7 +1430,18 @@ async fn dml_defaults_identity_and_cast_values() {
     let c = &*conn;
     let v = c.server_version().clone();
     let name = format!("{}_d", f.scratch("table", &token()));
-    guarded(
+    // An enum type of the test's own, dropped afterwards whatever happens.
+    let mood = PgQuoting.qualify(
+        &ObjectRef::new(ObjectKind::Type, format!("{name}_mood")).in_schema(Some(&f.schema)),
+    );
+    run(c, &format!("DROP TYPE IF EXISTS {mood} CASCADE"), &[]).await;
+    run(
+        c,
+        &format!("CREATE TYPE {mood} AS ENUM ('sad', 'happy')"),
+        &[],
+    )
+    .await;
+    let result = AssertUnwindSafe(Box::pin(guarded(
         c,
         &f,
         std::slice::from_ref(&name),
@@ -1189,7 +1458,13 @@ async fn dml_defaults_identity_and_cast_values() {
             note.default = Some(quote("n'x"));
             let def = simple_table(
                 table_ref.clone(),
-                vec![id, note, col("tags", "text[]"), col("span", "interval")],
+                vec![
+                    id,
+                    note,
+                    col("tags", "text[]"),
+                    col("span", "interval"),
+                    col("mood", &mood),
+                ],
             );
             apply(c, &ddl_create(&ObjectDef::Table(def), &v, None)).await;
             let table = load_table(c, &table_ref).await;
@@ -1258,6 +1533,44 @@ async fn dml_defaults_identity_and_cast_values() {
                     Some("1 day 02:00:00".to_owned())
                 ]]
             );
+            // An enum value arrives as text and is cast to the enum type in SQL.
+            let insert = RowEdit::Insert {
+                values: vec![ColumnValue::new("mood", "happy")],
+            };
+            let id_only = ["id".to_owned()];
+            let p = plan(&table, &key, &v, &id_only, &insert);
+            assert!(p.write.sql.contains("CAST($1::text AS "), "{}", p.write.sql);
+            assert!(p.write.sql.contains("_mood)"), "{}", p.write.sql);
+            let out = run(c, &p.write.sql, &p.write.params).await;
+            assert_eq!(touched(&out, p.returning), 1);
+            let rows = texts(
+                &run(
+                    c,
+                    &format!("SELECT mood::text FROM {qualified} WHERE id = 3"),
+                    &[],
+                )
+                .await,
+            );
+            assert_eq!(rows, [[Some("happy".to_owned())]]);
+            let update = RowEdit::Update {
+                key: vec![Value::Int(3)],
+                changes: vec![ColumnValue::new("mood", "sad")],
+            };
+            let p = plan(&table, &key, &v, &id_only, &update);
+            assert_eq!(
+                touched(&run(c, &p.write.sql, &p.write.params).await, p.returning),
+                1
+            );
+            let rows = texts(
+                &run(
+                    c,
+                    &format!("SELECT mood::text FROM {qualified} WHERE id = 3"),
+                    &[],
+                )
+                .await,
+            );
+            assert_eq!(rows, [[Some("sad".to_owned())]]);
+
             // The GENERATED ALWAYS identity cannot be written.
             let err = registry()
                 .dml_writer(Engine::Postgres)
@@ -1276,6 +1589,11 @@ async fn dml_defaults_identity_and_cast_values() {
                 .unwrap_err();
             assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
         }),
-    )
+    )))
+    .catch_unwind()
     .await;
+    run(c, &format!("DROP TYPE IF EXISTS {mood} CASCADE"), &[]).await;
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
 }

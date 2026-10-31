@@ -717,8 +717,14 @@ async fn partitioned_foreign_keys_are_listed_once() {
         check.extras.get(&oxbase_pg::dialect::NOT_ENFORCED),
         Some(&Value::Bool(true))
     );
-    assert_eq!(check.extras.get(&oxbase_pg::dialect::NOT_VALID), None);
-    assert_eq!(fk.extras.get(&oxbase_pg::dialect::NOT_ENFORCED), None);
+    assert_eq!(
+        check.extras.get(&oxbase_pg::dialect::NOT_VALID),
+        Some(&Value::Bool(false))
+    );
+    assert_eq!(
+        fk.extras.get(&oxbase_pg::dialect::NOT_ENFORCED),
+        Some(&Value::Bool(false))
+    );
 
     // Partitioned on both sides: one foreign key on the parent, and the inherited one on the
     // partition (its parent constraint is on another table, so it stays).

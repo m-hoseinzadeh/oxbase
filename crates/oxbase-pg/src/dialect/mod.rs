@@ -47,8 +47,11 @@
 //! - DDL (`ddl.rs`): native, transactional statements for every change (see its module docs
 //!   for the order of an alter and the version gates); identifiers through [`PgQuoting`],
 //!   literals through `quote_str`, expressions and type names checked lexically.
-//! - Comparison: `RulesComparator(`[`PgRules`]`)`, which folds type aliases
-//!   ([`canonical_type`]) and the server's rewriting of expressions
+//! - Comparison: [`PgComparator`], which fills in the PostgreSQL default of every extra the
+//!   designer edits ([`normalize_def`]: an absent `nulls_not_distinct` is `false`, an absent
+//!   `match_type` is `simple`, ...) and then runs `oxbase_dialect::compare` with [`PgRules`]
+//!   (the shared walk compares an extra only when both sides have it). [`PgRules`] folds type
+//!   aliases ([`canonical_type`]) and the server's rewriting of expressions
 //!   ([`normalize_expression`]).
 //! - Grid writes (`dml.rs`): bound `$n` parameters, key-only `WHERE`, `RETURNING` read-back.
 
@@ -63,19 +66,18 @@ mod types;
 
 use std::sync::Arc;
 
-use oxbase_dialect::compare::RulesComparator;
 use oxbase_dialect::{
     Capabilities, ChildGroup, DESIGNER_KINDS, DatabaseScope, DesignerCapabilities, DialectRegistry,
     PgQuoting, TreeLayout,
 };
 use oxbase_types::{Engine, ObjectKind, PropId, ServerVersion};
 
-pub use compare::{PgRules, canonical_type, normalize_expression};
+pub use compare::{PgComparator, PgRules, canonical_type, normalize_def, normalize_expression};
 
 pub use fetch::{
     BASE_TYPE, CTYPE, ENUM_LABELS, EXCLUSION, EXTENSION_SCHEMA, EXTENSION_VERSION,
-    IDENTITY_SEQUENCE, MATCH_TYPE, NO_INHERIT, NOT_ENFORCED, NOT_VALID, NULLS_FIRST,
-    NULLS_NOT_DISTINCT, PARALLEL, TYPE_KIND,
+    IDENTITY_SEQUENCE, INDEX_OPTIONS, KEY_COLLATIONS, MATCH_TYPE, NO_INHERIT, NOT_ENFORCED,
+    NOT_VALID, NULLS_FIRST, NULLS_NOT_DISTINCT, OPCLASS_OPTIONS, OPCLASSES, PARALLEL, TYPE_KIND,
 };
 
 /// Object kinds PostgreSQL has (everything but MySQL events and key-value keys).
@@ -108,7 +110,7 @@ pub fn register(reg: &mut DialectRegistry) {
         reg.register_fetcher(engine, kind, Arc::new(fetch::PgFetcher::new(kind)));
     }
     let ddl = Arc::new(ddl::PgDdl);
-    let comparator = Arc::new(RulesComparator(PgRules));
+    let comparator = Arc::new(PgComparator);
     for kind in DESIGNER_KINDS {
         reg.register_ddl(engine, kind, ddl.clone());
         reg.register_comparator(engine, kind, comparator.clone());

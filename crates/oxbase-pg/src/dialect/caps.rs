@@ -17,6 +17,10 @@ pub(crate) fn designer(v: &ServerVersion) -> DesignerCapabilities {
         "Changing a column's type rewrites the table and may fail on existing values; it holds \
          an exclusive lock on the table while it runs."
             .to_owned(),
+        "Changing the primary key or a UNIQUE constraint drops and adds it again: foreign keys \
+         of other tables that reference it must be dropped first. Indexes whose operator classes \
+         have parameters cannot be recreated."
+            .to_owned(),
     ];
     if !at_least(v, 17) {
         notes.push(
@@ -86,12 +90,12 @@ mod tests {
         assert_eq!(v18.max_identifier_length, Some(63));
         assert_eq!(v18.fk_actions.len(), 5);
         assert!(!v18.index_prefix_lengths);
-        assert_eq!(v18.notes.len(), 3);
+        assert_eq!(v18.notes.len(), 4);
 
         let v11 = designer(&ServerVersion::new(11, 22, 0));
         assert!(v11.identity);
         assert!(!v11.generated_stored && !v11.generated_virtual);
-        assert_eq!(v11.notes.len(), 4);
+        assert_eq!(v11.notes.len(), 5);
 
         let v12 = designer(&ServerVersion::new(12, 0, 0));
         assert!(v12.generated_stored && !v12.generated_virtual);

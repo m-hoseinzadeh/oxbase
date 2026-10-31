@@ -16,10 +16,168 @@
     reason = "a hand-written lexer reads best with short index names"
 )]
 
-use oxbase_dialect::compare::{CompareRules, normalize_ws};
-use oxbase_types::ColumnDef;
+use oxbase_dialect::Comparator;
+use oxbase_dialect::compare::{CompareRules, diff_objects, normalize_ws};
+use oxbase_types::{
+    CheckDef, ColumnDef, Extras, ForeignKeyDef, IndexDef, ObjectDef, PropId, PropertyDiff,
+    TableDef, Value, props,
+};
 
 use super::ddl::neutral_type;
+use super::fetch::{
+    INDEX_OPTIONS, KEY_COLLATIONS, MATCH_TYPE, NO_INHERIT, NOT_ENFORCED, NOT_VALID, NULLS_FIRST,
+    NULLS_NOT_DISTINCT, OPCLASS_OPTIONS, OPCLASSES,
+};
+
+/// The PostgreSQL [`Comparator`] for the designer kinds: [`normalize_def`] on both sides, then
+/// the shared walk (`oxbase_dialect::compare::diff_objects`) with [`PgRules`].
+///
+/// The shared walk compares an extra only when both sides have it, so an extra the designer
+/// sets on an object fetched without it (or a fetched extra the designer's definition leaves
+/// out) would never show as a difference. Filling in PostgreSQL's default first makes "absent"
+/// mean "the default" on both sides.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PgComparator;
+
+impl Comparator for PgComparator {
+    fn diff(&self, a: &ObjectDef, b: &ObjectDef) -> Vec<PropertyDiff> {
+        diff_objects(&normalize_def(a), &normalize_def(b), &PgRules)
+    }
+}
+
+/// `def` with the PostgreSQL default filled in for every extra the designer edits:
+///
+/// - table: `unlogged` and `temporary` `false`; `tablespace`, `partition_by` and `table_type`
+///   `null`;
+/// - index: `index_method` `btree`; `nulls_not_distinct`, `not_valid`, `opclass_options`,
+///   `deferrable` and `initially_deferred` `false`; `include_columns` and `index_options` `[]`;
+///   `tablespace` `null`; `nulls_first`, `opclasses` and `key_collations` one entry per key
+///   (`nulls_first` defaults to the key's `descending`, the others to `null`);
+/// - foreign key: `deferrable`, `initially_deferred`, `not_valid`, `not_enforced` `false`,
+///   `match_type` `simple`;
+/// - check: `no_inherit`, `not_valid`, `not_enforced` `false`.
+///
+/// `initially_deferred` implies `deferrable`, and `not_enforced` makes `not_valid` `false` (as
+/// the server reports them). Other kinds are returned unchanged.
+#[must_use]
+pub fn normalize_def(def: &ObjectDef) -> ObjectDef {
+    let mut out = def.clone();
+    match &mut out {
+        ObjectDef::Table(t) => normalize_table(t),
+        ObjectDef::Index { index, .. } => normalize_index(index),
+        ObjectDef::ForeignKey { foreign_key, .. } => normalize_fk(foreign_key),
+        ObjectDef::Check { check, .. } => normalize_check(check),
+        _ => {}
+    }
+    out
+}
+
+/// Sets `prop` to `value` when it is absent or `null`.
+fn fill(extras: &mut Extras, prop: &PropId, value: impl Into<Value>) {
+    if matches!(extras.get(prop), None | Some(Value::Null)) {
+        extras.insert(prop.clone(), value);
+    }
+}
+
+fn is_true(extras: &Extras, prop: &PropId) -> bool {
+    extras.get(prop).and_then(Value::as_bool).unwrap_or(false)
+}
+
+/// `deferrable` / `initially_deferred` defaults; deferred implies deferrable.
+fn fill_deferrable(extras: &mut Extras) {
+    fill(extras, &props::INITIALLY_DEFERRED, false);
+    if is_true(extras, &props::INITIALLY_DEFERRED) {
+        extras.insert(props::DEFERRABLE, true);
+    }
+    fill(extras, &props::DEFERRABLE, false);
+}
+
+/// `not_valid` / `not_enforced` defaults; a constraint that is not enforced is not "not valid".
+fn fill_validity(extras: &mut Extras) {
+    fill(extras, &NOT_ENFORCED, false);
+    if is_true(extras, &NOT_ENFORCED) {
+        extras.insert(NOT_VALID, false);
+    }
+    fill(extras, &NOT_VALID, false);
+}
+
+/// [`normalize_def`] of a table and everything in it.
+pub(crate) fn normalize_table(t: &mut TableDef) {
+    fill(&mut t.extras, &props::UNLOGGED, false);
+    fill(&mut t.extras, &props::TEMPORARY, false);
+    for prop in [props::TABLESPACE, props::PARTITION_BY, props::TABLE_TYPE] {
+        if t.extras.get(&prop).is_none() {
+            t.extras.insert(prop, Value::Null);
+        }
+    }
+    for index in &mut t.indexes {
+        normalize_index(index);
+    }
+    for fk in &mut t.foreign_keys {
+        normalize_fk(fk);
+    }
+    for check in &mut t.checks {
+        normalize_check(check);
+    }
+}
+
+/// One entry per key column of a per-key JSON array extra: the given entry, else `default(k)`.
+/// Left alone when it is not an array (the generator reports that).
+fn per_key(
+    extras: &mut Extras,
+    prop: &PropId,
+    keys: usize,
+    default: impl Fn(usize) -> serde_json::Value,
+) {
+    let given: Vec<serde_json::Value> = match extras.get(prop) {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Json(serde_json::Value::Array(items))) => items.clone(),
+        Some(_) => return,
+    };
+    let full: Vec<serde_json::Value> = (0..keys.max(given.len()))
+        .map(|k| match given.get(k) {
+            Some(v) if !v.is_null() && v.as_str() != Some("") => v.clone(),
+            _ => default(k),
+        })
+        .collect();
+    extras.insert(prop.clone(), Value::Json(serde_json::Value::Array(full)));
+}
+
+/// [`normalize_def`] of an index.
+pub(crate) fn normalize_index(i: &mut IndexDef) {
+    let e = &mut i.extras;
+    fill(e, &props::INDEX_METHOD, "btree");
+    fill(e, &NULLS_NOT_DISTINCT, false);
+    fill(e, &NOT_VALID, false);
+    fill(e, &OPCLASS_OPTIONS, false);
+    fill_deferrable(e);
+    for prop in [props::INCLUDE_COLUMNS, INDEX_OPTIONS] {
+        fill(e, &prop, Value::Json(serde_json::Value::Array(Vec::new())));
+    }
+    if e.get(&props::TABLESPACE).is_none() {
+        e.insert(props::TABLESPACE, Value::Null);
+    }
+    let descending: Vec<bool> = i.columns.iter().map(|c| c.descending).collect();
+    per_key(e, &NULLS_FIRST, descending.len(), |k| {
+        serde_json::Value::Bool(descending.get(k).copied().unwrap_or(false))
+    });
+    for prop in [OPCLASSES, KEY_COLLATIONS] {
+        per_key(e, &prop, descending.len(), |_| serde_json::Value::Null);
+    }
+}
+
+/// [`normalize_def`] of a foreign key.
+pub(crate) fn normalize_fk(fk: &mut ForeignKeyDef) {
+    fill_deferrable(&mut fk.extras);
+    fill_validity(&mut fk.extras);
+    fill(&mut fk.extras, &MATCH_TYPE, "simple");
+}
+
+/// [`normalize_def`] of a check.
+pub(crate) fn normalize_check(check: &mut CheckDef) {
+    fill(&mut check.extras, &NO_INHERIT, false);
+    fill_validity(&mut check.extras);
+}
 
 /// The PostgreSQL normalization rules, registered as `RulesComparator(PgRules)` for the
 /// designer kinds.
@@ -436,6 +594,9 @@ fn strip_parens(mut toks: Vec<Tok>) -> Vec<Tok> {
             let inner = &toks[i + 1..close];
             let atom = inner.len() == 1;
             let whole = i == 0 && close == toks.len() - 1;
+            // `(now())::date`, `(code)::text`: `::` binds tighter than anything but a call or a
+            // single token.
+            let cast_target = matches!(after, Some(Tok::Cast)) && (atom || is_call(inner));
             let bool_operand = !has_top_level_bool(inner)
                 && (before.is_none()
                     || matches!(before, Some(Tok::Open))
@@ -443,7 +604,7 @@ fn strip_parens(mut toks: Vec<Tok>) -> Vec<Tok> {
                 && (after.is_none()
                     || matches!(after, Some(Tok::Close))
                     || is_word(after, &["and", "or"]));
-            if !inner.is_empty() && !call && (atom || whole || bool_operand) {
+            if !inner.is_empty() && !call && (atom || whole || bool_operand || cast_target) {
                 toks.remove(close);
                 toks.remove(i);
                 changed = true;
@@ -457,22 +618,156 @@ fn strip_parens(mut toks: Vec<Tok>) -> Vec<Tok> {
     }
 }
 
+/// `true` when `toks` is one call, `f(...)`.
+fn is_call(toks: &[Tok]) -> bool {
+    toks.len() >= 3
+        && matches!(toks[0], Tok::Word(_) | Tok::QIdent(_))
+        && toks[1] == Tok::Open
+        && matching_close(toks, 1) == Some(toks.len() - 1)
+}
+
+/// Index of the token opening the group closed at `close`.
+fn matching_open(toks: &[Tok], close: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (k, t) in toks.get(..=close)?.iter().enumerate().rev() {
+        match t {
+            Tok::Close => depth += 1,
+            Tok::Open => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(k);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// What a `::type` cast applies to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CastOperand {
+    /// A literal (`'x'`, `2`, `(-1)`, `NULL`): the server types every literal with a cast.
+    Literal,
+    /// A bare column (`code`, `(code)`): the server writes out implicit casts of columns.
+    Column,
+    /// Anything else (a call, an operator expression): only the user writes such casts.
+    Other,
+}
+
+/// The operand of a cast that follows the normalized tokens `out`.
+fn cast_operand(out: &[Tok]) -> CastOperand {
+    match out.last() {
+        Some(Tok::Str(_) | Tok::Number(_)) => CastOperand::Literal,
+        Some(Tok::Word(w)) if matches!(w.as_str(), "null" | "true" | "false") => {
+            CastOperand::Literal
+        }
+        Some(Tok::Word(_) | Tok::QIdent(_)) => CastOperand::Column,
+        Some(Tok::Close) => {
+            let close = out.len() - 1;
+            let Some(open) = matching_open(out, close) else {
+                return CastOperand::Other;
+            };
+            let before = open.checked_sub(1).map(|k| &out[k]);
+            let call = matches!(before, Some(Tok::Word(_) | Tok::QIdent(_)))
+                && !is_word(before, &["and", "or", "not", "when", "then", "else", "is"]);
+            match &out[open + 1..close] {
+                [single] if !call && *single != Tok::Close => {
+                    cast_operand(std::slice::from_ref(single))
+                }
+                _ => CastOperand::Other,
+            }
+        }
+        _ => CastOperand::Other,
+    }
+}
+
+/// Types the server casts a column to on its own (an implicit cast written out by
+/// `pg_get_expr`: `code::text` for a `varchar` column in a text function, `(qty)::numeric`
+/// next to a decimal literal). Narrowing casts (`::integer`, `::date`) are the user's.
+fn implicit_target(ty: &str) -> bool {
+    let mut base = ty;
+    while let Some(rest) = base.strip_suffix("[]") {
+        base = rest;
+    }
+    matches!(
+        base,
+        "text"
+            | "character varying"
+            | "numeric"
+            | "bigint"
+            | "double precision"
+            | "real"
+            | "timestamp with time zone"
+            | "timestamp without time zone"
+    )
+}
+
+/// The text of a cast's type tokens, for [`canonical_type`].
+fn type_text(toks: &[Tok]) -> String {
+    let mut out = String::new();
+    for t in toks {
+        match t {
+            Tok::Word(w) | Tok::Number(w) => {
+                if matches!(t, Tok::Word(_))
+                    && out
+                        .chars()
+                        .last()
+                        .is_some_and(|c| c.is_alphanumeric() || c == ')' || c == '"' || c == '_')
+                {
+                    out.push(' ');
+                }
+                out.push_str(w);
+            }
+            Tok::QIdent(q) => {
+                out.push('"');
+                out.push_str(&q.replace('"', "\"\""));
+                out.push('"');
+            }
+            Tok::Open => out.push('('),
+            Tok::Close => out.push(')'),
+            Tok::Punct(c) => out.push(*c),
+            Tok::Str(_) | Tok::Cast | Tok::Op(_) => {}
+        }
+    }
+    out
+}
+
 /// A canonical form of a PostgreSQL expression, for comparing an expression as written with
 /// the text `pg_get_expr` prints back. Two expressions with the same canonical form mean the
 /// same; the converse does not hold (the server may rewrite `IN (...)` as `= ANY (ARRAY[...])`,
 /// for example).
 ///
-/// It drops `::type` casts (the server adds them to literals and to implicitly cast columns),
-/// unquotes numeric string literals (`'-1'::integer` is `-1`) and quoted identifiers that need
-/// no quotes, lowercases keywords and names outside quotes, writes `!=` as `<>`, ignores
-/// whitespace, and removes parentheses that do not change the meaning (see `strip_parens`).
+/// It drops the `::type` casts the server adds on its own: casts of literals (`'x'::text`,
+/// `(2)::numeric`, `NULL::integer`) and widening casts of a bare column (`code::text`,
+/// `(qty)::numeric`, see `implicit_target`). Every other cast (`now()::date`, `amount::integer`)
+/// is kept, with its type in [`canonical_type`] spelling. It also unquotes numeric string
+/// literals (`'-1'::integer` is `-1`) and quoted identifiers that need no quotes, lowercases
+/// keywords and names outside quotes, writes `!=` as `<>`, ignores whitespace, and removes
+/// parentheses that do not change the meaning (see `strip_parens`).
 pub fn normalize_expression(text: &str) -> String {
     let toks = tokenize(text);
     let mut out: Vec<Tok> = Vec::with_capacity(toks.len());
     let mut i = 0;
     while i < toks.len() {
         if toks[i] == Tok::Cast {
-            i = skip_type(&toks, i + 1);
+            let end = skip_type(&toks, i + 1);
+            if end == i + 1 {
+                out.push(Tok::Cast);
+                i += 1;
+                continue;
+            }
+            let ty = canonical_type(&type_text(&toks[i + 1..end]));
+            let server_added = match cast_operand(&out) {
+                CastOperand::Literal => true,
+                CastOperand::Column => implicit_target(&ty),
+                CastOperand::Other => false,
+            };
+            if !server_added {
+                out.push(Tok::Cast);
+                out.push(Tok::Word(ty));
+            }
+            i = end;
             continue;
         }
         let tok = match &toks[i] {
@@ -526,11 +821,8 @@ pub fn normalize_expression(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oxbase_dialect::Comparator;
     use oxbase_dialect::compare::{RulesComparator, diff_tables};
-    use oxbase_types::{
-        CheckDef, DataType, Extras, IndexColumn, IndexDef, ObjectDef, ObjectRef, TableDef,
-    };
+    use oxbase_types::{DataType, FkAction, IndexColumn, ObjectRef};
 
     #[test]
     fn type_aliases_fold_to_the_catalog_spelling() {
@@ -627,7 +919,19 @@ mod tests {
             "'2020-01-01 00:00'",
         );
         same("lower(name)", "lower((name)::text)");
-        same("x::character varying(10)[]", "x");
+        same("'{a}'::character varying(10)[]", "'{a}'");
+        same("NULL::integer", "NULL");
+        same("(-1)::integer", "-1");
+        same("tags @> ARRAY['a']", "(tags)::text[] @> ARRAY['a'::text]");
+        same("now()::date", "(now())::date");
+        same("price::int > 0", "((price)::integer > 0)");
+        same("x::timestamptz(3)", "(x)::timestamp(3) with time zone");
+        // Casts the user wrote on calls, expressions and narrowing column casts stay.
+        differ("amount::integer * 2", "amount * 2");
+        differ("now()::date", "now()");
+        differ("(price::int > 0)", "(price > 0)");
+        differ("(a + b)::bigint", "a + b");
+        differ("now()::date", "now()::timestamp");
         same("E'a\\b'", "E'a\\b'");
         differ("qty > 0", "qty >= 0");
         differ("(a OR b) AND c", "a OR b AND c");
@@ -635,6 +939,133 @@ mod tests {
         differ("\"Qty\" > 0", "qty > 0");
         differ("'a  b'", "'a b'");
         differ("f(a) + 1", "f(a + 1)");
+    }
+
+    #[test]
+    fn comparator_fills_in_defaults_before_comparing() {
+        let table = ObjectRef::table(None, Some("m3"), "t");
+        let fetched = IndexDef {
+            name: "t_i".into(),
+            columns: vec![IndexColumn::column("a")],
+            unique: false,
+            is_constraint: false,
+            predicate: None,
+            extras: Extras::new().with(props::INDEX_METHOD, "btree"),
+        };
+        let index = |i: &IndexDef| ObjectDef::Index {
+            table: table.clone(),
+            index: i.clone(),
+        };
+        let cmp = PgComparator;
+        assert_eq!(cmp.diff(&index(&fetched), &index(&fetched)), []);
+        for (prop, value) in [
+            (NULLS_NOT_DISTINCT, Value::Bool(true)),
+            (
+                props::INCLUDE_COLUMNS,
+                Value::Json(serde_json::json!(["b"])),
+            ),
+            (NULLS_FIRST, Value::Json(serde_json::json!([true]))),
+            (
+                OPCLASSES,
+                Value::Json(serde_json::json!(["text_pattern_ops"])),
+            ),
+            (KEY_COLLATIONS, Value::Json(serde_json::json!(["C"]))),
+            (
+                INDEX_OPTIONS,
+                Value::Json(serde_json::json!(["fillfactor=70"])),
+            ),
+            (props::TABLESPACE, Value::Text("fast".into())),
+        ] {
+            let mut changed = fetched.clone();
+            changed.extras.insert(prop.clone(), value);
+            let diffs = cmp.diff(&index(&fetched), &index(&changed));
+            assert_eq!(diffs.len(), 1, "{prop}: {diffs:?}");
+            assert_eq!(diffs[0].prop.as_ref(), Some(&prop));
+            // The shared walk alone misses a property one side does not have.
+            assert_eq!(
+                RulesComparator(PgRules).diff(&index(&fetched), &index(&changed)),
+                [],
+                "{prop}"
+            );
+        }
+        // Restating the default is no difference.
+        let mut restated = fetched.clone();
+        restated
+            .extras
+            .insert(NULLS_FIRST, Value::Json(serde_json::json!([false])));
+        restated.extras.insert(NULLS_NOT_DISTINCT, false);
+        restated
+            .extras
+            .insert(OPCLASSES, Value::Json(serde_json::json!([null])));
+        assert_eq!(cmp.diff(&index(&fetched), &index(&restated)), []);
+
+        let fk = ForeignKeyDef {
+            name: Some("t_fk".into()),
+            columns: vec!["a".into()],
+            ref_table: ObjectRef::table(None, Some("m3"), "p"),
+            ref_columns: vec!["id".into()],
+            on_delete: FkAction::NoAction,
+            on_update: FkAction::NoAction,
+            extras: Extras::new(),
+        };
+        let fk_def = |f: &ForeignKeyDef| ObjectDef::ForeignKey {
+            table: table.clone(),
+            foreign_key: f.clone(),
+        };
+        for (prop, value, expected) in [
+            (MATCH_TYPE, Value::Text("full".into()), 1),
+            (MATCH_TYPE, Value::Text("simple".into()), 0),
+            (NOT_VALID, Value::Bool(true), 1),
+            (props::DEFERRABLE, Value::Bool(true), 1),
+            // Initially deferred implies deferrable: two properties change.
+            (props::INITIALLY_DEFERRED, Value::Bool(true), 2),
+        ] {
+            let mut changed = fk.clone();
+            changed.extras.insert(prop.clone(), value);
+            assert_eq!(
+                cmp.diff(&fk_def(&fk), &fk_def(&changed)).len(),
+                expected,
+                "{prop}"
+            );
+        }
+        let check = CheckDef {
+            name: Some("t_chk".into()),
+            expression: "a > 0".into(),
+            extras: Extras::new(),
+        };
+        let mut no_inherit = check.clone();
+        no_inherit.extras.insert(NO_INHERIT, true);
+        let check_def = |c: &CheckDef| ObjectDef::Check {
+            table: table.clone(),
+            check: c.clone(),
+        };
+        assert_eq!(
+            cmp.diff(&check_def(&check), &check_def(&no_inherit)).len(),
+            1
+        );
+        // Not enforced: never "not valid" as well.
+        let mut not_enforced = check.clone();
+        not_enforced.extras.insert(NOT_ENFORCED, true);
+        let mut both = not_enforced.clone();
+        both.extras.insert(NOT_VALID, true);
+        assert_eq!(cmp.diff(&check_def(&not_enforced), &check_def(&both)), []);
+
+        // Table: unlogged and tablespace, absent meaning the default.
+        let t = TableDef::new(table.clone());
+        let mut unlogged = t.clone();
+        unlogged.extras.insert(props::UNLOGGED, true);
+        assert_eq!(
+            cmp.diff(&ObjectDef::Table(t.clone()), &ObjectDef::Table(unlogged))
+                .len(),
+            1
+        );
+        let mut spaced = t.clone();
+        spaced.extras.insert(props::TABLESPACE, "fast");
+        assert_eq!(
+            cmp.diff(&ObjectDef::Table(spaced), &ObjectDef::Table(t))
+                .len(),
+            1
+        );
     }
 
     #[test]

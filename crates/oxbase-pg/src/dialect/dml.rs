@@ -69,7 +69,7 @@ fn bind(w: &mut SqlWriter<'_>, col: &ColumnDef, value: Value) -> Result<()> {
         let ty = if col.native_type.trim().is_empty() {
             neutral_type(&col.data_type)?
         } else {
-            checked_type(&col.name, &col.native_type)?.to_owned()
+            checked_type(&col.name, &col.native_type)?
         };
         w.push("CAST(")
             .param(value)
