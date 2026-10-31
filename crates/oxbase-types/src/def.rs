@@ -732,32 +732,32 @@ mod tests {
     fn m2_models_round_trip_and_report_their_kind() {
         let schema = ObjectRef::schema(Some("oxbase_test"), "m2");
 
-        let s = ObjectDef::Schema(SchemaDef::new(schema.clone()));
-        assert_eq!(s.kind(), ObjectKind::Schema);
-        assert_eq!(round_trip(&s)["kind"], "schema");
+        let sch = ObjectDef::Schema(SchemaDef::new(schema.clone()));
+        assert_eq!(sch.kind(), ObjectKind::Schema);
+        assert_eq!(round_trip(&sch)["kind"], "schema");
         let db = ObjectDef::Schema(SchemaDef::new(ObjectRef::database("oxbase_test")));
         assert_eq!(db.kind(), ObjectKind::Database);
 
-        let mut f = RoutineDef::new(
+        let mut fun = RoutineDef::new(
             schema
                 .child(ObjectKind::Function, "m2_fn")
                 .with_signature("integer"),
         );
-        f.args.push(RoutineArg {
+        fun.args.push(RoutineArg {
             name: Some("n".into()),
             mode: ArgMode::In,
             native_type: "integer".into(),
             default: None,
         });
-        f.returns = Some("integer".into());
-        f.language = Some("sql".into());
-        let f = ObjectDef::Routine(f);
-        assert_eq!(f.kind(), ObjectKind::Function);
-        assert_eq!(f.object_ref().signature.as_deref(), Some("integer"));
-        assert_eq!(round_trip(&f)["kind"], "routine");
+        fun.returns = Some("integer".into());
+        fun.language = Some("sql".into());
+        let fun = ObjectDef::Routine(fun);
+        assert_eq!(fun.kind(), ObjectKind::Function);
+        assert_eq!(fun.object_ref().signature.as_deref(), Some("integer"));
+        assert_eq!(round_trip(&fun)["kind"], "routine");
 
         let table = schema.child(ObjectKind::Table, "m2_child");
-        let t = ObjectDef::Trigger(TriggerDef {
+        let trg = ObjectDef::Trigger(TriggerDef {
             obj: table.child(ObjectKind::Trigger, "m2_trg"),
             timing: TriggerTiming::Before,
             events: vec![TriggerEvent::Insert, TriggerEvent::Update],
@@ -775,29 +775,30 @@ mod tests {
             comment: None,
             extras: Extras::default(),
         });
-        assert_eq!(t.kind(), ObjectKind::Trigger);
-        assert_eq!(t.object_ref().owner(), Some(table));
-        let json = round_trip(&t);
+        assert_eq!(trg.kind(), ObjectKind::Trigger);
+        assert_eq!(trg.object_ref().owner(), Some(table));
+        let json = round_trip(&trg);
         assert_eq!(json["timing"], "before");
         // `enabled` defaults to true when absent.
-        let mut j = json.clone();
-        j.as_object_mut().unwrap().remove("enabled");
-        assert_eq!(serde_json::from_value::<ObjectDef>(j).unwrap(), t);
+        let mut patched = json.clone();
+        patched.as_object_mut().unwrap().remove("enabled");
+        assert_eq!(serde_json::from_value::<ObjectDef>(patched).unwrap(), trg);
 
-        let mut q = SequenceDef::new(schema.child(ObjectKind::Sequence, "m2_seq"));
-        q.max_value = Some(i128::from(i64::MAX));
-        q.min_value = Some(-5);
-        q.cycle = true;
-        let q = ObjectDef::Sequence(q);
-        let json = round_trip(&q);
+        let mut seq = SequenceDef::new(schema.child(ObjectKind::Sequence, "m2_seq"));
+        seq.max_value = Some(i128::from(i64::MAX));
+        seq.min_value = Some(-5);
+        seq.cycle = true;
+        let seq = ObjectDef::Sequence(seq);
+        let json = round_trip(&seq);
         assert_eq!(json["start"], "1");
         assert_eq!(json["max_value"], "9223372036854775807");
         assert_eq!(json["min_value"], "-5");
         assert!(json.get("cache").is_none());
         // Plain JSON numbers are accepted too.
-        let mut j = json.clone();
-        j["start"] = serde_json::json!(7);
-        let ObjectDef::Sequence(back) = serde_json::from_value::<ObjectDef>(j).unwrap() else {
+        let mut patched = json.clone();
+        patched["start"] = serde_json::json!(7);
+        let ObjectDef::Sequence(back) = serde_json::from_value::<ObjectDef>(patched).unwrap()
+        else {
             panic!("not a sequence");
         };
         assert_eq!(back.start, 7);
