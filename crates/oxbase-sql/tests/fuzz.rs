@@ -470,3 +470,113 @@ fn joined_statements_split_back() {
         }
     }
 }
+
+/// Statements holding one secret, written `{s}`; each is a single statement in its dialect.
+fn secret_templates(dialect: SqlDialect) -> Vec<&'static str> {
+    let mut templates = vec![
+        "CREATE USER u IDENTIFIED BY '{s}'",
+        "SET PASSWORD = '{s}'",
+        "UPDATE t SET password = /* c */ '{s}'",
+        "SELECT dblink_connect('host=h password={s} port=1')",
+        "SELECT 'Server=x;Pwd={s};'",
+    ];
+    templates.extend_from_slice(match dialect {
+        SqlDialect::Postgres => &[
+            "ALTER ROLE r PASSWORD '{s}'",
+            "ALTER ROLE r PASSWORD $q${s}$q$",
+            "ALTER ROLE r PASSWORD E'{s}'",
+            "ALTER ROLE r PASSWORD U&'{s}'",
+            "DO $$ BEGIN EXECUTE 'ALTER ROLE r PASSWORD ''{s}'''; END $$",
+            "CREATE USER MAPPING FOR u SERVER s OPTIONS (password '{s}')",
+        ][..],
+        SqlDialect::MySql { mariadb } => {
+            if mariadb {
+                &[
+                    "CREATE USER u IDENTIFIED VIA ed25519 USING '{s}'",
+                    "SET PASSWORD FOR 'u'@'%' = '{s}'",
+                ][..]
+            } else {
+                &[
+                    "CREATE USER u IDENTIFIED WITH p BY \"{s}\"",
+                    "SET PASSWORD FOR 'u'@'%' = '{s}'",
+                    "CHANGE MASTER TO MASTER_PASSWORD = '{s}'",
+                    "SELECT 'host=x password=\\'{s} b\\''",
+                    "/*!80001 CREATE USER u IDENTIFIED BY '{s}' */",
+                    "PREPARE p FROM 'ALTER USER u IDENTIFIED BY \\'{s}\\''",
+                ][..]
+            }
+        }
+        SqlDialect::Sqlite => &[
+            "PRAGMA key = '{s}'",
+            "PRAGMA key = {s}",
+            "ATTACH 'f.db' AS a KEY '{s}'",
+            "ATTACH 'file:f.db?key={s}' AS a",
+        ][..],
+        SqlDialect::TSql => &["ALTER LOGIN l WITH PASSWORD = N'{s}'"][..],
+    });
+    templates
+}
+
+/// A statement without secrets: redaction must keep it byte for byte.
+fn benign_statement(rng: &mut Rng) -> String {
+    const PIECES: &[&str] = &[
+        "x", "1", "'abc'", "'a;b'", "'it''s'", "(", ")", ",", "+", "=", "é😀", "/* c */", "-- c\n",
+        "t.end", "WHERE", "name", "key", "FROM",
+    ];
+    let mut parts = vec![rng.pick(&["SELECT", "UPDATE", "INSERT", "x"])];
+    for _ in 0..rng.below(8) {
+        parts.push(rng.pick(PIECES));
+    }
+    parts.join(" ")
+}
+
+#[test]
+fn generated_secrets_are_masked_and_the_rest_is_kept() {
+    for seed in 0..1500 {
+        let mut rng = Rng::new(seed);
+        for dialect in ALL {
+            let marker = format!("S3cr3t{seed}");
+            let templates = secret_templates(dialect);
+            let secret = templates[rng.below(templates.len())].replace("{s}", &marker);
+            let separator = if dialect == TSQL { "\nGO\n" } else { ";\n" };
+            let prefix: Vec<String> = (0..rng.below(3))
+                .map(|_| benign_statement(&mut rng))
+                .collect();
+            let suffix: Vec<String> = (0..rng.below(3))
+                .map(|_| benign_statement(&mut rng))
+                .collect();
+            let mut head = String::new();
+            for statement in &prefix {
+                head.push_str(statement);
+                head.push_str(separator);
+            }
+            let mut tail = String::new();
+            for statement in &suffix {
+                tail.push_str(separator);
+                tail.push_str(statement);
+            }
+            let script = format!("{head}{secret}{tail}");
+            let context = format!("{dialect:?} seed {seed}: {script:?}");
+            let out = redact_secrets(dialect, &script);
+            assert!(matches!(out, Cow::Owned(_)), "not redacted: {context}");
+            assert!(!out.contains(&marker), "secret kept: {context} -> {out:?}");
+            assert!(
+                out.starts_with(&head),
+                "prefix changed: {context} -> {out:?}"
+            );
+            assert!(out.ends_with(&tail), "suffix changed: {context} -> {out:?}");
+            // The masked text still splits into the same statements.
+            assert_eq!(
+                split(dialect, &out).len(),
+                split(dialect, &script).len(),
+                "{context} -> {out:?}"
+            );
+            // Benign statements alone are never touched.
+            let benign = format!("{head}{}", tail.trim_start_matches(separator));
+            assert!(
+                matches!(redact_secrets(dialect, &benign), Cow::Borrowed(_)),
+                "benign text changed: {dialect:?} {benign:?}"
+            );
+        }
+    }
+}

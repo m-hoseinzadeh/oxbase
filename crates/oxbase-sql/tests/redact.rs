@@ -174,6 +174,91 @@ fn mysql_passwords() {
 }
 
 #[test]
+fn postgres_unicode_strings_and_nested_sql() {
+    redacts(
+        PG,
+        r"ALTER ROLE r PASSWORD U&'s\0065cret'",
+        "ALTER ROLE r PASSWORD U&'***'",
+    );
+    // Dynamic SQL inside a DO block: the dollar body, then the literal inside it.
+    redacts(
+        PG,
+        "DO $$ BEGIN EXECUTE 'ALTER ROLE r PASSWORD ''x'''; END $$",
+        "DO $$ BEGIN EXECUTE 'ALTER ROLE r PASSWORD ''***'''; END $$",
+    );
+    redacts(
+        PG,
+        "CREATE FUNCTION f() RETURNS void AS $body$\nBEGIN\n  ALTER ROLE r PASSWORD 'x';\n  \
+         PERFORM dblink_connect('host=h password=y');\nEND\n$body$ LANGUAGE plpgsql",
+        "CREATE FUNCTION f() RETURNS void AS $body$\nBEGIN\n  ALTER ROLE r PASSWORD '***';\n  \
+         PERFORM dblink_connect('host=h password=***');\nEND\n$body$ LANGUAGE plpgsql",
+    );
+    redacts(
+        PG,
+        r"SELECT E'ALTER ROLE r PASSWORD \'x\''",
+        "SELECT E'ALTER ROLE r PASSWORD ''***'''",
+    );
+    // Code in a function body is not a connection string.
+    keeps(
+        PG,
+        "CREATE FUNCTION f() RETURNS trigger AS $$\nBEGIN\n  IF NEW.password = OLD.password THEN \
+         RETURN NULL; END IF;\n  RETURN NEW;\nEND $$ LANGUAGE plpgsql",
+    );
+    keeps(PG, "SELECT 'reset your password: see the docs'");
+}
+
+#[test]
+fn mysql_extended_forms() {
+    for dialect in [MYSQL, MARIADB] {
+        redacts(
+            dialect,
+            "SET PASSWORD = OLD_PASSWORD('pw')",
+            "SET PASSWORD = OLD_PASSWORD('***')",
+        );
+        redacts(
+            dialect,
+            "CREATE USER app IDENTIFIED VIA ed25519 USING 'hash'",
+            "CREATE USER app IDENTIFIED VIA ed25519 USING '***'",
+        );
+        redacts(
+            dialect,
+            "ALTER USER app IDENTIFIED VIA ed25519 USING PASSWORD('pw')",
+            "ALTER USER app IDENTIFIED VIA ed25519 USING PASSWORD('***')",
+        );
+        // A backslash-quoted connection-string value is masked whole.
+        redacts(
+            dialect,
+            r"SELECT 'host=x password=\'a b\' port=5'",
+            "SELECT 'host=x password=*** port=5'",
+        );
+        // Dynamic SQL: the quotes inside come back doubled.
+        redacts(
+            dialect,
+            r"PREPARE s FROM 'CREATE USER u IDENTIFIED BY \'pw\''",
+            "PREPARE s FROM 'CREATE USER u IDENTIFIED BY ''***'''",
+        );
+    }
+}
+
+#[test]
+fn key_only_arms_in_sqlite_pragma_and_attach() {
+    for dialect in [PG, MYSQL, MARIADB, SQLITE, TSQL] {
+        keeps(dialect, "SELECT * FROM kv WHERE key = 'user:42'");
+        keeps(dialect, "UPDATE kv SET value = 1 WHERE key = 'x'");
+    }
+    keeps(PG, "PRAGMA key = 'not sqlite'");
+    redacts(
+        SQLITE,
+        "PRAGMA key = 'pw'; SELECT * FROM kv WHERE key = 'x'",
+        "PRAGMA key = '***'; SELECT * FROM kv WHERE key = 'x'",
+    );
+    keeps(
+        SQLITE,
+        "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT)",
+    );
+}
+
+#[test]
 fn sqlite_keys() {
     redacts(
         SQLITE,
@@ -183,6 +268,28 @@ fn sqlite_keys() {
     redacts(SQLITE, "PRAGMA key = 'pw'", "PRAGMA key = '***'");
     redacts(SQLITE, "PRAGMA key = \"x'2DD29CA8'\"", "PRAGMA key = '***'");
     redacts(SQLITE, "PRAGMA rekey = 'new'", "PRAGMA rekey = '***'");
+    redacts(
+        SQLITE,
+        "PRAGMA hexkey = '2DD29CA8'",
+        "PRAGMA hexkey = '***'",
+    );
+    redacts(
+        SQLITE,
+        "PRAGMA main.hexrekey = 'ab'",
+        "PRAGMA main.hexrekey = '***'",
+    );
+    redacts(SQLITE, "PRAGMA key = passphrase", "PRAGMA key = '***'");
+    redacts(SQLITE, "PRAGMA key = x'2DD2'", "PRAGMA key = x'***'");
+    redacts(
+        SQLITE,
+        "ATTACH 'file:enc.db?key=s3cret&cache=shared' AS e",
+        "ATTACH 'file:enc.db?key=***&cache=shared' AS e",
+    );
+    redacts(
+        SQLITE,
+        "ATTACH 'file:enc.db?hexkey=AB12' AS e",
+        "ATTACH 'file:enc.db?hexkey=***' AS e",
+    );
     keeps(SQLITE, "CREATE TABLE t (a INT, PRIMARY KEY (\"a\"))");
 }
 

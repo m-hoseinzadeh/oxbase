@@ -159,6 +159,10 @@ fn postgres_rules() {
             "CALL p()",
         ],
     );
+    // `end` as a column name inside an SQL-standard body.
+    let columns = "CREATE FUNCTION f() RETURNS int LANGUAGE sql BEGIN ATOMIC SELECT end FROM t; \
+        SELECT t.end, end + 1 FROM t; END";
+    case(PG, &format!("{columns}; SELECT 2"), &[columns, "SELECT 2"]);
     case(
         PG,
         "BEGIN; SELECT 1; END; COMMIT",
@@ -327,6 +331,21 @@ fn mysql_compound_bodies() {
         "CREATE PROCEDURE p() SELECT 1; SELECT 2",
         &["CREATE PROCEDURE p() SELECT 1", "SELECT 2"],
     );
+    // `end` and `begin` are non-reserved: column names inside a body are not block keywords.
+    let columns = "CREATE PROCEDURE p() BEGIN SELECT r.end INTO x FROM r; SELECT 2; \
+        SELECT end, begin FROM r WHERE end = 1 AND r.begin < 2; SELECT end FROM r; \
+        SELECT x, begin; UPDATE r SET end = NEW.begin; END";
+    case_all(d, &format!("{columns};\nSELECT 3"), &[columns, "SELECT 3"]);
+    case_all(
+        d,
+        "CREATE PROCEDURE p() SELECT begin; SELECT 2",
+        &["CREATE PROCEDURE p() SELECT begin", "SELECT 2"],
+    );
+    case_all(
+        d,
+        "CREATE PROCEDURE p() SELECT x.end; SELECT 2",
+        &["CREATE PROCEDURE p() SELECT x.end", "SELECT 2"],
+    );
     // Transactions and IF/REPEAT functions are not blocks.
     case_all(
         d,
@@ -427,6 +446,14 @@ fn sqlite_rules() {
         SQLITE,
         "CREATE TABLE t (begin INT, end INT); SELECT 2",
         &["CREATE TABLE t (begin INT, end INT)", "SELECT 2"],
+    );
+    // `end` / `begin` as column names in a trigger.
+    let columns = "CREATE TRIGGER t AFTER INSERT ON x WHEN new.begin > 0 BEGIN UPDATE y SET \
+        end = new.end, \"end\" = 1 WHERE end > 0; SELECT end FROM y; END";
+    case(
+        SQLITE,
+        &format!("{columns}; SELECT 1"),
+        &[columns, "SELECT 1"],
     );
 }
 

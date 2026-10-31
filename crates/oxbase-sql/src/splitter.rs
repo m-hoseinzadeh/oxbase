@@ -360,6 +360,9 @@ enum Kw {
     If,
     Loop,
     Not,
+    /// Reserved words that never follow a block's `END` but often follow a column named `end`:
+    /// `FROM`, `INTO`, `AS`, `AND`, `IS`, `IN`, `LIKE`, `WHERE`.
+    Operand,
     Or,
     Procedure,
     Repeat,
@@ -383,6 +386,9 @@ impl Kw {
         }
         match &*upper {
             b"AGGREGATE" => Self::Aggregate,
+            b"FROM" | b"INTO" | b"AS" | b"AND" | b"IS" | b"IN" | b"LIKE" | b"WHERE" => {
+                Self::Operand
+            }
             b"ATOMIC" => Self::Atomic,
             b"BEGIN" => Self::Begin,
             b"CASE" => Self::Case,
@@ -473,6 +479,16 @@ struct Blocks {
     after_end: bool,
     /// SQLite: the trigger body has been closed.
     body_done: bool,
+    /// The previous content token was `.`: the next word is part of a qualified name
+    /// (`NEW.end`, `r.begin`), never a keyword.
+    prev_dot: bool,
+    /// The block that the previous token, `END`, closed. It is reopened when the next token
+    /// shows that this `end` was a column name (`SELECT end, x`, `WHERE end = 1`).
+    closed: Option<Block>,
+    /// The previous token, `BEGIN`, opened a block (MySQL body, SQLite trigger body). It is
+    /// closed again when the next token shows that this `begin` was a column name: only words
+    /// follow a real `BEGIN`.
+    opened: bool,
 }
 
 impl Blocks {
@@ -488,6 +504,9 @@ impl Blocks {
             statement_start: false,
             after_end: false,
             body_done: false,
+            prev_dot: false,
+            closed: None,
+            opened: false,
         }
     }
 
@@ -495,8 +514,10 @@ impl Blocks {
         self.enabled
     }
 
+    /// Open blocks that a terminator at the next token would be inside. A `BEGIN` directly
+    /// before the terminator (`SELECT begin;`) was a column name, so it does not count.
     fn depth(&self) -> usize {
-        self.stack.len()
+        self.stack.len().saturating_sub(usize::from(self.opened))
     }
 
     fn reset(&mut self) {
@@ -508,9 +529,32 @@ impl Blocks {
         self.statement_start = false;
         self.after_end = false;
         self.body_done = false;
+        self.prev_dot = false;
+        self.closed = None;
+        self.opened = false;
     }
 
     fn feed(&mut self, signal: Signal) {
+        let signal = match signal {
+            Signal::Word(_) if self.prev_dot => Signal::Word(Kw::Other),
+            _ => signal,
+        };
+        if let Some(block) = self.closed.take()
+            && self.end_was_identifier(block, signal)
+        {
+            self.stack.push(block);
+            self.after_end = false;
+            self.body_done = false;
+        }
+        if std::mem::take(&mut self.opened)
+            && matches!(
+                signal,
+                Signal::Punct(_) | Signal::Word(Kw::Operand | Kw::Or)
+            )
+        {
+            self.stack.pop();
+            self.statement_start = false;
+        }
         match self.dialect {
             SqlDialect::Postgres => self.feed_postgres(signal),
             SqlDialect::Sqlite => self.feed_sqlite(signal),
@@ -521,6 +565,22 @@ impl Blocks {
             Signal::Word(kw) => kw,
             _ => Kw::Other,
         };
+        self.prev_dot = signal == Signal::Punct(b'.');
+    }
+
+    /// Whether the `END` that just closed `block` was really an identifier, judging by the
+    /// `next` token. A `CASE` expression's `END` is followed by anything, so it always counts.
+    /// Otherwise only `;` (or nothing) may follow a body's `END`, plus in MySQL a block keyword
+    /// (`END IF`) or a label: there punctuation or an [`Kw::Operand`] word means an identifier.
+    fn end_was_identifier(&self, block: Block, next: Signal) -> bool {
+        match (block, next) {
+            (Block::CaseExpression, _) | (_, Signal::Punct(b';')) => false,
+            (_, Signal::Punct(_) | Signal::Other) => true,
+            (_, Signal::Word(kw)) => {
+                !matches!(self.dialect, SqlDialect::MySql { .. })
+                    || matches!(kw, Kw::Operand | Kw::Or)
+            }
+        }
     }
 
     /// `BEGIN ATOMIC ... END`, with `CASE ... END` counted inside.
@@ -530,9 +590,7 @@ impl Blocks {
             Signal::Word(Kw::Case) if !self.stack.is_empty() => {
                 self.stack.push(Block::CaseExpression);
             }
-            Signal::Word(Kw::End) => {
-                self.stack.pop();
-            }
+            Signal::Word(Kw::End) => self.closed = self.stack.pop(),
             _ => {}
         }
     }
@@ -552,10 +610,11 @@ impl Blocks {
             (Header::Compound, _) => match kw {
                 Kw::Begin if self.stack.is_empty() && !self.body_done => {
                     self.stack.push(Block::Begin);
+                    self.opened = true;
                 }
                 Kw::Case if !self.stack.is_empty() => self.stack.push(Block::CaseExpression),
                 Kw::End if !self.stack.is_empty() => {
-                    self.stack.pop();
+                    self.closed = self.stack.pop();
                     self.body_done = self.stack.is_empty();
                 }
                 _ => {}
@@ -646,6 +705,7 @@ impl Blocks {
             Kw::Begin => {
                 self.stack.push(Block::Begin);
                 self.statement_start = true;
+                self.opened = true;
             }
             // `BEGIN NOT ATOMIC`: the body starts after `ATOMIC`.
             Kw::Not | Kw::Atomic if matches!(self.prev, Kw::Begin | Kw::Not) => {
@@ -663,7 +723,7 @@ impl Blocks {
             }
             Kw::While | Kw::For if statement_start => self.stack.push(Block::Loop),
             Kw::End => {
-                self.stack.pop();
+                self.closed = self.stack.pop();
                 self.after_end = true;
             }
             Kw::Then | Kw::Else => {

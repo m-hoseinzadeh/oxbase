@@ -49,7 +49,7 @@ pub(crate) struct Token {
 pub(crate) struct Rules {
     pub dialect: SqlDialect,
     /// A backslash escapes the next byte in `'...'` (and in `"..."` strings): MySQL.
-    backslash_escapes: bool,
+    pub backslash_escapes: bool,
     /// `"..."` is a string, not an identifier: MySQL.
     double_quote_string: bool,
     /// `` `...` `` identifiers: MySQL, SQLite.

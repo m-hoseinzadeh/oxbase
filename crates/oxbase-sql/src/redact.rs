@@ -2,12 +2,28 @@
 //!
 //! One pass over the tokens of [`crate::lex`] (comments are skipped, so keywords inside them
 //! are ignored; MySQL executable comments are opened so the keywords inside them count). A
-//! small state machine arms on a secret keyword and replaces the next string literal; every
-//! literal that is not replaced is scanned for `password=` / `pwd=` connection-string values.
+//! small state machine arms on a secret keyword and replaces the next string literal. Every
+//! literal that is not replaced is scanned for `password=` / `pwd=` connection-string values
+//! (rule 2) and is then redacted again as SQL text, so statements nested in literals are
+//! masked too: dynamic SQL (`EXECUTE 'ALTER ROLE r PASSWORD ''x'''`) and PostgreSQL
+//! dollar-quoted bodies (`DO $$ ... $$`, `CREATE FUNCTION ... AS $$ ... $$`). Nesting is
+//! followed [`MAX_DEPTH`] levels deep, so the whole pass stays linear.
 //!
 //! Beyond the crate docs, also masked (best effort): MySQL `SET PASSWORD FOR user = '...'`,
-//! the old password of `ALTER USER ... IDENTIFIED BY '...' REPLACE '...'`, SQLCipher
-//! `PRAGMA rekey = '...'`, and SQLite double-quoted keys (`PRAGMA key = "x'...'"`).
+//! `OLD_PASSWORD('...')`, the old password of `ALTER USER ... IDENTIFIED BY '...' REPLACE
+//! '...'`, MariaDB `IDENTIFIED VIA plugin USING '...'`, a backslash-quoted MySQL
+//! connection-string value (`password=\'a b\'`), PostgreSQL `U&'...'` literals, and SQLite /
+//! SQLCipher `PRAGMA key|rekey|hexkey|hexrekey = ...` (string, double-quoted or bare-word
+//! value), `ATTACH ... KEY '...'` and `key=` / `hexkey=` values inside literals (URIs).
+//!
+//! Deliberate narrowings:
+//!
+//! - `KEY` (and `REKEY`, `HEXKEY`, `HEXREKEY`) arms only in the SQLite dialect and only in a
+//!   `PRAGMA` or `ATTACH` statement, so key-value queries (`WHERE key = 'user:42'`) keep their
+//!   literals in history.
+//! - Rule 2 is not applied to the raw text of a dollar-quoted body that looks like code (it
+//!   holds a `;` or a line feed), so `IF NEW.password = OLD.password` in a function body is
+//!   kept; the literals inside that body still get rule 2.
 
 use std::borrow::Cow;
 
@@ -16,6 +32,16 @@ use crate::{REDACTED_LITERAL, SqlDialect};
 
 /// What replaces a connection-string password value.
 const REDACTED_VALUE: &str = "***";
+
+/// How many literal levels deep nested SQL is redacted (a `DO $$ ... $$` body is one level, a
+/// dynamic SQL string inside it is two). Each level re-lexes at most the text of the level
+/// above, so the work stays linear in the input.
+const MAX_DEPTH: u8 = 3;
+
+/// Connection-string keys of rule 2, lowercase, every dialect.
+const VALUE_KEYS: &[&[u8]] = &[b"password", b"pwd"];
+/// SQLite also masks SQLCipher URI parameters (`file:x.db?key=...`).
+const SQLITE_VALUE_KEYS: &[&[u8]] = &[b"password", b"pwd", b"hexkey", b"key"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
@@ -26,7 +52,7 @@ enum State {
         paren: bool,
         password: bool,
     },
-    /// After `WITH`: the next word or literal is an authentication plugin name.
+    /// After `WITH` / `VIA`: the next word or literal is an authentication plugin name.
     Plugin {
         paren: bool,
     },
@@ -36,6 +62,16 @@ enum State {
     AfterSecret,
 }
 
+/// The first word of the current statement, as far as `KEY` arming cares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Head {
+    /// No content token yet.
+    Start,
+    /// `PRAGMA` or `ATTACH`: SQLCipher keys may follow.
+    Keyed,
+    Other,
+}
+
 /// Words the state machine reacts to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Word {
@@ -43,9 +79,12 @@ enum Word {
     Secret {
         password: bool,
     },
-    /// `BY`, `AS`: may sit between the keyword and the literal.
+    /// `KEY`, `REKEY`, `HEXKEY`, `HEXREKEY`: arm in a SQLite `PRAGMA` / `ATTACH` only.
+    Key,
+    /// `BY`, `AS`, `USING`: may sit between the keyword and the literal.
     Filler,
-    With,
+    /// `WITH`, `VIA`: a plugin name follows.
+    Plugin,
     For,
     Replace,
     Other,
@@ -59,15 +98,16 @@ impl Word {
         } else if is("IDENTIFIED")
             || is("MASTER_PASSWORD")
             || is("SOURCE_PASSWORD")
+            || is("OLD_PASSWORD")
             || is("SECRET")
-            || is("KEY")
-            || is("REKEY")
         {
             Self::Secret { password: false }
-        } else if is("BY") || is("AS") {
+        } else if is("KEY") || is("REKEY") || is("HEXKEY") || is("HEXREKEY") {
+            Self::Key
+        } else if is("BY") || is("AS") || is("USING") {
             Self::Filler
-        } else if is("WITH") {
-            Self::With
+        } else if is("WITH") || is("VIA") {
+            Self::Plugin
         } else if is("FOR") {
             Self::For
         } else if is("REPLACE") {
@@ -78,94 +118,202 @@ impl Word {
     }
 }
 
+/// One replacement: `start..end` of the text becomes `text`.
+type Edit = (usize, usize, Cow<'static, str>);
+
 pub(crate) fn redact(dialect: SqlDialect, sql: &str) -> Cow<'_, str> {
+    redact_at(dialect, sql, 0)
+}
+
+fn redact_at(dialect: SqlDialect, sql: &str, depth: u8) -> Cow<'_, str> {
     let mut rules = Rules::new(dialect);
     rules.open_exec_comments = true;
-    let bytes = sql.as_bytes();
-    // Replacements as (start, end, text), in order and not overlapping.
-    let mut edits: Vec<(usize, usize, &'static str)> = Vec::new();
-    let mut state = State::Off;
+    let mut redactor = Redactor {
+        rules,
+        sql,
+        depth,
+        edits: Vec::new(),
+        state: State::Off,
+        head: Head::Start,
+        after_eq: false,
+    };
     let mut i = 0;
-    while i < bytes.len() {
+    while i < sql.len() {
         let tok = lex::token_at(sql, i, rules, &[]);
         i = tok.end;
-        state = match tok.kind {
-            TokenKind::Space | TokenKind::LineComment | TokenKind::BlockComment => continue,
+        if matches!(
+            tok.kind,
+            TokenKind::Space | TokenKind::LineComment | TokenKind::BlockComment
+        ) {
+            continue;
+        }
+        let prev_eq = std::mem::replace(&mut redactor.after_eq, false);
+        if redactor.head == Head::Start && tok.kind != TokenKind::Word {
+            redactor.head = Head::Other;
+        }
+        redactor.state = match tok.kind {
             TokenKind::Str {
                 inner_start,
                 inner_end,
-            } => {
-                if let State::Armed { .. } = state {
-                    edits.push((tok.start, tok.end, REDACTED_LITERAL));
-                    State::AfterSecret
-                } else {
-                    connection_string_values(bytes, inner_start, inner_end, &mut edits);
-                    match state {
-                        State::Plugin { paren } => State::Armed {
-                            paren,
-                            password: false,
-                        },
-                        State::ForUser => State::ForUser,
-                        _ => State::Off,
-                    }
-                }
-            }
-            TokenKind::Ident { quote } => match state {
-                // SQLCipher keys are often written `PRAGMA key = "x'...'"`.
-                State::Armed { paren: false, .. }
-                    if dialect == SqlDialect::Sqlite && quote == b'"' =>
-                {
-                    edits.push((tok.start, tok.end, REDACTED_LITERAL));
-                    State::AfterSecret
-                }
-                State::Plugin { paren } => State::Armed {
-                    paren,
-                    password: false,
-                },
-                State::ForUser => State::ForUser,
-                _ => State::Off,
-            },
-            TokenKind::Word => {
-                let word = &bytes[tok.start..tok.end];
-                match (state, Word::of(word)) {
-                    (_, Word::Secret { password }) => State::Armed {
-                        paren: false,
-                        password,
-                    },
-                    (State::Armed { paren, .. }, Word::Filler) | (State::Plugin { paren }, _) => {
-                        State::Armed {
-                            paren,
-                            password: false,
-                        }
-                    }
-                    (State::Armed { paren, .. }, Word::With) => State::Plugin { paren },
-                    (State::Armed { password: true, .. }, Word::For) | (State::ForUser, _) => {
-                        State::ForUser
-                    }
-                    (State::Armed { .. }, _) if is_introducer(word, bytes.get(tok.end)) => state,
-                    (State::AfterSecret, Word::Replace) => State::Armed {
-                        paren: false,
-                        password: false,
-                    },
-                    _ => State::Off,
-                }
-            }
-            TokenKind::Punct => match (state, bytes[tok.start]) {
-                (State::Armed { password, .. }, b'(') => State::Armed {
-                    paren: true,
-                    password,
-                },
-                (State::Armed { .. }, b'=') => state,
-                (State::ForUser, b'=') => State::Armed {
-                    paren: false,
-                    password: false,
-                },
-                (State::ForUser, c) if c != b';' => State::ForUser,
-                _ => State::Off,
-            },
-            TokenKind::ExecComment => State::Off,
+            } => redactor.on_str(tok.start, tok.end, inner_start, inner_end),
+            TokenKind::Ident { quote } => redactor.on_ident(tok.start, tok.end, quote),
+            TokenKind::Word => redactor.on_word(tok.start, tok.end, prev_eq),
+            TokenKind::Punct => redactor.on_punct(tok.start, tok.end),
+            // Not produced while executable comments are opened; nothing to arm on anyway.
+            TokenKind::ExecComment
+            | TokenKind::Space
+            | TokenKind::LineComment
+            | TokenKind::BlockComment => State::Off,
         };
     }
+    apply(sql, redactor.edits)
+}
+
+/// The state of one redaction pass.
+struct Redactor<'a> {
+    rules: Rules,
+    sql: &'a str,
+    depth: u8,
+    /// Replacements in order and not overlapping.
+    edits: Vec<Edit>,
+    state: State,
+    head: Head,
+    /// The previous content token was `=`.
+    after_eq: bool,
+}
+
+impl Redactor<'_> {
+    fn sqlite(&self) -> bool {
+        self.rules.dialect == SqlDialect::Sqlite
+    }
+
+    /// Replaces `start..end` with [`REDACTED_LITERAL`].
+    fn mask(&mut self, start: usize, end: usize) -> State {
+        self.edits
+            .push((start, end, Cow::Borrowed(REDACTED_LITERAL)));
+        State::AfterSecret
+    }
+
+    fn on_str(&mut self, start: usize, end: usize, inner_start: usize, inner_end: usize) -> State {
+        if let State::Armed { .. } = self.state {
+            return self.mask(start, end);
+        }
+        if let Some(content) = redact_literal(
+            self.rules,
+            self.sql,
+            start,
+            inner_start,
+            inner_end,
+            self.depth,
+        ) {
+            self.edits
+                .push((inner_start, inner_end, Cow::Owned(content)));
+        }
+        match self.state {
+            State::Plugin { paren } => State::Armed {
+                paren,
+                password: false,
+            },
+            State::ForUser => State::ForUser,
+            _ => State::Off,
+        }
+    }
+
+    fn on_ident(&mut self, start: usize, end: usize, quote: u8) -> State {
+        let state = self.state;
+        match state {
+            // SQLCipher keys are often written `PRAGMA key = "x'...'"`.
+            State::Armed { paren: false, .. } if self.sqlite() && quote == b'"' => {
+                self.mask(start, end)
+            }
+            State::Plugin { paren } => State::Armed {
+                paren,
+                password: false,
+            },
+            State::ForUser => State::ForUser,
+            _ => State::Off,
+        }
+    }
+
+    fn on_word(&mut self, start: usize, end: usize, prev_eq: bool) -> State {
+        let sql = self.sql;
+        let bytes = sql.as_bytes();
+        let word = &bytes[start..end];
+        if self.head == Head::Start {
+            self.head =
+                if word.eq_ignore_ascii_case(b"PRAGMA") || word.eq_ignore_ascii_case(b"ATTACH") {
+                    Head::Keyed
+                } else {
+                    Head::Other
+                };
+        }
+        let keyed = self.sqlite() && self.head == Head::Keyed;
+        let kind = match Word::of(word) {
+            Word::Key if keyed => Word::Secret { password: false },
+            Word::Key => Word::Other,
+            kind => kind,
+        };
+        let state = self.state;
+        match (state, kind) {
+            (_, Word::Secret { password }) => State::Armed {
+                paren: false,
+                password,
+            },
+            (State::Armed { paren, .. }, Word::Filler) | (State::Plugin { paren }, _) => {
+                State::Armed {
+                    paren,
+                    password: false,
+                }
+            }
+            (State::Armed { paren, .. }, Word::Plugin) => State::Plugin { paren },
+            (State::Armed { password: true, .. }, Word::For) | (State::ForUser, _) => {
+                State::ForUser
+            }
+            (State::Armed { .. }, _) if is_introducer(self.rules.dialect, bytes, end, word) => {
+                state
+            }
+            // SQLCipher `PRAGMA key = passphrase`: a bare word is the key.
+            (State::Armed { paren: false, .. }, _) if keyed && prev_eq => self.mask(start, end),
+            (State::AfterSecret, Word::Replace) => State::Armed {
+                paren: false,
+                password: false,
+            },
+            _ => State::Off,
+        }
+    }
+
+    fn on_punct(&mut self, start: usize, end: usize) -> State {
+        let sql = self.sql;
+        let bytes = sql.as_bytes();
+        let c = bytes[start];
+        self.after_eq = c == b'=';
+        if c == b';' {
+            self.head = Head::Start;
+        }
+        // PostgreSQL `U&'...'`: the `&` between the `U` and the quote.
+        let unicode_amp = c == b'&'
+            && self.rules.dialect == SqlDialect::Postgres
+            && start > 0
+            && bytes[start - 1] | 0x20 == b'u'
+            && bytes.get(end) == Some(&b'\'');
+        match (self.state, c) {
+            (State::Armed { password, .. }, b'(') => State::Armed {
+                paren: true,
+                password,
+            },
+            (State::Armed { .. }, b'=' | b'&') if c == b'=' || unicode_amp => self.state,
+            (State::ForUser, b'=') => State::Armed {
+                paren: false,
+                password: false,
+            },
+            (State::ForUser, c) if c != b';' => State::ForUser,
+            _ => State::Off,
+        }
+    }
+}
+
+/// `sql` with `edits` applied; borrowed when there are none.
+fn apply(sql: &str, edits: Vec<Edit>) -> Cow<'_, str> {
     if edits.is_empty() {
         return Cow::Borrowed(sql);
     }
@@ -174,38 +322,150 @@ pub(crate) fn redact(dialect: SqlDialect, sql: &str) -> Cow<'_, str> {
     for (start, end, replacement) in edits {
         // Every edit boundary is next to an ASCII byte or at a token boundary.
         out.push_str(sql.get(last..start).unwrap_or_default());
-        out.push_str(replacement);
+        out.push_str(&replacement);
         last = end;
     }
     out.push_str(sql.get(last..).unwrap_or_default());
     Cow::Owned(out)
 }
 
-/// Rule 2: inside a literal's content `start..end`, masks the value after `password=` or
-/// `pwd=` (case-insensitive, not inside a longer word, spaces allowed around `=`) up to the
-/// next whitespace, `;`, `&` or the end of the content. A value starting with quotes runs to
-/// the closing quote run.
+/// A literal that is not itself a secret: rule 2 over its content `start..end`, then the
+/// content redacted again as SQL (with its quote escapes undone, and redone afterwards).
+/// Returns the new content when something was masked.
+fn redact_literal(
+    rules: Rules,
+    sql: &str,
+    token_start: usize,
+    start: usize,
+    end: usize,
+    depth: u8,
+) -> Option<String> {
+    let bytes = sql.as_bytes();
+    // The content starts after an ASCII quote / dollar tag and ends at one or at the text end,
+    // so it is on char boundaries.
+    let content = sql.get(start..end)?;
+    // `None`: a dollar-quoted body (no escapes). Otherwise the quote byte and whether a
+    // backslash escapes.
+    let escapes = match bytes[token_start] {
+        b'$' => None,
+        b'E' | b'e' => Some((b'\'', true)),
+        quote => Some((quote, rules.backslash_escapes)),
+    };
+    let looks_like_code = escapes.is_none() && content.bytes().any(|b| b == b';' || b == b'\n');
+    let mut current = Cow::Borrowed(content);
+    if !looks_like_code {
+        let keys = if rules.dialect == SqlDialect::Sqlite {
+            SQLITE_VALUE_KEYS
+        } else {
+            VALUE_KEYS
+        };
+        let backslash = escapes.is_some_and(|(_, backslash)| backslash);
+        let mut edits = Vec::new();
+        connection_string_values(bytes, start, end, keys, backslash, &mut edits);
+        if !edits.is_empty() {
+            let local = edits
+                .into_iter()
+                .map(|(from, to, text)| (from - start, to - start, text))
+                .collect();
+            current = apply(content, local);
+        }
+    }
+    if depth < MAX_DEPTH {
+        let nested = match escapes {
+            None => match redact_at(rules.dialect, &current, depth + 1) {
+                Cow::Owned(text) => Some(text),
+                Cow::Borrowed(_) => None,
+            },
+            Some((quote, backslash)) => {
+                let plain = unescape(&current, quote, backslash);
+                match redact_at(rules.dialect, &plain, depth + 1) {
+                    Cow::Owned(text) => Some(escape(&text, quote)),
+                    Cow::Borrowed(_) => None,
+                }
+            }
+        };
+        if let Some(text) = nested {
+            current = Cow::Owned(text);
+        }
+    }
+    match current {
+        Cow::Owned(text) => Some(text),
+        Cow::Borrowed(_) => None,
+    }
+}
+
+/// The text a quoted literal's content stands for: a doubled quote and (with `backslash`) a
+/// backslash-escaped quote become one quote; every other byte is kept.
+fn unescape(content: &str, quote: u8, backslash: bool) -> Cow<'_, str> {
+    let bytes = content.as_bytes();
+    if !bytes
+        .iter()
+        .any(|&b| b == quote || (backslash && b == b'\\'))
+    {
+        return Cow::Borrowed(content);
+    }
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        let next = bytes.get(i + 1).copied();
+        if (b == quote || (backslash && b == b'\\')) && next == Some(quote) {
+            out.push(quote);
+            i += 2;
+        } else if backslash && b == b'\\' {
+            out.push(b);
+            if let Some(next) = next {
+                out.push(next);
+            }
+            i += 2;
+        } else {
+            out.push(b);
+            i += 1;
+        }
+    }
+    // Only ASCII pairs were merged, so the bytes are still UTF-8.
+    String::from_utf8(out).map_or(Cow::Borrowed(content), Cow::Owned)
+}
+
+/// The inverse of [`unescape`] for text going back into a literal: every quote is doubled.
+fn escape(text: &str, quote: u8) -> String {
+    let quote = char::from(quote);
+    let mut out = String::with_capacity(text.len() + 8);
+    for c in text.chars() {
+        out.push(c);
+        if c == quote {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Rule 2: inside a literal's content `start..end`, masks the value after one of `keys`
+/// (`password=`, `pwd=`, ...; case-insensitive, not inside a longer word, spaces allowed
+/// around `=`) up to the next whitespace, `;`, `&` or the end of the content. A value starting
+/// with quotes runs to the closing quote run; with `backslash`, a value starting with `\'`
+/// runs to the next `\'`. Edits are pushed in byte offsets of the whole text.
 fn connection_string_values(
     bytes: &[u8],
     start: usize,
     end: usize,
-    edits: &mut Vec<(usize, usize, &'static str)>,
+    keys: &[&[u8]],
+    backslash: bool,
+    edits: &mut Vec<Edit>,
 ) {
     let end = end.min(bytes.len());
     let mut k = start;
     while k < end {
-        if bytes[k] | 0x20 != b'p' {
+        let first = bytes[k] | 0x20;
+        if !keys.iter().any(|key| key[0] == first) {
             k += 1;
             continue;
         }
         let rest = &bytes[k..end];
-        let key_len = if starts_with_ignore_case(rest, b"password") {
-            8
-        } else if starts_with_ignore_case(rest, b"pwd") {
-            3
-        } else {
-            0
-        };
+        let key_len = keys
+            .iter()
+            .find(|key| starts_with_ignore_case(rest, key))
+            .map_or(0, |key| key.len());
         let in_word = k > start && is_key_byte(bytes[k - 1]);
         if key_len == 0 || in_word {
             k += 1;
@@ -217,9 +477,9 @@ fn connection_string_values(
             continue;
         }
         v = skip_blanks(bytes, v + 1, end);
-        let stop = value_end(bytes, v, end);
+        let stop = value_end(bytes, v, end, backslash);
         if stop > v {
-            edits.push((v, stop, REDACTED_VALUE));
+            edits.push((v, stop, Cow::Borrowed(REDACTED_VALUE)));
         }
         k = stop.max(v);
     }
@@ -231,11 +491,17 @@ fn starts_with_ignore_case(haystack: &[u8], needle: &[u8]) -> bool {
         .is_some_and(|head| head.eq_ignore_ascii_case(needle))
 }
 
-/// A literal prefix written as a separate word: a MySQL charset introducer (`_utf8mb4'...'`)
-/// or a one-letter prefix directly before the quote (`N'...'`, `X'...'`, `B'...'`).
-fn is_introducer(word: &[u8], next: Option<&u8>) -> bool {
+/// A literal prefix written as a separate word: a MySQL charset introducer (`_utf8mb4'...'`),
+/// a one-letter prefix directly before the quote (`N'...'`, `X'...'`, `B'...'`), or the `U` of
+/// PostgreSQL `U&'...'`.
+fn is_introducer(dialect: SqlDialect, bytes: &[u8], word_end: usize, word: &[u8]) -> bool {
+    let next = bytes.get(word_end);
     word.first() == Some(&b'_')
         || (matches!(word, [b'N' | b'n' | b'X' | b'x' | b'B' | b'b']) && next == Some(&b'\''))
+        || (dialect == SqlDialect::Postgres
+            && matches!(word, [b'U' | b'u'])
+            && next == Some(&b'&')
+            && bytes.get(word_end + 1) == Some(&b'\''))
 }
 
 const fn is_key_byte(b: u8) -> bool {
@@ -249,7 +515,7 @@ fn skip_blanks(bytes: &[u8], mut i: usize, end: usize) -> usize {
     i
 }
 
-fn value_end(bytes: &[u8], v: usize, end: usize) -> usize {
+fn value_end(bytes: &[u8], v: usize, end: usize, backslash: bool) -> usize {
     let Some(&first) = bytes.get(v).filter(|_| v < end) else {
         return v;
     };
@@ -265,6 +531,24 @@ fn value_end(bytes: &[u8], v: usize, end: usize) -> usize {
             j += 1;
         }
         return j;
+    }
+    // MySQL `password=\'a b\'` inside a `'...'` literal.
+    if backslash
+        && first == b'\\'
+        && let Some(&quote) = bytes.get(v + 1).filter(|&&q| q == b'\'' || q == b'"')
+    {
+        j = v + 2;
+        while j < end {
+            if bytes[j] == b'\\' {
+                if bytes.get(j + 1) == Some(&quote) {
+                    return (j + 2).min(end);
+                }
+                j += 2;
+            } else {
+                j += 1;
+            }
+        }
+        return end;
     }
     while j < end && !matches!(bytes[j], b';' | b'&') && !lex::is_space(bytes[j]) {
         j += 1;

@@ -1,5 +1,7 @@
-//! Benchmark-style tests: the splitter is linear. The bounds are generous in debug builds
-//! (`cargo test` on CI) and strict in release (`cargo test --release`).
+//! Benchmark-style tests: the splitter is linear. The release bounds (`cargo test --release`)
+//! are the contract's; CI runs a debug `cargo test`, where the bounds are about ten times
+//! looser (unoptimised code is roughly that much slower) but still catch any super-linear
+//! behaviour. Each timing is the best of a few runs, so a busy CI machine does not fail them.
 
 use std::time::{Duration, Instant};
 
@@ -27,13 +29,24 @@ const MYSQL_CHUNK: &str = "SELECT 'a\\';b', `c;d` FROM t; # c;\n\
     INSERT INTO t VALUES (\"x;y\", 'é');\n\
     CREATE PROCEDURE p() BEGIN IF 1 THEN SELECT 1; END IF; END;\n";
 
+/// The shortest of `runs` timings of `f`.
+fn best_of(runs: usize, mut f: impl FnMut()) -> Duration {
+    (0..runs)
+        .map(|_| {
+            let started = Instant::now();
+            f();
+            started.elapsed()
+        })
+        .min()
+        .unwrap_or_default()
+}
+
 #[track_caller]
 fn timed_split(dialect: SqlDialect, chunk: &str, per_chunk: usize, bytes: usize, limit: Duration) {
     let (sql, repeats) = script(chunk, bytes);
-    let started = Instant::now();
-    let statements = split(dialect, &sql);
-    let elapsed = started.elapsed();
-    assert_eq!(statements.len(), per_chunk * repeats);
+    let mut count = 0;
+    let elapsed = best_of(3, || count = split(dialect, &sql).len());
+    assert_eq!(count, per_chunk * repeats);
     assert!(
         elapsed < limit,
         "{dialect:?}: splitting {} bytes took {elapsed:?} (limit {limit:?})",
@@ -43,7 +56,7 @@ fn timed_split(dialect: SqlDialect, chunk: &str, per_chunk: usize, bytes: usize,
 
 #[test]
 fn ten_megabytes_split_fast() {
-    let limit = bound(Duration::from_secs(1), Duration::from_secs(30));
+    let limit = bound(Duration::from_secs(1), Duration::from_secs(10));
     timed_split(SqlDialect::Postgres, PG_CHUNK, 3, 10 << 20, limit);
     timed_split(
         SqlDialect::MySql { mariadb: false },
@@ -56,7 +69,7 @@ fn ten_megabytes_split_fast() {
 
 #[test]
 fn one_megabyte_splits_in_well_under_100_ms() {
-    let limit = bound(Duration::from_millis(100), Duration::from_secs(5));
+    let limit = bound(Duration::from_millis(100), Duration::from_secs(1));
     timed_split(SqlDialect::Postgres, PG_CHUNK, 3, 1 << 20, limit);
     timed_split(
         SqlDialect::Sqlite,
@@ -69,7 +82,7 @@ fn one_megabyte_splits_in_well_under_100_ms() {
 
 #[test]
 fn one_huge_statement_and_one_huge_literal() {
-    let limit = bound(Duration::from_millis(500), Duration::from_secs(15));
+    let limit = bound(Duration::from_millis(500), Duration::from_secs(5));
     // No terminator at all: one 4 MB statement.
     let (sql, _) = script("x + ", 4 << 20);
     let started = Instant::now();
@@ -82,6 +95,13 @@ fn one_huge_statement_and_one_huge_literal() {
     // Redaction over a large script.
     let (sql, _) = script("ALTER ROLE r PASSWORD 'x'; SELECT 'password=y';\n", 2 << 20);
     assert!(redact_secrets(SqlDialect::Postgres, &sql).contains("PASSWORD '***'"));
+    // Nested redaction over a 4 MB dollar-quoted body full of dynamic SQL.
+    let body = format!(
+        "DO $$ {} $$",
+        "EXECUTE 'ALTER ROLE r PASSWORD ''x'''; ".repeat(100_000)
+    );
+    let redacted = redact_secrets(SqlDialect::Postgres, &body);
+    assert!(redacted.contains("PASSWORD ''***''") && !redacted.contains("''x''"));
     let elapsed = started.elapsed();
     assert!(elapsed < limit * 2, "took {elapsed:?}");
 }
