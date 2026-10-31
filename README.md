@@ -227,6 +227,11 @@ SQL Server 2025, MongoDB 7.0.45, Redis, SQLite 3.54.1 file).
   | MariaDB | 1625 ms | 36 ms | 0.28 ms | 28 MiB | 7.8 MiB | 1001 ms after cancel |
   | SQLite | 885 ms | 3 ms | 0.29 ms | 21 MiB | 6.6 MiB | 0 ms after cancel |
 
+  After the cancel, the editor's next `SELECT 1` must finish within 2 s. In CI run
+  41231834815 it took 455 ms (PostgreSQL), 3 ms (MySQL), 3 ms (MariaDB) and 1 ms (SQLite).
+  On MySQL and MariaDB the driver was still stopping the killed stream after 1 s, so that
+  `SELECT 1` ran on a new session. On PostgreSQL and SQLite it ran on the same session.
+
 The dialect, driver, tunnel and connection-manager live tests and the keychain tests passed in
 the same CI run.
 

@@ -212,7 +212,8 @@ received stayed pageable. All 42 `fetch_list` cells pass. Where the build differ
   it: when the stopped stream has not wound down within 1 s, the editor's next run opens a new
   session at once, closes the old one in the background and warns that its temporary tables,
   settings and open transaction are gone. The live test requires that next `SELECT 1` within
-  2 s on every engine.
+  2 s on every engine. In CI run 41231834815 it took 3 ms on MySQL and MariaDB (new session),
+  455 ms on PostgreSQL and 1 ms on SQLite (same session).
 - The query service's unit tests no longer carry a stand-in splitter or redactor. They use
   `oxbase_sql::split` and `redact_secrets`.
 - The Glide Data Grid is pinned to `6.0.4-alpha24`, the first line that declares React 19

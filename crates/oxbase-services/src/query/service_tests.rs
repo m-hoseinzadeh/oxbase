@@ -1017,6 +1017,25 @@ async fn history_records_each_statement_that_started() {
     );
 }
 
+/// Sets the modification time of directory `dir`.
+fn set_dir_modified(dir: &Path, time: std::time::SystemTime) {
+    let mut options = std::fs::OpenOptions::new();
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        // Windows opens a directory only with FILE_FLAG_BACKUP_SEMANTICS; setting its times
+        // needs FILE_WRITE_ATTRIBUTES.
+        options.access_mode(0x0100).custom_flags(0x0200_0000);
+    }
+    #[cfg(not(windows))]
+    options.read(true);
+    options
+        .open(dir)
+        .unwrap_or_else(|e| panic!("open {}: {e}", dir.display()))
+        .set_modified(time)
+        .unwrap_or_else(|e| panic!("set the time of {}: {e}", dir.display()));
+}
+
 #[tokio::test]
 async fn dropping_the_service_removes_run_directories_and_stale_ones_go_on_start() {
     let h = Harness::new(|c| c.memory_budget_bytes = 1).await;
@@ -1043,14 +1062,8 @@ async fn dropping_the_service_removes_run_directories_and_stale_ones_go_on_start
         std::fs::create_dir_all(d).unwrap();
     }
     let old = std::time::SystemTime::now() - Duration::from_secs(25 * 60 * 60);
-    std::fs::File::open(&stale)
-        .unwrap()
-        .set_modified(old)
-        .unwrap();
-    std::fs::File::open(&other)
-        .unwrap()
-        .set_modified(old)
-        .unwrap();
+    set_dir_modified(&stale, old);
+    set_dir_modified(&other, old);
     let _service = QueryService::new(
         manager,
         Arc::new(DialectRegistry::new()),
