@@ -16,7 +16,7 @@ pub fn default_dialects() -> DialectRegistry {
     // M2 engine streams: each uncomments its own line (and only that line) when its `dialect`
     // module lands. Keep one blank line between them so the merges do not touch each other.
 
-    // oxbase_pg::dialect::register(&mut reg);
+    oxbase_pg::dialect::register(&mut reg);
 
     // oxbase_mysql::dialect::register(&mut reg);
 
