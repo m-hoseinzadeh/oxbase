@@ -13,6 +13,7 @@ export const Keys = {
   escape: "",
   control: "",
   backspace: "",
+  end: "\uE010",
 };
 
 export class WebDriverError extends Error {

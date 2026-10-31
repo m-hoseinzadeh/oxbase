@@ -17,6 +17,10 @@
 #   OXBASE_E2E_OUT   output directory (default target/e2e): e2e-perf.json, logs, failure
 #                    screenshot and DOM dump
 #   OXBASE_E2E_P95_LIMIT_MS, OXBASE_E2E_CANCEL_LIMIT_MS   bounds (defaults 250 and 2000)
+#   OXBASE_E2E_REQUIRE_EDIT  1: the M3 edit step must run (a skip fails). Default: 1 when the
+#                    checkout has both the M3 table-data UI (ui/src/workbench/data/
+#                    TableDataPanel.tsx) and the M3 PostgreSQL fixture
+#                    (tests/docker/init/postgres/05-m3.sql), else 0
 #
 # The app runs with its own temporary config and data directories (OXBASE_CONFIG_DIR,
 # OXBASE_DATA_DIR, XDG_*), holding one saved profile for the fixture whose password is
@@ -87,6 +91,16 @@ if [[ -z "$pg_host" || -z "$pg_port" || -z "$pg_user" || -z "$pg_database" || -z
   echo "e2e-smoke: could not read [engines.postgres] from tests/fixtures.toml" >&2
   exit 1
 fi
+# Once the M3 table-data UI and the M3 fixture are both in the checkout, the edit step is
+# required: a skip (UI not detected) then fails the run instead of passing with a warning.
+if [[ -z "${OXBASE_E2E_REQUIRE_EDIT:-}" ]]; then
+  if [[ -f "$repo_root/ui/src/workbench/data/TableDataPanel.tsx" \
+    && -f "$repo_root/tests/docker/init/postgres/05-m3.sql" ]]; then
+    OXBASE_E2E_REQUIRE_EDIT=1
+  else
+    OXBASE_E2E_REQUIRE_EDIT=0
+  fi
+fi
 version="$(awk -F'"' '/^\[workspace.package\]/ { s = 1; next } /^\[/ { s = 0 } s && /^version *=/ { print $2; exit }' "$repo_root/Cargo.toml")"
 
 work="$(mktemp -d "${TMPDIR:-/tmp}/oxbase-e2e.XXXXXX")"
@@ -139,6 +153,7 @@ export NO_AT_BRIDGE=1
 echo "e2e-smoke: app $app"
 echo "e2e-smoke: tauri-driver $(command -v tauri-driver), WebKitWebDriver $(command -v WebKitWebDriver)"
 echo "e2e-smoke: output $out"
+echo "e2e-smoke: M3 edit step required: $OXBASE_E2E_REQUIRE_EDIT"
 
 tauri-driver --port 4444 --native-port 4445 >"$out/webdriver.log" 2>&1 &
 driver_pid=$!
@@ -150,11 +165,15 @@ OXBASE_E2E_APP="$app" \
   OXBASE_E2E_VERSION="$version" \
   OXBASE_E2E_PG_PASSWORD="$pg_password" \
   OXBASE_E2E_DRIVER_URL="http://127.0.0.1:4444" \
+  OXBASE_E2E_REQUIRE_EDIT="$OXBASE_E2E_REQUIRE_EDIT" \
   node "$repo_root/ui/e2e/smoke.mjs" || status=$?
 
 if [[ "$status" -ne 0 ]]; then
   echo "e2e-smoke: FAILED (exit $status); WebDriver log: $out/webdriver.log" >&2
+  # tauri-driver and WebKitWebDriver have no verbose mode, so this log is often empty; the
+  # failure screenshot and DOM dump in $out are the main evidence.
   echo "--- last lines of the WebDriver log ---" >&2
   tail -n 60 "$out/webdriver.log" >&2 || true
+  echo "e2e-smoke: failure screenshot and DOM dump: $out/failure.png, $out/failure-dom.html" >&2
 fi
 exit "$status"

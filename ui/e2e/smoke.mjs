@@ -18,6 +18,8 @@
 //   OXBASE_E2E_OUT            output directory for e2e-perf.json, screenshots, DOM dumps
 //   OXBASE_E2E_P95_LIMIT_MS   page latency bound (default 250)
 //   OXBASE_E2E_CANCEL_LIMIT_MS cancel bound (default 2000)
+//   OXBASE_E2E_REQUIRE_EDIT   1: the M3 edit step must run; a skip fails the job. e2e-smoke.sh
+//                             sets it when the checkout has the M3 table-data UI and fixtures
 //   GITHUB_STEP_SUMMARY       if set, a Markdown summary is appended to it
 
 import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
@@ -37,6 +39,7 @@ const config = {
   outDir: env.OXBASE_E2E_OUT || path.resolve(here, "../../target/e2e"),
   p95LimitMs: Number(env.OXBASE_E2E_P95_LIMIT_MS || 250),
   cancelLimitMs: Number(env.OXBASE_E2E_CANCEL_LIMIT_MS || 2000),
+  requireEdit: /^(1|true|yes)$/i.test(env.OXBASE_E2E_REQUIRE_EDIT || ""),
   rows: 1_000_000,
   probeSamples: 60,
   pageSize: 200,
@@ -75,10 +78,13 @@ const HOOKS = {
   runStatus: { testids: ["run-status"], css: ".query-editor__status" },
   rowCounter: { testids: ["row-counter", "result-status"] },
   resultGrid: { testids: ["result-grid"], css: ".results .result-grid" },
-  // M3 table data and editing (app stream). Absent hooks make the edit step skip.
-  openTableData: { testids: ["open-table-data"] },
-  tableData: { testids: ["table-data"] },
-  applyEdits: { testids: ["edit-apply"] },
+  // M3 table data and editing (app stream, origin/wip/m3-app TableDataPanel / CellEditor). A
+  // table-data tab is the `section.table-data` labelled "Table <schema>.<name>".
+  tableData: { testids: ["table-data"], css: "section.table-data" },
+  tableDataStatus: { testids: ["table-data-status"] },
+  applyEdits: { testids: ["apply-edits", "edit-apply"] },
+  applyErrors: { testids: ["apply-errors"] },
+  cellEditor: { testids: ["cell-editor"] },
 };
 
 // In-page helpers, installed once after the window loads. `locate(spec)` resolves a HOOKS
@@ -181,6 +187,7 @@ const results = [];
 const report = {
   startedAt: new Date().toISOString(),
   application: config.application,
+  requireEdit: config.requireEdit,
   query: null,
   pageLatency: null,
   scroll: [],
@@ -196,9 +203,9 @@ function log(message) {
 }
 
 /** A GitHub Actions error annotation (shown on the run page and by scripts/ci-wait.mjs). */
-function annotate(message) {
+function annotate(message, level = "error") {
   const escaped = message.replaceAll("%", "%25").replaceAll("\r", "%0D").replaceAll("\n", "%0A");
-  console.log(`::error::Webview smoke: ${escaped}`);
+  console.log(`::${level}::Webview smoke: ${escaped}`);
 }
 
 class SkipStep extends Error {}
@@ -216,10 +223,19 @@ async function step(name, fn) {
     return true;
   } catch (error) {
     const message = String(error?.message ?? error);
-    if (error instanceof SkipStep) {
+    if (error instanceof SkipStep && !config.requireEdit) {
       results.push({ name, status: "skipped", ms: Date.now() - started, detail: message });
+      // A warning annotation, so the skip shows on the run page and in scripts/ci-wait.mjs.
+      annotate(`skipped: ${name}: ${message}`, "warning");
       log(`skipped: ${name}: ${message}`);
       return true;
+    }
+    if (error instanceof SkipStep) {
+      const detail = `${message} (a skip fails the run: OXBASE_E2E_REQUIRE_EDIT=1)`;
+      results.push({ name, status: "failed", ms: Date.now() - started, detail });
+      annotate(`${name}: ${detail}`);
+      log(`FAILED: ${name}: ${detail}`);
+      return false;
     }
     results.push({ name, status: "failed", ms: Date.now() - started, detail: message });
     annotate(`${name}: ${message}`);
@@ -465,10 +481,17 @@ async function runBigQuery() {
     firstCounts: counts.slice(0, 10),
     msToFinished: doneAt === null ? null : Math.round(doneAt - t0),
   };
-  if (counts.length < 2) {
-    log("note: the row counter changed only once; the run streamed faster than the UI redrew");
+  // Channel events: the counter must have shown partial counts before the final one, else the
+  // UI may only be showing the finished result.
+  const partial = counts.filter((n) => n > 0 && n < config.rows);
+  report.query.partialCounts = partial.length;
+  if (partial.length < 2) {
+    throw new Error(
+      `the row counter showed ${partial.length} partial counts before ${config.rows} ` +
+        `(${counts.slice(0, 10).join(", ")}): Channel row events did not reach the UI while streaming`,
+    );
   }
-  return `${final} rows; row counter updated ${counts.length} times while streaming; ${done.status}`;
+  return `${final} rows; row counter showed ${partial.length} partial counts while streaming; ${done.status}`;
 }
 
 /** Clicks Run and waits until the run shows as running; returns the click time (page clock). */
@@ -598,6 +621,16 @@ async function scrollGrid() {
   return `${out.length} positions, ${loaded} page requests, rows ${out.map((o) => o.firstRow).join(", ")}`;
 }
 
+/** Loads apache-arrow (the UI's own dependency, Apache-2.0) into the webview as `window.Arrow`. */
+async function loadArrow() {
+  if (await wd.execute("return typeof window.Arrow?.tableFromIPC === 'function';")) return;
+  const arrowPath = path.resolve(here, "../node_modules/apache-arrow/Arrow.es2015.min.js");
+  const arrow = await readFile(arrowPath, "utf8");
+  await wd.execute(`if (!window.Arrow) { (function () {\n${arrow}\n}).call(window); }`);
+  const hasArrow = await wd.execute("return typeof window.Arrow?.tableFromIPC === 'function';");
+  if (!hasArrow) throw new Error("could not load apache-arrow into the webview");
+}
+
 /** Runs probe pages (`query_page` invoked from the webview, decoded with apache-arrow there). */
 async function measurePages() {
   // The run behind the grid: the last page the grid requested.
@@ -605,12 +638,7 @@ async function measurePages() {
     "const p = window.__e2e.ipc.filter((e) => e.cmd === 'query_page' && e.runId);" +
       "return p.length ? p[p.length - 1].runId : null;",
   );
-  // apache-arrow (the UI's own dependency, Apache-2.0) decodes the pages in the webview.
-  const arrowPath = path.resolve(here, "../node_modules/apache-arrow/Arrow.es2015.min.js");
-  const arrow = await readFile(arrowPath, "utf8");
-  await wd.execute(`if (!window.Arrow) { (function () {\n${arrow}\n}).call(window); }`);
-  const hasArrow = await wd.execute("return typeof window.Arrow?.tableFromIPC === 'function';");
-  if (!hasArrow) throw new Error("could not load apache-arrow into the webview");
+  await loadArrow();
   let source = "grid run";
   if (!runId) {
     runId = await startProbeRun();
@@ -752,21 +780,36 @@ async function cancelRun() {
   return `cancelled ${ms} ms after Stop, at ${streaming} rows (${rowsAtEnd} rows kept)`;
 }
 
-/** Expands the object tree along `labels` (labels not shown are skipped) and returns the row. */
+/**
+ * Expands the object tree along `labels` and returns the row labelled `target` below them.
+ * Each label is looked up among the descendants of the previous one, so "Tables" of schema
+ * `m3` is not confused with "Tables" of `public`; a label the tree does not show is skipped.
+ */
 async function treeRow(labels, target) {
-  const find = (label) =>
+  // The first row labelled `label` after row `parent` and inside its subtree (any level).
+  const find = (label, parent) =>
     wd.executeElement(
-      "for (const r of document.querySelectorAll('[role=tree] [role=treeitem]')) {" +
+      "const [label, parent] = arguments;" +
+        "const rows = Array.from(document.querySelectorAll('[role=tree] [role=treeitem]'));" +
+        "let i = 0, level = 0;" +
+        "if (parent) { i = rows.indexOf(parent) + 1; if (i === 0) return null;" +
+        "  level = Number(parent.getAttribute('aria-level')); }" +
+        "for (; i < rows.length; i += 1) {" +
+        "  const r = rows[i];" +
+        "  if (parent && Number(r.getAttribute('aria-level')) <= level) return null;" +
         "  const l = r.querySelector('.tree__label');" +
-        "  if (l && l.textContent.trim().toLowerCase() === arguments[0].toLowerCase()) return r; }" +
+        "  if (l && l.textContent.trim().toLowerCase() === label.toLowerCase()) return r; }" +
         "return null;",
       label,
+      parent,
     );
+  let parent = null;
   for (const label of labels) {
-    const row = await waitFor(`tree item "${label}"`, () => find(label), {
+    const row = await waitFor(`tree item "${label}"`, () => find(label, parent), {
       timeoutMs: 5_000,
     }).catch(() => null);
     if (!row) continue;
+    parent = row;
     const expanded = await wd.execute("return arguments[0].getAttribute('aria-expanded');", row);
     if (expanded === "false") {
       await wd.execute("arguments[0].querySelector('.tree__twisty').click();", row);
@@ -782,103 +825,312 @@ async function treeRow(labels, target) {
       );
     }
   }
-  return waitFor(`tree item "${target}"`, () => find(target), { timeoutMs: 5_000 }).catch(
+  return waitFor(`tree item "${target}"`, () => find(target, parent), { timeoutMs: 5_000 }).catch(
     () => null,
   );
 }
 
-/** Opens a table's data from its tree row: the app's open button, else a double-click. */
+/** Opens a table's data from its tree row (double-click, as a user would). */
 async function openTableData(node) {
   await wd.execute("arguments[0].click();", node);
-  const opener = await locate("openTableData");
-  if (opener) {
-    await wd.click(opener);
-    return;
-  }
   await wd.execute(
     "arguments[0].dispatchEvent(new MouseEvent('dblclick', { bubbles: true }));",
     node,
   );
 }
 
-async function editCell() {
-  const table = "m3_edit_pk";
-  const code = `e2e-${Date.now().toString(36)}`;
-  // A row of its own: live edit tests never change the seed rows 1-3.
-  await typeSql(`INSERT INTO m3.${table} (code) VALUES ('${code}')`);
-  const t0 = await clickRun();
-  const inserted = (
-    await waitFor("the INSERT to finish", () => endedSince(t0), { timeoutMs: 30_000 })
-  ).status;
-  if (!inserted.startsWith("Finished")) {
-    throw new SkipStep(`could not insert a test row into m3.${table} (${inserted}); M3 fixtures?`);
+/** The table-data tab of table `name` (its section is labelled "Table <schema>.<name>"). */
+function tableView(name) {
+  return wd.executeElement(
+    "const name = arguments[0];" +
+      "const views = new Set(document.querySelectorAll('[data-testid=table-data], section.table-data'));" +
+      "for (const v of views) { const l = (v.getAttribute('aria-label') || '').trim();" +
+      "  if (l === 'Table ' + name || l.endsWith('.' + name) || l.endsWith('.\"' + name + '\"')) return v; }" +
+      "return null;",
+    name,
+  );
+}
+
+/** Text of a hook inside `view` (the tab's own status, errors, ...). */
+function viewHookText(view, hook) {
+  return wd.execute(
+    "const [view, hook] = arguments;" +
+      "for (const id of window.__e2e.hooks[hook].testids) {" +
+      "  const e = view.querySelector('[data-testid=\"' + id + '\"]');" +
+      "  if (e) return e.textContent.replace(/\\u00a0/g, ' ').trim(); }" +
+      "return null;",
+    view,
+    hook,
+  );
+}
+
+/** The cell of column `column` whose text is `text` in the grid of `view`, or null. */
+function viewCell(view, column, text) {
+  return wd.executeElement(
+    "const [view, column, text] = arguments;" +
+      "const table = view.querySelector('table[role=grid]'); if (!table) return null;" +
+      "let idx = null; for (const th of table.querySelectorAll('thead th')) {" +
+      "  const t = th.textContent.trim(); if (t === column || t.split(/\\s/)[0] === column) idx = th.getAttribute('aria-colindex'); }" +
+      "if (!idx) return null;" +
+      "for (const td of table.querySelectorAll('tbody td[aria-colindex=\"' + idx + '\"]'))" +
+      "  if (td.textContent.trim() === text) return td;" +
+      "return null;",
+    view,
+    column,
+    text,
+  );
+}
+
+/**
+ * Waits for a cell of `view`'s grid (Glide's accessibility table). That table is rebuilt when
+ * the selection or viewport changes, not when a page arrives, so it switches the view to Form
+ * and back to Grid when the cell stays absent (the grid remounts from the loaded pages).
+ */
+async function waitViewCell(view, column, text, what, timeoutMs = 20_000) {
+  let nudged = Date.now();
+  return waitFor(
+    what,
+    async () => {
+      const cell = await viewCell(view, column, text);
+      if (cell) return cell;
+      if (Date.now() - nudged > 2_500) {
+        nudged = Date.now();
+        await wd.execute(
+          "const tabs = arguments[0].querySelectorAll('[role=tablist] [role=tab]');" +
+            "const by = (t) => Array.from(tabs).find((b) => b.textContent.trim() === t);" +
+            "const form = by('Form'), grid = by('Grid');" +
+            "if (form && grid) { form.click(); setTimeout(() => grid.click(), 150); }",
+          view,
+        );
+      }
+      return null;
+    },
+    { timeoutMs, intervalMs: 200 },
+  );
+}
+
+/**
+ * Runs `sql` on the open connection through the app's IPC (`query_run` + `query_page`), not
+ * through the UI, and returns the first result's rows as strings. Used to set up, check and
+ * clean up the edit step independently of the view under test.
+ */
+let sqlRuns = 0;
+async function sqlViaIpc(sql) {
+  await loadArrow();
+  sqlRuns += 1;
+  const result = await wd.executeAsync(
+    `const [sql, editorId, done] = arguments;
+     (async () => {
+       const T = window.__TAURI_INTERNALS__;
+       const sessions = await T.invoke("list_open_connections");
+       if (!sessions.length) throw new Error("no open connection");
+       const failures = [];
+       let hasResult = false;
+       let finish;
+       const ended = new Promise((resolve) => { finish = resolve; });
+       const callback = T.transformCallback((raw) => {
+         const m = raw && typeof raw === "object" && "message" in raw ? raw.message : raw;
+         if (!m || typeof m !== "object") return;
+         if (m.type === "resultSet" && m.resultIndex === 0) hasResult = true;
+         if (m.type === "statementFailed") failures.push(m.error && m.error.message || "statement failed");
+         if (m.type === "finished" || m.type === "failed" || m.type === "cancelled") finish(m);
+       });
+       try {
+         const runId = await T.invoke("query_run", { sessionId: sessions[0].id, editorId,
+           script: sql, options: null, onEvent: "__CHANNEL__:" + callback });
+         const end = await Promise.race([ended,
+           new Promise((_, reject) => setTimeout(() => reject(new Error("no end event in 30 s")), 30000))]);
+         if (end.type !== "finished" || failures.length) {
+           return { error: end.type + (end.error ? ": " + end.error.message : "") +
+             (failures.length ? ": " + failures.join("; ") : "") };
+         }
+         if (!hasResult) return { rows: [] };
+         const raw = await T.invoke("query_page", { runId, resultIndex: 0, offset: 0, limit: 100 });
+         const bytes = raw instanceof ArrayBuffer ? new Uint8Array(raw)
+           : raw instanceof Uint8Array ? raw : Uint8Array.from(raw);
+         const table = window.Arrow.tableFromIPC(bytes);
+         const rows = [];
+         for (let r = 0; r < table.numRows; r += 1) {
+           const row = [];
+           for (let c = 0; c < table.numCols; c += 1) {
+             const v = table.getChildAt(c).get(r);
+             row.push(v === null || v === undefined ? null : String(v));
+           }
+           rows.push(row);
+         }
+         return { rows };
+       } finally {
+         await T.invoke("query_close_editor", { editorId }).catch(() => {});
+       }
+     })().then(done, (e) => done({ error: String(e && e.message || e) }));`,
+    sql,
+    `e2e-sql-${sqlRuns}`,
+  );
+  if (!result || !Array.isArray(result.rows)) {
+    throw new Error(`${sql.split(/\s/)[0]} through IPC failed: ${result?.error}`);
   }
-  const node = await treeRow([config.profileName, "oxbase_test", "m3", "Tables"], table);
-  if (!node) throw new SkipStep(`m3.${table} is not in the object tree (M3 fixtures not merged?)`);
-  await openTableData(node);
-  const view = await waitFor("the table data view", () => locate("tableData"), {
-    timeoutMs: 10_000,
-  }).catch(() => null);
-  if (!view) {
+  return result.rows;
+}
+
+/** 10 base36 characters from the time and the pid (tests/fixtures.toml [m3] convention). */
+function runToken() {
+  const time = Date.now().toString(36).slice(-6);
+  const pid = process.pid.toString(36).padStart(4, "0").slice(-4);
+  return `${time}${pid}`;
+}
+
+async function editCell() {
+  // 1. Is the M3 table-data UI in this build? Open the data of an M2 fixture table first, so a
+  //    missing M3 fixture is never mistaken for a missing UI.
+  const probe = await treeRow([config.profileName, "oxbase_test", "public", "Tables"], "customers");
+  if (!probe) throw new Error("public.customers (M2 fixture) is not in the object tree");
+  await openTableData(probe);
+  const probeView = await waitFor(
+    "a table data tab for public.customers",
+    () => tableView("customers"),
+    { timeoutMs: 10_000 },
+  ).catch(() => null);
+  if (!probeView) {
     throw new SkipStep(
-      'the M3 table data UI is not in this build (no [data-testid="table-data"] after ' +
-        "opening the table; see ui/e2e/README.md for the hooks it expects)",
+      "the M3 table data UI is not in this build (double-clicking a table in the object tree " +
+        "opened no table-data tab; see ui/e2e/README.md for the hooks it expects)",
     );
   }
-  const edited = `${code}-edited`;
-  const cell = await waitFor(
-    `the "code" cell of the test row`,
-    () =>
-      wd.executeElement(
-        "const view = arguments[0];" +
-          "const table = view.querySelector('table[role=grid]'); if (!table) return null;" +
-          "let idx = null; for (const th of table.querySelectorAll('thead th'))" +
-          "  if (th.textContent.trim() === 'code') idx = th.getAttribute('aria-colindex');" +
-          "if (!idx) return null;" +
-          "for (const td of table.querySelectorAll('tbody td[aria-colindex=\"' + idx + '\"]'))" +
-          "  if (td.textContent === arguments[1]) return td;" +
+  // From here on the UI is present: every problem is a failure, never a skip.
+
+  // 2. A row of its own: live edit tests never change the seed rows 1-3.
+  const table = "m3_edit_pk";
+  const token = runToken();
+  const code = `t${token}-e`;
+  const edited = `t${token}-edited`;
+  const inserted = await sqlViaIpc(
+    `INSERT INTO m3.${table} (code, name) VALUES ('${code}', 'webview smoke') RETURNING id`,
+  ).catch((error) => {
+    throw new Error(`could not insert a test row into m3.${table} (M3 fixture?): ${error.message}`);
+  });
+  const id = inserted[0]?.[0];
+  if (!id || !/^\d+$/.test(id))
+    throw new Error(`INSERT ... RETURNING id gave ${JSON.stringify(inserted)}`);
+  report.edit = { table: `m3.${table}`, id: Number(id), from: code, to: edited, cleanedUp: false };
+  try {
+    // 3. Open the table's data from the tree.
+    const node = await treeRow([config.profileName, "oxbase_test", "m3", "Tables"], table);
+    if (!node) throw new Error(`m3.${table} is not in the object tree`);
+    await openTableData(node);
+    const view = await waitFor(`the table data tab of m3.${table}`, () => tableView(table), {
+      timeoutMs: 15_000,
+    });
+    await waitFor(
+      "the table data to load and become editable",
+      async () => {
+        const errors = await viewHookText(view, "applyErrors");
+        if (errors) throw new Fatal(`table data shows errors: ${errors}`);
+        const readOnly = await wd.execute(
+          "const b = arguments[0].querySelector('[data-testid=read-only-banner]');" +
+            "return b ? b.textContent : null;",
+          view,
+        );
+        if (readOnly) throw new Fatal(`m3.${table} opened read-only: ${readOnly}`);
+        const status = (await viewHookText(view, "tableDataStatus")) ?? "";
+        if (status.startsWith("Failed")) throw new Fatal(`table data: ${status}`);
+        return parseCount(status) !== null && !status.startsWith("Loading");
+      },
+      { timeoutMs: 30_000 },
+    );
+
+    // 4. Edit the test row's `code` cell in the grid's overlay editor.
+    const cell = await waitViewCell(view, "code", code, `the "code" cell of the test row`);
+    const input = await waitFor(
+      "the cell editor",
+      async () => {
+        const found = await wd.executeElement(
+          "const e = document.querySelector('[data-testid=cell-editor]');" +
+            "return e ? e.querySelector('textarea.value-input, input.value-input') : null;",
+        );
+        if (found) return found;
+        // A click on the accessibility cell selects it and sends Enter (opens the editor).
+        await wd.execute("arguments[0].focus(); arguments[0].click();", cell).catch(() => {});
+        return null;
+      },
+      { timeoutMs: 15_000, intervalMs: 1_000 },
+    );
+    // The editor starts from the stored text (loaded with row_get_form): wait for it, then
+    // replace it.
+    await waitFor("the cell editor to show the stored value", () =>
+      wd.execute("return arguments[0].value === arguments[1];", input, code),
+    );
+    await wd.sendKeys(input, Keys.end + Keys.backspace.repeat(code.length + 2) + edited);
+    const typed = await wd.execute("return arguments[0].value;", input);
+    if (typed !== edited) throw new Error(`the cell editor shows ${JSON.stringify(typed)}`);
+    await wd.sendKeys(input, Keys.enter);
+    await waitFor("the edit to be pending", async () => {
+      const status = (await viewHookText(view, "tableDataStatus")) ?? "";
+      return status.includes("pending") ? status : null;
+    });
+
+    // 5. Apply, and wait for the result: committed, no errors, nothing left pending.
+    const apply = await waitFor("an enabled Apply button", async () => {
+      const el = await wd.executeElement(
+        "for (const id of window.__e2e.hooks.applyEdits.testids) {" +
+          "  const e = arguments[0].querySelector('[data-testid=\"' + id + '\"]'); if (e) return e; }" +
           "return null;",
         view,
-        code,
-      ),
-    { timeoutMs: 15_000 },
-  );
-  // Clicking the accessibility cell opens Glide's overlay editor for it.
-  await wd.execute("arguments[0].click();", cell);
-  const input = await waitFor(
-    "the cell editor",
-    () =>
-      wd.executeElement(
-        "return document.querySelector('.gdg-growing-entry textarea, #portal textarea, " +
-          ".result-grid__portal textarea, [data-testid=cell-editor] textarea, [data-testid=cell-editor] input');",
-      ),
-    { timeoutMs: 5_000 },
-  );
-  await wd.chord(Keys.control, "a");
-  await wd.sendKeys(input, edited);
-  await wd.sendKeys(input, Keys.enter);
-  const apply = await waitFor("the Apply button", () => locate("applyEdits"), {
-    timeoutMs: 5_000,
-  }).catch(() => null);
-  if (!apply) throw new SkipStep('no [data-testid="edit-apply"] button in the table data view');
-  await wd.click(apply);
-  await sleep(500);
-  // Reopen and look for the new value.
-  await openTableData(node);
-  await waitFor(
-    "the edited value after reopening",
-    () =>
-      wd.execute(
-        "for (const v of document.querySelectorAll('[data-testid=table-data]'))" +
-          "  for (const td of v.querySelectorAll('table[role=grid] tbody td'))" +
-          "    if (td.textContent === arguments[0]) return true;" +
-          "return false;",
-        edited,
-      ),
-    { timeoutMs: 15_000 },
-  );
-  report.edit = { table: `m3.${table}`, from: code, to: edited };
-  return `m3.${table}: "${code}" -> "${edited}" applied and read back`;
+      );
+      return el && (await wd.execute("return !arguments[0].disabled;", el)) ? el : null;
+    });
+    await wd.click(apply);
+    const saved = await waitFor(
+      "the apply to commit",
+      async () => {
+        const errors = await viewHookText(view, "applyErrors");
+        if (errors) throw new Fatal(`apply failed: ${errors}`);
+        const status = (await viewHookText(view, "tableDataStatus")) ?? "";
+        const busy = await wd.execute("return /Applying/.test(arguments[0].textContent);", apply);
+        if (busy || status.includes("pending")) return null;
+        return status;
+      },
+      { timeoutMs: 30_000 },
+    );
+
+    // 6. The database has the new value (read independently of the open view).
+    const stored = await sqlViaIpc(`SELECT code FROM m3.${table} WHERE id = ${id}`);
+    if (stored.length !== 1 || stored[0][0] !== edited) {
+      throw new Error(`after apply the row holds ${JSON.stringify(stored)}, not "${edited}"`);
+    }
+
+    // 7. Reopen: Refresh issues a new table_data_open, and the reloaded grid shows the value.
+    const refresh = await wd.executeElement(
+      "for (const b of arguments[0].querySelectorAll('[role=toolbar] button'))" +
+        "  if (b.textContent.trim() === 'Refresh') return b;" +
+        "return null;",
+      view,
+    );
+    if (!refresh) throw new Error("no Refresh button in the table data tab");
+    const t0 = await wd.execute("return performance.now();");
+    await wd.click(refresh);
+    const ipcSeen = await wd.execute("return window.__e2e.ipc.length > 0;");
+    if (ipcSeen) {
+      await waitFor("a new table_data_open request", () =>
+        wd.execute(
+          "return window.__e2e.ipc.some((e) => e.cmd === 'table_data_open' && e.start >= arguments[0]);",
+          t0,
+        ),
+      );
+    }
+    await waitViewCell(view, "code", edited, "the edited value in the reloaded grid");
+    const reloaded = (await viewHookText(view, "tableDataStatus")) ?? "";
+    if (reloaded.includes("pending")) throw new Error(`after reload the tab shows "${reloaded}"`);
+    report.edit.saved = saved;
+    return `m3.${table} row ${id}: "${code}" -> "${edited}" committed, stored and shown after reload`;
+  } finally {
+    // 8. Clean up, also after a failure.
+    try {
+      await sqlViaIpc(`DELETE FROM m3.${table} WHERE id = ${id}`);
+      report.edit.cleanedUp = true;
+    } catch (error) {
+      log(`could not delete test row ${id} of m3.${table}: ${error.message}`);
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -889,6 +1141,14 @@ function markdownSummary() {
   for (const r of results) {
     const detail = String(r.detail).replaceAll("|", "\\|").replaceAll("\n", " ").slice(0, 300);
     lines.push(`| ${r.name} | ${r.status} | ${(r.ms / 1000).toFixed(1)} s | ${detail} |`);
+  }
+  if (results.some((r) => r.status === "skipped")) {
+    lines.push(
+      "",
+      "> **Warning:** a step was skipped (see its detail). Set `OXBASE_E2E_REQUIRE_EDIT=1` to make " +
+        "a skip fail; `scripts/e2e-smoke.sh` sets it when the checkout has the M3 table-data UI " +
+        "and the M3 PostgreSQL fixture.",
+    );
   }
   const pl = report.pageLatency;
   if (pl) {
@@ -928,6 +1188,12 @@ function markdownSummary() {
       "",
       `Query: ${report.query.rows.toLocaleString("en-US")} rows, finished ${report.query.msToFinished} ms ` +
         `after Run; the row counter changed ${report.query.counterUpdates} times while streaming.`,
+    );
+  }
+  if (report.edit) {
+    lines.push(
+      `Edit: m3.m3_edit_pk row ${report.edit.id} "${report.edit.from}" -> "${report.edit.to}"; ` +
+        `test row ${report.edit.cleanedUp ? "deleted" : "NOT deleted"} afterwards.`,
     );
   }
   if (report.cancel) {
