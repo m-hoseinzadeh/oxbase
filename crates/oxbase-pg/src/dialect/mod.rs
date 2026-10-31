@@ -1,5 +1,9 @@
-//! PostgreSQL dialect cells (M2): catalog [`Fetcher`](oxbase_dialect::Fetcher)s, the object-tree
-//! layout, capabilities and quoting. Register them with [`register`].
+//! PostgreSQL dialect cells: catalog [`Fetcher`](oxbase_dialect::Fetcher)s, the object-tree
+//! layout, capabilities and quoting (M2), and the table designer and grid editing roles (M3):
+//! [`DdlGenerator`](oxbase_dialect::DdlGenerator) and
+//! [`Comparator`](oxbase_dialect::Comparator) cells for tables, columns, indexes, foreign keys
+//! and checks, the [`DmlWriter`](oxbase_dialect::DmlWriter) and
+//! [`Capabilities::designer`]. Register them with [`register`].
 //!
 //! # Object tree
 //!
@@ -37,7 +41,21 @@
 //!
 //! Engine-specific extras beyond `oxbase_types::props` are the constants re-exported here
 //! ([`NULLS_NOT_DISTINCT`], [`NOT_VALID`], ...).
+//!
+//! # Designer and grid editing (M3)
+//!
+//! - DDL (`ddl.rs`): native, transactional statements for every change (see its module docs
+//!   for the order of an alter and the version gates); identifiers through [`PgQuoting`],
+//!   literals through `quote_str`, expressions and type names checked lexically.
+//! - Comparison: `RulesComparator(`[`PgRules`]`)`, which folds type aliases
+//!   ([`canonical_type`]) and the server's rewriting of expressions
+//!   ([`normalize_expression`]).
+//! - Grid writes (`dml.rs`): bound `$n` parameters, key-only `WHERE`, `RETURNING` read-back.
 
+mod caps;
+mod compare;
+mod ddl;
+mod dml;
 mod fetch;
 mod rows;
 mod sql;
@@ -45,10 +63,14 @@ mod types;
 
 use std::sync::Arc;
 
+use oxbase_dialect::compare::RulesComparator;
 use oxbase_dialect::{
-    Capabilities, ChildGroup, DatabaseScope, DialectRegistry, PgQuoting, TreeLayout,
+    Capabilities, ChildGroup, DESIGNER_KINDS, DatabaseScope, DesignerCapabilities, DialectRegistry,
+    PgQuoting, TreeLayout,
 };
 use oxbase_types::{Engine, ObjectKind, PropId, ServerVersion};
+
+pub use compare::{PgRules, canonical_type, normalize_expression};
 
 pub use fetch::{
     BASE_TYPE, CTYPE, ENUM_LABELS, EXCLUSION, EXTENSION_SCHEMA, EXTENSION_VERSION,
@@ -78,12 +100,20 @@ const APPLICABLE: [ObjectKind; 18] = [
     ObjectKind::Extension,
 ];
 
-/// Registers the PostgreSQL fetchers, tree layout, capabilities and quoting in `reg`.
+/// Registers the PostgreSQL fetchers, tree layout, capabilities and quoting (M2), and the DDL
+/// generators, comparators and grid writer (M3) in `reg`.
 pub fn register(reg: &mut DialectRegistry) {
     let engine = Engine::Postgres;
     for kind in fetch::KINDS {
         reg.register_fetcher(engine, kind, Arc::new(fetch::PgFetcher::new(kind)));
     }
+    let ddl = Arc::new(ddl::PgDdl);
+    let comparator = Arc::new(RulesComparator(PgRules));
+    for kind in DESIGNER_KINDS {
+        reg.register_ddl(engine, kind, ddl.clone());
+        reg.register_comparator(engine, kind, comparator.clone());
+    }
+    reg.register_dml_writer(engine, Arc::new(dml::PgDmlWriter));
     reg.register_tree_layout(engine, tree_layout());
     reg.register_capabilities(engine, Arc::new(PgCapabilities));
     reg.register_quoting(engine, Arc::new(PgQuoting));
@@ -150,6 +180,10 @@ impl Capabilities for PgCapabilities {
             _ => true,
         }
     }
+
+    fn designer(&self, v: &ServerVersion) -> DesignerCapabilities {
+        caps::designer(v)
+    }
 }
 
 #[cfg(test)]
@@ -193,6 +227,26 @@ mod tests {
             reg.status(engine, ObjectKind::User),
             CellStatus::NotApplicable
         );
+    }
+
+    #[test]
+    fn registers_every_designer_role() {
+        let mut reg = DialectRegistry::new();
+        register(&mut reg);
+        assert_eq!(
+            reg.missing_designer_roles(Engine::Postgres),
+            Vec::<String>::new()
+        );
+        let caps = reg.capabilities(Engine::Postgres).unwrap();
+        assert!(
+            caps.designer(&ServerVersion::new(18, 6, 0))
+                .transactional_ddl
+        );
+        for kind in DESIGNER_KINDS {
+            assert!(reg.ddl(Engine::Postgres, kind).is_ok(), "{kind}");
+            assert!(reg.comparator(Engine::Postgres, kind).is_ok(), "{kind}");
+        }
+        assert!(reg.dml_writer(Engine::Postgres).is_ok());
     }
 
     #[test]
