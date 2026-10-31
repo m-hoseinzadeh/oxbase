@@ -201,7 +201,7 @@ impl Filter {
         Self::Or { items }
     }
 
-    pub fn not(item: Filter) -> Self {
+    pub fn negate(item: Filter) -> Self {
         Self::Not {
             item: Box::new(item),
         }
@@ -442,7 +442,7 @@ mod tests {
     fn depth_and_size_are_bounded() {
         let mut f = cond(FilterOp::IsNull, vec![]);
         for _ in 0..MAX_FILTER_DEPTH {
-            f = Filter::not(f);
+            f = Filter::negate(f);
         }
         assert!(f.validate().is_err());
         let wide = Filter::and(
@@ -457,7 +457,7 @@ mod tests {
     fn empty_groups_add_nothing() {
         assert!(Filter::and(vec![]).is_empty());
         assert!(Filter::or(vec![Filter::and(vec![])]).is_empty());
-        assert!(Filter::not(Filter::or(vec![])).is_empty());
+        assert!(Filter::negate(Filter::or(vec![])).is_empty());
         assert!(!Filter::and(vec![Filter::raw_sql("x > 1")]).is_empty());
     }
 
@@ -465,7 +465,7 @@ mod tests {
     fn serde_is_camel_case_and_type_tagged() {
         let f = Filter::and(vec![
             Filter::condition("id", FilterOp::Ge, vec![Value::Int(3)]),
-            Filter::not(Filter::condition(
+            Filter::negate(Filter::condition(
                 "name",
                 FilterOp::StartsWith,
                 vec!["a%".into()],

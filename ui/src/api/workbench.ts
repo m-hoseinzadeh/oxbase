@@ -3,10 +3,10 @@
  * Every failure is normalised to a `{ category, message }` CommandError, like the connection
  * commands. Result pages come back as Arrow IPC bytes and are decoded here, never as JSON.
  */
-import { Channel, invoke, isTauri } from "@tauri-apps/api/core";
+import { Channel } from "@tauri-apps/api/core";
 import type { Table } from "apache-arrow";
-import { toCommandError } from "../connections/api";
-import { decodeArrowPage, NoCoreError, type RawBytes } from "../ipc";
+import { decodeArrowPage, type RawBytes } from "../ipc";
+import { call } from "./call";
 import type {
   EditorId,
   Engine,
@@ -23,15 +23,6 @@ import type {
   TreeNodeRef,
   TreeOptions,
 } from "./types";
-
-async function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
-  if (!isTauri()) throw toCommandError(new NoCoreError());
-  try {
-    return await invoke<T>(cmd, args);
-  } catch (error) {
-    throw toCommandError(error);
-  }
-}
 
 /** Children of a tree node. `requestId` makes the call cancellable with `cancelRequest`. */
 export function treeChildren(

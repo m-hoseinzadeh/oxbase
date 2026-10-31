@@ -1,3 +1,10 @@
-/** M2 workbench API: payload types and typed command wrappers (docs/m2-contracts.md §5). */
+/**
+ * Workbench API: payload types and typed command wrappers. M2: tree, query runs, history
+ * (docs/m2-contracts.md §5). M3: table data, grid editing, table designer
+ * (docs/m3-contracts.md §7).
+ */
+export * from "./data";
+export * from "./designer";
+export * from "./pending";
 export * from "./types";
 export * from "./workbench";

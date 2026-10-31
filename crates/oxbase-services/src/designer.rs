@@ -166,20 +166,21 @@ impl DesignerService {
             .ok_or_else(|| Error::not_found(format!("no open session {session}")))?;
         let engine = handle.summary().engine;
         let server_version = handle.info().server_version.clone();
-        let designer = self
-            .dialects
-            .capabilities(engine)
-            .map(|caps| caps.designer(&server_version))
-            .unwrap_or_default();
+        let designer = match self.dialects.capabilities(engine) {
+            Ok(caps) => caps.designer(&server_version),
+            Err(_) => DesignerCapabilities::read_only(),
+        };
+        let grid_editing = self.dialects.dml_writer(engine).is_ok();
+        let nulls_ordering = match self.dialects.quoting(engine) {
+            Ok(quoting) => quoting.nulls_ordering(),
+            Err(_) => false,
+        };
         Ok(EngineCapabilities {
             engine,
-            designer,
-            grid_editing: self.dialects.dml_writer(engine).is_ok(),
-            nulls_ordering: self
-                .dialects
-                .quoting(engine)
-                .is_ok_and(|quoting| quoting.nulls_ordering()),
             server_version,
+            designer,
+            grid_editing,
+            nulls_ordering,
         })
     }
 

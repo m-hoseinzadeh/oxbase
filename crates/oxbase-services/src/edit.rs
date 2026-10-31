@@ -279,9 +279,10 @@ impl PendingChanges {
 
     /// Marks an existing row for deletion, dropping its pending update.
     pub fn delete_row(&mut self, row: u64) {
-        match self.position(row) {
-            Some(pos) => self.edits[pos] = PendingEdit::Delete { row },
-            None => self.edits.push(PendingEdit::Delete { row }),
+        if let Some(pos) = self.position(row) {
+            self.edits[pos] = PendingEdit::Delete { row };
+        } else {
+            self.edits.push(PendingEdit::Delete { row });
         }
     }
 

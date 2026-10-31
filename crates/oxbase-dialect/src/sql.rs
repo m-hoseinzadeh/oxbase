@@ -640,7 +640,7 @@ mod tests {
                 Filter::condition("name", FilterOp::IsNull, vec![]),
             ]),
             Filter::and(vec![]),
-            Filter::not(Filter::condition(
+            Filter::negate(Filter::condition(
                 "order",
                 FilterOp::In,
                 vec!["a".into(), "b".into()],
