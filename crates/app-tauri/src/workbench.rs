@@ -242,7 +242,7 @@ pub async fn history_set_settings(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oxbase_store::{HistoryRepository, MemoryHistoryRepository};
+    use oxbase_store::MemoryHistoryRepository;
 
     #[tokio::test]
     async fn history_commands_forward_to_the_service() {
