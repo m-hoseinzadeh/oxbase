@@ -806,10 +806,8 @@ mod tests {
         assert_eq!(cell["object_kind"], "database");
         assert_eq!(cell["check"], "roundtrip");
         assert_eq!(cell["status"], "pending");
-        assert_eq!(
-            cell["detail"],
-            "pending (M3: needs DdlGenerator and Comparator cells)"
-        );
+        // Databases have no round trip (only the designer kinds do).
+        assert_eq!(cell["detail"], crate::matrix::PENDING_ROUNDTRIP);
         assert!(cell.get("elapsed_ms").is_none());
         let back: Report = serde_json::from_value(json).unwrap();
         assert_eq!(back.summary, report.summary);

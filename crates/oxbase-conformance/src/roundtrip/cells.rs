@@ -2,7 +2,6 @@
 //! [`super`]).
 
 use std::fmt::Write as _;
-use std::future::Future;
 use std::sync::Arc;
 
 use oxbase_dialect::{
@@ -76,37 +75,35 @@ impl CellReport {
 
 /// Runs the round trip of `kind` (holding the session for the whole cell) and the capability
 /// checks that go with it.
-pub(crate) fn run(env: Arc<Env>, kind: ObjectKind) -> impl Future<Output = CellReport> + Send {
-    async move {
-        let _guard = env.session.exclusive().await;
-        let roles = match Roles::resolve(&env.registry, env.engine, kind) {
-            Ok(r) => r,
-            Err(why) => {
-                return CellReport {
-                    roundtrip: (CellStatus::Pending, format!("pending ({why})")),
-                    capabilities: (CellStatus::Pending, format!("pending ({why})")),
-                };
-            }
-        };
-        let conn = env.session.connection().clone();
-        let mut run = Run {
-            env: &env,
-            roles,
-            conn,
-            agree: Vec::new(),
-            disagree: Vec::new(),
-            done: Vec::new(),
-        };
-        let result = match kind {
-            ObjectKind::Table => run.table().await,
-            ObjectKind::Column => run.column().await,
-            ObjectKind::Index => run.index().await,
-            ObjectKind::ForeignKey => run.foreign_key().await,
-            ObjectKind::Check => run.check().await,
-            other => Err(format!("no round trip is defined for {other}")),
-        };
-        run.report(result)
-    }
+pub(crate) async fn run(env: Arc<Env>, kind: ObjectKind) -> CellReport {
+    let _guard = env.session.exclusive().await;
+    let roles = match Roles::resolve(&env.registry, env.engine, kind) {
+        Ok(r) => r,
+        Err(why) => {
+            return CellReport {
+                roundtrip: (CellStatus::Pending, format!("pending ({why})")),
+                capabilities: (CellStatus::Pending, format!("pending ({why})")),
+            };
+        }
+    };
+    let conn = env.session.connection().clone();
+    let mut run = Run {
+        env: &env,
+        roles,
+        conn,
+        agree: Vec::new(),
+        disagree: Vec::new(),
+        done: Vec::new(),
+    };
+    let result = match kind {
+        ObjectKind::Table => run.table().await,
+        ObjectKind::Column => run.column().await,
+        ObjectKind::Index => run.index().await,
+        ObjectKind::ForeignKey => run.foreign_key().await,
+        ObjectKind::Check => run.check().await,
+        other => Err(format!("no round trip is defined for {other}")),
+    };
+    run.report(&result)
 }
 
 /// The dialect roles one cell uses.
@@ -341,13 +338,13 @@ impl Run<'_> {
             .child(ObjectKind::Table, self.env.names[i].clone())
     }
 
-    fn report(self, result: Outcome) -> CellReport {
+    fn report(self, result: &Outcome) -> CellReport {
         let done = if self.done.is_empty() {
             "nothing".to_owned()
         } else {
             self.done.join(", ")
         };
-        let roundtrip = match &result {
+        let roundtrip = match result {
             Ok(None) => (CellStatus::Pass, done),
             Ok(Some(why)) => (CellStatus::NotApplicable, why.clone()),
             Err(e) => (CellStatus::Fail, format!("{e} (passed before: {done})")),

@@ -15,7 +15,7 @@ use arrow_array::{
     LargeStringArray, StringArray, StringViewArray, UInt8Array, UInt16Array, UInt32Array,
     UInt64Array,
 };
-use oxbase_driver::{CancellationToken, Collected, Connection, ResultStream, Tx};
+use oxbase_driver::{CancellationToken, Collected, Connection, ResultSet, ResultStream, Tx};
 use oxbase_types::{Result, Script, ScriptStep, StepCheck, StepPhase, Value};
 
 /// Where a step runs: on the connection (auto-commit) or inside the script's transaction.
@@ -149,7 +149,7 @@ async fn run_step(
         captures.insert(name.clone(), first_text(&out).unwrap_or_default());
     }
     if step.check == StepCheck::ExpectNoRows {
-        let rows: usize = out.result_sets.iter().map(|r| r.num_rows()).sum();
+        let rows: usize = out.result_sets.iter().map(ResultSet::num_rows).sum();
         if rows > 0 {
             return Err(format!(
                 "{label}: expected no rows, got {rows} (first value: {})",
