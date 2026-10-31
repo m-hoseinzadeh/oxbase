@@ -6,6 +6,10 @@
 //! [`DriverRegistry`](oxbase_driver::DriverRegistry) for both. A connection reports the flavour
 //! its server announces in `VERSION()` ([`Flavor`]).
 //!
+//! The dialect cells (object-tree fetchers, tree layout, capabilities, quoting) are in
+//! [`dialect`]; [`dialect::register`] adds them to a
+//! [`DialectRegistry`](oxbase_dialect::DialectRegistry) for both engines.
+//!
 //! # Results
 //!
 //! - Rows stream as Arrow batches of at most [`MySqlOptions::batch_rows`] rows or about
@@ -54,6 +58,7 @@
 //!   never logged or formatted by this crate.
 
 mod conn;
+pub mod dialect;
 mod driver;
 mod error;
 pub mod types;

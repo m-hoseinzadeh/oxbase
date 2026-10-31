@@ -140,6 +140,8 @@ pub struct MySqlConnection {
     version: ServerVersion,
     tls: bool,
     server: String,
+    /// The connect-time default database (`ConnectParams::database`), if any.
+    database: Option<String>,
 }
 
 impl fmt::Debug for MySqlConnection {
@@ -151,6 +153,7 @@ impl fmt::Debug for MySqlConnection {
             .field("version", &self.version.raw())
             .field("connection_id", &self.shared.connection_id)
             .field("tls", &self.tls)
+            .field("database", &self.database)
             .finish_non_exhaustive()
     }
 }
@@ -181,7 +184,16 @@ impl MySqlConnection {
             version,
             tls,
             server,
+            database: None,
         }
+    }
+
+    /// Records the connect-time default database, reported by [`Connection::current_database`].
+    /// An empty name means "none", as it does for the server.
+    #[must_use]
+    pub(crate) fn with_database(mut self, database: Option<String>) -> Self {
+        self.database = database.filter(|d| !d.is_empty());
+        self
     }
 
     /// Whether the server is MySQL or MariaDB (detected from its version string).
@@ -217,6 +229,10 @@ impl Connection for MySqlConnection {
 
     fn tls_in_use(&self) -> bool {
         self.tls
+    }
+
+    fn current_database(&self) -> Option<String> {
+        self.database.clone()
     }
 
     async fn execute(
