@@ -218,6 +218,26 @@ impl Live {
     /// Connects to engine `key`; with `generic_writer`, an engine without a `DmlWriter` gets
     /// the generic one.
     pub(crate) async fn connect(key: &'static str, engine: Engine, generic_writer: bool) -> Self {
+        Self::connect_with(key, engine, |registry| {
+            if generic_writer
+                && registry.dml_writer(engine).is_err()
+                && let Ok(quoting) = registry.quoting(engine)
+            {
+                report(&format!(
+                    "{key}: no DmlWriter registered yet; using the generic test writer"
+                ));
+                registry.register_dml_writer(engine, Arc::new(GenericWriter { quoting }));
+            }
+        })
+        .await
+    }
+
+    /// Connects to engine `key` with `default_dialects()` changed by `configure`.
+    pub(crate) async fn connect_with(
+        key: &'static str,
+        engine: Engine,
+        configure: impl FnOnce(&mut DialectRegistry),
+    ) -> Self {
         let fx = fixtures();
         let dirs = tempfile::tempdir().unwrap();
         let secrets = Arc::new(MemorySecretStore::new());
@@ -270,15 +290,7 @@ impl Live {
             .await
             .unwrap_or_else(|e| panic!("{key}: connect failed: {e}"));
         let mut registry = default_dialects();
-        if generic_writer
-            && registry.dml_writer(engine).is_err()
-            && let Ok(quoting) = registry.quoting(engine)
-        {
-            report(&format!(
-                "{key}: no DmlWriter registered yet; using the generic test writer"
-            ));
-            registry.register_dml_writer(engine, Arc::new(GenericWriter { quoting }));
-        }
+        configure(&mut registry);
         let dialects = Arc::new(registry);
         let query = Arc::new(QueryService::new(
             Arc::clone(&manager),

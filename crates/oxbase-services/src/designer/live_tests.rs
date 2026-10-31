@@ -14,9 +14,11 @@
 //! ```
 
 use oxbase_designer::{DesignColumn, DesignItem};
+use oxbase_dialect::compare::{DefaultRules, RulesComparator};
+use oxbase_dialect::{Capabilities, DdlContext, DdlGenerator, Quoting, Support};
 use oxbase_types::{
     CheckDef, ColumnDef, DataType, Extras, FkAction, ForeignKeyDef, IndexColumn, IndexDef,
-    PrimaryKeyDef,
+    PrimaryKeyDef, PropId,
 };
 
 use super::*;
@@ -272,4 +274,294 @@ fn live_engines_are_the_m3_sql_engines() {
             Engine::Sqlite
         ]
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// The service's apply path on engines whose DDL cells have not landed yet
+// ---------------------------------------------------------------------------------------------
+
+/// A minimal standard-SQL generator for the live apply test (only while the engine has none of
+/// its own): `CREATE TABLE` and `ALTER TABLE ... ADD COLUMN`. A new column named `boom` adds a
+/// step that fails on every engine (it adds the first column again).
+struct GenericDdl {
+    quoting: Arc<dyn Quoting>,
+    transactional: bool,
+}
+
+impl GenericDdl {
+    fn type_sql(data_type: &DataType) -> String {
+        match data_type {
+            DataType::Int { .. } => "integer".to_owned(),
+            DataType::VarChar { length: Some(n) } => format!("varchar({n})"),
+            _ => "varchar(255)".to_owned(),
+        }
+    }
+
+    fn column_sql(&self, column: &ColumnDef) -> String {
+        let not_null = if column.nullable { "" } else { " NOT NULL" };
+        format!(
+            "{} {}{not_null}",
+            self.quoting.quote_ident(&column.name),
+            Self::type_sql(&column.data_type)
+        )
+    }
+
+    fn step(&self, sql: String, description: &str) -> ScriptStep {
+        let step = ScriptStep::new(sql).described(description);
+        if self.transactional {
+            step
+        } else {
+            step.non_transactional()
+        }
+    }
+}
+
+impl DdlGenerator for GenericDdl {
+    fn create(&self, d: &ObjectDef, _ctx: &DdlContext<'_>) -> Result<Script> {
+        let ObjectDef::Table(t) = d else {
+            return Err(Error::unsupported("only tables"));
+        };
+        let mut parts: Vec<String> = t.columns.iter().map(|c| self.column_sql(c)).collect();
+        if let Some(pk) = &t.primary_key {
+            let columns: Vec<String> = pk
+                .columns
+                .iter()
+                .map(|c| self.quoting.quote_ident(c))
+                .collect();
+            parts.push(format!("PRIMARY KEY ({})", columns.join(", ")));
+        }
+        let sql = format!(
+            "CREATE TABLE {} ({})",
+            self.quoting.qualify(&t.obj),
+            parts.join(", ")
+        );
+        Ok([self.step(sql, "Create the table")].into_iter().collect())
+    }
+
+    fn alter(&self, old: &ObjectDef, new: &ObjectDef, ctx: &DdlContext<'_>) -> Result<Script> {
+        let (ObjectDef::Table(a), ObjectDef::Table(b)) = (old, new) else {
+            return Err(Error::unsupported("only tables"));
+        };
+        if !ctx.renames.is_empty() || a.columns.iter().any(|c| b.column(&c.name).is_none()) {
+            return Err(Error::unsupported("the test generator only adds columns"));
+        }
+        let table = self.quoting.qualify(&b.obj);
+        let mut script = Script::new();
+        for column in b.columns.iter().filter(|c| a.column(&c.name).is_none()) {
+            let sql = if column.name == "boom" {
+                format!(
+                    "ALTER TABLE {table} ADD COLUMN {}",
+                    self.column_sql(&a.columns[0])
+                )
+            } else {
+                format!("ALTER TABLE {table} ADD COLUMN {}", self.column_sql(column))
+            };
+            script.push_step(self.step(sql, "Add a column"));
+        }
+        Ok(script)
+    }
+
+    fn drop_object(&self, r: &ObjectRef, _ctx: &DdlContext<'_>) -> Result<Script> {
+        Ok(Script::single(format!(
+            "DROP TABLE {}",
+            self.quoting.qualify(r)
+        )))
+    }
+}
+
+/// The engine's capabilities with a designer that can create tables and add columns.
+struct AddColumnsOnly {
+    inner: Arc<dyn Capabilities>,
+    transactional: bool,
+}
+
+impl Capabilities for AddColumnsOnly {
+    fn supports(&self, kind: ObjectKind, prop: PropId, v: &ServerVersion) -> bool {
+        self.inner.supports(kind, prop, v)
+    }
+
+    fn supports_kind(&self, kind: ObjectKind, v: &ServerVersion) -> bool {
+        self.inner.supports_kind(kind, v)
+    }
+
+    fn designer(&self, _v: &ServerVersion) -> DesignerCapabilities {
+        DesignerCapabilities {
+            transactional_ddl: self.transactional,
+            create_table: true,
+            add_column: Support::Native,
+            auto_increment: true,
+            identity: true,
+            unique_constraints: true,
+            checks_enforced: true,
+            max_identifier_length: Some(63),
+            ..DesignerCapabilities::default()
+        }
+    }
+}
+
+async fn generic_apply(key: &'static str, engine: Engine) {
+    if crate::default_dialects()
+        .ddl(engine, ObjectKind::Table)
+        .is_ok()
+    {
+        report(&format!(
+            "{key}: the engine has its own DDL cells; its round trip covers the apply"
+        ));
+        return;
+    }
+    // MySQL and MariaDB commit every DDL statement on their own.
+    let transactional = !matches!(engine, Engine::MySql | Engine::MariaDb);
+    let live = Live::connect_with(key, engine, |registry| {
+        let quoting = registry.quoting(engine).unwrap();
+        let inner = registry.capabilities(engine).unwrap();
+        registry
+            .register_ddl(
+                engine,
+                ObjectKind::Table,
+                Arc::new(GenericDdl {
+                    quoting,
+                    transactional,
+                }),
+            )
+            .register_comparator(
+                engine,
+                ObjectKind::Table,
+                Arc::new(RulesComparator(DefaultRules)),
+            )
+            .register_capabilities(
+                engine,
+                Arc::new(AddColumnsOnly {
+                    inner,
+                    transactional,
+                }),
+            );
+    })
+    .await;
+    let table = live.table(&format!("m3_svc_{}_g", live.token));
+    live.drop_table(&table).await;
+    let q = live.qualified(&table);
+    live.sql(&format!(
+        "CREATE TABLE {q} (id integer NOT NULL PRIMARY KEY, name varchar(20))"
+    ))
+    .await;
+    let outcome = std::panic::AssertUnwindSafe(generic_steps(&live, &table, transactional));
+    let result = futures::FutureExt::catch_unwind(outcome).await;
+    live.drop_table(&table).await;
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+    report(&format!(
+        "{key}: designer apply (generic generator, transactional {transactional}) ok"
+    ));
+}
+
+async fn generic_steps(live: &Live, table: &ObjectRef, transactional: bool) {
+    let key = live.key;
+    let names = |design: &TableDesign| -> Vec<String> {
+        design
+            .columns
+            .iter()
+            .map(|c| c.column.name.clone())
+            .collect()
+    };
+    let load = || async {
+        live.designer
+            .load(live.session, table, CancellationToken::new())
+            .await
+            .unwrap_or_else(|e| panic!("{key}: load: {e}"))
+    };
+    let options = DesignApplyOptions::default;
+
+    // Add a column: one step, committed, reloaded.
+    let loaded = load().await;
+    let mut edited = loaded.clone();
+    edited
+        .columns
+        .push(column("note", DataType::VarChar { length: Some(20) }, true));
+    let applied = live
+        .designer
+        .apply(live.session, &edited, options(), CancellationToken::new())
+        .await
+        .unwrap_or_else(|e| panic!("{key}: apply: {e}"));
+    assert!(applied.outcome.committed, "{key}: {:?}", applied.outcome);
+    assert_eq!(applied.outcome.atomic, transactional, "{key}");
+    let reloaded = applied.design.expect("reloaded");
+    assert_eq!(names(&reloaded), ["id", "name", "note"], "{key}");
+
+    // A failing second step: all or nothing where DDL is transactional.
+    let mut edited = reloaded.clone();
+    edited
+        .columns
+        .push(column("late", DataType::VarChar { length: Some(20) }, true));
+    edited
+        .columns
+        .push(column("boom", DataType::VarChar { length: Some(20) }, true));
+    let failed = live
+        .designer
+        .apply(live.session, &edited, options(), CancellationToken::new())
+        .await
+        .unwrap_or_else(|e| panic!("{key}: apply: {e}"));
+    assert!(!failed.outcome.committed, "{key}: {:?}", failed.outcome);
+    let statuses: Vec<StepStatus> = failed.outcome.steps.iter().map(|s| s.status).collect();
+    if transactional {
+        assert_eq!(
+            statuses,
+            [StepStatus::RolledBack, StepStatus::Failed],
+            "{key}"
+        );
+        assert_eq!(failed.design, None, "{key}");
+        assert_eq!(names(&load().await), ["id", "name", "note"], "{key}");
+    } else {
+        assert_eq!(statuses, [StepStatus::Done, StepStatus::Failed], "{key}");
+        let partial = failed.design.expect("a non-atomic failure reloads");
+        assert_eq!(names(&partial), ["id", "name", "note", "late"], "{key}");
+    }
+
+    // The table changes between load and apply: refused, nothing runs.
+    let before = load().await;
+    let mut edited = before.clone();
+    edited.columns.push(column(
+        "later",
+        DataType::VarChar { length: Some(20) },
+        true,
+    ));
+    let q = live.qualified(table);
+    live.sql(&format!("ALTER TABLE {q} ADD COLUMN other_col integer"))
+        .await;
+    let err = live
+        .designer
+        .apply(live.session, &edited, options(), CancellationToken::new())
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains(CHANGED_SINCE_LOADED),
+        "{key}: {err}"
+    );
+    assert!(
+        load()
+            .await
+            .columns
+            .iter()
+            .all(|c| c.column.name != "later"),
+        "{key}"
+    );
+}
+
+macro_rules! generic_per_engine {
+    ($($name:ident => ($key:literal, $engine:expr);)*) => {
+        $(
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            #[ignore = "needs the Docker fixtures (scripts/fixtures-up.sh)"]
+            async fn $name() {
+                generic_apply($key, $engine).await;
+            }
+        )*
+    };
+}
+
+generic_per_engine! {
+    postgres_designer_apply_path => ("postgres", Engine::Postgres);
+    mysql_designer_apply_path => ("mysql", Engine::MySql);
+    mariadb_designer_apply_path => ("mariadb", Engine::MariaDb);
+    sqlite_designer_apply_path => ("sqlite", Engine::Sqlite);
 }
