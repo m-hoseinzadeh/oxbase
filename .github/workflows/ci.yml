@@ -214,13 +214,18 @@ jobs:
           bash scripts/ci-fixtures.sh up
 
       # Prints the object-kind matrix (M2: fetch_list cells list and load the [m2] seed objects
-      # through every registered Fetcher) and the M1 connection table (plain, TLS, SSH, TLS over
+      # through every registered Fetcher; M3: the round-trip table) and the M1 connection table (plain, TLS, SSH, TLS over
       # SSH, cancel, 200k-row stream). One thread so the cancel timings do not compete with probes.
       # Every lane also requires each M2 engine (PostgreSQL, MySQL, MariaDB, SQLite) to register
       # its tree layout and pass its fetch_list cells (all four M2 dialects are merged).
+      # M3: the roundtrip / capabilities cells (table, column, index, foreign key, check) run for
+      # every engine that registered its DdlGenerator and Comparator cells; a failing one fails
+      # the job, a pending one does not. The integrator sets OXBASE_CONFORMANCE_REQUIRE_M3_ROUNDTRIP
+      # to "1" once the pg, mysql and sqlite streams are merged, so every M3 cell must then pass.
       - name: Run conformance harness
         env:
           OXBASE_CONFORMANCE_REQUIRE_M2_FETCH: "1"
+          OXBASE_CONFORMANCE_REQUIRE_M3_ROUNDTRIP: "0"
         run: cargo test -p oxbase-conformance --locked -- --include-ignored --nocapture --test-threads 1
 
       # Driver, tunnel and connection-manager live tests (SSH bastion, TLS-only users, cancel),
