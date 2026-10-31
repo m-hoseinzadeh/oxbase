@@ -747,7 +747,20 @@ impl<'a> Validator<'a> {
 
     fn column(&mut self, path: &str, item: &DesignColumn, column: &ColumnDef) {
         let caps = self.caps;
-        if (column.auto_increment || column.identity.is_some()) && !is_integer(&column.data_type) {
+        let old = item
+            .origin
+            .and_then(|origin| self.original().and_then(|o| o.columns.get(origin)));
+        // What the server reported for an unchanged property is not the user's to fix: only
+        // new and changed properties are checked against the engine.
+        let generates_changed = old.is_none_or(|o| {
+            o.auto_increment != column.auto_increment
+                || o.identity != column.identity
+                || o.data_type != column.data_type
+        });
+        if generates_changed
+            && (column.auto_increment || column.identity.is_some())
+            && !is_integer(&column.data_type)
+        {
             self.error(
                 path.to_owned(),
                 format!(
@@ -756,13 +769,17 @@ impl<'a> Validator<'a> {
                 ),
             );
         }
-        if column.identity.is_some() && !caps.identity {
+        if generates_changed && column.identity.is_some() && !caps.identity {
             self.error(
                 path.to_owned(),
                 "identity columns are not supported on this database",
             );
         }
-        if column.auto_increment && column.identity.is_none() && !caps.auto_increment {
+        if generates_changed
+            && column.auto_increment
+            && column.identity.is_none()
+            && !caps.auto_increment
+        {
             self.error(
                 path.to_owned(),
                 "auto-increment columns are not supported on this database",
@@ -770,10 +787,13 @@ impl<'a> Validator<'a> {
         }
         if item.default_literal.is_none()
             && let Some(default) = &column.default
+            && old.is_none_or(|o| o.default.as_ref() != Some(default))
         {
             self.expression(&format!("{path}.default"), "the default", default);
         }
-        if let Some(generated) = &column.generated {
+        if let Some(generated) = &column.generated
+            && old.is_none_or(|o| o.generated.as_ref() != Some(generated))
+        {
             self.expression(
                 &format!("{path}.generated"),
                 "the generation expression",
@@ -795,9 +815,6 @@ impl<'a> Validator<'a> {
                 );
             }
         }
-        let old = item
-            .origin
-            .and_then(|origin| self.original().and_then(|o| o.columns.get(origin)));
         let Some(old) = old else {
             // A new column.
             if self.original().is_some() {
@@ -905,6 +922,16 @@ impl<'a> Validator<'a> {
 
     fn primary_key(&mut self) {
         let design = self.design;
+        // Renaming a column the key uses is not a key change.
+        let changed = self.original().is_none_or(|original| {
+            let before: Option<Vec<String>> = original.primary_key.as_ref().map(|pk| {
+                pk.columns
+                    .iter()
+                    .map(|c| renamed_column(design, original, c))
+                    .collect()
+            });
+            before.as_ref() != design.primary_key.as_ref().map(|pk| &pk.columns)
+        });
         if let Some(pk) = &design.primary_key {
             if pk.columns.is_empty() {
                 self.error("primaryKey", "the primary key has no columns");
@@ -917,10 +944,14 @@ impl<'a> Validator<'a> {
                 }
                 match design.columns.iter().find(|c| c.column.name == *name) {
                     None => self.error(path, format!("there is no column '{name}'")),
-                    Some(c) if c.column.nullable => self.error(
-                        path,
-                        format!("primary key column '{name}' must be NOT NULL"),
-                    ),
+                    // A key the server reported as it is stays acceptable (SQLite allows NULL
+                    // in some primary keys).
+                    Some(c) if c.column.nullable && (changed || self.nullability_changed(c)) => {
+                        self.error(
+                            path,
+                            format!("primary key column '{name}' must be NOT NULL"),
+                        );
+                    }
                     Some(_) => {}
                 }
             }
@@ -928,25 +959,21 @@ impl<'a> Validator<'a> {
                 self.name("primaryKey.name", "the primary key", name);
             }
         }
-        if let Some(original) = self.original() {
-            let before = original.primary_key.as_ref().map(|pk| &pk.columns);
-            let after = design.primary_key.as_ref().map(|pk| &pk.columns);
-            if before != after {
-                // Renaming a column the key uses is not a key change.
-                let renamed_before: Option<Vec<String>> = before.map(|cols| {
-                    cols.iter()
-                        .map(|c| renamed_column(design, original, c))
-                        .collect()
-                });
-                if renamed_before.as_ref() != after {
-                    self.need(
-                        self.caps.change_primary_key,
-                        "primaryKey",
-                        "changing the primary key",
-                    );
-                }
-            }
+        if changed && self.original().is_some() {
+            self.need(
+                self.caps.change_primary_key,
+                "primaryKey",
+                "changing the primary key",
+            );
         }
+    }
+
+    /// `true` for a new column, or one whose nullability differs from its origin's.
+    fn nullability_changed(&self, column: &DesignColumn) -> bool {
+        column
+            .origin
+            .and_then(|o| self.original().and_then(|t| t.columns.get(o)))
+            .is_none_or(|old| old.nullable != column.column.nullable)
     }
 
     /// Names of every constraint and index so far (they share one namespace on most engines).
@@ -986,6 +1013,34 @@ impl<'a> Validator<'a> {
                 self.error(format!("{path}.columns"), "the index has no columns");
             }
             for (k, part) in index.columns.iter().enumerate() {
+                if !part.is_expression && !columns.contains(&part.name) {
+                    self.error(
+                        format!("{path}.columns[{k}]"),
+                        format!("there is no column '{}'", part.name),
+                    );
+                }
+            }
+            let original = item
+                .origin
+                .and_then(|o| self.original().and_then(|t| t.indexes.get(o)));
+            if let Some(old) = original {
+                let mut renamed = old.clone();
+                renamed.name.clone_from(&index.name);
+                if let Some(design_original) = self.original() {
+                    for part in renamed.columns.iter_mut().filter(|p| !p.is_expression) {
+                        part.name = renamed_column(design, design_original, &part.name);
+                    }
+                }
+                if renamed == *index {
+                    // Unchanged (or only renamed): the server's own definition.
+                    continue;
+                }
+                self.need(caps.drop_index, &path, "changing an index");
+                self.need(caps.add_index, &path, "changing an index");
+            } else if self.original().is_some() {
+                self.need(caps.add_index, &path, "adding an index");
+            }
+            for (k, part) in index.columns.iter().enumerate() {
                 let part_path = format!("{path}.columns[{k}]");
                 if part.is_expression {
                     if !caps.expression_indexes {
@@ -995,11 +1050,6 @@ impl<'a> Validator<'a> {
                         );
                     }
                     self.expression(&part_path, "the index expression", &part.name);
-                } else if !columns.contains(&part.name) {
-                    self.error(
-                        part_path.clone(),
-                        format!("there is no column '{}'", part.name),
-                    );
                 }
                 if part.descending && !caps.descending_indexes {
                     self.error(
@@ -1032,29 +1082,6 @@ impl<'a> Validator<'a> {
                     path.clone(),
                     "unique constraints are not supported on this database",
                 );
-            }
-            let original = item
-                .origin
-                .and_then(|o| self.original().and_then(|t| t.indexes.get(o)));
-            match original {
-                None => {
-                    if self.original().is_some() {
-                        self.need(caps.add_index, &path, "adding an index");
-                    }
-                }
-                Some(old) => {
-                    let mut renamed = old.clone();
-                    renamed.name.clone_from(&index.name);
-                    if let Some(design_original) = self.original() {
-                        for part in renamed.columns.iter_mut().filter(|p| !p.is_expression) {
-                            part.name = renamed_column(design, design_original, &part.name);
-                        }
-                    }
-                    if renamed != *index {
-                        self.need(caps.drop_index, &path, "changing an index");
-                        self.need(caps.add_index, &path, "changing an index");
-                    }
-                }
             }
         }
         if let Some(original) = self.original()
@@ -1115,6 +1142,26 @@ impl<'a> Validator<'a> {
                     "the foreign key references no table",
                 );
             }
+            let original = item
+                .origin
+                .and_then(|o| self.original().and_then(|t| t.foreign_keys.get(o)));
+            if let Some(old) = original {
+                let mut renamed = old.clone();
+                renamed.name.clone_from(&fk.name);
+                if let Some(design_original) = self.original() {
+                    for column in &mut renamed.columns {
+                        *column = renamed_column(design, design_original, column);
+                    }
+                }
+                if renamed == *fk {
+                    // Unchanged (or only renamed): the server's own definition.
+                    continue;
+                }
+                self.need(caps.drop_foreign_key, &path, "changing a foreign key");
+                self.need(caps.add_foreign_key, &path, "changing a foreign key");
+            } else if self.original().is_some() {
+                self.need(caps.add_foreign_key, &path, "adding a foreign key");
+            }
             if references_itself(design, fk) {
                 // A self-reference: the target columns are this design's.
                 for (k, (from, to)) in fk.columns.iter().zip(&fk.ref_columns).enumerate() {
@@ -1147,28 +1194,6 @@ impl<'a> Validator<'a> {
                         format!("the action {action:?} is not supported on this database"),
                     );
                 }
-            }
-            let original = item
-                .origin
-                .and_then(|o| self.original().and_then(|t| t.foreign_keys.get(o)));
-            match original {
-                None if self.original().is_some() => {
-                    self.need(caps.add_foreign_key, &path, "adding a foreign key");
-                }
-                Some(old) => {
-                    let mut renamed = old.clone();
-                    renamed.name.clone_from(&fk.name);
-                    if let Some(design_original) = self.original() {
-                        for column in &mut renamed.columns {
-                            *column = renamed_column(design, design_original, column);
-                        }
-                    }
-                    if renamed != *fk {
-                        self.need(caps.drop_foreign_key, &path, "changing a foreign key");
-                        self.need(caps.add_foreign_key, &path, "changing a foreign key");
-                    }
-                }
-                None => {}
             }
         }
         if let Some(original) = self.original()
@@ -1208,15 +1233,6 @@ impl<'a> Validator<'a> {
                 );
                 names.push(name.clone());
             }
-            if check.expression.trim().is_empty() {
-                self.error(format!("{path}.expression"), "the check has no expression");
-            } else {
-                self.expression(
-                    &format!("{path}.expression"),
-                    "the check",
-                    &check.expression,
-                );
-            }
             if !caps.checks_enforced {
                 self.warning(
                     path.clone(),
@@ -1226,19 +1242,26 @@ impl<'a> Validator<'a> {
             let original = item
                 .origin
                 .and_then(|o| self.original().and_then(|t| t.checks.get(o)));
-            match original {
-                None if self.original().is_some() => {
-                    self.need(caps.add_check, &path, "adding a check");
+            if let Some(old) = original {
+                let mut renamed = old.clone();
+                renamed.name.clone_from(&check.name);
+                if renamed == *check {
+                    // Unchanged (or only renamed): the server's own text.
+                    continue;
                 }
-                Some(old) => {
-                    let mut renamed = old.clone();
-                    renamed.name.clone_from(&check.name);
-                    if renamed != *check {
-                        self.need(caps.drop_check, &path, "changing a check");
-                        self.need(caps.add_check, &path, "changing a check");
-                    }
-                }
-                None => {}
+                self.need(caps.drop_check, &path, "changing a check");
+                self.need(caps.add_check, &path, "changing a check");
+            } else if self.original().is_some() {
+                self.need(caps.add_check, &path, "adding a check");
+            }
+            if check.expression.trim().is_empty() {
+                self.error(format!("{path}.expression"), "the check has no expression");
+            } else {
+                self.expression(
+                    &format!("{path}.expression"),
+                    "the check",
+                    &check.expression,
+                );
             }
         }
         if let Some(original) = self.original()
