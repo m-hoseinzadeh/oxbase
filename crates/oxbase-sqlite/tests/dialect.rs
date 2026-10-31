@@ -482,10 +482,13 @@ async fn reads_sqlite_specific_shapes() {
     let id = t.column("id").unwrap();
     assert!(id.auto_increment);
     assert_eq!(id.extras.get(&AUTOINCREMENT), Some(&Value::Bool(true)));
-    let g = t.column("g").unwrap().generated.clone().unwrap();
-    assert_eq!((g.expression.as_str(), g.stored), ("n * 2", true));
-    let h = t.column("h").unwrap().generated.clone().unwrap();
-    assert_eq!((h.expression.as_str(), h.stored), ("n + 1", false));
+    let stored = t.column("g").unwrap().generated.clone().unwrap();
+    assert_eq!((stored.expression.as_str(), stored.stored), ("n * 2", true));
+    let computed = t.column("h").unwrap().generated.clone().unwrap();
+    assert_eq!(
+        (computed.expression.as_str(), computed.stored),
+        ("n + 1", false)
+    );
     assert_eq!(
         t.column("name").unwrap().collation.as_deref(),
         Some("NOCASE")
