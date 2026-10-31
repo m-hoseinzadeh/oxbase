@@ -61,15 +61,25 @@
 //!
 //! Owner of the bodies marked `unimplemented!("m3: services")`: the **services** stream.
 
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use oxbase_dialect::DialectRegistry;
-use oxbase_types::{BoundStatement, DataType, Error, ObjectRef, Result, RowKey, TableDataQuery};
+use arrow_array::RecordBatch;
+use oxbase_dialect::sql::select_table_data;
+use oxbase_dialect::{DialectRegistry, DmlPlan, DmlTarget, DmlWriter};
+use oxbase_driver::{Collected, Tx, collect};
+use oxbase_types::{
+    ColumnDef, ColumnValue, DataType, Engine, Error, ErrorCategory, Filter, KeyKind, ObjectDef,
+    ObjectKind, ObjectRef, Result, RowEdit, RowKey, ServerVersion, TableDataQuery, TableDef, Value,
+};
 use serde::{Deserialize, Serialize};
 
-use crate::query::{ErrorInfo, QueryService, RunHandle, RunId, RunOptions, RunState, RunTarget};
+use crate::convert::{JsonField, cell_text, cell_value, object_json, parse_input, value_text};
+use crate::query::{
+    ColumnInfo, ErrorInfo, QueryService, RunHandle, RunId, RunOptions, RunState, RunTarget,
+};
 use crate::tree::TreeService;
-use crate::{CancellationToken, SessionHandle};
+use crate::{CancellationToken, check_cancelled, until_cancelled};
 
 /// Read-only reasons [`Editability::read_only_reason`] uses (the UI may match on them).
 pub mod reasons {
@@ -368,10 +378,92 @@ pub struct EditService {
     query: Arc<QueryService>,
     tree: Arc<TreeService>,
     dialects: Arc<DialectRegistry>,
+    /// Runs started by [`EditService::open_table_data`], with what editing them needs.
+    sources: Mutex<HashMap<RunId, Arc<Source>>>,
 }
 
-// The async bodies below are skeletons until the services stream fills them.
-#[allow(clippy::unused_async)]
+/// A table-data run: the table, its definition and the values earlier applies wrote.
+struct Source {
+    table: ObjectRef,
+    /// The definition the run was opened with; `None` for views.
+    def: Option<TableDef>,
+    engine: Engine,
+    version: ServerVersion,
+    /// Applies of one run take turns (each reads and updates the overlay).
+    apply: tokio::sync::Mutex<()>,
+    overlay: Mutex<Overlay>,
+}
+
+/// What earlier applies changed: the result store itself is immutable.
+#[derive(Default)]
+struct Overlay {
+    /// Rows updated or inserted by an earlier apply, by grid row.
+    rows: HashMap<u64, OverlayRow>,
+    /// Rows deleted by an earlier apply.
+    deleted: HashSet<u64>,
+    /// Rows inserted so far (numbered after the stored rows).
+    inserted: u64,
+}
+
+/// One row as an earlier apply left it, in result-column order.
+#[derive(Debug, Clone, PartialEq)]
+struct OverlayRow {
+    values: Vec<Value>,
+    texts: Vec<Option<String>>,
+    /// `false` for a new row that could not be read back: its key is unknown, so it cannot be
+    /// edited again before a reload.
+    known: bool,
+}
+
+/// One validated, planned edit of an apply.
+struct Prepared {
+    /// The grid row of an update or delete.
+    row: Option<u64>,
+    kind: EditKind,
+    /// The row before the edit (updates), in result-column order.
+    before: Option<OverlayRow>,
+    /// Columns the edit writes: result index and value.
+    written: Vec<(usize, Value)>,
+    plan: DmlPlan,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditKind {
+    Update,
+    Insert,
+    Delete,
+}
+
+/// What running one plan inside the transaction gave.
+struct Executed {
+    affected: u64,
+    /// The row as returned or read back (first row of the batch), when there was one.
+    row: Option<RecordBatch>,
+}
+
+/// Why an apply stopped inside the transaction.
+struct Stop {
+    index: usize,
+    status: EditStatus,
+    error: Error,
+}
+
+/// The message of a conflict: the write did not affect exactly one row.
+fn conflict_error(affected: u64) -> Error {
+    if affected == 0 {
+        Error::not_found("no row matched its key: the row was changed or deleted by someone else")
+    } else {
+        Error::invalid_input(format!(
+            "{affected} rows matched its key instead of one: the row was changed by someone \
+             else, or its key is not unique"
+        ))
+    }
+}
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 impl EditService {
     pub fn new(
         query: Arc<QueryService>,
@@ -382,6 +474,7 @@ impl EditService {
             query,
             tree,
             dialects,
+            sources: Mutex::new(HashMap::new()),
         }
     }
 
@@ -404,19 +497,107 @@ impl EditService {
     pub async fn open_table_data(
         &self,
         target: RunTarget,
-        request: TableDataQuery,
-        options: RunOptions,
+        mut request: TableDataQuery,
+        mut options: RunOptions,
         cancel: CancellationToken,
     ) -> Result<RunHandle> {
-        let _ = (self, target, request, options, cancel);
-        unimplemented!("m3: services")
+        self.prune();
+        check_cancelled(&cancel)?;
+        let base = self
+            .query
+            .manager()
+            .get(target.session)
+            .ok_or_else(|| Error::not_found(format!("no open session {}", target.session)))?;
+        let engine = base.summary().engine;
+        let version = base.info().server_version.clone();
+        if !matches!(
+            request.table.kind,
+            ObjectKind::Table | ObjectKind::View | ObjectKind::MatView
+        ) {
+            return Err(Error::invalid_input(format!(
+                "{} is not a table or view",
+                request.table.display_name()
+            )));
+        }
+        let quoting = self.dialects.quoting(engine)?;
+        let loaded = self
+            .tree
+            .load(target.session, &request.table, cancel.clone())
+            .await;
+        let def = match loaded {
+            Ok(ObjectDef::Table(table)) => Some(table),
+            Err(e)
+                if request.table.kind == ObjectKind::Table
+                    || e.category() != ErrorCategory::Unsupported =>
+            {
+                return Err(e);
+            }
+            // A view (also one without a fetcher, which can still be read).
+            Ok(ObjectDef::View(_)) | Err(_) => None,
+            Ok(other) => {
+                return Err(Error::invalid_input(format!(
+                    "{} is not a table or view",
+                    other.object_ref().display_name()
+                )));
+            }
+        };
+        if let (Some(filter), Some(table)) = (request.filter.as_mut(), def.as_ref()) {
+            typed_filter_values(filter, table)?;
+        }
+        let statement = select_table_data(quoting.as_ref(), &request, def.as_ref())?;
+        if let Some(catalog) = &request.table.catalog {
+            options.database = Some(catalog.clone());
+        }
+        options.record_history = false;
+        check_cancelled(&cancel)?;
+        drop(cancel);
+        let handle = self.query.run_bound(target, statement, options).await?;
+        let source = Source {
+            table: request.table,
+            def,
+            engine,
+            version,
+            apply: tokio::sync::Mutex::new(()),
+            overlay: Mutex::new(Overlay::default()),
+        };
+        lock(&self.sources).insert(handle.id, Arc::new(source));
+        Ok(handle)
     }
 
     /// Whether and how run `run`'s result can be edited. A run that is not table data is
     /// read-only with [`reasons::NOT_TABLE_DATA`]; `NotFound` for an unknown run.
     pub async fn begin(&self, run: RunId, cancel: CancellationToken) -> Result<Editability> {
-        let _ = (self, run, cancel);
-        unimplemented!("m3: services")
+        self.prune();
+        check_cancelled(&cancel)?;
+        drop(cancel);
+        // Lets a run that was just started register its result columns first.
+        tokio::task::yield_now().await;
+        let info = self.query.info(run)?;
+        let source = lock(&self.sources).get(&run).cloned();
+        let Some(source) = source else {
+            let columns = info
+                .results
+                .first()
+                .map(|result| {
+                    result
+                        .columns
+                        .iter()
+                        .enumerate()
+                        .map(|(index, c)| query_column(index, c))
+                        .collect()
+                })
+                .unwrap_or_default();
+            return Ok(Editability {
+                run_id: run,
+                result_index: 0,
+                table: ObjectRef::root(),
+                editable: false,
+                read_only_reason: Some(reasons::NOT_TABLE_DATA.to_owned()),
+                key: None,
+                columns,
+            });
+        };
+        Ok(self.analyse(run, &source))
     }
 
     /// Applies `changes` to run `run`'s table (module docs, *Pending changes and apply*).
@@ -429,16 +610,847 @@ impl EditService {
         changes: &PendingChanges,
         cancel: CancellationToken,
     ) -> Result<ApplyReport> {
-        let _ = (self, run, changes, cancel);
-        unimplemented!("m3: services")
+        self.prune();
+        check_cancelled(&cancel)?;
+        let source = self.source(run)?;
+        let _turn = until_cancelled(&cancel, async { Ok(source.apply.lock().await) }).await?;
+        match self.query.run_state(run) {
+            None => return Err(Error::not_found(format!("no open query run {run}"))),
+            Some(RunState::Running) => {
+                return Err(Error::invalid_input(
+                    "the rows are still loading; wait for them (or cancel the query) before \
+                     saving changes",
+                ));
+            }
+            Some(_) => {}
+        }
+        let editability = self.analyse(run, &source);
+        if !editability.editable {
+            return Err(Error::invalid_input(
+                editability
+                    .read_only_reason
+                    .unwrap_or_else(|| reasons::NO_KEY.to_owned()),
+            ));
+        }
+        let (Some(def), Some(key)) = (source.def.as_ref(), editability.key.as_ref()) else {
+            return Err(Error::internal("an editable result has no table key"));
+        };
+        let stored_rows = self
+            .query
+            .info(run)?
+            .results
+            .first()
+            .map(|r| r.rows)
+            .ok_or_else(|| Error::invalid_input("the table data has no result to edit"))?;
+        let writer = self.dialects.dml_writer(source.engine)?;
+        let names: Vec<String> = editability.columns.iter().map(|c| c.name.clone()).collect();
+
+        // 1-2. Validate and plan everything before touching the database.
+        let context = PrepareContext {
+            run,
+            source: &source,
+            def,
+            key,
+            columns: &editability.columns,
+            names: &names,
+            stored_rows,
+            writer: writer.as_ref(),
+        };
+        let mut prepared = Vec::with_capacity(changes.edits.len());
+        let mut invalid: Vec<Option<Error>> = Vec::with_capacity(changes.edits.len());
+        let mut seen_rows = HashSet::new();
+        for edit in &changes.edits {
+            match self.prepare(&context, edit, &mut seen_rows).await {
+                Ok(p) => {
+                    prepared.push(p);
+                    invalid.push(None);
+                }
+                Err(e) => invalid.push(Some(e)),
+            }
+        }
+        if invalid.iter().any(Option::is_some) {
+            let outcomes = changes
+                .edits
+                .iter()
+                .zip(invalid)
+                .map(|(edit, error)| match error {
+                    Some(e) => outcome(EditStatus::Failed, Some(&e), edit_row(edit)),
+                    None => outcome(EditStatus::NotRun, None, edit_row(edit)),
+                })
+                .collect();
+            return Ok(ApplyReport {
+                committed: false,
+                outcomes,
+            });
+        }
+        if prepared.is_empty() {
+            return Ok(ApplyReport {
+                committed: true,
+                outcomes: Vec::new(),
+            });
+        }
+
+        // 3. Run in one transaction on the run's own session.
+        let session = self.query.run_session(run)?;
+        let guard = until_cancelled(&cancel, async { Ok(session.exclusive().await) }).await?;
+        let tx = session.connection().begin().await?;
+        let mut executed: Vec<Executed> = Vec::with_capacity(prepared.len());
+        let mut stop: Option<Stop> = None;
+        for (index, p) in prepared.iter().enumerate() {
+            if cancel.is_cancelled() {
+                stop = Some(Stop {
+                    index,
+                    status: EditStatus::Failed,
+                    error: Error::Cancelled,
+                });
+                break;
+            }
+            match execute_plan(tx.as_ref(), &p.plan, &cancel).await {
+                Ok(done) if done.affected == 1 => executed.push(done),
+                Ok(done) => {
+                    stop = Some(Stop {
+                        index,
+                        status: EditStatus::Conflict,
+                        error: conflict_error(done.affected),
+                    });
+                    break;
+                }
+                Err(error) => {
+                    stop = Some(Stop {
+                        index,
+                        status: EditStatus::Failed,
+                        error,
+                    });
+                    break;
+                }
+            }
+        }
+        if let Some(stop) = stop {
+            if let Err(e) = tx.rollback().await {
+                tracing::debug!(category = %e.category(), "rolling back table edits failed");
+            }
+            drop(guard);
+            return Ok(rolled_back(&prepared, &stop));
+        }
+        if let Err(error) = tx.commit().await {
+            // The server refused the commit: nothing was kept.
+            drop(guard);
+            let last = prepared.len() - 1;
+            let error = Error::sql(
+                None::<String>,
+                format!("saving the changes failed: {error}"),
+            );
+            let outcomes = prepared
+                .iter()
+                .enumerate()
+                .map(|(index, p)| {
+                    if index == last {
+                        outcome(EditStatus::Failed, Some(&error), p.row)
+                    } else {
+                        outcome(EditStatus::RolledBack, None, p.row)
+                    }
+                })
+                .collect();
+            return Ok(ApplyReport {
+                committed: false,
+                outcomes,
+            });
+        }
+        drop(guard);
+
+        // 4. Committed: remember what the rows look like now.
+        let mut overlay = lock(&source.overlay);
+        let outcomes = prepared
+            .into_iter()
+            .zip(executed)
+            .map(|(p, done)| record_applied(&mut overlay, def, &names, stored_rows, p, done))
+            .collect();
+        Ok(ApplyReport {
+            committed: true,
+            outcomes,
+        })
     }
 
     /// Row `row` of result `result_index` of `run` for the form / JSON view, with the values an
     /// earlier apply read back. Works for any run (read-only results too). `NotFound` for an
     /// unknown run, result or row, or a deleted row.
     pub async fn row_form(&self, run: RunId, result_index: usize, row: u64) -> Result<FormRow> {
-        let _ = (self, run, result_index, row);
-        unimplemented!("m3: services")
+        self.prune();
+        let info = self.query.info(run)?;
+        let result = info.results.get(result_index).ok_or_else(|| {
+            Error::not_found(format!("query run {run} has no result {result_index}"))
+        })?;
+        let source = lock(&self.sources).get(&run).cloned();
+        let def = source.as_ref().and_then(|s| s.def.as_ref());
+        let names: Vec<String> = result.columns.iter().map(|c| c.name.clone()).collect();
+        let column_def = |name: &str| def.and_then(|d| d.column(name));
+        if let Some(source) = source.as_ref().filter(|_| result_index == 0) {
+            let overlay = lock(&source.overlay);
+            if overlay.deleted.contains(&row) {
+                return Err(Error::not_found(format!("row {row} was deleted")));
+            }
+            if let Some(stored) = overlay.rows.get(&row) {
+                let fields = names
+                    .iter()
+                    .zip(&stored.texts)
+                    .map(|(name, text)| FormField {
+                        column: name.clone(),
+                        text: text.clone(),
+                    })
+                    .collect();
+                let json = object_json(
+                    &names
+                        .iter()
+                        .zip(&stored.values)
+                        .map(|(name, value)| JsonField {
+                            name: name.clone(),
+                            value: value.clone(),
+                            is_json: column_def(name)
+                                .is_some_and(|c| matches!(c.data_type, DataType::Json { .. })),
+                        })
+                        .collect::<Vec<_>>(),
+                );
+                return Ok(FormRow { row, fields, json });
+            }
+        }
+        if row >= result.rows {
+            return Err(Error::not_found(format!(
+                "result {result_index} of query run {run} has no row {row}"
+            )));
+        }
+        let batch = self.query.page(run, result_index, row, 1).await?;
+        if batch.num_rows() == 0 {
+            return Err(Error::not_found(format!(
+                "result {result_index} of query run {run} has no row {row}"
+            )));
+        }
+        let schema = batch.schema();
+        let mut fields = Vec::with_capacity(batch.num_columns());
+        let mut json_fields = Vec::with_capacity(batch.num_columns());
+        for (field, array) in schema.fields().iter().zip(batch.columns()) {
+            let column = column_def(field.name());
+            fields.push(FormField {
+                column: field.name().clone(),
+                text: cell_text(array.as_ref(), 0)?,
+            });
+            let is_json = column.is_some_and(|c| matches!(c.data_type, DataType::Json { .. }))
+                || field
+                    .metadata()
+                    .get("ARROW:extension:name")
+                    .is_some_and(|name| name == "arrow.json");
+            json_fields.push(JsonField {
+                name: field.name().clone(),
+                value: cell_value(array.as_ref(), 0, column)?,
+                is_json,
+            });
+        }
+        Ok(FormRow {
+            row,
+            fields,
+            json: object_json(&json_fields),
+        })
+    }
+
+    /// Forgets the sources of runs the query service no longer knows (closed).
+    fn prune(&self) {
+        lock(&self.sources).retain(|run, _| self.query.run_state(*run).is_some());
+    }
+
+    /// The table-data source of `run`: `NotFound` for an unknown run, `InvalidInput` for a run
+    /// that is not table data.
+    fn source(&self, run: RunId) -> Result<Arc<Source>> {
+        if let Some(source) = lock(&self.sources).get(&run) {
+            return Ok(Arc::clone(source));
+        }
+        if self.query.run_state(run).is_some() {
+            Err(Error::invalid_input(reasons::NOT_TABLE_DATA))
+        } else {
+            Err(Error::not_found(format!("no open query run {run}")))
+        }
+    }
+
+    /// The editability of a table-data run (see the module docs).
+    fn analyse(&self, run: RunId, source: &Source) -> Editability {
+        let result_columns: Option<Vec<String>> = self.query.info(run).ok().and_then(|info| {
+            info.results
+                .first()
+                .map(|r| r.columns.iter().map(|c| c.name.clone()).collect())
+        });
+        let read_only = |reason: &str, key: Option<RowKey>, columns: Vec<EditColumn>| Editability {
+            run_id: run,
+            result_index: 0,
+            table: source.table.clone(),
+            editable: false,
+            read_only_reason: Some(reason.to_owned()),
+            key,
+            columns,
+        };
+        let Some(def) = &source.def else {
+            let columns = result_columns
+                .unwrap_or_default()
+                .iter()
+                .enumerate()
+                .map(|(index, name)| EditColumn {
+                    name: name.clone(),
+                    index,
+                    data_type: DataType::Other {
+                        name: String::new(),
+                    },
+                    native_type: String::new(),
+                    nullable: true,
+                    has_default: false,
+                    key: false,
+                    editable: false,
+                    read_only_reason: None,
+                    input: InputKind::Other,
+                })
+                .collect();
+            return read_only(reasons::VIEW, None, columns);
+        };
+        let names = result_columns.unwrap_or_else(|| {
+            def.columns
+                .iter()
+                .map(|c| c.name.clone())
+                .collect::<Vec<_>>()
+        });
+        let key = find_key(def, &source.table);
+        let reason = if self.dialects.dml_writer(source.engine).is_err() {
+            Some(reasons::ENGINE)
+        } else {
+            match &key {
+                None => Some(reasons::NO_KEY),
+                Some(k) if !k.columns.iter().all(|c| names.contains(c)) => {
+                    Some(reasons::KEY_NOT_IN_RESULT)
+                }
+                Some(_) => None,
+            }
+        };
+        let editable = reason.is_none();
+        let columns = names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| {
+                let in_key = key.as_ref().is_some_and(|k| k.columns.contains(name));
+                edit_column(index, name, def.column(name), in_key, editable)
+            })
+            .collect();
+        match reason {
+            Some(reason) => read_only(reason, key, columns),
+            None => Editability {
+                run_id: run,
+                result_index: 0,
+                table: source.table.clone(),
+                editable: true,
+                read_only_reason: None,
+                key,
+                columns,
+            },
+        }
+    }
+
+    /// The row `row` as it is now: from an earlier apply, or from the result store.
+    async fn current_row(&self, context: &PrepareContext<'_>, row: u64) -> Result<OverlayRow> {
+        {
+            let overlay = lock(&context.source.overlay);
+            if overlay.deleted.contains(&row) {
+                return Err(Error::invalid_input(format!("row {row} was deleted")));
+            }
+            if let Some(stored) = overlay.rows.get(&row) {
+                if !stored.known {
+                    return Err(Error::invalid_input(format!(
+                        "row {row} was added but could not be read back; reload the table data \
+                         to edit it"
+                    )));
+                }
+                return Ok(stored.clone());
+            }
+        }
+        if row >= context.stored_rows {
+            return Err(Error::invalid_input(format!("there is no row {row}")));
+        }
+        let batch = self.query.page(context.run, 0, row, 1).await?;
+        if batch.num_rows() == 0 {
+            return Err(Error::invalid_input(format!("there is no row {row}")));
+        }
+        Ok(row_of(&batch, context.def, context.names))
+    }
+
+    /// Validates and plans one pending edit (nothing touches the database).
+    async fn prepare(
+        &self,
+        context: &PrepareContext<'_>,
+        edit: &PendingEdit,
+        seen_rows: &mut HashSet<u64>,
+    ) -> Result<Prepared> {
+        let (row, kind, cells): (Option<u64>, EditKind, &[CellEdit]) = match edit {
+            PendingEdit::Update { row, cells } => (Some(*row), EditKind::Update, cells.as_slice()),
+            PendingEdit::Insert { cells } => (None, EditKind::Insert, cells.as_slice()),
+            PendingEdit::Delete { row } => (Some(*row), EditKind::Delete, <&[CellEdit]>::default()),
+        };
+        let mut written: Vec<(usize, Value)> = Vec::with_capacity(cells.len());
+        for cell in cells {
+            let column = context
+                .columns
+                .iter()
+                .find(|c| c.name == cell.column)
+                .ok_or_else(|| {
+                    Error::invalid_input(format!("the table has no column '{}'", cell.column))
+                })?;
+            if !column.editable {
+                return Err(Error::invalid_input(format!(
+                    "column '{}' is read-only{}",
+                    column.name,
+                    column
+                        .read_only_reason
+                        .as_deref()
+                        .map(|r| format!(" ({r})"))
+                        .unwrap_or_default()
+                )));
+            }
+            if written.iter().any(|(index, _)| *index == column.index) {
+                return Err(Error::invalid_input(format!(
+                    "column '{}' is changed twice",
+                    column.name
+                )));
+            }
+            if kind == EditKind::Update && cell.input == CellInput::Default {
+                return Err(Error::invalid_input(format!(
+                    "column '{}': DEFAULT can only be used for new rows",
+                    column.name
+                )));
+            }
+            let def = context.def.column(&column.name).ok_or_else(|| {
+                Error::invalid_input(format!("the table has no column '{}'", column.name))
+            })?;
+            if let Some(value) = parse_input(&cell.input, def)? {
+                written.push((column.index, value));
+            }
+        }
+        if let Some(row) = row
+            && !seen_rows.insert(row)
+        {
+            return Err(Error::invalid_input(format!(
+                "row {row} has more than one pending change"
+            )));
+        }
+        let before = match row {
+            Some(row) => Some(self.current_row(context, row).await?),
+            None => None,
+        };
+        let changes = || {
+            written
+                .iter()
+                .map(|(index, value)| {
+                    ColumnValue::new(context.names[*index].clone(), value.clone())
+                })
+                .collect::<Vec<_>>()
+        };
+        let key_values = |row: &OverlayRow| -> Result<Vec<Value>> {
+            context
+                .key
+                .columns
+                .iter()
+                .map(|key_column| {
+                    let index = context
+                        .names
+                        .iter()
+                        .position(|n| n == key_column)
+                        .ok_or_else(|| Error::invalid_input(reasons::KEY_NOT_IN_RESULT))?;
+                    match row.values.get(index) {
+                        Some(Value::Null) | None => Err(Error::invalid_input(format!(
+                            "key column '{key_column}' of the row is NULL"
+                        ))),
+                        Some(value) => Ok(value.clone()),
+                    }
+                })
+                .collect()
+        };
+        let row_edit = match (kind, &before) {
+            (EditKind::Update, Some(before)) => {
+                if written.is_empty() {
+                    return Err(Error::invalid_input("the change has no cells"));
+                }
+                RowEdit::Update {
+                    key: key_values(before)?,
+                    changes: changes(),
+                }
+            }
+            (EditKind::Delete, Some(before)) => RowEdit::Delete {
+                key: key_values(before)?,
+            },
+            (EditKind::Insert, _) => {
+                for column in &context.def.columns {
+                    let given = written
+                        .iter()
+                        .any(|(index, _)| context.names[*index] == column.name);
+                    if !given && !column.nullable && !has_default(column) {
+                        return Err(Error::invalid_input(format!(
+                            "column '{}' is NOT NULL and has no default: give it a value",
+                            column.name
+                        )));
+                    }
+                }
+                RowEdit::Insert { values: changes() }
+            }
+            _ => return Err(Error::internal("an update or delete without its row")),
+        };
+        context.key.validate(&row_edit)?;
+        let target = DmlTarget {
+            table: context.def,
+            key: context.key,
+            version: &context.source.version,
+            read_back: context.names,
+        };
+        let plan = context.writer.plan(&row_edit, &target)?;
+        Ok(Prepared {
+            row,
+            kind,
+            before,
+            written,
+            plan,
+        })
+    }
+}
+
+/// What preparing the edits of one apply needs.
+struct PrepareContext<'a> {
+    run: RunId,
+    source: &'a Source,
+    def: &'a TableDef,
+    key: &'a RowKey,
+    columns: &'a [EditColumn],
+    /// Result column names, in order.
+    names: &'a [String],
+    stored_rows: u64,
+    writer: &'a dyn DmlWriter,
+}
+
+/// The grid row an edit names (updates and deletes).
+fn edit_row(edit: &PendingEdit) -> Option<u64> {
+    match edit {
+        PendingEdit::Update { row, .. } | PendingEdit::Delete { row } => Some(*row),
+        PendingEdit::Insert { .. } => None,
+    }
+}
+
+fn outcome(status: EditStatus, error: Option<&Error>, row: Option<u64>) -> EditOutcome {
+    EditOutcome {
+        status,
+        error: error.map(ErrorInfo::from),
+        row,
+        values: None,
+        warning: None,
+    }
+}
+
+/// The report of an apply that stopped at `stop` and rolled back.
+fn rolled_back(prepared: &[Prepared], stop: &Stop) -> ApplyReport {
+    let outcomes = prepared
+        .iter()
+        .enumerate()
+        .map(|(index, p)| match index.cmp(&stop.index) {
+            std::cmp::Ordering::Less => outcome(EditStatus::RolledBack, None, p.row),
+            std::cmp::Ordering::Equal => outcome(stop.status, Some(&stop.error), p.row),
+            std::cmp::Ordering::Greater => outcome(EditStatus::NotRun, None, p.row),
+        })
+        .collect();
+    ApplyReport {
+        committed: false,
+        outcomes,
+    }
+}
+
+/// Runs one plan inside the transaction: the write, then its read-back.
+async fn execute_plan(tx: &dyn Tx, plan: &DmlPlan, cancel: &CancellationToken) -> Result<Executed> {
+    let stream = tx
+        .execute(&plan.write.sql, &plan.write.params, cancel.clone())
+        .await?;
+    let written = collect(stream).await?;
+    let affected: u64 = if plan.returning {
+        written
+            .result_sets
+            .iter()
+            .map(|set| u64::try_from(set.num_rows()).unwrap_or(u64::MAX))
+            .sum()
+    } else {
+        written.rows_affected.iter().sum()
+    };
+    let mut row = if plan.returning {
+        first_row(&written)
+    } else {
+        None
+    };
+    if affected == 1
+        && !plan.returning
+        && let Some(read_back) = &plan.read_back
+    {
+        let stream = tx
+            .execute(&read_back.sql, &read_back.params, cancel.clone())
+            .await?;
+        row = first_row(&collect(stream).await?);
+    }
+    Ok(Executed { affected, row })
+}
+
+/// The first row of the first result set, as a one-row batch.
+fn first_row(collected: &Collected) -> Option<RecordBatch> {
+    collected
+        .result_sets
+        .first()?
+        .batches
+        .iter()
+        .find(|batch| batch.num_rows() > 0)
+        .map(|batch| batch.slice(0, 1))
+}
+
+/// Row 0 of `batch` in result-column order (`names`), matched by column name.
+fn row_of(batch: &RecordBatch, def: &TableDef, names: &[String]) -> OverlayRow {
+    let schema = batch.schema();
+    let mut values = Vec::with_capacity(names.len());
+    let mut texts = Vec::with_capacity(names.len());
+    let mut known = true;
+    for name in names {
+        let cell = schema.index_of(name).ok().and_then(|index| {
+            let array = batch.column(index);
+            let value = cell_value(array.as_ref(), 0, def.column(name)).ok()?;
+            let text = cell_text(array.as_ref(), 0).ok()?;
+            Some((value, text))
+        });
+        if let Some((value, text)) = cell {
+            values.push(value);
+            texts.push(text);
+        } else {
+            known = false;
+            values.push(Value::Null);
+            texts.push(None);
+        }
+    }
+    OverlayRow {
+        values,
+        texts,
+        known,
+    }
+}
+
+/// Records an applied edit in the overlay and reports it.
+fn record_applied(
+    overlay: &mut Overlay,
+    def: &TableDef,
+    names: &[String],
+    stored_rows: u64,
+    prepared: Prepared,
+    done: Executed,
+) -> EditOutcome {
+    let read = done.row.map(|batch| row_of(&batch, def, names));
+    let mut report = outcome(EditStatus::Applied, None, prepared.row);
+    match prepared.kind {
+        EditKind::Delete => {
+            if let Some(row) = prepared.row {
+                overlay.rows.remove(&row);
+                overlay.deleted.insert(row);
+            }
+        }
+        EditKind::Update | EditKind::Insert => {
+            let row = match prepared.row {
+                Some(row) => row,
+                None => {
+                    let row = stored_rows.saturating_add(overlay.inserted);
+                    overlay.inserted += 1;
+                    row
+                }
+            };
+            report.row = Some(row);
+            let stored = match read {
+                Some(read) => {
+                    report.values = Some(read.texts.clone());
+                    read
+                }
+                None => {
+                    report.warning = Some(
+                        "the row was saved but could not be read back; it shows the values as \
+                         entered until the data is reloaded"
+                            .to_owned(),
+                    );
+                    typed_row(prepared.before, &prepared.written, names.len())
+                }
+            };
+            overlay.rows.insert(row, stored);
+        }
+    }
+    report
+}
+
+/// The row an edit wrote when it could not be read back: the row before (an update, still
+/// identifiable) or only the typed values (an insert, whose key is unknown).
+fn typed_row(before: Option<OverlayRow>, written: &[(usize, Value)], width: usize) -> OverlayRow {
+    let mut row = before.unwrap_or_else(|| OverlayRow {
+        values: vec![Value::Null; width],
+        texts: vec![None; width],
+        known: false,
+    });
+    for (index, value) in written {
+        if let (Some(slot), Some(text)) = (row.values.get_mut(*index), row.texts.get_mut(*index)) {
+            *text = value_text(value);
+            *slot = value.clone();
+        }
+    }
+    row
+}
+
+/// The column has a default, identity, auto-increment or generation expression.
+fn has_default(column: &ColumnDef) -> bool {
+    column.default.is_some()
+        || column.auto_increment
+        || column.identity.is_some()
+        || column.generated.is_some()
+}
+
+/// The editing key of `def`: the primary key, else the first unique index or constraint on
+/// NOT NULL plain columns without a predicate.
+fn find_key(def: &TableDef, table: &ObjectRef) -> Option<RowKey> {
+    if let Some(pk) = def.primary_key.as_ref().filter(|pk| !pk.columns.is_empty()) {
+        return Some(RowKey::new(
+            table.clone(),
+            KeyKind::Primary,
+            pk.columns.clone(),
+        ));
+    }
+    def.indexes
+        .iter()
+        .find(|index| {
+            index.unique
+                && index.predicate.is_none()
+                && !index.columns.is_empty()
+                && index.columns.iter().all(|part| {
+                    !part.is_expression
+                        && def
+                            .column(&part.name)
+                            .is_some_and(|c| !c.nullable && c.generated.is_none())
+                })
+        })
+        .map(|index| {
+            RowKey::new(
+                table.clone(),
+                KeyKind::Unique,
+                index.columns.iter().map(|part| part.name.clone()).collect(),
+            )
+        })
+}
+
+/// One result column of a table-data run.
+fn edit_column(
+    index: usize,
+    name: &str,
+    def: Option<&ColumnDef>,
+    key: bool,
+    grid_editable: bool,
+) -> EditColumn {
+    let Some(def) = def else {
+        return EditColumn {
+            name: name.to_owned(),
+            index,
+            data_type: DataType::Other {
+                name: String::new(),
+            },
+            native_type: String::new(),
+            nullable: true,
+            has_default: false,
+            key,
+            editable: false,
+            read_only_reason: Some("not a column of the table".to_owned()),
+            input: InputKind::Other,
+        };
+    };
+    let reason = if def.generated.is_some() {
+        Some("generated column")
+    } else if def
+        .identity
+        .as_ref()
+        .is_some_and(|identity| identity.always)
+    {
+        Some("identity column (GENERATED ALWAYS)")
+    } else {
+        None
+    };
+    EditColumn {
+        name: name.to_owned(),
+        index,
+        data_type: def.data_type.clone(),
+        native_type: def.native_type.clone(),
+        nullable: def.nullable,
+        has_default: has_default(def),
+        key,
+        editable: grid_editable && reason.is_none(),
+        read_only_reason: reason.map(ToOwned::to_owned),
+        input: InputKind::for_type(&def.data_type),
+    }
+}
+
+/// A read-only column of a result that is not table data.
+fn query_column(index: usize, column: &ColumnInfo) -> EditColumn {
+    EditColumn {
+        name: column.name.clone(),
+        index,
+        data_type: DataType::Other {
+            name: column.data_type.clone(),
+        },
+        native_type: String::new(),
+        nullable: column.nullable,
+        has_default: false,
+        key: false,
+        editable: false,
+        read_only_reason: None,
+        input: InputKind::Other,
+    }
+}
+
+/// `true` for column types whose filter values are converted from typed text before binding.
+fn converts_filter_values(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Bool
+            | DataType::Int { .. }
+            | DataType::Float { .. }
+            | DataType::Decimal { .. }
+            | DataType::Date
+            | DataType::Time { .. }
+            | DataType::Timestamp { .. }
+            | DataType::TimestampTz { .. }
+            | DataType::Uuid
+            | DataType::Binary { .. }
+            | DataType::VarBinary { .. }
+    )
+}
+
+/// Converts the text values the UI typed into a comparison filter to the column's type
+/// (`convert::parse_input`), so they bind with the right type. Pattern operators keep text.
+fn typed_filter_values(filter: &mut Filter, table: &TableDef) -> Result<()> {
+    match filter {
+        Filter::And { items } | Filter::Or { items } => items
+            .iter_mut()
+            .try_for_each(|item| typed_filter_values(item, table)),
+        Filter::Not { item } => typed_filter_values(item, table),
+        Filter::Condition { column, op, values } => {
+            let Some(def) = table.column(column) else {
+                // Unknown columns are reported by the SELECT builder.
+                return Ok(());
+            };
+            if op.is_pattern() || !converts_filter_values(&def.data_type) {
+                return Ok(());
+            }
+            let mut as_value = def.clone();
+            as_value.nullable = true;
+            for value in values.iter_mut() {
+                if let Value::Text(text) = value {
+                    let input = CellInput::text(text.clone());
+                    if let Some(typed) = parse_input(&input, &as_value)? {
+                        *value = typed;
+                    }
+                }
+            }
+            Ok(())
+        }
+        Filter::RawSql { .. } => Ok(()),
     }
 }
 
@@ -448,37 +1460,10 @@ impl std::fmt::Debug for EditService {
     }
 }
 
-/// M3 additions to the query service used by table data and editing. The **services** stream
-/// implements them (and may move them into `query.rs`).
-#[allow(clippy::unused_async)]
-impl QueryService {
-    /// Starts a run of exactly one statement with bound parameters. Same editor rules, events,
-    /// paging, cancel and close as [`QueryService::run`]; the statement is not split, and its
-    /// [`RunEvent::Started`](crate::query::RunEvent::Started) lists one statement spanning the
-    /// whole SQL text. History records the SQL text (redacted, never the parameter values)
-    /// unless `options.record_history` is off.
-    pub async fn run_bound(
-        &self,
-        target: RunTarget,
-        statement: BoundStatement,
-        options: RunOptions,
-    ) -> Result<RunHandle> {
-        let _ = (self, target, statement, options);
-        unimplemented!("m3: services")
-    }
-
-    /// The session run `run` executed on (its editor's session), for edits that must run on
-    /// the same session. `NotFound` for an unknown or closed run, or when that session is gone.
-    pub fn run_session(&self, run: RunId) -> Result<SessionHandle> {
-        let _ = (self, run);
-        unimplemented!("m3: services")
-    }
-
-    /// Where run `run` is; `None` when unknown or closed.
-    pub fn run_state(&self, run: RunId) -> Option<RunState> {
-        self.info(run).ok().map(|info| info.state)
-    }
-}
+#[cfg(test)]
+pub(crate) mod live_tests;
+#[cfg(test)]
+mod service_tests;
 
 #[cfg(test)]
 mod tests {
