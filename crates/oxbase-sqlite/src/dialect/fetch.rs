@@ -13,6 +13,15 @@
 //! table's foreign keys / checks in declaration order, and mark the row with
 //! [`UNNAMED`](super::UNNAMED); `load` accepts those names. The loaded definition keeps
 //! `name: None`.
+//!
+//! **`TEMP` triggers.** A `TEMP` trigger is stored in `temp` but may fire on a table of any
+//! database. It is listed (marked [`props::TEMPORARY`]) under the table it fires on, and `load`
+//! finds it from that table's database too.
+//!
+//! **Unreadable owners.** Views and virtual tables have no indexes or foreign keys, so those
+//! listings are empty without asking the pragmas (which fail on a virtual table whose module is
+//! not loaded). When a column pragma fails on an existing owner (a view whose query no longer
+//! resolves), the SQL error names the owner.
 
 use std::collections::HashMap;
 
@@ -111,6 +120,38 @@ impl Owner {
     fn name(&self) -> &str {
         &self.row.name
     }
+
+    /// `true` for owners that cannot have indexes or foreign keys: views and virtual tables.
+    /// Their listings are empty without asking the pragmas, which fail on a virtual table whose
+    /// module is not loaded in this session.
+    fn keyless(&self) -> bool {
+        self.kind == ObjectKind::View || self.parsed().module.is_some()
+    }
+
+    /// Adds which owner a failed catalog pragma was reading. On an owner that exists, the
+    /// pragmas fail when a virtual table's module is not loaded (`no such module`) or a view's
+    /// query no longer resolves (`no such table`).
+    fn context(&self, err: Error) -> Error {
+        match err {
+            Error::Sql { code, message } => Error::sql(
+                code,
+                format!(
+                    "{} {}.{} cannot be read: {message}",
+                    self.kind.display_name(),
+                    self.schema,
+                    self.name()
+                ),
+            ),
+            other => other,
+        }
+    }
+
+    /// Columns as `pragma_table_xinfo` reports them.
+    async fn column_rows(&self, cat: &Catalog<'_>) -> Result<Vec<ColumnRow>> {
+        cat.columns(&self.schema, self.name())
+            .await
+            .map_err(|e| self.context(e))
+    }
 }
 
 // --- columns -------------------------------------------------------------------------------
@@ -161,6 +202,11 @@ fn build_columns(
         && let [(_, only)] = pk.as_slice()
         && let Some(col) = columns.iter_mut().find(|c| c.name == *only)
         && types::is_rowid_alias_type(&col.native_type)
+        // A column-level `INTEGER PRIMARY KEY DESC` is SQLite's documented exception.
+        && !parsed
+            .columns
+            .iter()
+            .any(|p| p.pk_desc && p.name.eq_ignore_ascii_case(only))
     {
         // `INTEGER PRIMARY KEY` is the rowid: never NULL, filled in when not given.
         col.auto_increment = true;
@@ -177,7 +223,7 @@ async fn owner_columns(
     cat: &Catalog<'_>,
     owner: &Owner,
 ) -> Result<(Vec<ColumnDef>, Option<PrimaryKeyDef>)> {
-    let rows = cat.columns(&owner.schema, owner.name()).await?;
+    let rows = owner.column_rows(cat).await?;
     let parsed = owner.parsed();
     Ok(build_columns(&rows, &parsed, parsed.without_rowid))
 }
@@ -222,7 +268,13 @@ fn index_def(row: &IndexRow, keys: &[IndexKeyRow], parsed: &ParsedIndex) -> Inde
 
 /// Every index of `owner`, primary-key ones included (marked `PRIMARY_KEY`), sorted by name.
 async fn index_defs(cat: &Catalog<'_>, owner: &Owner) -> Result<Vec<IndexDef>> {
-    let list = cat.indexes(&owner.schema, owner.name()).await?;
+    if owner.keyless() {
+        return Ok(Vec::new());
+    }
+    let list = cat
+        .indexes(&owner.schema, owner.name())
+        .await
+        .map_err(|e| owner.context(e))?;
     if list.is_empty() {
         return Ok(Vec::new());
     }
@@ -234,7 +286,10 @@ async fn index_defs(cat: &Catalog<'_>, owner: &Owner) -> Result<Vec<IndexDef>> {
         .collect();
     let mut out = Vec::with_capacity(list.len());
     for row in &list {
-        let keys = cat.index_keys(&owner.schema, &row.name).await?;
+        let keys = cat
+            .index_keys(&owner.schema, &row.name)
+            .await
+            .map_err(|e| owner.context(e))?;
         let parsed = sqls
             .get(&row.name.to_ascii_lowercase())
             .map(|sql| parse::parse_create_index(sql.as_str()))
@@ -283,7 +338,13 @@ async fn foreign_key_defs(
     owner: &Owner,
     owner_ref: &ObjectRef,
 ) -> Result<Vec<ForeignKeyInfo>> {
-    let rows = cat.foreign_keys(&owner.schema, owner.name()).await?;
+    if owner.keyless() {
+        return Ok(Vec::new());
+    }
+    let rows = cat
+        .foreign_keys(&owner.schema, owner.name())
+        .await
+        .map_err(|e| owner.context(e))?;
     let mut groups: Vec<Vec<&ForeignKeyRow>> = Vec::new();
     for r in &rows {
         match groups.last_mut() {
@@ -411,8 +472,16 @@ fn table_extras(schema: &str, flags: Option<&TableFlags>, parsed: &ParsedTable) 
     e
 }
 
+/// `pragma_table_list` flags by lower-cased name. They only add to what the `CREATE` text says
+/// (shadow tables, mostly), so a failing `pragma_table_list` (it resolves every view and virtual
+/// table of the database, and one broken view or unloaded module fails it) yields no flags
+/// instead of failing the listing. Cancellation still fails.
 async fn flags_by_name(cat: &Catalog<'_>, schema: &str) -> Result<HashMap<String, TableFlags>> {
-    Ok(cat.table_flags(schema).await?.into_iter().collect())
+    match cat.table_flags(schema).await {
+        Ok(rows) => Ok(rows.into_iter().collect()),
+        Err(Error::Sql { .. }) => Ok(HashMap::new()),
+        Err(e) => Err(e),
+    }
 }
 
 // --- the cells -----------------------------------------------------------------------------
@@ -524,7 +593,7 @@ impl Fetcher for TableFetcher {
         let parsed = owner.parsed();
         let flags = flags_by_name(&cat, &owner.schema).await?;
         let flags = flags.get(&owner.name().to_ascii_lowercase());
-        let rows = cat.columns(&owner.schema, owner.name()).await?;
+        let rows = owner.column_rows(&cat).await?;
         let without_rowid = parsed.without_rowid || flags.is_some_and(|f| f.without_rowid);
         let (columns, primary_key) = build_columns(&rows, &parsed, without_rowid);
         let indexes = index_defs(&cat, &owner)
@@ -621,8 +690,8 @@ impl Fetcher for ColumnFetcher {
     ) -> Result<Vec<ObjectSummary>> {
         let cat = Catalog::new(c, &cancel);
         let owner = Owner::any(&cat, parent).await?;
-        let out = cat
-            .columns(&owner.schema, owner.name())
+        let out = owner
+            .column_rows(&cat)
             .await?
             .into_iter()
             .map(|col| {
@@ -669,9 +738,14 @@ impl Fetcher for IndexFetcher {
     ) -> Result<Vec<ObjectSummary>> {
         let cat = Catalog::new(c, &cancel);
         let owner = Owner::any(&cat, parent).await?;
-        let mut out: Vec<ObjectSummary> = cat
-            .indexes(&owner.schema, owner.name())
-            .await?
+        let rows = if owner.keyless() {
+            Vec::new()
+        } else {
+            cat.indexes(&owner.schema, owner.name())
+                .await
+                .map_err(|e| owner.context(e))?
+        };
+        let mut out: Vec<ObjectSummary> = rows
             .into_iter()
             .map(|row| {
                 let mut s = ObjectSummary::new(parent.child(ObjectKind::Index, row.name));
@@ -878,6 +952,64 @@ fn trigger_def(obj: ObjectRef, row: &SchemaRow, schema: &str) -> Result<TriggerD
     })
 }
 
+/// The database holding the table or view a trigger stored in `temp` fires on.
+///
+/// A `TEMP` trigger may fire on a table of any database, and `temp.sqlite_schema` only records
+/// the table's name. SQLite binds it to the database written in the `ON` clause (`ON main.t`)
+/// or, without one, to the first database holding a table or view of that name in its search
+/// order: `temp`, `main`, then the attached ones. `None` when no database holds it.
+async fn temp_trigger_target(cat: &Catalog<'_>, row: &SchemaRow) -> Result<Option<String>> {
+    if let Some(schema) = row
+        .sql
+        .as_deref()
+        .and_then(parse::parse_create_trigger)
+        .and_then(|p| p.table_schema)
+    {
+        return Ok(Some(schema));
+    }
+    let owners = ["table", "view"];
+    if cat.object("temp", &row.tbl_name, &owners).await?.is_some() {
+        return Ok(Some("temp".to_owned()));
+    }
+    for db in cat.databases().await? {
+        if !is_temp(&db.name)
+            && cat
+                .object(&db.name, &row.tbl_name, &owners)
+                .await?
+                .is_some()
+        {
+            return Ok(Some(db.name));
+        }
+    }
+    Ok(None)
+}
+
+/// `true` when the `temp` trigger `row` fires on a table or view of database `schema`.
+async fn temp_trigger_fires_in(cat: &Catalog<'_>, row: &SchemaRow, schema: &str) -> Result<bool> {
+    Ok(temp_trigger_target(cat, row)
+        .await?
+        .is_some_and(|target| target.eq_ignore_ascii_case(schema)))
+}
+
+/// The triggers of `owner` with the database each is stored in: its own database's, plus the
+/// `TEMP` triggers on it (stored in `temp` whatever database the table is in), sorted by name.
+async fn owner_triggers(cat: &Catalog<'_>, owner: &Owner) -> Result<Vec<(SchemaRow, String)>> {
+    let mut out = Vec::new();
+    if !is_temp(&owner.schema) {
+        let own = cat
+            .objects_on(&owner.schema, "trigger", owner.name())
+            .await?;
+        out.extend(own.into_iter().map(|row| (row, owner.schema.clone())));
+    }
+    for row in cat.objects_on("temp", "trigger", owner.name()).await? {
+        if temp_trigger_fires_in(cat, &row, &owner.schema).await? {
+            out.push((row, "temp".to_owned()));
+        }
+    }
+    out.sort_by(|a, b| a.0.name.cmp(&b.0.name));
+    Ok(out)
+}
+
 #[async_trait]
 impl Fetcher for TriggerFetcher {
     async fn list(
@@ -888,13 +1020,12 @@ impl Fetcher for TriggerFetcher {
     ) -> Result<Vec<ObjectSummary>> {
         let cat = Catalog::new(c, &cancel);
         let owner = Owner::any(&cat, parent).await?;
-        let out = cat
-            .objects_on(&owner.schema, "trigger", owner.name())
+        let out = owner_triggers(&cat, &owner)
             .await?
             .into_iter()
-            .map(|row| {
+            .map(|(row, stored_in)| {
                 let mut s = ObjectSummary::new(parent.child(ObjectKind::Trigger, row.name));
-                if is_temp(&owner.schema) {
+                if is_temp(&stored_in) {
                     s.extras.insert(props::TEMPORARY, true);
                 }
                 s
@@ -912,10 +1043,22 @@ impl Fetcher for TriggerFetcher {
     ) -> Result<ObjectDef> {
         let cat = Catalog::new(c, &cancel);
         let schema = schema_of(obj);
-        let row = cat
-            .object(schema, &obj.name, &["trigger"])
-            .await?
-            .ok_or_else(|| not_found(ObjectKind::Trigger, obj))?;
+        // The trigger is stored in the ref's database, or it is a `TEMP` trigger on a table of
+        // that database (stored in `temp`).
+        let (row, stored_in) = match cat.object(schema, &obj.name, &["trigger"]).await? {
+            Some(row) => (row, schema.to_owned()),
+            None if !is_temp(schema) => {
+                let row = cat
+                    .object("temp", &obj.name, &["trigger"])
+                    .await?
+                    .ok_or_else(|| not_found(ObjectKind::Trigger, obj))?;
+                if !temp_trigger_fires_in(&cat, &row, schema).await? {
+                    return Err(not_found(ObjectKind::Trigger, obj));
+                }
+                (row, "temp".to_owned())
+            }
+            None => return Err(not_found(ObjectKind::Trigger, obj)),
+        };
         let mut r = obj.clone();
         match obj.parent.as_deref() {
             // A trigger looked up under another table is not this one.
@@ -924,9 +1067,18 @@ impl Fetcher for TriggerFetcher {
             }
             Some(_) => {}
             None => {
+                let owner_schema = if is_temp(&stored_in) && is_temp(schema) {
+                    temp_trigger_target(&cat, &row)
+                        .await?
+                        .unwrap_or_else(|| "temp".to_owned())
+                } else {
+                    schema.to_owned()
+                };
                 let owner = cat
-                    .object(schema, &row.tbl_name, &["table", "view"])
-                    .await?;
+                    .object(&owner_schema, &row.tbl_name, &["table", "view"])
+                    .await
+                    .ok()
+                    .flatten();
                 r.parent = Some(row.tbl_name.clone());
                 r.parent_kind = Some(match owner {
                     Some(o) if o.kind == "view" => ObjectKind::View,
@@ -934,7 +1086,7 @@ impl Fetcher for TriggerFetcher {
                 });
             }
         }
-        let def = trigger_def(r, &row, schema)?;
+        let def = trigger_def(r, &row, &stored_in)?;
         check(&cancel)?;
         Ok(ObjectDef::Trigger(def))
     }
@@ -982,6 +1134,16 @@ mod tests {
         // Composite keys keep their key order.
         let (_, pk) = build_columns(&[col("a", "INTEGER", 2), col("b", "TEXT", 1)], &none, false);
         assert_eq!(pk.unwrap().columns, ["b", "a"]);
+
+        // A column-level `INTEGER PRIMARY KEY DESC` is not a rowid alias; a table-level
+        // `PRIMARY KEY (x DESC)` is.
+        let desc = parse::parse_create_table("CREATE TABLE t (id INTEGER PRIMARY KEY DESC)");
+        let (cols, _) = build_columns(&[col("id", "INTEGER", 1)], &desc, false);
+        assert!(!cols[0].auto_increment && cols[0].nullable);
+        let table_desc =
+            parse::parse_create_table("CREATE TABLE t (id INTEGER, PRIMARY KEY (id DESC))");
+        let (cols, _) = build_columns(&[col("id", "INTEGER", 1)], &table_desc, false);
+        assert!(cols[0].auto_increment && !cols[0].nullable);
     }
 
     #[test]

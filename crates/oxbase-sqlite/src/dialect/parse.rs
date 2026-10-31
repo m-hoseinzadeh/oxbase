@@ -136,18 +136,19 @@ fn lex(sql: &str) -> Lexed<'_> {
 /// The value of an identifier written in SQL: quotes removed and doubled quotes undone. String
 /// literals count too (SQLite accepts `'name'` where it expects a name).
 pub(crate) fn unquote(text: &str) -> String {
-    if text.len() < 2 {
-        return text.to_owned();
-    }
-    let (Some(first), Some(last)) = (text.chars().next(), text.chars().next_back()) else {
+    // Every quote character is ASCII, so the first and last bytes decide; slicing one byte off
+    // each end is then always on a character boundary. A text of one multi-byte character (an
+    // unquoted `名`) is longer than one byte but never quoted.
+    let bytes = text.as_bytes();
+    let [first, .., last] = bytes else {
         return text.to_owned();
     };
-    let inner = &text[first.len_utf8()..text.len() - last.len_utf8()];
-    match (first, last) {
-        ('"', '"') => inner.replace("\"\"", "\""),
-        ('`', '`') => inner.replace("``", "`"),
-        ('\'', '\'') => inner.replace("''", "'"),
-        ('[', ']') => inner.to_owned(),
+    let inner = || &text[1..text.len() - 1];
+    match (*first, *last) {
+        (b'"', b'"') => inner().replace("\"\"", "\""),
+        (b'`', b'`') => inner().replace("``", "`"),
+        (b'\'', b'\'') => inner().replace("''", "'"),
+        (b'[', b']') => inner().to_owned(),
         _ => text.to_owned(),
     }
 }
@@ -314,6 +315,9 @@ pub(crate) struct ParsedColumn {
     pub generated: Option<String>,
     /// `PRIMARY KEY ... AUTOINCREMENT`.
     pub autoincrement: bool,
+    /// A column-level `PRIMARY KEY DESC`: SQLite does not make such an `INTEGER` column a rowid
+    /// alias (a table-level `PRIMARY KEY (x DESC)` still is one).
+    pub pk_desc: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -413,6 +417,9 @@ fn column_def(lx: &Lexed<'_>, a: usize, b: usize, out: &mut ParsedTable) {
             i += 2;
         } else if lx.is(i, "PRIMARY") {
             out.pk_name = pending.take();
+            if lx.is(i + 1, "KEY") && lx.is(i + 2, "DESC") {
+                col.pk_desc = true;
+            }
             i += 1;
         } else if lx.is(i, "AUTOINCREMENT") {
             col.autoincrement = true;
@@ -628,10 +635,43 @@ pub(crate) struct ParsedTrigger {
     pub event: ParsedEvent,
     /// `UPDATE OF a, b` columns.
     pub update_columns: Vec<String>,
+    /// The database written in the `ON` clause (`ON main.t`), if any. Only `TEMP` triggers keep
+    /// it: SQLite ignores it for a trigger stored in the table's own database.
+    pub table_schema: Option<String>,
     /// The `WHEN` expression without the keyword and without one pair of enclosing parentheses.
     pub condition: Option<String>,
     /// `BEGIN ... END`.
     pub body: String,
+}
+
+/// Words a trigger body's first statement can start with.
+const TRIGGER_STATEMENT_START: &[&str] = &[
+    "SELECT", "INSERT", "UPDATE", "DELETE", "REPLACE", "WITH", "VALUES",
+];
+
+/// Index of the `BEGIN` that opens a trigger body, searching from `from`. `begin` is also a valid
+/// unquoted column name (`WHEN NEW.begin > 0`), so only a `BEGIN` outside parentheses and not
+/// after a `.` counts, preferably one followed by a statement keyword.
+fn body_start(lx: &Lexed<'_>, from: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut fallback = None;
+    for j in from..lx.toks.len() {
+        match lx.kind(j) {
+            Some(Tok::LParen) => depth += 1,
+            Some(Tok::RParen) => depth = depth.saturating_sub(1),
+            _ if depth == 0
+                && lx.is(j, "BEGIN")
+                && (j == 0 || lx.kind(j - 1) != Some(Tok::Dot)) =>
+            {
+                if lx.is_any(j + 1, TRIGGER_STATEMENT_START) {
+                    return Some(j);
+                }
+                fallback = fallback.or(Some(j));
+            }
+            _ => {}
+        }
+    }
+    fallback
 }
 
 /// Reads a stored `CREATE TRIGGER` statement; `None` when it does not look like one.
@@ -677,11 +717,13 @@ pub(crate) fn parse_create_trigger(sql: &str) -> Option<ParsedTrigger> {
     if !lx.is(i, "ON") {
         return None;
     }
+    let table_schema =
+        (lx.kind(i + 2) == Some(Tok::Dot) && lx.is_name(i + 3)).then(|| lx.name(i + 1));
     i = lx.skip_name(i + 1);
     if lx.is(i, "FOR") && lx.is(i + 1, "EACH") && lx.is(i + 2, "ROW") {
         i += 3;
     }
-    let begin = (i..lx.toks.len()).find(|&j| lx.is(j, "BEGIN"))?;
+    let begin = body_start(&lx, i)?;
     let condition = lx.is(i, "WHEN").then(|| {
         let mut text = lx.slice(i + 1, begin).trim();
         if lx.kind(i + 1) == Some(Tok::LParen) && lx.close_of(i + 1) + 1 == begin {
@@ -693,6 +735,7 @@ pub(crate) fn parse_create_trigger(sql: &str) -> Option<ParsedTrigger> {
         timing,
         event,
         update_columns,
+        table_schema,
         condition,
         body: lx.rest(begin).to_owned(),
     })
@@ -710,6 +753,48 @@ mod tests {
         assert_eq!(unquote("'it''s'"), "it's");
         assert_eq!(unquote("plain"), "plain");
         assert_eq!(unquote("\""), "\"");
+        assert_eq!(unquote("\"\""), "");
+        // One multi-byte character is longer than one byte but is not quoted.
+        assert_eq!(unquote("é"), "é");
+        assert_eq!(unquote("名"), "名");
+        assert_eq!(unquote("π"), "π");
+        assert_eq!(unquote("\"名\""), "名");
+        assert_eq!(unquote("[é]"), "é");
+        assert_eq!(unquote("名\""), "名\"");
+    }
+
+    #[test]
+    fn reads_single_character_non_ascii_names() {
+        let t = parse_create_table(
+            "CREATE TABLE 表 (名 TEXT COLLATE é, é INT CONSTRAINT π CHECK (é > 0), \
+             ü INT REFERENCES 表 (é), FOREIGN KEY (名) REFERENCES 表 (名))",
+        );
+        let names: Vec<&str> = t.columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["名", "é", "ü"]);
+        assert_eq!(t.columns[0].collation.as_deref(), Some("é"));
+        assert_eq!(t.checks[0].name.as_deref(), Some("π"));
+        assert_eq!(t.checks[0].column.as_deref(), Some("é"));
+        assert_eq!(t.foreign_keys[0].ref_table, "表");
+        assert_eq!(t.foreign_keys[0].ref_columns, ["é"]);
+        assert_eq!(t.foreign_keys[1].columns, ["名"]);
+        let trg = parse_create_trigger(
+            "CREATE TRIGGER ť AFTER UPDATE OF 名, é ON 表 BEGIN SELECT 1; END",
+        )
+        .unwrap();
+        assert_eq!(trg.update_columns, ["名", "é"]);
+        let v = parse_create_view("CREATE VIEW ν (名) AS SELECT 1");
+        assert_eq!(v.columns, ["名"]);
+    }
+
+    #[test]
+    fn marks_column_level_primary_key_desc() {
+        let t = parse_create_table(
+            "CREATE TABLE t (a INTEGER PRIMARY KEY DESC, b INTEGER CONSTRAINT k PRIMARY KEY ASC)",
+        );
+        assert!(t.columns[0].pk_desc);
+        assert!(!t.columns[1].pk_desc);
+        let t = parse_create_table("CREATE TABLE t (a INTEGER, PRIMARY KEY (a DESC))");
+        assert!(!t.columns[0].pk_desc);
     }
 
     #[test]
@@ -922,6 +1007,17 @@ mod tests {
         assert_eq!(t.timing, ParsedTiming::InsteadOf);
         assert_eq!(t.event, ParsedEvent::Delete);
         assert_eq!(t.condition, None);
+        assert_eq!(t.table_schema, None);
         assert!(parse_create_trigger("CREATE TABLE x(a)").is_none());
+
+        // `begin` as a column name does not open the body.
+        let t = parse_create_trigger(
+            "CREATE TEMP TRIGGER tb AFTER INSERT ON main.x WHEN NEW.begin > 0 AND (begin) \
+             BEGIN SELECT NEW.begin; END",
+        )
+        .unwrap();
+        assert_eq!(t.table_schema.as_deref(), Some("main"));
+        assert_eq!(t.condition.as_deref(), Some("NEW.begin > 0 AND (begin)"));
+        assert_eq!(t.body, "BEGIN SELECT NEW.begin; END");
     }
 }

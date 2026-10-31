@@ -716,3 +716,210 @@ async fn cancelled_tokens_and_missing_objects() {
         .unwrap_err();
     assert_eq!(err.category(), ErrorCategory::NotFound);
 }
+
+#[tokio::test]
+async fn reads_single_character_non_ascii_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let c = open(&dir.path().join("names.sqlite")).await;
+    let c = c.as_ref();
+    run(
+        c,
+        "CREATE TABLE 表 (
+             名 INTEGER PRIMARY KEY,
+             é TEXT COLLATE NOCASE CONSTRAINT π CHECK (é <> ''),
+             ü INTEGER REFERENCES 表 (名)
+         );
+         CREATE INDEX ι ON 表 (é);
+         CREATE VIEW ν (名) AS SELECT 名 FROM 表;
+         CREATE TRIGGER ť AFTER UPDATE OF é ON 表 BEGIN SELECT 1; END;",
+        &[],
+    )
+    .await;
+    let db = main_db();
+    assert_eq!(user_names(&list(c, ObjectKind::Table, &db).await), ["表"]);
+    let table = db.child(ObjectKind::Table, "表");
+    let ObjectDef::Table(t) = load(c, &table).await.unwrap() else {
+        panic!("not a table");
+    };
+    let cols: Vec<&str> = t.columns.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(cols, ["名", "é", "ü"]);
+    assert!(t.column("名").unwrap().auto_increment);
+    assert_eq!(t.column("é").unwrap().collation.as_deref(), Some("NOCASE"));
+    assert_eq!(t.checks[0].name.as_deref(), Some("π"));
+    assert_eq!(t.checks[0].expression, "é <> ''");
+    assert_eq!(t.foreign_keys[0].columns, ["ü"]);
+    assert_eq!(t.foreign_keys[0].ref_columns, ["名"]);
+
+    let columns = list(c, ObjectKind::Column, &table).await;
+    assert_eq!(names(&columns), ["名", "é", "ü"]);
+    let ObjectDef::Column { column, .. } = load(c, &columns[1].obj).await.unwrap() else {
+        panic!("not a column");
+    };
+    assert_eq!(column.name, "é");
+    let checks = list(c, ObjectKind::Check, &table).await;
+    assert_eq!(names(&checks), ["π"]);
+    load(c, &checks[0].obj).await.unwrap();
+    let fks = list(c, ObjectKind::ForeignKey, &table).await;
+    assert_eq!(names(&fks), ["(foreign key 1)"]);
+    load(c, &fks[0].obj).await.unwrap();
+    assert_eq!(names(&list(c, ObjectKind::Index, &table).await), ["ι"]);
+    let triggers = list(c, ObjectKind::Trigger, &table).await;
+    assert_eq!(names(&triggers), ["ť"]);
+    let ObjectDef::Trigger(trg) = load(c, &triggers[0].obj).await.unwrap() else {
+        panic!("not a trigger");
+    };
+    assert_eq!(trg.update_columns, ["é"]);
+    let ObjectDef::View(v) = load(c, &db.child(ObjectKind::View, "ν")).await.unwrap() else {
+        panic!("not a view");
+    };
+    assert_eq!(v.columns, ["名"]);
+}
+
+#[tokio::test]
+async fn integer_primary_key_desc_is_not_a_rowid_alias() {
+    let dir = tempfile::tempdir().unwrap();
+    let c = open(&dir.path().join("pkdesc.sqlite")).await;
+    let c = c.as_ref();
+    run(
+        c,
+        "CREATE TABLE pkd (id INTEGER PRIMARY KEY DESC, v TEXT);
+         CREATE TABLE pkt (id INTEGER, v TEXT, PRIMARY KEY (id DESC));",
+        &[],
+    )
+    .await;
+    let db = main_db();
+    let ObjectDef::Table(t) = load(c, &db.child(ObjectKind::Table, "pkd")).await.unwrap() else {
+        panic!("not a table");
+    };
+    let id = t.column("id").unwrap();
+    assert!(!id.auto_increment && id.nullable, "{id:?}");
+    assert_eq!(t.primary_key.unwrap().columns, ["id"]);
+    // The table-level form is an alias.
+    let ObjectDef::Table(t) = load(c, &db.child(ObjectKind::Table, "pkt")).await.unwrap() else {
+        panic!("not a table");
+    };
+    let id = t.column("id").unwrap();
+    assert!(id.auto_increment && !id.nullable, "{id:?}");
+}
+
+#[tokio::test]
+async fn temp_triggers_show_under_the_table_they_fire_on() {
+    let (_dir, c) = fixture().await;
+    let c = c.as_ref();
+    run(
+        c,
+        "CREATE TABLE main.m2_aux_t (id INTEGER);
+         CREATE TEMP TRIGGER m2_temp_trg AFTER INSERT ON m2_child BEGIN SELECT 1; END;
+         CREATE TEMP TRIGGER m2_temp_aux AFTER DELETE ON m2aux.m2_aux_t BEGIN SELECT 1; END;",
+        &[],
+    )
+    .await;
+    let db = main_db();
+    let child = db.child(ObjectKind::Table, "m2_child");
+    let triggers = list(c, ObjectKind::Trigger, &child).await;
+    assert_eq!(names(&triggers), ["m2_temp_trg", "m2_trg"]);
+    assert_eq!(
+        extra(&triggers[0], &props::TEMPORARY),
+        Some(&Value::Bool(true))
+    );
+    assert_eq!(extra(&triggers[1], &props::TEMPORARY), None);
+    assert_eq!(triggers[0].obj.catalog.as_deref(), Some("main"));
+
+    let ObjectDef::Trigger(trg) = load(c, &triggers[0].obj).await.unwrap() else {
+        panic!("not a trigger");
+    };
+    assert_eq!(trg.obj.parent.as_deref(), Some("m2_child"));
+    assert_eq!(trg.events, [TriggerEvent::Insert]);
+    assert_eq!(trg.extras.get(&props::TEMPORARY), Some(&Value::Bool(true)));
+    // Without its owner, under the table's database.
+    let ObjectDef::Trigger(trg) = load(
+        c,
+        &ObjectRef::new(ObjectKind::Trigger, "m2_temp_trg").in_catalog(Some("main")),
+    )
+    .await
+    .unwrap() else {
+        panic!("not a trigger");
+    };
+    assert_eq!(trg.obj.parent.as_deref(), Some("m2_child"));
+    assert_eq!(trg.obj.parent_kind, Some(ObjectKind::Table));
+    // Not under a database it does not fire in.
+    let err = load(
+        c,
+        &ObjectRef::new(ObjectKind::Trigger, "m2_temp_trg").in_catalog(Some("m2aux")),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.category(), ErrorCategory::NotFound);
+
+    // `ON m2aux.m2_aux_t` binds to the attached table, not the same-named one in `main`.
+    let aux_table = ObjectRef::database("m2aux").child(ObjectKind::Table, "m2_aux_t");
+    assert_eq!(
+        names(&list(c, ObjectKind::Trigger, &aux_table).await),
+        ["m2_temp_aux"]
+    );
+    let main_table = db.child(ObjectKind::Table, "m2_aux_t");
+    assert_eq!(
+        list(c, ObjectKind::Trigger, &main_table).await,
+        Vec::<ObjectSummary>::new()
+    );
+    let ObjectDef::Trigger(trg) = load(c, &aux_table.child(ObjectKind::Trigger, "m2_temp_aux"))
+        .await
+        .unwrap()
+    else {
+        panic!("not a trigger");
+    };
+    assert_eq!(trg.events, [TriggerEvent::Delete]);
+}
+
+#[tokio::test]
+async fn broken_views_do_not_break_the_tree() {
+    let dir = tempfile::tempdir().unwrap();
+    let c = open(&dir.path().join("broken.sqlite")).await;
+    let c = c.as_ref();
+    run(
+        c,
+        "CREATE TABLE gone (a INTEGER);
+         CREATE TABLE kept (b INTEGER);
+         CREATE VIEW broken AS SELECT a FROM gone;
+         DROP TABLE gone;",
+        &[],
+    )
+    .await;
+    let db = main_db();
+    assert_eq!(user_names(&list(c, ObjectKind::Table, &db).await), ["kept"]);
+    assert_eq!(names(&list(c, ObjectKind::View, &db).await), ["broken"]);
+    let view = db.child(ObjectKind::View, "broken");
+    let ObjectDef::View(v) = load(c, &view).await.unwrap() else {
+        panic!("not a view");
+    };
+    assert_eq!(v.definition, "SELECT a FROM gone");
+    // Views have no indexes, foreign keys or checks: empty without asking the pragmas.
+    for kind in [
+        ObjectKind::Index,
+        ObjectKind::ForeignKey,
+        ObjectKind::Check,
+        ObjectKind::Trigger,
+    ] {
+        assert_eq!(
+            list(c, kind, &view).await,
+            Vec::<ObjectSummary>::new(),
+            "{kind}"
+        );
+    }
+    // The columns cannot be resolved; when SQLite says so, the error names the view.
+    match fetcher(ObjectKind::Column)
+        .list(c, &view, CancellationToken::new())
+        .await
+    {
+        Ok(columns) => assert_eq!(columns, Vec::<ObjectSummary>::new()),
+        Err(err) => {
+            assert_eq!(err.category(), ErrorCategory::Sql, "{err}");
+            let text = err.to_string();
+            assert!(text.contains("View main.broken cannot be read"), "{text}");
+        }
+    }
+    let ObjectDef::Table(t) = load(c, &db.child(ObjectKind::Table, "kept")).await.unwrap() else {
+        panic!("not a table");
+    };
+    assert_eq!(t.columns.len(), 1);
+}

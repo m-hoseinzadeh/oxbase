@@ -9,6 +9,16 @@
 //! SQLite returns is written, quoted as an identifier with embedded quotes doubled
 //! ([`AnsiQuoting`]). A name that is not an attached database never reaches SQL. Everything else
 //! (tables, indexes, triggers, and the schema arguments of the pragma functions) is bound.
+//!
+//! # Versions
+//!
+//! The reads need the table-valued pragma functions, so SQLite 3.16 is the floor (older
+//! libraries get `Unsupported`). Before 3.33 the catalog table is `sqlite_master`, before 3.26
+//! columns come from `pragma_table_info` (no generated or hidden columns), and before 3.37 there
+//! is no `pragma_table_list` (no table-type flags; the `CREATE` text still gives `WITHOUT ROWID`,
+//! `STRICT` and virtual tables). The driver bundles a current SQLite, so today only the newest
+//! branch runs against a live library; the version choices are the pure functions below and
+//! their unit tests cover every branch.
 
 use std::mem;
 
@@ -18,7 +28,7 @@ use arrow_array::{Array, RecordBatch};
 use arrow_schema::DataType as ArrowType;
 use oxbase_dialect::{AnsiQuoting, Quoting};
 use oxbase_driver::{CancellationToken, Connection, collect};
-use oxbase_types::{Error, Result, Value};
+use oxbase_types::{Error, Result, ServerVersion, Value};
 
 /// One decoded catalog value.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -147,6 +157,37 @@ pub(crate) fn check(cancel: &CancellationToken) -> Result<()> {
     }
 }
 
+/// `false` below SQLite 3.16, which has no table-valued pragma functions.
+pub(crate) fn readable_catalog(v: &ServerVersion) -> bool {
+    v.at_least(3, 16)
+}
+
+/// `sqlite_schema` from SQLite 3.33, `sqlite_master` before (the same table).
+pub(crate) fn schema_table_for(v: &ServerVersion) -> &'static str {
+    if v.at_least(3, 33) {
+        "sqlite_schema"
+    } else {
+        "sqlite_master"
+    }
+}
+
+/// `true` from SQLite 3.37 (`pragma_table_list`, `STRICT` tables).
+pub(crate) fn has_table_list_for(v: &ServerVersion) -> bool {
+    v.at_least(3, 37)
+}
+
+/// The column query: `pragma_table_xinfo` (generated and hidden columns) from 3.26,
+/// `pragma_table_info` with every column reported as not hidden before.
+pub(crate) fn columns_sql_for(v: &ServerVersion) -> &'static str {
+    if v.at_least(3, 26) {
+        "SELECT name, type, \"notnull\", dflt_value, pk, hidden \
+         FROM pragma_table_xinfo(?1, ?2) ORDER BY cid"
+    } else {
+        "SELECT name, type, \"notnull\", dflt_value, pk, 0 \
+         FROM pragma_table_info(?1, ?2) ORDER BY cid"
+    }
+}
+
 /// A row of `sqlite_schema`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SchemaRow {
@@ -245,6 +286,12 @@ impl<'a> Catalog<'a> {
     /// nothing) when the token is cancelled before or during the query.
     pub(crate) async fn rows(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>> {
         check(self.cancel)?;
+        let version = self.c.server_version();
+        if !readable_catalog(version) {
+            return Err(Error::unsupported(format!(
+                "reading the catalog needs SQLite 3.16 or newer; this library is {version}"
+            )));
+        }
         let got = collect(self.c.execute(sql, params, self.cancel.clone()).await?).await?;
         check(self.cancel)?;
         let mut rows = Vec::new();
@@ -256,18 +303,14 @@ impl<'a> Catalog<'a> {
         Ok(rows)
     }
 
-    /// `sqlite_schema` from SQLite 3.33, `sqlite_master` before (the same table).
+    /// The catalog table's name for this library ([`schema_table_for`]).
     fn schema_table_name(&self) -> &'static str {
-        if self.c.server_version().at_least(3, 33) {
-            "sqlite_schema"
-        } else {
-            "sqlite_master"
-        }
+        schema_table_for(self.c.server_version())
     }
 
-    /// `true` from SQLite 3.37 (`pragma_table_list`, `STRICT` tables).
+    /// [`has_table_list_for`] this library.
     pub(crate) fn has_table_list(&self) -> bool {
-        self.c.server_version().at_least(3, 37)
+        has_table_list_for(self.c.server_version())
     }
 
     /// The `FROM` target for the catalog table of database `schema`. See the module docs.
@@ -420,13 +463,7 @@ impl<'a> Catalog<'a> {
     /// Columns of table or view `table` in `schema`, in ordinal order (generated and hidden
     /// columns included from SQLite 3.26).
     pub(crate) async fn columns(&self, schema: &str, table: &str) -> Result<Vec<ColumnRow>> {
-        let sql = if self.c.server_version().at_least(3, 26) {
-            "SELECT name, type, \"notnull\", dflt_value, pk, hidden \
-             FROM pragma_table_xinfo(?1, ?2) ORDER BY cid"
-        } else {
-            "SELECT name, type, \"notnull\", dflt_value, pk, 0 \
-             FROM pragma_table_info(?1, ?2) ORDER BY cid"
-        };
+        let sql = columns_sql_for(self.c.server_version());
         let rows = self
             .rows(sql, &[Value::from(table), Value::from(schema)])
             .await?;
@@ -516,6 +553,26 @@ mod tests {
     use arrow_schema::{Field, Schema};
 
     use super::*;
+
+    #[test]
+    fn picks_the_catalog_reads_by_version() {
+        let v = |minor| ServerVersion::new(3, minor, 0);
+        assert!(!readable_catalog(&v(15)));
+        assert!(readable_catalog(&v(16)));
+        assert!(readable_catalog(&ServerVersion::new(4, 0, 0)));
+        assert_eq!(schema_table_for(&v(32)), "sqlite_master");
+        assert_eq!(schema_table_for(&v(33)), "sqlite_schema");
+        assert!(!has_table_list_for(&v(36)));
+        assert!(has_table_list_for(&v(37)));
+        assert!(columns_sql_for(&v(25)).contains("pragma_table_info(?1, ?2)"));
+        assert!(columns_sql_for(&v(26)).contains("pragma_table_xinfo(?1, ?2)"));
+        // Both forms return the same six columns.
+        for minor in [25, 26] {
+            let sql = columns_sql_for(&v(minor));
+            let select = &sql[..sql.find(" FROM ").unwrap()];
+            assert_eq!(select.matches(',').count(), 5, "{sql}");
+        }
+    }
 
     #[test]
     fn decodes_every_catalog_column_type() {
