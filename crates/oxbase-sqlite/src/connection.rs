@@ -226,6 +226,12 @@ impl Connection for SqliteConnection {
         &self.version
     }
 
+    /// Always `main`: the database the connection opened (attached ones are `ObjectRef`
+    /// catalogs on the same session).
+    fn current_database(&self) -> Option<String> {
+        Some("main".to_owned())
+    }
+
     async fn execute(
         &self,
         sql: &str,
