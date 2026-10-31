@@ -599,7 +599,7 @@ pub(crate) fn parse_create_view(sql: &str) -> ParsedView {
         i = next;
     }
     if lx.is(i, "AS") {
-        out.definition = lx.rest(i + 1).to_owned();
+        lx.rest(i + 1).clone_into(&mut out.definition);
     }
     out
 }
@@ -760,7 +760,7 @@ mod tests {
                 column: None,
             }]
         );
-        assert!(parent.foreign_keys.is_empty());
+        assert_eq!(parent.foreign_keys, Vec::<ParsedForeignKey>::new());
 
         let child = parse_create_table(
             "CREATE TABLE m2_child (id INTEGER PRIMARY KEY, parent_id INTEGER NOT NULL, qty \
@@ -854,7 +854,7 @@ mod tests {
 
         let v = parse_create_table("CREATE VIRTUAL TABLE docs USING fts5(title, body)");
         assert_eq!(v.module.as_deref(), Some("fts5"));
-        assert!(v.columns.is_empty());
+        assert_eq!(v.columns, Vec::<ParsedColumn>::new());
 
         let ctas = parse_create_table("CREATE TABLE copy AS SELECT 1 AS x");
         assert_eq!(ctas, ParsedTable::default());
@@ -883,7 +883,7 @@ mod tests {
             "CREATE VIEW m2_view AS SELECT c.id, c.qty, p.code FROM m2_child c JOIN m2_parent p \
              ON p.id = c.parent_id",
         );
-        assert!(v.columns.is_empty());
+        assert_eq!(v.columns, Vec::<String>::new());
         assert_eq!(
             v.definition,
             "SELECT c.id, c.qty, p.code FROM m2_child c JOIN m2_parent p ON p.id = c.parent_id"

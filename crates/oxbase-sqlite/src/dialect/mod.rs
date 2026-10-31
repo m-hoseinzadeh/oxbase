@@ -197,7 +197,10 @@ mod tests {
     fn registers_a_complete_layout() {
         let mut reg = DialectRegistry::new();
         register(&mut reg);
-        assert!(reg.missing_layout_fetchers(Engine::Sqlite).is_empty());
+        assert_eq!(
+            reg.missing_layout_fetchers(Engine::Sqlite),
+            Vec::<ObjectKind>::new()
+        );
         assert_eq!(
             reg.tree_layout(Engine::Sqlite).unwrap().scope,
             DatabaseScope::Attached

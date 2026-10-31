@@ -10,8 +10,9 @@ use oxbase_driver::{CancellationToken, ConnectParams, Connection, Driver, collec
 use oxbase_sqlite::SqliteDriver;
 use oxbase_sqlite::dialect::{self, AUTOINCREMENT, MODULE, UNNAMED};
 use oxbase_types::{
-    DataType, Engine, ErrorCategory, FkAction, ObjectDef, ObjectKind, ObjectRef, ObjectSummary,
-    PropId, Result, TriggerEvent, TriggerLevel, TriggerTiming, Value, props,
+    DataType, Engine, ErrorCategory, FkAction, ForeignKeyDef, IndexDef, ObjectDef, ObjectKind,
+    ObjectRef, ObjectSummary, PropId, Result, TriggerEvent, TriggerLevel, TriggerTiming, Value,
+    props,
 };
 use tempfile::TempDir;
 
@@ -116,7 +117,10 @@ fn the_seed_matches_fixtures_toml() {
 #[tokio::test]
 async fn registers_the_layout_and_reports_main() {
     let reg = registry();
-    assert!(reg.missing_layout_fetchers(Engine::Sqlite).is_empty());
+    assert_eq!(
+        reg.missing_layout_fetchers(Engine::Sqlite),
+        Vec::<ObjectKind>::new()
+    );
     let layout = reg.tree_layout(Engine::Sqlite).unwrap();
     assert_eq!(layout.scope, DatabaseScope::Attached);
     assert_eq!(layout.root()[0].kind, ObjectKind::Database);
@@ -213,7 +217,7 @@ async fn lists_and_loads_every_fixture_object() {
     assert_eq!(t.checks.len(), 1);
     assert_eq!(t.checks[0].name.as_deref(), Some("m2_parent_code_chk"));
     assert_eq!(t.checks[0].expression, "length(code) > 0");
-    assert!(t.foreign_keys.is_empty());
+    assert_eq!(t.foreign_keys, Vec::<ForeignKeyDef>::new());
     assert_eq!(t.comment, None);
 
     // m2_child
@@ -331,13 +335,19 @@ async fn lists_and_loads_every_fixture_object() {
         v.definition,
         "SELECT c.id, c.qty, p.code FROM m2_child c JOIN m2_parent p ON p.id = c.parent_id"
     );
-    assert!(v.columns.is_empty());
+    assert_eq!(v.columns, Vec::<String>::new());
     assert_eq!(
         names(&list(c, ObjectKind::Column, view).await),
         ["id", "qty", "code"]
     );
-    assert!(list(c, ObjectKind::Trigger, view).await.is_empty());
-    assert!(list(c, ObjectKind::Index, view).await.is_empty());
+    assert_eq!(
+        list(c, ObjectKind::Trigger, view).await,
+        Vec::<ObjectSummary>::new()
+    );
+    assert_eq!(
+        list(c, ObjectKind::Index, view).await,
+        Vec::<ObjectSummary>::new()
+    );
 
     // Every `[m2.sqlite].objects` entry was found above under its parent.
     let found: Vec<&str> = tables
@@ -366,7 +376,10 @@ async fn lists_and_loads_every_fixture_object() {
         panic!("not a table");
     };
     assert_eq!(t.columns.len(), 2);
-    assert!(list(c, ObjectKind::View, &aux).await.is_empty());
+    assert_eq!(
+        list(c, ObjectKind::View, &aux).await,
+        Vec::<ObjectSummary>::new()
+    );
     // A ref without a catalog means `main`.
     assert!(
         load(c, &ObjectRef::table(None, None, "m2_parent"))
@@ -440,7 +453,7 @@ async fn reads_sqlite_specific_shapes() {
     let ObjectDef::Table(t) = load(c, &wr).await.unwrap() else {
         panic!("not a table");
     };
-    assert!(t.indexes.is_empty());
+    assert_eq!(t.indexes, Vec::<IndexDef>::new());
     assert_eq!(t.primary_key.unwrap().columns, ["k"]);
     assert!(!t.columns[0].nullable && !t.columns[0].auto_increment);
     assert_eq!(

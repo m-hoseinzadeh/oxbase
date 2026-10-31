@@ -692,16 +692,15 @@ impl Fetcher for IndexFetcher {
         cancel: CancellationToken,
     ) -> Result<ObjectDef> {
         let cat = Catalog::new(c, &cancel);
-        let table = match obj.owner() {
-            Some(t) => t,
-            None => {
-                // An index ref without its table: find the table in `sqlite_schema`.
-                let row = cat
-                    .object(schema_of(obj), &obj.name, &["index"])
-                    .await?
-                    .ok_or_else(|| not_found(ObjectKind::Index, obj))?;
-                ObjectRef::table(obj.catalog.as_deref(), None, row.tbl_name)
-            }
+        let table = if let Some(t) = obj.owner() {
+            t
+        } else {
+            // An index ref without its table: find the table in `sqlite_schema`.
+            let row = cat
+                .object(schema_of(obj), &obj.name, &["index"])
+                .await?
+                .ok_or_else(|| not_found(ObjectKind::Index, obj))?;
+            ObjectRef::table(obj.catalog.as_deref(), None, row.tbl_name)
         };
         let owner = Owner::any(&cat, &table).await?;
         let index = index_defs(&cat, &owner)
