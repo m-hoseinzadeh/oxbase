@@ -93,7 +93,7 @@ mod test_split;
 
 /// How long a stopped statement's stream may take to wind down (server-side cancel, drain)
 /// before it is dropped. Keeps "cancel ends the run within 2 s".
-const STOP_GRACE: Duration = Duration::from_millis(1500);
+const STOP_GRACE: Duration = Duration::from_millis(1000);
 /// How long `close` waits for a cancelled run to end before forgetting it anyway.
 const CLOSE_WAIT: Duration = Duration::from_secs(3);
 /// Spill directories older than this are left over from a crash and removed on start.

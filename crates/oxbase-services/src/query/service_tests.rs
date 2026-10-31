@@ -481,7 +481,7 @@ async fn multi_statement_scripts_report_every_step_in_order() {
     let err = h.service.page(run, 3, 0, 10).await.unwrap_err();
     assert_eq!(err.category(), ErrorCategory::NotFound);
     let ipc = h.service.page_ipc(run, 1, 0, 10).await.unwrap();
-    assert!(!ipc.is_empty());
+    assert!(ipc.len() > 8, "an IPC stream with a schema and a batch");
 
     let info = h.service.info(run).unwrap();
     assert_eq!(info.state, RunState::Finished);
