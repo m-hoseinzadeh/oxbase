@@ -9,6 +9,7 @@ use oxbase_types::{
 };
 
 use super::coltype::{TypeFacts, charset_of_collation, column_default, data_type};
+use super::expr::catalog_sql;
 use super::rows::{Row, query, text};
 use super::{
     ENFORCED, INVISIBLE, ON_UPDATE_EXPRESSION, by_name, database_of, expect_kind, is_mariadb,
@@ -208,8 +209,13 @@ fn column_from_row(
         &col.data_type,
     );
     col.auto_increment = extra_upper.contains("AUTO_INCREMENT");
+    // MySQL escapes the quotes of GENERATION_EXPRESSION (see `catalog_sql`).
     col.generated = row.non_empty(15).map(|expression| GeneratedColumn {
-        expression,
+        expression: if mariadb {
+            expression
+        } else {
+            catalog_sql(expression)
+        },
         stored: extra_upper.contains("STORED") || extra_upper.contains("PERSISTENT"),
     });
     if col.generated.is_some() {
@@ -344,7 +350,7 @@ async fn read_indexes(
         let key = match (row.non_empty(3), row.non_empty(8)) {
             (Some(column), _) => IndexColumn::column(column),
             (None, Some(expression)) => IndexColumn {
-                name: expression,
+                name: catalog_sql(expression),
                 is_expression: true,
                 descending: false,
                 length: None,
@@ -646,7 +652,12 @@ async fn read_checks(
         .iter()
         .map(|row| {
             let name = row.string(0);
-            let expression = row.string(1);
+            // MySQL escapes the quotes of CHECK_CLAUSE (see `catalog_sql`).
+            let expression = if mariadb {
+                row.string(1)
+            } else {
+                catalog_sql(row.string(1))
+            };
             let json_auto = mariadb && is_json_auto(&name, &expression);
             let mut def = CheckDef {
                 name: Some(name),

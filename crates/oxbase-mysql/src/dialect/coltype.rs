@@ -4,6 +4,8 @@
 use oxbase_dialect::{BacktickQuoting, Quoting};
 use oxbase_types::DataType;
 
+use super::expr::catalog_sql;
+
 /// What `information_schema.COLUMNS` says about a column's type.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct TypeFacts {
@@ -130,6 +132,9 @@ pub(crate) fn column_default(
         return (raw != "NULL").then(|| raw.to_owned());
     }
     if extra.to_ascii_uppercase().contains("DEFAULT_GENERATED") {
+        // MySQL escapes the quotes of an expression default (`_utf8mb4\'{}\'`).
+        let raw = catalog_sql(raw.to_owned());
+        let raw = raw.as_str();
         let upper = raw.trim_start().to_ascii_uppercase();
         let temporal = [
             "CURRENT_TIMESTAMP",
@@ -278,6 +283,11 @@ mod tests {
         assert_eq!(
             column_default(false, Some("rand()"), "DEFAULT_GENERATED", &int).as_deref(),
             Some("(rand())")
+        );
+        // MySQL escapes the quotes of an expression default; the model holds valid SQL.
+        assert_eq!(
+            column_default(false, Some("_utf8mb4\\'{}\\'"), "DEFAULT_GENERATED", &text).as_deref(),
+            Some("(_utf8mb4'{}')")
         );
         // MySQL before 8.0.13 (no DEFAULT_GENERATED) and MariaDB before 10.2.7.
         assert_eq!(
