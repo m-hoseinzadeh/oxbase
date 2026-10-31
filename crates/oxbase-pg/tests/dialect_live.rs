@@ -684,6 +684,186 @@ async fn loads_views_routines_and_sequences() {
 
 #[tokio::test]
 #[ignore = "needs the postgres fixture with the M2 seed"]
+async fn partitioned_foreign_keys_are_listed_once() {
+    let f = fixture();
+    let conn = connect(&f.params(&f.database)).await;
+    let pg = f.database_ref().child(ObjectKind::Schema, "m2_pg");
+    let part_p = pg.child(ObjectKind::Table, "part_p");
+
+    // A foreign key to a partitioned table: PostgreSQL adds hidden rows per referenced
+    // partition, which are not foreign keys of their own.
+    let part_ref = pg.child(ObjectKind::Table, "part_ref");
+    let fks = list(&*conn, ObjectKind::ForeignKey, &part_ref).await;
+    assert_eq!(names(&fks), ["part_ref_pid_fk"]);
+    let ObjectDef::ForeignKey { foreign_key, .. } = load(&*conn, &fks[0].obj).await else {
+        panic!("not a foreign key");
+    };
+    assert_eq!(foreign_key.ref_table, part_p);
+    let ObjectDef::Table(t) = load(&*conn, &part_ref).await else {
+        panic!("not a table");
+    };
+    assert_eq!(t.foreign_keys.len(), 1, "{:?}", t.foreign_keys);
+    let fk = &t.foreign_keys[0];
+    assert_eq!(fk.name.as_deref(), Some("part_ref_pid_fk"));
+    assert_eq!(fk.ref_table, part_p);
+    assert_eq!(fk.columns, ["pid"]);
+    assert_eq!(fk.ref_columns, ["id"]);
+
+    // PostgreSQL 18 NOT ENFORCED: reported as such, not as NOT VALID.
+    assert_eq!(t.checks.len(), 1, "{:?}", t.checks);
+    let check = &t.checks[0];
+    assert_eq!(check.name.as_deref(), Some("part_ref_pid_chk"));
+    assert_eq!(
+        check.extras.get(&oxbase_pg::dialect::NOT_ENFORCED),
+        Some(&Value::Bool(true))
+    );
+    assert_eq!(check.extras.get(&oxbase_pg::dialect::NOT_VALID), None);
+    assert_eq!(fk.extras.get(&oxbase_pg::dialect::NOT_ENFORCED), None);
+
+    // Partitioned on both sides: one foreign key on the parent, and the inherited one on the
+    // partition (its parent constraint is on another table, so it stays).
+    for table in ["part_c", "part_c1"] {
+        let r = pg.child(ObjectKind::Table, table);
+        let ObjectDef::Table(t) = load(&*conn, &r).await else {
+            panic!("not a table");
+        };
+        assert_eq!(t.foreign_keys.len(), 1, "{table}: {:?}", t.foreign_keys);
+        assert_eq!(t.foreign_keys[0].ref_table, part_p, "{table}");
+        assert_eq!(t.foreign_keys[0].columns, ["pid"], "{table}");
+        assert_eq!(
+            list(&*conn, ObjectKind::ForeignKey, &r).await.len(),
+            1,
+            "{table}"
+        );
+    }
+    conn.close().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "needs the postgres fixture with the M2 seed"]
+async fn trigger_conditions_exclusions_and_null_ordering() {
+    let f = fixture();
+    let conn = connect(&f.params(&f.database)).await;
+    let pg = f.database_ref().child(ObjectKind::Schema, "m2_pg");
+    let trg_t = pg.child(ObjectKind::Table, "trg_t");
+
+    let triggers = list(&*conn, ObjectKind::Trigger, &trg_t).await;
+    assert_eq!(names(&triggers), ["trg_case", "trg_distinct"]);
+
+    let ObjectDef::Trigger(case) =
+        load(&*conn, &trg_t.child(ObjectKind::Trigger, "trg_case")).await
+    else {
+        panic!("not a trigger");
+    };
+    assert_eq!(case.timing, TriggerTiming::Before);
+    assert_eq!(case.events, [TriggerEvent::Update]);
+    assert_eq!(case.update_columns, ["code", "n"]);
+    let cond = case.condition.as_deref().expect("WHEN condition");
+    // The whole CASE expression, not the text after its inner WHEN.
+    assert!(
+        cond.starts_with("CASE") && cond.ends_with("END") && cond.contains("new.n > 0"),
+        "{cond:?}"
+    );
+
+    let ObjectDef::Trigger(distinct) =
+        load(&*conn, &trg_t.child(ObjectKind::Trigger, "trg_distinct")).await
+    else {
+        panic!("not a trigger");
+    };
+    assert_eq!(distinct.timing, TriggerTiming::After);
+    assert_eq!(distinct.update_columns, ["code"]);
+    assert_eq!(
+        distinct.condition.as_deref(),
+        Some("old.code IS DISTINCT FROM new.code")
+    );
+    assert_eq!(
+        distinct.function,
+        Some(
+            pg.child(ObjectKind::Function, "trg_noop")
+                .with_signature("")
+        )
+    );
+
+    let ObjectDef::Table(t) = load(&*conn, &trg_t).await else {
+        panic!("not a table");
+    };
+    let excl = t
+        .indexes
+        .iter()
+        .find(|i| i.name == "trg_t_r_excl")
+        .unwrap_or_else(|| panic!("no exclusion index in {:?}", t.indexes));
+    assert!(excl.is_constraint && !excl.unique, "{excl:?}");
+    assert_eq!(text(excl.extras.get(&props::INDEX_METHOD)), Some("gist"));
+    let exclusion = text(excl.extras.get(&oxbase_pg::dialect::EXCLUSION)).unwrap_or_default();
+    assert!(
+        exclusion.starts_with("EXCLUDE USING gist") && exclusion.contains("&&"),
+        "{exclusion}"
+    );
+    let nulls = t
+        .indexes
+        .iter()
+        .find(|i| i.name == "trg_t_nulls_idx")
+        .unwrap_or_else(|| panic!("no trg_t_nulls_idx in {:?}", t.indexes));
+    assert!(!nulls.is_constraint);
+    assert_eq!(
+        nulls
+            .columns
+            .iter()
+            .map(|c| (c.name.as_str(), c.descending))
+            .collect::<Vec<_>>(),
+        [("code", false), ("n", true)]
+    );
+    assert_eq!(
+        nulls.extras.get(&oxbase_pg::dialect::NULLS_FIRST),
+        Some(&Value::Json(serde_json::json!([true, false])))
+    );
+    let indexes = list(&*conn, ObjectKind::Index, &trg_t).await;
+    assert_eq!(
+        names(&indexes),
+        ["trg_t_nulls_idx", "trg_t_pkey", "trg_t_r_excl"]
+    );
+    let ObjectDef::Index { index, .. } =
+        load(&*conn, &trg_t.child(ObjectKind::Index, "trg_t_pkey")).await
+    else {
+        panic!("not an index");
+    };
+    assert_eq!(index.extras.get(&oxbase_pg::dialect::NULLS_FIRST), None);
+    conn.close().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "needs the postgres fixture with the M2 seed"]
+async fn extension_objects_are_flagged_system() {
+    let f = fixture();
+    let conn = connect(&f.params(&f.database)).await;
+    let schemas = list(&*conn, ObjectKind::Schema, &f.database_ref()).await;
+    assert!(!find(&schemas, "m2_pg_ext").system);
+    let ext = f.database_ref().child(ObjectKind::Schema, "m2_pg_ext");
+    let functions = list(&*conn, ObjectKind::Function, &ext).await;
+    assert!(
+        names(&functions).contains(&"citext".to_owned()),
+        "{:?}",
+        names(&functions)
+    );
+    assert!(functions.iter().all(|s| s.system), "{functions:?}");
+    // Objects of the same schema kinds that no extension owns stay user objects.
+    let pg = f.database_ref().child(ObjectKind::Schema, "m2_pg");
+    let user_functions = list(&*conn, ObjectKind::Function, &pg).await;
+    assert!(!find(&user_functions, "trg_noop").system);
+    let user_tables = list(&*conn, ObjectKind::Table, &pg).await;
+    assert!(user_tables.iter().all(|t| !t.system), "{user_tables:?}");
+    let columns = list(
+        &*conn,
+        ObjectKind::Column,
+        &pg.child(ObjectKind::Table, "trg_t"),
+    )
+    .await;
+    assert!(columns.iter().all(|c| !c.system));
+    conn.close().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "needs the postgres fixture with the M2 seed"]
 async fn system_objects_are_flagged() {
     let f = fixture();
     let conn = connect(&f.params(&f.database)).await;

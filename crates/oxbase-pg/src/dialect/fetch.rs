@@ -49,6 +49,15 @@ pub const EXTENSION_VERSION: PropId = PropId::from_static("extension_version");
 pub const EXTENSION_SCHEMA: PropId = PropId::from_static("extension_schema");
 /// Extra: a sequence belongs to an identity column (`GENERATED ... AS IDENTITY`).
 pub const IDENTITY_SEQUENCE: PropId = PropId::from_static("identity_sequence");
+/// Extra: a foreign key or check constraint is `NOT ENFORCED` (PostgreSQL 18+).
+pub const NOT_ENFORCED: PropId = PropId::from_static("not_enforced");
+/// Extra: the `EXCLUDE` constraint an index implements, as `pg_get_constraintdef` prints it
+/// (`EXCLUDE USING gist (r WITH &&)`); such an index has `is_constraint` set.
+pub const EXCLUSION: PropId = PropId::from_static("exclusion");
+/// Extra: per key column of an index, whether NULLs sort first (a JSON array of booleans in
+/// column order). Only set when a column differs from the default (`NULLS LAST` for ascending,
+/// `NULLS FIRST` for descending columns).
+pub const NULLS_FIRST: PropId = PropId::from_static("nulls_first");
 
 /// Every kind with a PostgreSQL fetcher.
 pub(crate) const KINDS: [ObjectKind; 15] = [
@@ -257,6 +266,8 @@ struct Relation {
     oid: i64,
     /// The owner ref, with the kind the catalog reports.
     obj: ObjectRef,
+    /// An extension owns the relation (`pg_depend` type `e`).
+    extension_member: bool,
 }
 
 /// Looks up the table, view or materialized view `owner` (a ref whose `kind` may be a guess;
@@ -281,6 +292,7 @@ async fn find_relation(cx: &Cx<'_>, owner: &ObjectRef) -> Result<Option<Relation
     Ok(Some(Relation {
         oid: row.i64("oid")?,
         obj,
+        extension_member: row.flag("extension_member")?,
     }))
 }
 
@@ -433,7 +445,7 @@ async fn list_relations(
     rows.iter()
         .map(|row| {
             let mut s = ObjectSummary::new(parent.child(kind, row.string("name")?));
-            s.system = system;
+            s.system = system || row.flag("extension_member")?;
             s.comment = row.opt_string("comment")?;
             if matches!(kind, ObjectKind::Table | ObjectKind::MatView) {
                 s.row_estimate = row
@@ -606,7 +618,7 @@ async fn list_types(cx: &Cx<'_>, parent: &ObjectRef) -> Result<Vec<ObjectSummary
     rows.iter()
         .map(|row| {
             let mut s = ObjectSummary::new(parent.child(ObjectKind::Type, row.string("name")?));
-            s.system = system;
+            s.system = system || row.flag("extension_member")?;
             s.comment = row.opt_string("comment")?;
             if let Some(kind) = type_kind(row.code("typtype")?) {
                 s.extras.insert(TYPE_KIND, kind);
@@ -684,7 +696,7 @@ async fn list_routines(
                 .child(kind, row.string("name")?)
                 .with_signature(row.opt_string("signature")?.unwrap_or_default());
             let mut s = ObjectSummary::new(r);
-            s.system = system;
+            s.system = system || row.flag("extension_member")?;
             s.comment = row.opt_string("comment")?;
             Ok(s)
         })
@@ -816,7 +828,7 @@ async fn list_table_children(
     let rel = find_relation(cx, &parent)
         .await?
         .ok_or_else(|| not_found(&parent))?;
-    let system = is_system_schema(schema_of(&parent)?);
+    let system = is_system_schema(schema_of(&parent)?) || rel.extension_member;
     // Refs keep the kind the caller used for the parent: it is how the tree addresses them.
     let summary = |name: &str, comment: Option<String>| {
         let mut s = ObjectSummary::new(parent.child(kind, name));
@@ -1026,11 +1038,14 @@ fn fk_action(code: &str) -> FkAction {
 /// The constraints of relation `oid` in name order. `catalog` is the database of referenced
 /// tables.
 async fn constraints(cx: &Cx<'_>, oid: i64, catalog: Option<&str>) -> Result<Vec<NamedConstraint>> {
-    let rows = cx.query(sql::CONSTRAINTS, &[Value::Int(oid)]).await?;
+    let rows = cx
+        .query(sql::constraints(cx.version()), &[Value::Int(oid)])
+        .await?;
     let col_rows = cx
         .query(sql::CONSTRAINT_COLUMNS, &[Value::Int(oid)])
         .await?;
-    // (constraint oid, referenced side) -> columns in key order.
+    // (constraint oid, referenced side) -> columns in key order. Entries of constraints the
+    // first query leaves out (partition clones of foreign keys) are never looked up.
     let mut cols: BTreeMap<(i64, bool), Vec<String>> = BTreeMap::new();
     for row in col_rows.iter() {
         cols.entry((row.i64("con")?, row.flag("is_referenced")?))
@@ -1043,8 +1058,13 @@ async fn constraints(cx: &Cx<'_>, oid: i64, catalog: Option<&str>) -> Result<Vec
         let name = row.string("name")?;
         let key = cols.remove(&(con_oid, false)).unwrap_or_default();
         let mut extras = Extras::new();
-        if !row.flag("is_validated")? {
-            extras.insert(NOT_VALID, true);
+        // NOT ENFORCED constraints are never validated; NOT VALID is about enforced ones.
+        if row.flag("is_enforced")? {
+            if !row.flag("is_validated")? {
+                extras.insert(NOT_VALID, true);
+            }
+        } else {
+            extras.insert(NOT_ENFORCED, true);
         }
         let def = match row.code("contype")? {
             "p" => Constraint::PrimaryKey(PrimaryKeyDef {
@@ -1107,6 +1127,7 @@ struct IndexPart {
     /// The column or expression text (`pg_get_indexdef`).
     text: String,
     descending: bool,
+    nulls_first: bool,
 }
 
 /// One index with listing facts.
@@ -1129,6 +1150,7 @@ async fn indexes(cx: &Cx<'_>, oid: i64) -> Result<Vec<Index>> {
             column: row.opt_string("name")?,
             text: row.opt_string("expr")?.unwrap_or_default(),
             descending: row.flag("descending")?,
+            nulls_first: row.flag("nulls_first")?,
         });
     }
     let mut out = Vec::new();
@@ -1136,11 +1158,13 @@ async fn indexes(cx: &Cx<'_>, oid: i64) -> Result<Vec<Index>> {
         let key_count = row.i64("key_count")?;
         let mut columns = Vec::new();
         let mut include = Vec::new();
+        let mut nulls_first = Vec::new();
         for part in cols.remove(&row.i64("oid")?).unwrap_or_default() {
             if part.ord > key_count {
                 include.push(part.column.unwrap_or(part.text));
                 continue;
             }
+            nulls_first.push((part.nulls_first, part.descending));
             columns.push(IndexColumn {
                 is_expression: part.column.is_none(),
                 name: part.column.unwrap_or(part.text),
@@ -1157,6 +1181,13 @@ async fn indexes(cx: &Cx<'_>, oid: i64) -> Result<Vec<Index>> {
                 props::INCLUDE_COLUMNS,
                 Value::Json(serde_json::Value::from(include)),
             );
+        }
+        if nulls_first.iter().any(|(first, desc)| first != desc) {
+            let flags: Vec<bool> = nulls_first.iter().map(|(first, _)| *first).collect();
+            extras.insert(NULLS_FIRST, Value::Json(serde_json::Value::from(flags)));
+        }
+        if let Some(exclusion) = row.opt_string("exclusion")? {
+            extras.insert(EXCLUSION, exclusion);
         }
         if row.flag("nulls_not_distinct")? {
             extras.insert(NULLS_NOT_DISTINCT, true);
@@ -1236,6 +1267,7 @@ async fn triggers(cx: &Cx<'_>, oid: i64, catalog: Option<&str>) -> Result<Vec<Tr
                 .child(ObjectKind::Function, row.string("fn_name")?)
                 .with_signature(row.opt_string("fn_signature")?.unwrap_or_default());
             let comment = row.opt_string("comment")?;
+            let definition = row.opt_string("definition")?;
             Ok(Trigger {
                 oid: row.i64("oid")?,
                 def: TriggerDef {
@@ -1244,10 +1276,10 @@ async fn triggers(cx: &Cx<'_>, oid: i64, catalog: Option<&str>) -> Result<Vec<Tr
                     events,
                     update_columns: Vec::new(),
                     level,
-                    condition: row.opt_string("condition")?,
+                    condition: definition.as_deref().and_then(trigger_condition),
                     function: Some(function),
                     body: None,
-                    definition: row.opt_string("definition")?,
+                    definition,
                     enabled: row.code("enabled")? != "D",
                     comment: comment.clone(),
                     extras: Extras::new(),
@@ -1259,9 +1291,126 @@ async fn triggers(cx: &Cx<'_>, oid: i64, catalog: Option<&str>) -> Result<Vec<Tr
         .collect()
 }
 
+/// The `WHEN (...)` condition of a trigger, without `WHEN` and the parentheses, cut out of its
+/// pretty-printed definition (`pg_get_triggerdef(oid, true)`). The condition follows
+/// `FOR EACH ROW` / `FOR EACH STATEMENT`; quoted names and string literals are skipped while
+/// looking for that clause and for the closing parenthesis, so names, literals or nested
+/// `CASE WHEN (...)` expressions do not cut it short.
+fn trigger_condition(definition: &str) -> Option<String> {
+    const WHEN: [&[u8]; 2] = [b" FOR EACH ROW WHEN (", b" FOR EACH STATEMENT WHEN ("];
+    let b = definition.as_bytes();
+    let mut i = 0;
+    let open = loop {
+        if i >= b.len() {
+            return None;
+        }
+        if b[i] == b'"' || b[i] == b'\'' {
+            i = skip_quoted(b, i);
+            continue;
+        }
+        let rest = &b[i..];
+        if let Some(m) = WHEN.iter().find(|m| rest.starts_with(m)) {
+            break i + m.len();
+        }
+        if rest.starts_with(b" FOR EACH ") {
+            // The level clause without a WHEN.
+            return None;
+        }
+        i += 1;
+    };
+    let mut depth = 1_usize;
+    let mut j = open;
+    while j < b.len() {
+        match b[j] {
+            b'"' | b'\'' => {
+                j = skip_quoted(b, j);
+                continue;
+            }
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    // `open` and `j` sit next to ASCII bytes: both are char boundaries.
+                    return Some(definition[open..j].trim().to_owned());
+                }
+            }
+            _ => {}
+        }
+        j += 1;
+    }
+    None
+}
+
+/// The index just past the quoted text starting at `start` (a `"` identifier or `'` literal; a
+/// doubled quote inside is an escaped one). Unterminated text runs to the end.
+fn skip_quoted(b: &[u8], start: usize) -> usize {
+    let quote = b[start];
+    let mut i = start + 1;
+    while i < b.len() {
+        if b[i] == quote {
+            if b.get(i + 1) == Some(&quote) {
+                i += 2;
+                continue;
+            }
+            return i + 1;
+        }
+        i += 1;
+    }
+    b.len()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trigger_conditions_are_cut_out_of_the_definition() {
+        let head = "CREATE TRIGGER t BEFORE UPDATE OF a ON s.t";
+        let tail = "EXECUTE FUNCTION s.f()";
+        assert_eq!(
+            trigger_condition(&format!("{head} FOR EACH ROW {tail}")),
+            None
+        );
+        assert_eq!(
+            trigger_condition(&format!(
+                "{head} FOR EACH ROW WHEN (old.a IS DISTINCT FROM new.a) {tail}"
+            ))
+            .as_deref(),
+            Some("old.a IS DISTINCT FROM new.a")
+        );
+        // A nested `CASE WHEN (...)` and a literal with parentheses in the arguments.
+        assert_eq!(
+            trigger_condition(&format!(
+                "{head} FOR EACH ROW WHEN (CASE WHEN (new.a > 0) THEN true ELSE false END) \
+                 EXECUTE FUNCTION s.f(')')"
+            ))
+            .as_deref(),
+            Some("CASE WHEN (new.a > 0) THEN true ELSE false END")
+        );
+        // Multi-line pretty output.
+        assert_eq!(
+            trigger_condition(&format!(
+                "{head} FOR EACH STATEMENT WHEN (\n    CASE\n    WHEN x THEN true\n    END) {tail}"
+            ))
+            .as_deref(),
+            Some("CASE\n    WHEN x THEN true\n    END")
+        );
+        // Quoted names holding the marker, literals holding parentheses and quotes.
+        assert_eq!(
+            trigger_condition(
+                "CREATE TRIGGER \"x FOR EACH ROW WHEN (\" AFTER UPDATE ON \"s\"\")\".\"é\" \
+                 FOR EACH ROW WHEN (new.t = ')(''' AND new.u <> 'a''b') EXECUTE FUNCTION f()"
+            )
+            .as_deref(),
+            Some("new.t = ')(''' AND new.u <> 'a''b'")
+        );
+        // Unbalanced text gives nothing rather than a wrong condition.
+        assert_eq!(
+            trigger_condition(&format!("{head} FOR EACH ROW WHEN (new.a > (1) {tail}")),
+            None
+        );
+        assert_eq!(trigger_condition(""), None);
+    }
 
     #[test]
     fn trigger_bits() {

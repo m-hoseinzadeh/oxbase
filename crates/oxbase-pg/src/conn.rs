@@ -648,7 +648,8 @@ pub struct PgConnection {
     version: ServerVersion,
     tls_in_use: bool,
     server: Endpoint,
-    /// The connected database: `ConnectParams::database`, or the user name (the server default).
+    /// The connected database as the server reports it (`current_database()`); when that could
+    /// not be read, `ConnectParams::database` or the user name (the server default).
     database: String,
 }
 
@@ -833,6 +834,31 @@ impl PgConnection {
             }
         });
 
+        // The database the server actually opened (a pooler alias such as pgbouncer's
+        // `[databases] app = dbname=real` connects to `real`); the requested name is the fallback.
+        let database = match tokio::time::timeout(
+            limit,
+            client.simple_query("SELECT pg_catalog.current_database()"),
+        )
+        .await
+        {
+            Ok(Ok(messages)) => messages
+                .into_iter()
+                .find_map(|m| match m {
+                    SimpleQueryMessage::Row(row) => row.get(0).map(str::to_owned),
+                    _ => None,
+                })
+                .unwrap_or(database),
+            Ok(Err(e)) => {
+                tracing::debug!(error = %from_pg(&e), "could not read current_database()");
+                database
+            }
+            Err(_) => {
+                tracing::debug!("reading current_database() timed out");
+                database
+            }
+        };
+
         let shared = Arc::new(Shared {
             cancel_token: client.cancel_token(),
             client: StdMutex::new(Some(Arc::new(client))),
@@ -867,8 +893,8 @@ impl Connection for PgConnection {
         self.tls_in_use
     }
 
-    /// The connected database (`ConnectParams::database`, or the user name, which is the
-    /// server's default).
+    /// The connected database, read from the server right after connecting
+    /// (`ConnectParams::database` or the user name when that failed).
     fn current_database(&self) -> Option<String> {
         Some(self.database.clone())
     }

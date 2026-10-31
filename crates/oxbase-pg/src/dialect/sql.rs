@@ -5,23 +5,29 @@
 //! differences are separate constants, picked by the functions at the bottom of this module from
 //! the server version.
 //!
-//! Tables are schema-qualified (`pg_catalog.pg_class`) so a session `search_path` cannot change
-//! what is read. Columns of PostgreSQL-internal types (`name`, `"char"`, `oid`) are cast to
-//! `text` / `int8` so the driver returns plain `Utf8` / `Int64` columns.
+//! Catalog tables and functions are schema-qualified (`pg_catalog.pg_class`,
+//! `pg_catalog.format_type(...)`), so objects of the same name in a schema the session
+//! `search_path` lists before `pg_catalog` are not picked up instead. Type names in casts and
+//! operators are still resolved through the `search_path`, where `pg_catalog` comes first unless
+//! the user explicitly lists it later. Columns of PostgreSQL-internal types (`name`, `"char"`,
+//! `oid`) are cast to `text` / `int8` so the driver returns plain `Utf8` / `Int64` columns.
 //!
 //! Supported servers: PostgreSQL 10 and newer. Version-dependent pieces: `prokind` (11+,
-//! procedures), `indnkeyatts` (11+, `INCLUDE` columns), `attgenerated` (12+), `prosqlbody`
-//! (14+, SQL-standard bodies), `indnullsnotdistinct` (15+).
+//! procedures), `indnkeyatts` and `conparentid` (11+, `INCLUDE` columns, partition constraint
+//! clones), `attgenerated` (12+), `prosqlbody` (14+, SQL-standard bodies),
+//! `indnullsnotdistinct` (15+), `conenforced` (18+, `NOT ENFORCED` constraints). Only the newest
+//! branch runs live in CI (the postgres fixture is PostgreSQL 18); the older branches are checked
+//! by the query-text tests below.
 
 use oxbase_types::ServerVersion;
 
 /// Databases a client can connect to (templates and `datallowconn = false` are left out).
 pub(crate) const DATABASES: &str = "\
 SELECT d.datname::text AS name, \
-       shobj_description(d.oid, 'pg_database') AS comment, \
-       pg_encoding_to_char(d.encoding)::text AS encoding, \
+       pg_catalog.shobj_description(d.oid, 'pg_database') AS comment, \
+       pg_catalog.pg_encoding_to_char(d.encoding)::text AS encoding, \
        d.datcollate::text AS collate_name, \
-       (d.datname = current_database()) AS is_current \
+       (d.datname = pg_catalog.current_database()) AS is_current \
 FROM pg_catalog.pg_database d \
 WHERE NOT d.datistemplate AND d.datallowconn \
 ORDER BY d.datname";
@@ -29,13 +35,13 @@ ORDER BY d.datname";
 /// One database by name (`$1`).
 pub(crate) const DATABASE: &str = "\
 SELECT d.datname::text AS name, \
-       pg_get_userbyid(d.datdba)::text AS owner, \
-       shobj_description(d.oid, 'pg_database') AS comment, \
-       pg_encoding_to_char(d.encoding)::text AS encoding, \
+       pg_catalog.pg_get_userbyid(d.datdba)::text AS owner, \
+       pg_catalog.shobj_description(d.oid, 'pg_database') AS comment, \
+       pg_catalog.pg_encoding_to_char(d.encoding)::text AS encoding, \
        d.datcollate::text AS collate_name, \
        d.datctype::text AS ctype, \
        ts.spcname::text AS tablespace, \
-       (d.datname = current_database()) AS is_current \
+       (d.datname = pg_catalog.current_database()) AS is_current \
 FROM pg_catalog.pg_database d \
 LEFT JOIN pg_catalog.pg_tablespace ts ON ts.oid = d.dattablespace \
 WHERE d.datname = $1";
@@ -44,18 +50,18 @@ WHERE d.datname = $1";
 /// session's own temporary schema is listed.
 pub(crate) const SCHEMAS: &str = "\
 SELECT n.nspname::text AS name, \
-       obj_description(n.oid, 'pg_namespace') AS comment, \
-       (n.oid = pg_my_temp_schema()) AS is_temp \
+       pg_catalog.obj_description(n.oid, 'pg_namespace') AS comment, \
+       (n.oid = pg_catalog.pg_my_temp_schema()) AS is_temp \
 FROM pg_catalog.pg_namespace n \
-WHERE n.nspname !~ '^pg_(toast_)?temp_' OR n.oid = pg_my_temp_schema() \
+WHERE n.nspname !~ '^pg_(toast_)?temp_' OR n.oid = pg_catalog.pg_my_temp_schema() \
 ORDER BY n.nspname";
 
 /// One schema by name (`$1`).
 pub(crate) const SCHEMA: &str = "\
 SELECT n.nspname::text AS name, \
-       pg_get_userbyid(n.nspowner)::text AS owner, \
-       obj_description(n.oid, 'pg_namespace') AS comment, \
-       (n.oid = pg_my_temp_schema()) AS is_temp \
+       pg_catalog.pg_get_userbyid(n.nspowner)::text AS owner, \
+       pg_catalog.obj_description(n.oid, 'pg_namespace') AS comment, \
+       (n.oid = pg_catalog.pg_my_temp_schema()) AS is_temp \
 FROM pg_catalog.pg_namespace n \
 WHERE n.nspname = $1";
 
@@ -64,12 +70,15 @@ macro_rules! relations {
     ($kinds:literal) => {
         concat!(
             "SELECT c.relname::text AS name, ",
-            "obj_description(c.oid, 'pg_class') AS comment, ",
+            "pg_catalog.obj_description(c.oid, 'pg_class') AS comment, ",
             "CASE WHEN c.reltuples >= 0 THEN c.reltuples::int8 END AS row_estimate, ",
             "c.relkind::text AS relkind, ",
             "c.relispartition AS is_partition, ",
             "c.relpersistence::text AS persistence, ",
-            "c.relispopulated AS populated ",
+            "c.relispopulated AS populated, ",
+            "EXISTS (SELECT 1 FROM pg_catalog.pg_depend d ",
+            "WHERE d.classid = 'pg_catalog.pg_class'::regclass AND d.objid = c.oid ",
+            "AND d.deptype = 'e') AS extension_member ",
             "FROM pg_catalog.pg_class c ",
             "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace ",
             "WHERE n.nspname = $1 AND c.relkind IN (",
@@ -88,22 +97,26 @@ pub(crate) const MATVIEWS: &str = relations!("'m'");
 /// Sequences of schema `$1`.
 pub(crate) const SEQUENCES: &str = relations!("'S'");
 
-/// One relation by schema (`$1`) and name (`$2`): its oid and `relkind`.
+/// One relation by schema (`$1`) and name (`$2`): its oid, `relkind` and whether an extension
+/// owns it.
 pub(crate) const RELATION: &str = "\
-SELECT c.oid::int8 AS oid, c.relkind::text AS relkind \
+SELECT c.oid::int8 AS oid, c.relkind::text AS relkind, \
+       EXISTS (SELECT 1 FROM pg_catalog.pg_depend d \
+                WHERE d.classid = 'pg_catalog.pg_class'::regclass AND d.objid = c.oid \
+                  AND d.deptype = 'e') AS extension_member \
 FROM pg_catalog.pg_class c \
 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
 WHERE n.nspname = $1 AND c.relname = $2";
 
 /// Table-level facts of relation `$1` (oid).
 pub(crate) const TABLE_HEAD: &str = "\
-SELECT obj_description(c.oid, 'pg_class') AS comment, \
+SELECT pg_catalog.obj_description(c.oid, 'pg_class') AS comment, \
        c.relkind::text AS relkind, \
        c.relpersistence::text AS persistence, \
        c.relispartition AS is_partition, \
-       pg_get_userbyid(c.relowner)::text AS owner, \
+       pg_catalog.pg_get_userbyid(c.relowner)::text AS owner, \
        ts.spcname::text AS tablespace, \
-       pg_get_partkeydef(c.oid) AS partition_by \
+       pg_catalog.pg_get_partkeydef(c.oid) AS partition_by \
 FROM pg_catalog.pg_class c \
 LEFT JOIN pg_catalog.pg_tablespace ts ON ts.oid = c.reltablespace \
 WHERE c.oid = $1";
@@ -115,15 +128,15 @@ macro_rules! columns {
         concat!(
             "SELECT a.attnum::int4 AS ordinal, ",
             "a.attname::text AS name, ",
-            "format_type(a.atttypid, a.atttypmod) AS native_type, ",
+            "pg_catalog.format_type(a.atttypid, a.atttypmod) AS native_type, ",
             "NOT a.attnotnull AS nullable, ",
-            "pg_get_expr(ad.adbin, ad.adrelid, true) AS default_expr, ",
+            "pg_catalog.pg_get_expr(ad.adbin, ad.adrelid, true) AS default_expr, ",
             "a.attidentity::text AS identity, ",
             $generated,
             " AS generated, ",
             "CASE WHEN a.attcollation <> t.typcollation THEN co.collname::text END ",
             "AS collation_name, ",
-            "col_description(a.attrelid, a.attnum) AS comment, ",
+            "pg_catalog.col_description(a.attrelid, a.attnum) AS comment, ",
             "EXISTS (SELECT 1 FROM pg_catalog.pg_constraint k WHERE k.conrelid = a.attrelid ",
             "AND k.contype = 'p' AND a.attnum = ANY (k.conkey)) AS in_primary_key, ",
             "EXISTS (SELECT 1 FROM pg_catalog.pg_depend dep ",
@@ -156,45 +169,76 @@ pub(crate) const COLUMNS_12: &str = columns!("a.attgenerated::text");
 /// [`columns`] before PostgreSQL 12.
 pub(crate) const COLUMNS_10: &str = columns!("''::text");
 
-/// Primary key, unique, foreign key and check constraints of relation `$1` (oid).
-pub(crate) const CONSTRAINTS: &str = "\
-SELECT k.oid::int8 AS oid, \
-       k.conname::text AS name, \
-       k.contype::text AS contype, \
-       k.condeferrable AS is_deferrable, \
-       k.condeferred AS is_deferred, \
-       k.convalidated AS is_validated, \
-       k.connoinherit AS no_inherit, \
-       CASE WHEN k.contype = 'c' THEN pg_get_expr(k.conbin, k.conrelid, true) END AS check_expr, \
-       k.confupdtype::text AS on_update, \
-       k.confdeltype::text AS on_delete, \
-       k.confmatchtype::text AS match_type, \
-       rn.nspname::text AS ref_schema, \
-       rc.relname::text AS ref_table, \
-       obj_description(k.oid, 'pg_constraint') AS comment \
-FROM pg_catalog.pg_constraint k \
-LEFT JOIN pg_catalog.pg_class rc ON rc.oid = k.confrelid \
-LEFT JOIN pg_catalog.pg_namespace rn ON rn.oid = rc.relnamespace \
-WHERE k.conrelid = $1 AND k.contype IN ('p', 'u', 'f', 'c') \
-ORDER BY k.conname";
+/// Primary key, unique, foreign key and check constraints of relation `$1` (oid). `$enforced`
+/// is `conenforced` (18+) or `true`; `$clones` leaves out the foreign keys PostgreSQL 12+ adds
+/// for each partition of a referenced partitioned table (`conparentid` on the same relation;
+/// 11+) or is empty. Inherited foreign keys of a partition (parent constraint on another
+/// relation) stay.
+macro_rules! constraints {
+    ($enforced:literal, $clones:literal) => {
+        concat!(
+            "SELECT k.oid::int8 AS oid, ",
+            "k.conname::text AS name, ",
+            "k.contype::text AS contype, ",
+            "k.condeferrable AS is_deferrable, ",
+            "k.condeferred AS is_deferred, ",
+            "k.convalidated AS is_validated, ",
+            $enforced,
+            " AS is_enforced, ",
+            "k.connoinherit AS no_inherit, ",
+            "CASE WHEN k.contype = 'c' THEN pg_catalog.pg_get_expr(k.conbin, k.conrelid, true) END ",
+            "AS check_expr, ",
+            "k.confupdtype::text AS on_update, ",
+            "k.confdeltype::text AS on_delete, ",
+            "k.confmatchtype::text AS match_type, ",
+            "rn.nspname::text AS ref_schema, ",
+            "rc.relname::text AS ref_table, ",
+            "pg_catalog.obj_description(k.oid, 'pg_constraint') AS comment ",
+            "FROM pg_catalog.pg_constraint k ",
+            "LEFT JOIN pg_catalog.pg_class rc ON rc.oid = k.confrelid ",
+            "LEFT JOIN pg_catalog.pg_namespace rn ON rn.oid = rc.relnamespace ",
+            "WHERE k.conrelid = $1 AND k.contype IN ('p', 'u', 'f', 'c')",
+            $clones,
+            " ORDER BY k.conname"
+        )
+    };
+}
+
+/// [`constraints`] for PostgreSQL 18+.
+pub(crate) const CONSTRAINTS_18: &str = constraints!(
+    "k.conenforced",
+    " AND NOT (k.contype = 'f' AND EXISTS (SELECT 1 FROM pg_catalog.pg_constraint pk \
+     WHERE pk.oid = k.conparentid AND pk.conrelid = k.conrelid))"
+);
+/// [`constraints`] for PostgreSQL 11 to 17.
+pub(crate) const CONSTRAINTS_11: &str = constraints!(
+    "true",
+    " AND NOT (k.contype = 'f' AND EXISTS (SELECT 1 FROM pg_catalog.pg_constraint pk \
+     WHERE pk.oid = k.conparentid AND pk.conrelid = k.conrelid))"
+);
+/// [`constraints`] before PostgreSQL 11 (no `conparentid`; partitioned tables cannot be
+/// referenced yet).
+pub(crate) const CONSTRAINTS_10: &str = constraints!("true", "");
 
 /// Key columns (`is_referenced = false`) and referenced columns (`true`, foreign keys) of the
-/// constraints of relation `$1` (oid), in key order.
+/// constraints of relation `$1` (oid), in key order. Rows of constraints [`constraints`] leaves
+/// out (partition clones) are ignored by the caller.
 pub(crate) const CONSTRAINT_COLUMNS: &str = "\
 SELECT k.oid::int8 AS con, false AS is_referenced, x.ord::int4 AS ord, a.attname::text AS name \
 FROM pg_catalog.pg_constraint k \
-CROSS JOIN LATERAL unnest(k.conkey) WITH ORDINALITY AS x(attnum, ord) \
+CROSS JOIN LATERAL pg_catalog.unnest(k.conkey) WITH ORDINALITY AS x(attnum, ord) \
 JOIN pg_catalog.pg_attribute a ON a.attrelid = k.conrelid AND a.attnum = x.attnum \
 WHERE k.conrelid = $1 AND k.contype IN ('p', 'u', 'f', 'c') \
 UNION ALL \
 SELECT k.oid::int8, true, x.ord::int4, a.attname::text \
 FROM pg_catalog.pg_constraint k \
-CROSS JOIN LATERAL unnest(k.confkey) WITH ORDINALITY AS x(attnum, ord) \
+CROSS JOIN LATERAL pg_catalog.unnest(k.confkey) WITH ORDINALITY AS x(attnum, ord) \
 JOIN pg_catalog.pg_attribute a ON a.attrelid = k.confrelid AND a.attnum = x.attnum \
 WHERE k.conrelid = $1 AND k.contype = 'f' \
 ORDER BY 1, 2, 3";
 
-/// Indexes of relation `$1` (oid). `$keys` counts the key columns (`indnkeyatts`, 11+, else
+/// Indexes of relation `$1` (oid), with whether a `UNIQUE` or `EXCLUDE` constraint owns each
+/// (and the `EXCLUDE` definition). `$keys` counts the key columns (`indnkeyatts`, 11+, else
 /// `indnatts`); `$nnd` is `indnullsnotdistinct` (15+) or `false`.
 macro_rules! indexes {
     ($keys:literal, $nnd:literal) => {
@@ -205,14 +249,17 @@ macro_rules! indexes {
             "i.indisprimary AS is_primary, ",
             "i.indisvalid AS is_valid, ",
             "am.amname::text AS method, ",
-            "pg_get_expr(i.indpred, i.indrelid, true) AS predicate, ",
+            "pg_catalog.pg_get_expr(i.indpred, i.indrelid, true) AS predicate, ",
             $keys,
             "::int4 AS key_count, ",
             $nnd,
             " AS nulls_not_distinct, ",
             "EXISTS (SELECT 1 FROM pg_catalog.pg_constraint k WHERE k.conindid = ci.oid ",
-            "AND k.conrelid = i.indrelid AND k.contype = 'u') AS is_constraint, ",
-            "obj_description(ci.oid, 'pg_class') AS comment ",
+            "AND k.conrelid = i.indrelid AND k.contype IN ('u', 'x')) AS is_constraint, ",
+            "(SELECT pg_catalog.pg_get_constraintdef(k.oid, true) FROM pg_catalog.pg_constraint k ",
+            "WHERE k.conindid = ci.oid AND k.conrelid = i.indrelid AND k.contype = 'x' ",
+            "LIMIT 1) AS exclusion, ",
+            "pg_catalog.obj_description(ci.oid, 'pg_class') AS comment ",
             "FROM pg_catalog.pg_index i ",
             "JOIN pg_catalog.pg_class ci ON ci.oid = i.indexrelid ",
             "JOIN pg_catalog.pg_am am ON am.oid = ci.relam ",
@@ -230,34 +277,34 @@ pub(crate) const INDEXES_11: &str = indexes!("i.indnkeyatts", "false");
 pub(crate) const INDEXES_10: &str = indexes!("i.indnatts", "false");
 
 /// Every column of every index of relation `$1` (oid), key columns first, then `INCLUDE`
-/// columns. `name` is NULL for an expression; `expr` is the column or expression text.
+/// columns. `name` is NULL for an expression; `expr` is the column or expression text;
+/// `descending` and `nulls_first` are the `indoption` bits (only key columns have them).
 pub(crate) const INDEX_COLUMNS: &str = "\
 SELECT i.indexrelid::int8 AS idx, \
        k.n AS ord, \
        a.attname::text AS name, \
-       pg_get_indexdef(i.indexrelid, k.n, true) AS expr, \
-       COALESCE((i.indoption[k.n - 1]::int4 & 1) = 1, false) AS descending \
+       pg_catalog.pg_get_indexdef(i.indexrelid, k.n, true) AS expr, \
+       COALESCE((i.indoption[k.n - 1]::int4 & 1) = 1, false) AS descending, \
+       COALESCE((i.indoption[k.n - 1]::int4 & 2) = 2, false) AS nulls_first \
 FROM pg_catalog.pg_index i \
-CROSS JOIN LATERAL generate_series(1, i.indnatts::int4) AS k(n) \
+CROSS JOIN LATERAL pg_catalog.generate_series(1, i.indnatts::int4) AS k(n) \
 LEFT JOIN pg_catalog.pg_attribute a \
        ON a.attrelid = i.indrelid AND a.attnum = i.indkey[k.n - 1] AND i.indkey[k.n - 1] <> 0 \
 WHERE i.indrelid = $1 \
 ORDER BY 1, 2";
 
-/// User triggers of relation `$1` (oid). `condition` is the `WHEN (...)` text, taken from the
-/// server's own trigger definition.
+/// User triggers of relation `$1` (oid). The `WHEN (...)` condition is cut out of `definition`
+/// (the pretty-printed `pg_get_triggerdef`) by the caller.
 pub(crate) const TRIGGERS: &str = "\
 SELECT t.oid::int8 AS oid, \
        t.tgname::text AS name, \
        t.tgtype::int4 AS tgtype, \
        t.tgenabled::text AS enabled, \
-       pg_get_triggerdef(t.oid, true) AS definition, \
-       (regexp_match(pg_get_triggerdef(t.oid), \
-                     '.{35,} WHEN \\((.+)\\) EXECUTE (?:FUNCTION|PROCEDURE)'))[1] AS condition, \
+       pg_catalog.pg_get_triggerdef(t.oid, true) AS definition, \
        fn.nspname::text AS fn_schema, \
        p.proname::text AS fn_name, \
-       pg_get_function_identity_arguments(p.oid) AS fn_signature, \
-       obj_description(t.oid, 'pg_trigger') AS comment \
+       pg_catalog.pg_get_function_identity_arguments(p.oid) AS fn_signature, \
+       pg_catalog.obj_description(t.oid, 'pg_trigger') AS comment \
 FROM pg_catalog.pg_trigger t \
 JOIN pg_catalog.pg_proc p ON p.oid = t.tgfoid \
 JOIN pg_catalog.pg_namespace fn ON fn.oid = p.pronamespace \
@@ -268,7 +315,7 @@ ORDER BY t.tgname";
 pub(crate) const TRIGGER_COLUMNS: &str = "\
 SELECT a.attname::text AS name \
 FROM pg_catalog.pg_trigger t \
-CROSS JOIN LATERAL unnest(t.tgattr::int2[]) WITH ORDINALITY AS k(attnum, ord) \
+CROSS JOIN LATERAL pg_catalog.unnest(t.tgattr::int2[]) WITH ORDINALITY AS k(attnum, ord) \
 JOIN pg_catalog.pg_attribute a ON a.attrelid = t.tgrelid AND a.attnum = k.attnum \
 WHERE t.oid = $1 \
 ORDER BY k.ord";
@@ -279,8 +326,11 @@ macro_rules! routines {
         concat!(
             "SELECT p.oid::int8 AS oid, ",
             "p.proname::text AS name, ",
-            "pg_get_function_identity_arguments(p.oid) AS signature, ",
-            "obj_description(p.oid, 'pg_proc') AS comment ",
+            "pg_catalog.pg_get_function_identity_arguments(p.oid) AS signature, ",
+            "pg_catalog.obj_description(p.oid, 'pg_proc') AS comment, ",
+            "EXISTS (SELECT 1 FROM pg_catalog.pg_depend d ",
+            "WHERE d.classid = 'pg_catalog.pg_proc'::regclass AND d.objid = p.oid ",
+            "AND d.deptype = 'e') AS extension_member ",
             "FROM pg_catalog.pg_proc p ",
             "JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace ",
             "WHERE n.nspname = $1 AND ",
@@ -309,18 +359,18 @@ pub(crate) const PROCEDURES_BY_NAME: &str = routines!("p.prokind = 'p'", " AND p
 macro_rules! routine {
     ($sql_body:literal) => {
         concat!(
-            "SELECT pg_get_function_result(p.oid) AS returns, ",
+            "SELECT pg_catalog.pg_get_function_result(p.oid) AS returns, ",
             "l.lanname::text AS language, ",
             "p.prosrc AS src, ",
             $sql_body,
             " AS sql_body, ",
-            "pg_get_functiondef(p.oid) AS definition, ",
-            "obj_description(p.oid, 'pg_proc') AS comment, ",
+            "pg_catalog.pg_get_functiondef(p.oid) AS definition, ",
+            "pg_catalog.obj_description(p.oid, 'pg_proc') AS comment, ",
             "p.provolatile::text AS volatility, ",
             "p.proisstrict AS is_strict, ",
             "p.prosecdef AS security_definer, ",
             "p.proparallel::text AS parallel, ",
-            "pg_get_userbyid(p.proowner)::text AS owner ",
+            "pg_catalog.pg_get_userbyid(p.proowner)::text AS owner ",
             "FROM pg_catalog.pg_proc p ",
             "JOIN pg_catalog.pg_language l ON l.oid = p.prolang ",
             "WHERE p.oid = $1"
@@ -329,8 +379,9 @@ macro_rules! routine {
 }
 
 /// [`routine`] for PostgreSQL 14+.
-pub(crate) const ROUTINE_14: &str =
-    routine!("CASE WHEN p.prosqlbody IS NOT NULL THEN pg_get_function_sqlbody(p.oid) END");
+pub(crate) const ROUTINE_14: &str = routine!(
+    "CASE WHEN p.prosqlbody IS NOT NULL THEN pg_catalog.pg_get_function_sqlbody(p.oid) END"
+);
 /// [`routine`] before PostgreSQL 14.
 pub(crate) const ROUTINE_10: &str = routine!("NULL::text");
 
@@ -339,24 +390,24 @@ pub(crate) const ROUTINE_ARGS: &str = "\
 SELECT a.n AS ord, \
        (p.proargnames)[a.n] AS name, \
        COALESCE((p.proargmodes)[a.n]::text, 'i') AS mode, \
-       format_type(COALESCE((p.proallargtypes)[a.n], p.proargtypes[a.n - 1]), NULL) AS native_type, \
-       pg_get_function_arg_default(p.oid, a.n) AS default_expr \
+       pg_catalog.format_type(COALESCE((p.proallargtypes)[a.n], p.proargtypes[a.n - 1]), NULL) AS native_type, \
+       pg_catalog.pg_get_function_arg_default(p.oid, a.n) AS default_expr \
 FROM pg_catalog.pg_proc p \
-CROSS JOIN LATERAL generate_series(1, COALESCE(array_length(p.proallargtypes, 1), p.pronargs::int4)) AS a(n) \
+CROSS JOIN LATERAL pg_catalog.generate_series(1, COALESCE(pg_catalog.array_length(p.proallargtypes, 1), p.pronargs::int4)) AS a(n) \
 WHERE p.oid = $1 \
 ORDER BY a.n";
 
 /// One sequence by schema (`$1`) and name (`$2`), with the column that owns it.
 pub(crate) const SEQUENCE: &str = "\
-SELECT format_type(s.seqtypid, NULL) AS data_type, \
+SELECT pg_catalog.format_type(s.seqtypid, NULL) AS data_type, \
        s.seqstart AS start_value, \
        s.seqincrement AS increment_by, \
        s.seqmin AS min_value, \
        s.seqmax AS max_value, \
        s.seqcache AS cache_size, \
        s.seqcycle AS is_cycle, \
-       obj_description(c.oid, 'pg_class') AS comment, \
-       pg_get_userbyid(c.relowner)::text AS owner, \
+       pg_catalog.obj_description(c.oid, 'pg_class') AS comment, \
+       pg_catalog.pg_get_userbyid(c.relowner)::text AS owner, \
        dep.deptype::text AS dep_type, \
        own_n.nspname::text AS owned_schema, \
        own_c.relname::text AS owned_table, \
@@ -377,12 +428,12 @@ WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind = 'S'";
 /// A view or materialized view by schema (`$1`) and name (`$2`).
 pub(crate) const VIEW: &str = "\
 SELECT c.relkind::text AS relkind, \
-       pg_get_viewdef(c.oid, true) AS definition, \
-       obj_description(c.oid, 'pg_class') AS comment, \
-       pg_get_userbyid(c.relowner)::text AS owner, \
+       pg_catalog.pg_get_viewdef(c.oid, true) AS definition, \
+       pg_catalog.obj_description(c.oid, 'pg_class') AS comment, \
+       pg_catalog.pg_get_userbyid(c.relowner)::text AS owner, \
        c.relispopulated AS populated, \
        ts.spcname::text AS tablespace, \
-       (SELECT o.option_value FROM pg_options_to_table(c.reloptions) o \
+       (SELECT o.option_value FROM pg_catalog.pg_options_to_table(c.reloptions) o \
          WHERE o.option_name = 'check_option') AS check_option \
 FROM pg_catalog.pg_class c \
 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
@@ -393,8 +444,11 @@ WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind IN ('v', 'm')";
 /// multiranges (array types and table row types are left out).
 pub(crate) const TYPES: &str = "\
 SELECT t.typname::text AS name, \
-       obj_description(t.oid, 'pg_type') AS comment, \
-       t.typtype::text AS typtype \
+       pg_catalog.obj_description(t.oid, 'pg_type') AS comment, \
+       t.typtype::text AS typtype, \
+       EXISTS (SELECT 1 FROM pg_catalog.pg_depend d \
+                WHERE d.classid = 'pg_catalog.pg_type'::regclass AND d.objid = t.oid \
+                  AND d.deptype = 'e') AS extension_member \
 FROM pg_catalog.pg_type t \
 JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace \
 WHERE n.nspname = $1 AND t.typtype IN ('c', 'd', 'e', 'r', 'm') \
@@ -405,10 +459,10 @@ ORDER BY t.typname";
 /// One type by schema (`$1`) and name (`$2`).
 pub(crate) const TYPE: &str = "\
 SELECT t.typtype::text AS typtype, \
-       obj_description(t.oid, 'pg_type') AS comment, \
-       pg_get_userbyid(t.typowner)::text AS owner, \
-       CASE WHEN t.typtype = 'd' THEN format_type(t.typbasetype, t.typtypmod) END AS base_type, \
-       (SELECT string_agg(quote_literal(e.enumlabel), ', ' ORDER BY e.enumsortorder) \
+       pg_catalog.obj_description(t.oid, 'pg_type') AS comment, \
+       pg_catalog.pg_get_userbyid(t.typowner)::text AS owner, \
+       CASE WHEN t.typtype = 'd' THEN pg_catalog.format_type(t.typbasetype, t.typtypmod) END AS base_type, \
+       (SELECT pg_catalog.string_agg(pg_catalog.quote_literal(e.enumlabel), ', ' ORDER BY e.enumsortorder) \
           FROM pg_catalog.pg_enum e WHERE e.enumtypid = t.oid) AS enum_labels \
 FROM pg_catalog.pg_type t \
 JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace \
@@ -417,7 +471,7 @@ WHERE n.nspname = $1 AND t.typname = $2";
 /// Extensions installed in the session's database.
 pub(crate) const EXTENSIONS: &str = "\
 SELECT e.extname::text AS name, \
-       obj_description(e.oid, 'pg_extension') AS comment, \
+       pg_catalog.obj_description(e.oid, 'pg_extension') AS comment, \
        e.extversion AS version, \
        n.nspname::text AS schema_name \
 FROM pg_catalog.pg_extension e \
@@ -427,10 +481,10 @@ ORDER BY e.extname";
 /// One extension by name (`$1`).
 pub(crate) const EXTENSION: &str = "\
 SELECT e.extname::text AS name, \
-       obj_description(e.oid, 'pg_extension') AS comment, \
+       pg_catalog.obj_description(e.oid, 'pg_extension') AS comment, \
        e.extversion AS version, \
        n.nspname::text AS schema_name, \
-       pg_get_userbyid(e.extowner)::text AS owner \
+       pg_catalog.pg_get_userbyid(e.extowner)::text AS owner \
 FROM pg_catalog.pg_extension e \
 JOIN pg_catalog.pg_namespace n ON n.oid = e.extnamespace \
 WHERE e.extname = $1";
@@ -447,6 +501,17 @@ pub(crate) fn columns(v: &ServerVersion) -> &'static str {
         COLUMNS_12
     } else {
         COLUMNS_10
+    }
+}
+
+/// The constraint query for `v`.
+pub(crate) fn constraints(v: &ServerVersion) -> &'static str {
+    if at_least(v, 18) {
+        CONSTRAINTS_18
+    } else if at_least(v, 11) {
+        CONSTRAINTS_11
+    } else {
+        CONSTRAINTS_10
     }
 }
 
@@ -504,7 +569,9 @@ pub(crate) const ALL: &[&str] = &[
     TABLE_HEAD,
     COLUMNS_12,
     COLUMNS_10,
-    CONSTRAINTS,
+    CONSTRAINTS_18,
+    CONSTRAINTS_11,
+    CONSTRAINTS_10,
     CONSTRAINT_COLUMNS,
     INDEXES_15,
     INDEXES_11,
@@ -586,6 +653,63 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn catalog_functions_are_qualified() {
+        const FUNCTIONS: &[&str] = &[
+            "obj_description",
+            "shobj_description",
+            "col_description",
+            "current_database",
+            "format_type",
+            "pg_get_expr",
+            "pg_get_userbyid",
+            "pg_get_viewdef",
+            "pg_get_functiondef",
+            "pg_get_triggerdef",
+            "pg_get_indexdef",
+            "pg_get_constraintdef",
+            "pg_options_to_table",
+            "unnest",
+            "generate_series",
+            "array_length",
+            "string_agg",
+            "quote_literal",
+        ];
+        for sql in ALL {
+            for name in FUNCTIONS {
+                let call = format!("{name}(");
+                for (at, _) in sql.match_indices(&call) {
+                    let before = &sql[..at];
+                    // `pg_catalog.name(`, or a longer name ending in `name` (`shobj_description`).
+                    let qualified = before.ends_with("pg_catalog.")
+                        || before
+                            .chars()
+                            .last()
+                            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
+                    assert!(qualified, "unqualified {name}() in {sql}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn constraint_queries_skip_partition_clones_from_11() {
+        let v10 = ServerVersion::new(10, 23, 0);
+        let v11 = ServerVersion::new(11, 22, 0);
+        let v17 = ServerVersion::new(17, 6, 0);
+        let v18 = ServerVersion::new(18, 0, 0);
+        assert!(!constraints(&v10).contains("conparentid"));
+        assert!(constraints(&v11).contains("conparentid"));
+        assert!(!constraints(&v17).contains("conenforced"));
+        assert!(constraints(&v18).contains("conenforced"));
+        assert!(constraints(&v18).contains("conparentid"));
+        // The filter sits inside the WHERE clause, before ORDER BY.
+        for sql in [CONSTRAINTS_18, CONSTRAINTS_11, CONSTRAINTS_10] {
+            assert!(sql.trim_end().ends_with("ORDER BY k.conname"), "{sql}");
+        }
+        assert!(INDEXES_15.contains("('u', 'x')"));
     }
 
     #[test]

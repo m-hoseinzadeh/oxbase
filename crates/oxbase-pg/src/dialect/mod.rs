@@ -25,7 +25,11 @@
 //! catalog queries are fixed text in `sql.rs` with names bound as parameters, picked by server
 //! version (PostgreSQL 10 and newer; see `sql.rs` for the version-dependent parts). System
 //! schemas (`pg_catalog`, `information_schema`, `pg_toast*`) and everything in them are listed
-//! with `system = true`.
+//! with `system = true`, and so are relations, routines and types an extension owns (and the
+//! children of such relations), whatever schema they live in.
+//!
+//! Table listings carry no `SIZE_BYTES`: `pg_total_relation_size` locks each relation and stats
+//! its files, so one table held by an `ACCESS EXCLUSIVE` lock would stall the whole folder.
 //!
 //! Routines are told apart by [`ObjectRef::signature`](oxbase_types::ObjectRef::signature), the
 //! text of `pg_get_function_identity_arguments` (`n integer`, `t text, n integer`, empty for no
@@ -47,8 +51,9 @@ use oxbase_dialect::{
 use oxbase_types::{Engine, ObjectKind, PropId, ServerVersion};
 
 pub use fetch::{
-    BASE_TYPE, CTYPE, ENUM_LABELS, EXTENSION_SCHEMA, EXTENSION_VERSION, IDENTITY_SEQUENCE,
-    MATCH_TYPE, NO_INHERIT, NOT_VALID, NULLS_NOT_DISTINCT, PARALLEL, TYPE_KIND,
+    BASE_TYPE, CTYPE, ENUM_LABELS, EXCLUSION, EXTENSION_SCHEMA, EXTENSION_VERSION,
+    IDENTITY_SEQUENCE, MATCH_TYPE, NO_INHERIT, NOT_ENFORCED, NOT_VALID, NULLS_FIRST,
+    NULLS_NOT_DISTINCT, PARALLEL, TYPE_KIND,
 };
 
 /// Object kinds PostgreSQL has (everything but MySQL events and key-value keys).
