@@ -4,9 +4,29 @@ use std::fmt::Write as _;
 
 use oxbase_types::{ObjectKind, ObjectRef, Value};
 
-/// Quotes identifiers and renders literals for one engine. One implementation per engine.
+/// Lexical rules the expression check ([`crate::sql::check_expression`]) needs to find where
+/// strings and quoted identifiers end on an engine.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LexRules {
+    /// A backslash escapes the next character inside `'...'` and `"..."` (MySQL/MariaDB with the
+    /// default `sql_mode`).
+    pub backslash_escapes: bool,
+    /// `$tag$ ... $tag$` strings (PostgreSQL).
+    pub dollar_quotes: bool,
+    /// `E'...'` strings with backslash escapes (PostgreSQL).
+    pub e_strings: bool,
+    /// `#` starts a comment (MySQL/MariaDB).
+    pub hash_comments: bool,
+}
+
+/// Quotes identifiers and renders literals for one engine, plus the small lexical facts that
+/// generated SQL depends on (parameter placeholders, text casts, `NULLS FIRST` support, LIKE
+/// specials, `LIMIT`). One implementation per engine.
 ///
-/// The provided methods follow standard SQL; engines override what differs.
+/// The provided methods follow standard SQL; engines override what differs. M3 added
+/// [`Quoting::placeholder`], [`Quoting::text_cast`], [`Quoting::nulls_ordering`],
+/// [`Quoting::like_specials`], [`Quoting::limit_clause`] and [`Quoting::lex_rules`], all with
+/// defaults.
 pub trait Quoting: Send + Sync {
     /// Quotes an identifier unconditionally, escaping embedded quote characters.
     fn quote_ident(&self, ident: &str) -> String;
@@ -91,6 +111,42 @@ pub trait Quoting: Send + Sync {
             | Value::Json(_) => self.quote_str(&v.to_string()),
         }
     }
+
+    /// The placeholder of the `n`-th bound parameter (1-based): `?` by default (MySQL, MariaDB,
+    /// SQLite); [`PgQuoting`] `$n`; [`BracketQuoting`] `@Pn`.
+    fn placeholder(&self, n: usize) -> String {
+        let _ = n;
+        "?".to_owned()
+    }
+
+    /// `expr` converted to text, so a pattern operator can match a non-text column:
+    /// `CAST(expr AS TEXT)` by default (PostgreSQL, SQLite); MySQL/MariaDB `CAST(expr AS CHAR)`.
+    fn text_cast(&self, expr: &str) -> String {
+        format!("CAST({expr} AS TEXT)")
+    }
+
+    /// `true` when `ORDER BY` accepts `NULLS FIRST` / `NULLS LAST` (PostgreSQL, SQLite 3.30+).
+    /// Engines without it get an emulation (`CASE WHEN col IS NULL ...` before the key).
+    fn nulls_ordering(&self) -> bool {
+        true
+    }
+
+    /// Characters with a special meaning in a `LIKE` pattern: `%` and `_`, plus `[` on SQL
+    /// Server. Literal matches escape them (and the escape character `!`).
+    fn like_specials(&self) -> &'static str {
+        "%_"
+    }
+
+    /// The clause that limits a `SELECT` to `n` rows, appended at its end: `LIMIT n`.
+    fn limit_clause(&self, n: u64) -> String {
+        format!("LIMIT {n}")
+    }
+
+    /// Where strings, quoted identifiers and comments start and end (for
+    /// [`crate::sql::check_expression`]).
+    fn lex_rules(&self) -> LexRules {
+        LexRules::default()
+    }
 }
 
 /// Lowercase hex of `bytes`.
@@ -155,6 +211,27 @@ impl Quoting for PgQuoting {
         AnsiQuoting.quote_ident(ident)
     }
 
+    /// Like the default, but without the catalog: a PostgreSQL session reads exactly one
+    /// database (`DatabaseScope::Session`), and naming another one is an error, so the catalog
+    /// is never part of a name. Services run statements on a session of `obj.catalog`.
+    fn qualify(&self, obj: &ObjectRef) -> String {
+        let mut local = obj.clone();
+        local.catalog = None;
+        AnsiQuoting.qualify(&local)
+    }
+
+    fn placeholder(&self, n: usize) -> String {
+        format!("${n}")
+    }
+
+    fn lex_rules(&self) -> LexRules {
+        LexRules {
+            dollar_quotes: true,
+            e_strings: true,
+            ..LexRules::default()
+        }
+    }
+
     fn literal(&self, v: &Value) -> String {
         match v {
             Value::Bytes(b) => format!("'\\x{}'::bytea", hex(b)),
@@ -174,6 +251,22 @@ pub struct BacktickQuoting;
 impl Quoting for BacktickQuoting {
     fn quote_ident(&self, ident: &str) -> String {
         wrap(ident, '`', '`')
+    }
+
+    fn text_cast(&self, expr: &str) -> String {
+        format!("CAST({expr} AS CHAR)")
+    }
+
+    fn nulls_ordering(&self) -> bool {
+        false
+    }
+
+    fn lex_rules(&self) -> LexRules {
+        LexRules {
+            backslash_escapes: true,
+            hash_comments: true,
+            ..LexRules::default()
+        }
     }
 
     fn quote_str(&self, s: &str) -> String {
@@ -199,6 +292,22 @@ pub struct BracketQuoting;
 impl Quoting for BracketQuoting {
     fn quote_ident(&self, ident: &str) -> String {
         wrap(ident, '[', ']')
+    }
+
+    fn placeholder(&self, n: usize) -> String {
+        format!("@P{n}")
+    }
+
+    fn text_cast(&self, expr: &str) -> String {
+        format!("CAST({expr} AS nvarchar(max))")
+    }
+
+    fn nulls_ordering(&self) -> bool {
+        false
+    }
+
+    fn like_specials(&self) -> &'static str {
+        "%_["
     }
 
     fn quote_str(&self, s: &str) -> String {
@@ -252,9 +361,15 @@ mod tests {
             AnsiQuoting.qualify(&t.child(ObjectKind::Check, "ck")),
             "\"ck\""
         );
-        // Indexes and triggers are schema-scoped (PostgreSQL).
+        // Indexes and triggers are schema-scoped (PostgreSQL), and PostgreSQL names never carry
+        // the catalog (one database per session).
         assert_eq!(
             PgQuoting.qualify(&t.child(ObjectKind::Index, "ix")),
+            "\"public\".\"ix\""
+        );
+        assert_eq!(PgQuoting.qualify(&t), "\"public\".\"Order Items\"");
+        assert_eq!(
+            AnsiQuoting.qualify(&t.child(ObjectKind::Index, "ix")),
             "\"shop\".\"public\".\"ix\""
         );
         assert_eq!(
@@ -309,6 +424,48 @@ mod tests {
         assert_eq!(ms.literal(&Value::Text("x".into())), "N'x'");
         assert_eq!(ms.literal(&Value::Int(3)), "3");
         assert_eq!(ms.literal(&Value::Null), "NULL");
+    }
+
+    #[test]
+    fn m3_syntax_hooks() {
+        assert_eq!(AnsiQuoting.placeholder(3), "?");
+        assert_eq!(BacktickQuoting.placeholder(3), "?");
+        assert_eq!(PgQuoting.placeholder(3), "$3");
+        assert_eq!(BracketQuoting.placeholder(3), "@P3");
+        assert_eq!(PgQuoting.text_cast("\"c\""), "CAST(\"c\" AS TEXT)");
+        assert_eq!(BacktickQuoting.text_cast("`c`"), "CAST(`c` AS CHAR)");
+        assert!(PgQuoting.nulls_ordering() && AnsiQuoting.nulls_ordering());
+        assert!(!BacktickQuoting.nulls_ordering() && !BracketQuoting.nulls_ordering());
+        assert_eq!(BracketQuoting.like_specials(), "%_[");
+        assert_eq!(AnsiQuoting.limit_clause(10), "LIMIT 10");
+        assert!(PgQuoting.lex_rules().dollar_quotes && PgQuoting.lex_rules().e_strings);
+        assert!(BacktickQuoting.lex_rules().backslash_escapes);
+        assert_eq!(AnsiQuoting.lex_rules(), LexRules::default());
+    }
+
+    /// DDL literals (comments, literal defaults) are escaped by the dialect: quotes,
+    /// backslashes, unicode and reserved words.
+    #[test]
+    fn ddl_literals_and_reserved_words() {
+        let tricky = "it's a \\ test \u{e9}\u{1f600} 'x'";
+        assert_eq!(
+            AnsiQuoting.quote_str(tricky),
+            "'it''s a \\ test \u{e9}\u{1f600} ''x'''"
+        );
+        assert_eq!(PgQuoting.quote_str(tricky), AnsiQuoting.quote_str(tricky));
+        assert_eq!(
+            BacktickQuoting.quote_str(tricky),
+            "'it''s a \\\\ test \u{e9}\u{1f600} ''x'''"
+        );
+        assert_eq!(BacktickQuoting.quote_str("nul\0"), "'nul\\0'");
+        for word in ["select", "order", "group", "user", "table"] {
+            assert_eq!(AnsiQuoting.quote_ident(word), format!("\"{word}\""));
+            assert_eq!(BacktickQuoting.quote_ident(word), format!("`{word}`"));
+        }
+        assert_eq!(
+            PgQuoting.quote_ident("caf\u{e9} \"x\""),
+            "\"caf\u{e9} \"\"x\"\"\""
+        );
     }
 
     fn serde_json_value() -> serde_json::Value {

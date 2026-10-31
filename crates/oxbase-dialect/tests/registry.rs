@@ -4,17 +4,18 @@ use std::sync::Arc;
 
 use arrow_array::cast::AsArray;
 use async_trait::async_trait;
+use oxbase_dialect::sql::SqlWriter;
 use oxbase_dialect::{
-    AnsiQuoting, Capabilities, CellRole, CellStatus, ChildGroup, Comparator, DatabaseScope,
-    DdlGenerator, DialectRegistry, DmlWriter, EngineRole, Fetcher, MissingCell, PgQuoting, Quoting,
-    TreeLayout,
+    AnsiQuoting, Capabilities, CellRole, CellStatus, ChildGroup, Comparator, DESIGNER_KINDS,
+    DatabaseScope, DdlContext, DdlGenerator, DialectRegistry, DmlPlan, DmlTarget, DmlWriter,
+    EngineRole, Fetcher, MissingCell, PgQuoting, Quoting, Support, TreeLayout, write_key_predicate,
 };
 use oxbase_driver::mock::MockDriver;
 use oxbase_driver::{CancellationToken, ConnectParams, Connection, Driver, collect};
 use oxbase_types::{
     ColumnDef, DataType, Engine, Error, ErrorCategory, ObjectDef, ObjectKind, ObjectRef,
-    ObjectSummary, PropId, PropertyDiff, Result, RowEdit, RowKey, Script, ServerVersion, TableDef,
-    Value, props,
+    ObjectSummary, PropId, PropertyDiff, Result, RowEdit, RowKey, Script, ScriptStep,
+    ServerVersion, TableDef, Value, props,
 };
 use pretty_assertions::assert_eq;
 
@@ -80,29 +81,32 @@ impl Comparator for ToyComparator {
 struct ToyDdl;
 
 impl DdlGenerator for ToyDdl {
-    fn create(&self, d: &ObjectDef) -> Script {
-        Script::single(format!(
+    fn create(&self, d: &ObjectDef, _ctx: &DdlContext<'_>) -> Result<Script> {
+        Ok(Script::single(format!(
             "CREATE TABLE {}",
             AnsiQuoting.qualify(&d.object_ref())
-        ))
+        )))
     }
 
-    fn alter(&self, old: &ObjectDef, new: &ObjectDef) -> Script {
+    fn alter(&self, old: &ObjectDef, new: &ObjectDef, _ctx: &DdlContext<'_>) -> Result<Script> {
         let mut s = Script::new();
         for d in ToyComparator.diff(old, new) {
-            s.push(format!(
-                "ALTER TABLE {} ADD COLUMN {}",
-                AnsiQuoting.qualify(&old.object_ref()),
-                AnsiQuoting.quote_ident(&d.object.name)
-            ));
+            s.push_step(
+                ScriptStep::new(format!(
+                    "ALTER TABLE {} ADD COLUMN {}",
+                    AnsiQuoting.qualify(&old.object_ref()),
+                    AnsiQuoting.quote_ident(&d.object.name)
+                ))
+                .described(format!("Add column {}", d.object.name)),
+            );
         }
-        s
+        Ok(s)
     }
 
-    fn drop_object(&self, r: &ObjectRef) -> Script {
+    fn drop_object(&self, r: &ObjectRef, _ctx: &DdlContext<'_>) -> Result<Script> {
         let mut s = Script::new();
         s.push_destructive(format!("DROP TABLE {}", AnsiQuoting.qualify(r)));
-        s
+        Ok(s)
     }
 }
 
@@ -121,25 +125,19 @@ impl Capabilities for ToyCaps {
 struct ToyDml;
 
 impl DmlWriter for ToyDml {
-    fn apply(&self, edits: &[RowEdit], key: &RowKey) -> Script {
-        let q = AnsiQuoting;
-        edits
-            .iter()
-            .filter_map(|e| match e {
-                RowEdit::Delete { key: vals } => {
-                    let cond: Vec<String> = key
-                        .bind(vals)
-                        .map(|(c, v)| format!("{} = {}", q.quote_ident(c), q.literal(v)))
-                        .collect();
-                    Some(oxbase_types::Statement::destructive(format!(
-                        "DELETE FROM {} WHERE {}",
-                        q.qualify(&key.table),
-                        cond.join(" AND ")
-                    )))
-                }
-                _ => None,
-            })
-            .collect()
+    fn plan(&self, edit: &RowEdit, target: &DmlTarget<'_>) -> Result<DmlPlan> {
+        let q = PgQuoting;
+        let mut w = SqlWriter::new(&q);
+        match edit {
+            RowEdit::Delete { key } => {
+                w.push("DELETE FROM ")
+                    .qualified(&target.key.table)
+                    .push(" WHERE ");
+                write_key_predicate(&mut w, target.key, key)?;
+                Ok(DmlPlan::write_only(w.finish()))
+            }
+            _ => Err(Error::unsupported("toy writer only deletes")),
+        }
     }
 }
 
@@ -320,16 +318,24 @@ async fn cells_work_through_the_registry() {
         .diff(&def, &newer);
     assert_eq!(diffs.len(), 1);
     let ddl = reg.ddl(Engine::Postgres, ObjectKind::Table).unwrap();
+    let ctx = DdlContext::new(conn.server_version());
     assert_eq!(
-        ddl.create(&def).to_string(),
+        ddl.create(&def, &ctx).unwrap().to_string(),
         "CREATE TABLE \"shop\".\"public\".\"row 0\";\n"
     );
+    let alter = ddl.alter(&def, &newer, &ctx).unwrap();
     assert_eq!(
-        ddl.alter(&def, &newer).to_string(),
+        alter.to_string(),
         "ALTER TABLE \"shop\".\"public\".\"row 0\" ADD COLUMN \"note\";\n"
     );
+    assert_eq!(alter.steps[0].description, "Add column note");
+    assert!(alter.is_atomic());
     // Callable straight on the `Arc<dyn DdlGenerator>` (no clash with `Drop::drop`).
-    assert!(ddl.drop_object(&tables[0].obj).is_destructive());
+    assert!(
+        ddl.drop_object(&tables[0].obj, &ctx)
+            .unwrap()
+            .is_destructive()
+    );
 
     // Capabilities gate extras by version.
     let caps = reg.capabilities(Engine::Postgres).unwrap();
@@ -340,8 +346,13 @@ async fn cells_work_through_the_registry() {
         &ServerVersion::new(9, 0, 0)
     ));
     assert!(!caps.supports_kind(ObjectKind::Event, conn.server_version()));
+    // Engines that do not describe their designer get a read-only one.
+    assert_eq!(
+        caps.designer(conn.server_version()).add_column,
+        Support::Unsupported
+    );
 
-    // DmlWriter.
+    // DmlWriter: values are bound, never inlined.
     let key = RowKey::new(
         ObjectRef::table(None, Some("public"), "t"),
         oxbase_types::KeyKind::Primary,
@@ -351,14 +362,24 @@ async fn cells_work_through_the_registry() {
         key: vec![Value::Int(7)],
     };
     key.validate(&edit).unwrap();
-    let script = reg
+    let table = TableDef::new(key.table.clone());
+    let target = DmlTarget {
+        table: &table,
+        key: &key,
+        version: conn.server_version(),
+        read_back: &[],
+    };
+    let plan = reg
         .dml_writer(Engine::Postgres)
         .unwrap()
-        .apply(&[edit], &key);
+        .plan(&edit, &target)
+        .unwrap();
     assert_eq!(
-        script.to_string(),
-        "DELETE FROM \"public\".\"t\" WHERE \"id\" = 7;\n"
+        plan.write.sql,
+        "DELETE FROM \"public\".\"t\" WHERE \"id\" = $1"
     );
+    assert_eq!(plan.write.params, [Value::Int(7)]);
+    assert!(!plan.returning && plan.read_back.is_none());
     assert_eq!(
         reg.quoting(Engine::Postgres).unwrap().quote_ident("x"),
         "\"x\""
@@ -403,4 +424,20 @@ fn tree_layouts_and_applicability_helpers() {
         CellStatus::Roles(vec![])
     );
     assert_eq!(reg.engines(), [Engine::Postgres, Engine::Sqlite]);
+}
+
+#[test]
+fn missing_designer_roles_lists_what_m3_needs() {
+    let reg = full_postgres_table();
+    let missing = reg.missing_designer_roles(Engine::Postgres);
+    // Table has every role; the four child kinds lack DdlGenerator and Comparator.
+    assert_eq!(missing.len(), (DESIGNER_KINDS.len() - 1) * 2);
+    assert!(missing.contains(&"postgres/column: no DdlGenerator".to_owned()));
+    assert!(!missing.iter().any(|m| m.starts_with("postgres/table")));
+    let empty = DialectRegistry::new().missing_designer_roles(Engine::Sqlite);
+    assert_eq!(
+        empty.len(),
+        DESIGNER_KINDS.len() * 2 + EngineRole::ALL.len()
+    );
+    assert!(empty.contains(&"sqlite: no DmlWriter".to_owned()));
 }

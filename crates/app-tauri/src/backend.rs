@@ -1,11 +1,13 @@
 //! Picks the core implementations the desktop app runs with: drivers, dialects, the secret
-//! store, the profile repository, the SSH tunnel provider, and (M2) the tree, query and history
-//! services. Construction only; no behaviour.
+//! store, the profile repository, the SSH tunnel provider, (M2) the tree, query and history
+//! services, and (M3) the edit and designer services. Construction only; no behaviour.
 
 use std::path::Path;
 use std::sync::Arc;
 
 use oxbase_net::ssh::RusshTunnelProvider;
+use oxbase_services::designer::DesignerService;
+use oxbase_services::edit::EditService;
 use oxbase_services::history::HistoryService;
 use oxbase_services::query::{QueryConfig, QueryService};
 use oxbase_services::tree::TreeService;
@@ -16,7 +18,20 @@ use oxbase_store::{
 };
 
 use crate::connections::ConnectionsState;
+use crate::data::DataState;
+use crate::designer::DesignerState;
 use crate::workbench::WorkbenchState;
+
+/// Every piece of Tauri state the commands use. All share one `ConnectionManager` and one
+/// dialect registry.
+pub struct AppStates {
+    pub connections: ConnectionsState,
+    pub workbench: WorkbenchState,
+    /// M3: table data and grid editing.
+    pub data: DataState,
+    /// M3: the table designer.
+    pub designer: DesignerState,
+}
 
 /// The drivers the app ships with: the shared registry from `oxbase-services` (PostgreSQL,
 /// MySQL, MariaDB and SQLite), the same one `oxbase-cli` uses.
@@ -57,18 +72,17 @@ pub fn history_repository() -> Arc<dyn HistoryRepository> {
     }
 }
 
-/// Builds the state behind the connection commands and the M2 workbench commands, with history
-/// in the app database ([`history_repository`]).
-pub fn app_state(fallback_dir: Option<&Path>) -> (ConnectionsState, WorkbenchState) {
+/// Builds the state behind every command, with history in the app database
+/// ([`history_repository`]).
+pub fn app_state(fallback_dir: Option<&Path>) -> AppStates {
     app_state_with(fallback_dir, history_repository())
 }
 
-/// [`app_state`] with the given history repository. Both states share one
-/// `ConnectionManager`.
+/// [`app_state`] with the given history repository.
 pub fn app_state_with(
     fallback_dir: Option<&Path>,
     history: Arc<dyn HistoryRepository>,
-) -> (ConnectionsState, WorkbenchState) {
+) -> AppStates {
     let manager = Arc::new(ConnectionManager::new(
         driver_registry(),
         Arc::new(KeyringSecretStore::new()),
@@ -82,14 +96,26 @@ pub fn app_state_with(
     ));
     let query = Arc::new(QueryService::new(
         Arc::clone(&manager),
-        dialects,
+        Arc::clone(&dialects),
         Arc::clone(&history),
         QueryConfig::default(),
     ));
-    (
-        ConnectionsState::new(manager, profile_repository(fallback_dir)),
-        WorkbenchState::new(tree, query, history),
-    )
+    let edit = Arc::new(EditService::new(
+        Arc::clone(&query),
+        Arc::clone(&tree),
+        Arc::clone(&dialects),
+    ));
+    let designer = Arc::new(DesignerService::new(
+        Arc::clone(&manager),
+        Arc::clone(&tree),
+        dialects,
+    ));
+    AppStates {
+        connections: ConnectionsState::new(manager, profile_repository(fallback_dir)),
+        workbench: WorkbenchState::new(tree, query, history),
+        data: DataState::new(edit),
+        designer: DesignerState::new(designer),
+    }
 }
 
 #[cfg(test)]
@@ -100,12 +126,20 @@ mod tests {
     #[test]
     fn builds_the_app_state() {
         // In memory: tests never touch the user's app database.
-        let (connections, _workbench) =
-            app_state_with(None, Arc::new(MemoryHistoryRepository::new()));
+        let states = app_state_with(None, Arc::new(MemoryHistoryRepository::new()));
         assert_eq!(
-            connections.manager().list_open(),
+            states.connections.manager().list_open(),
             Vec::<oxbase_services::SessionSummary>::new()
         );
+        // The M3 services share the manager and the registry.
+        assert!(Arc::ptr_eq(
+            states.designer.service().manager(),
+            states.connections.manager()
+        ));
+        assert!(Arc::ptr_eq(
+            states.data.service().dialects(),
+            states.designer.service().dialects()
+        ));
     }
 
     #[test]

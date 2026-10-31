@@ -14,6 +14,10 @@
 //!   through a `Channel`), `query_page` (Arrow IPC bytes), `query_cancel`, `query_close`,
 //!   `query_close_editor`, `statement_at`, `history_list`, `history_delete`, `history_clear`,
 //!   `history_get_settings` and `history_set_settings`. Contract: `docs/m2-contracts.md` §5.
+//! * Table data and editing (M3, `src/data.rs`): `table_data_open` (a query run with a typed
+//!   filter and sort), `edit_begin`, `edit_apply` and `row_get_form`.
+//! * Table designer (M3, `src/designer.rs`): `designer_load`, `designer_preview`,
+//!   `designer_apply` and `capabilities_get`. Contract: `docs/m3-contracts.md` §7.
 //!
 //! Every fallible command rejects with [`error::CommandError`], serialized as
 //! `{ "category": "<snake_case ErrorCategory>", "message": "..." }`.
@@ -23,7 +27,9 @@
 
 mod backend;
 mod connections;
+mod data;
 mod demo_page;
+mod designer;
 mod error;
 mod profiles;
 mod workbench;
@@ -79,9 +85,11 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let data_dir = app.path().app_data_dir().ok();
-            let (connections, workbench) = backend::app_state(data_dir.as_deref());
-            app.manage(connections);
-            app.manage(workbench);
+            let states = backend::app_state(data_dir.as_deref());
+            app.manage(states.connections);
+            app.manage(states.workbench);
+            app.manage(states.data);
+            app.manage(states.designer);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -108,6 +116,14 @@ pub fn run() {
             workbench::history_clear,
             workbench::history_get_settings,
             workbench::history_set_settings,
+            data::table_data_open,
+            data::edit_begin,
+            data::edit_apply,
+            data::row_get_form,
+            designer::designer_load,
+            designer::designer_preview,
+            designer::designer_apply,
+            designer::capabilities_get,
         ])
         .build(tauri::generate_context!())
         .expect("error while building the oxbase desktop shell");

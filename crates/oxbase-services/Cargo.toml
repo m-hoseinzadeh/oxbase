@@ -19,6 +19,8 @@ oxbase-store.workspace = true
 # M2: dialect registry (tree layouts, fetchers) and the statement splitter / history redaction.
 oxbase-dialect.workspace = true
 oxbase-sql.workspace = true
+# M3: the table designer model, validation and preview.
+oxbase-designer.workspace = true
 # Engine drivers registered by `default_drivers` (and, from M2, their dialect cells).
 oxbase-pg.workspace = true
 oxbase-mysql.workspace = true

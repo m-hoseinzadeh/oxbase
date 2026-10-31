@@ -15,10 +15,12 @@ workspace = true
 oxbase-types.workspace = true
 oxbase-driver.workspace = true
 async-trait.workspace = true
+# M3: DesignerCapabilities (sent to the UI) and JSON values in PropertyDiffs.
+serde.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 arrow-array.workspace = true
 oxbase-driver = { workspace = true, features = ["mock"] }
 pretty_assertions.workspace = true
-serde_json.workspace = true
 tokio.workspace = true

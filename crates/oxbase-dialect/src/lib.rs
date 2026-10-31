@@ -9,23 +9,42 @@
 //! Roles per engine: [`Capabilities`], [`Quoting`], [`DmlWriter`].
 //! Data per engine (M2): the object-tree [`TreeLayout`] and its [`DatabaseScope`].
 //!
-//! How engine crates register their cells: see [`DialectRegistry`] (*Registration*). The M2
-//! contracts are in `docs/m2-contracts.md`.
+//! M3 adds the shared machinery the designer, the grid editor and the filter builder use:
+//!
+//! - [`sql`]: [`sql::SqlWriter`] (SQL with bound parameters in the engine's placeholder style),
+//!   [`sql::check_expression`] (user-typed SQL is one expression), the table-data query
+//!   [`sql::select_table_data`] with filter and sort rendering;
+//! - [`compare`]: the structural table comparison every engine's [`Comparator`] cells run
+//!   ([`compare::RulesComparator`] + the engine's [`compare::CompareRules`]), with fixed
+//!   property ids and order;
+//! - [`DdlContext`] for [`DdlGenerator`], [`DmlTarget`] / [`DmlPlan`] for [`DmlWriter`],
+//!   [`DesignerCapabilities`] from [`Capabilities::designer`].
+//!
+//! How engine crates register their cells: see [`DialectRegistry`] (*Registration*). The
+//! contracts are in `docs/m2-contracts.md` and `docs/m3-contracts.md`.
 
+mod capability;
+pub mod compare;
+mod ddl;
+mod dml;
 mod quoting;
 mod registry;
+pub mod sql;
 mod tree;
 
 use async_trait::async_trait;
 use oxbase_driver::{CancellationToken, Connection};
 use oxbase_types::{
-    ObjectDef, ObjectKind, ObjectRef, ObjectSummary, PropId, PropertyDiff, Result, RowEdit, RowKey,
-    Script, ServerVersion,
+    ObjectDef, ObjectKind, ObjectRef, ObjectSummary, PropId, PropertyDiff, Result, RowEdit, Script,
+    ServerVersion,
 };
 
-pub use quoting::{AnsiQuoting, BacktickQuoting, BracketQuoting, PgQuoting, Quoting};
+pub use capability::{DesignerCapabilities, Support};
+pub use ddl::DdlContext;
+pub use dml::{DmlPlan, DmlTarget, write_column_list, write_key_predicate};
+pub use quoting::{AnsiQuoting, BacktickQuoting, BracketQuoting, LexRules, PgQuoting, Quoting};
 pub use registry::{
-    CellRole, CellStatus, CoverageMatrix, DialectRegistry, EngineRole, MissingCell,
+    CellRole, CellStatus, CoverageMatrix, DESIGNER_KINDS, DialectRegistry, EngineRole, MissingCell,
 };
 pub use tree::{ChildGroup, DatabaseScope, TreeLayout};
 
@@ -82,25 +101,60 @@ pub trait Fetcher: Send + Sync {
 
 /// Produces DDL for one object kind. One implementation per (engine, kind).
 ///
-/// Generation does not fail: properties the engine or version cannot express are skipped and
-/// reported in [`Script::warnings`].
+/// # M3 rules for implementations
+///
+/// - **Kinds.** Every M3 engine registers a generator for `Table`, `Column`, `Index`,
+///   `ForeignKey` and `Check` ([`DESIGNER_KINDS`]). The designer uses the `Table` cell for
+///   everything (a table's `alter` covers its columns, keys, indexes, foreign keys, checks and
+///   comments); the child cells serve the conformance round trip and, later, sync. A child
+///   generator may build the table's new definition from [`DdlContext::table`] and delegate to
+///   the table generator.
+/// - **Quoting.** Every identifier goes through the engine's [`Quoting`]; comments and literal
+///   defaults through [`Quoting::quote_str`] (quotes, backslashes and unicode escaped for the
+///   engine). Expressions (defaults, checks, generated columns, index predicates) are
+///   engine-native SQL from the model and are inserted as they are; the designer has checked
+///   user-typed ones with [`sql::check_expression`].
+/// - **Steps.** One [`oxbase_types::ScriptStep`] per statement, with a human `description`,
+///   `destructive` for anything that can lose data (drop column / table / constraint, a
+///   narrowing type change, a table rebuild), and `transactional = false` for statements that
+///   commit implicitly (every MySQL/MariaDB DDL statement).
+/// - **Order of an `alter`.** Renames ([`DdlContext::renames`]) first; then drops of foreign
+///   keys, checks and indexes that change or go; then column drops, changes and adds; then the
+///   primary key; then new or changed indexes, checks and foreign keys; comments last. An empty
+///   script when nothing changed.
+/// - **Rebuilds.** An engine that cannot alter in place (SQLite beyond `RENAME` / `ADD COLUMN`
+///   / `DROP COLUMN` of a plain column) emits the documented table rebuild inside the script's
+///   transaction, with foreign-key enforcement switched off in a prepare step and restored in a
+///   finally step only if it was on (see the `oxbase_types::script` module docs), a
+///   `foreign_key_check` that must return no rows, and every index and trigger of the table
+///   ([`DdlContext::triggers`]) re-created. All rebuild steps are destructive.
+/// - **Errors.** What the engine or version cannot do is `Error::Unsupported` naming it; a
+///   change the model cannot express safely is `Error::InvalidInput`. Properties that are only
+///   informational and cannot be expressed are skipped with a [`Script::warn`] line.
 pub trait DdlGenerator: Send + Sync {
-    /// `CREATE` script for `d`.
-    fn create(&self, d: &ObjectDef) -> Script;
+    /// `CREATE` script for `d` (a table with its columns, keys, indexes, foreign keys, checks
+    /// and comments; or a child added to [`DdlContext::table`]).
+    fn create(&self, d: &ObjectDef, ctx: &DdlContext<'_>) -> Result<Script>;
 
-    /// Script that turns `old` into `new` (in place where possible, else drop and re-create with
-    /// destructive statements flagged).
-    fn alter(&self, old: &ObjectDef, new: &ObjectDef) -> Script;
+    /// Script that turns `old` into `new` (in place where possible, else a rebuild with
+    /// destructive steps flagged). Empty when they are equivalent.
+    fn alter(&self, old: &ObjectDef, new: &ObjectDef, ctx: &DdlContext<'_>) -> Result<Script>;
 
     /// `DROP` script for `r`.
     ///
     /// Named `drop_object` rather than `drop` so that calling it on an `Arc<dyn DdlGenerator>`
     /// or `Box<dyn DdlGenerator>` does not resolve to `Drop::drop`.
-    fn drop_object(&self, r: &ObjectRef) -> Script;
+    fn drop_object(&self, r: &ObjectRef, ctx: &DdlContext<'_>) -> Result<Script>;
 }
 
 /// Compares two definitions of the same kind. One implementation per (engine, kind), so engine
 /// normalisation (default expression spelling, implicit collations, ...) stays out of the diff.
+///
+/// M3: engines register [`compare::RulesComparator`] with their [`compare::CompareRules`] for
+/// the [`DESIGNER_KINDS`], which fixes the property ids and the order of the result (see the
+/// [`compare`] module docs). A definition fetched right after `DdlGenerator::create` /
+/// `alter` must compare equal (empty diff) to the definition the script was generated from;
+/// that is the conformance round trip.
 pub trait Comparator: Send + Sync {
     /// Differences going from `a` (source / old) to `b` (target / new). Empty when equivalent.
     fn diff(&self, a: &ObjectDef, b: &ObjectDef) -> Vec<PropertyDiff>;
@@ -117,11 +171,22 @@ pub trait Capabilities: Send + Sync {
         let _ = (kind, v);
         true
     }
+
+    /// What the table designer may offer on server version `v` (M3). Defaults to a read-only
+    /// designer.
+    fn designer(&self, v: &ServerVersion) -> DesignerCapabilities {
+        let _ = v;
+        DesignerCapabilities::read_only()
+    }
 }
 
-/// Turns grid edits into DML (grid write-back). One implementation per engine.
+/// Turns one grid edit into parameterized DML (grid write-back). One implementation per engine.
+///
+/// See the [`DmlPlan`] / [`DmlTarget`] docs (module `dml`) for the full contract: bound values
+/// only, rows matched by key, `RETURNING` or a read-back query per engine and version, and the
+/// service's "exactly one row" rule. Callers validate the edit with
+/// [`oxbase_types::RowKey::validate`] first.
 pub trait DmlWriter: Send + Sync {
-    /// One statement per edit, in order, addressing rows by `key`. Callers validate each edit with
-    /// [`RowKey::validate`] first.
-    fn apply(&self, edits: &[RowEdit], key: &RowKey) -> Script;
+    /// The statement(s) for `edit` on `target`.
+    fn plan(&self, edit: &RowEdit, target: &DmlTarget<'_>) -> Result<DmlPlan>;
 }

@@ -11,9 +11,12 @@
 //! - [`props`]: [`PropId`] and the typed [`Extras`] map for database-specific properties.
 //! - [`def`]: the typed object model [`ObjectDef`] (databases and schemas, tables, columns,
 //!   indexes, views, routines, triggers, sequences, ...).
-//! - [`script`]: [`Script`], an ordered list of statements plus warnings.
-//! - [`diff`]: [`PropertyDiff`], one difference found by a comparator.
+//! - [`script`]: [`Script`] / [`ScriptStep`], ordered DDL steps with phases, transactionality
+//!   and destructive flags (M3), and [`BoundStatement`], SQL with bound parameters.
+//! - [`diff`]: [`PropertyDiff`], one difference found by a comparator, and [`Rename`] (M3).
 //! - [`edit`]: [`RowEdit`] / [`RowKey`], grid edits for write-back.
+//! - [`filter`]: [`Filter`], [`SortKey`] and [`TableDataQuery`], the grid's filter and sort
+//!   model (M3).
 //! - [`progress`]: [`Progress`], one progress event of a long-running operation.
 //! - [`secret`]: [`Secret`], a string that never leaks into `Debug`, logs or documents.
 //! - [`net`]: [`Endpoint`], [`TlsOptions`] / [`TlsMode`] and [`SshOptions`] (connection addressing,
@@ -26,6 +29,7 @@ pub mod diff;
 pub mod edit;
 pub mod engine;
 pub mod error;
+pub mod filter;
 mod int_text;
 pub mod net;
 pub mod object;
@@ -43,17 +47,18 @@ pub use def::{
     SchemaDef, SequenceDef, TableDef, TriggerDef, TriggerEvent, TriggerLevel, TriggerTiming,
     ViewDef,
 };
-pub use diff::{DiffKind, PropertyDiff};
+pub use diff::{DiffKind, PropertyDiff, Rename};
 pub use edit::{ColumnValue, KeyKind, RowEdit, RowKey};
 pub use engine::Engine;
 pub use error::{Error, ErrorCategory, Result};
+pub use filter::{Filter, FilterOp, NullsOrder, SortKey, TableDataQuery};
 pub use net::{
     Endpoint, KeySource, KnownHostsPolicy, PemSource, SshAuth, SshOptions, TlsMode, TlsOptions,
 };
 pub use object::{ObjectKind, ObjectRef, ObjectSummary};
 pub use progress::{Progress, ProgressUnit};
 pub use props::{Extras, PropId};
-pub use script::{Script, Statement};
+pub use script::{BoundStatement, Script, ScriptStep, StepCheck, StepCondition, StepPhase};
 pub use secret::Secret;
 pub use value::Value;
 pub use version::ServerVersion;

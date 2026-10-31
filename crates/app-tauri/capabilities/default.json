@@ -29,6 +29,14 @@
     "allow-history-clear",
     "allow-history-get-settings",
     "allow-history-set-settings",
+    "allow-table-data-open",
+    "allow-edit-begin",
+    "allow-edit-apply",
+    "allow-row-get-form",
+    "allow-designer-load",
+    "allow-designer-preview",
+    "allow-designer-apply",
+    "allow-capabilities-get",
     "dialog:allow-open"
   ]
 }

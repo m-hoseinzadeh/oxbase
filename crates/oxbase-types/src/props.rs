@@ -68,6 +68,9 @@ pub const ON_DELETE: PropId = PropId::from_static("on_delete");
 pub const ON_UPDATE: PropId = PropId::from_static("on_update");
 pub const EXPRESSION: PropId = PropId::from_static("expression");
 pub const DEFINITION: PropId = PropId::from_static("definition");
+/// M3: an index is a declared `UNIQUE` constraint rather than a plain index
+/// (`IndexDef::is_constraint`).
+pub const CONSTRAINT: PropId = PropId::from_static("constraint");
 
 // --- Common database-specific extras (gated by `Capabilities`) ---
 
