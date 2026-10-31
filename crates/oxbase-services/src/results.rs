@@ -67,20 +67,36 @@ impl ByteBudget {
 
     /// Reserves `bytes` if they fit; returns whether they did. Never over-commits.
     pub fn try_reserve(&self, bytes: u64) -> bool {
-        self.used
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
-                used.checked_add(bytes).filter(|&total| total <= self.limit)
-            })
-            .is_ok()
+        // A compare-exchange loop rather than `fetch_update`, which newer toolchains deprecate
+        // and whose replacement is newer than the MSRV.
+        let mut used = self.used.load(Ordering::Acquire);
+        loop {
+            let Some(total) = used.checked_add(bytes).filter(|&t| t <= self.limit) else {
+                return false;
+            };
+            match self
+                .used
+                .compare_exchange_weak(used, total, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => return true,
+                Err(actual) => used = actual,
+            }
+        }
     }
 
     /// Gives back `bytes` reserved earlier (saturating at zero).
     pub fn release(&self, bytes: u64) {
-        let _ = self
-            .used
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
-                Some(used.saturating_sub(bytes))
-            });
+        let mut used = self.used.load(Ordering::Acquire);
+        loop {
+            let left = used.saturating_sub(bytes);
+            match self
+                .used
+                .compare_exchange_weak(used, left, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => return,
+                Err(actual) => used = actual,
+            }
+        }
     }
 }
 
