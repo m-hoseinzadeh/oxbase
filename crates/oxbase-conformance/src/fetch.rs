@@ -336,14 +336,15 @@ pub async fn check_kind(
 ) -> Result<String, String> {
     let mut parts = Vec::with_capacity(groups.len());
     for g in groups {
+        let parent = describe(&g.parent);
         let rows = fetcher
             .list(conn, &g.parent, CancellationToken::new())
             .await
-            .map_err(|err| format!("list under {}: {err}", g.parent))?;
+            .map_err(|err| format!("list under {parent}: {err}"))?;
         if let Some(r) = rows.iter().find(|r| r.obj.kind != kind) {
             return Err(format!(
-                "list of {kind} under {} returned {} (a {})",
-                g.parent, r.obj, r.obj.kind
+                "list of {kind} under {parent} returned {} (a {})",
+                r.obj, r.obj.kind
             ));
         }
         let missing: Vec<&str> = g
@@ -354,9 +355,8 @@ pub async fn check_kind(
             .collect();
         if !missing.is_empty() {
             return Err(format!(
-                "{} not listed under {} (listed: {})",
+                "{} not listed under {parent} (listed: {})",
                 missing.join(", "),
-                g.parent,
                 preview(&rows)
             ));
         }
@@ -382,13 +382,21 @@ pub async fn check_kind(
             }
         }
         parts.push(format!(
-            "{} under {}: listed, {loaded} loaded ({} rows)",
+            "{} under {parent}: listed, {loaded} loaded ({} rows)",
             g.names.join(", "),
-            g.parent,
             rows.len()
         ));
     }
     Ok(parts.join("; "))
+}
+
+/// A parent for messages: `the server` for the root, else the ref's display form.
+fn describe(parent: &ObjectRef) -> String {
+    if parent.is_root() {
+        "the server".to_owned()
+    } else {
+        parent.to_string()
+    }
 }
 
 /// A ref without its routine signature, with an unset `parent_kind` of a table child read as
@@ -552,7 +560,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            detail.starts_with("oxbase_test under database:"),
+            detail.starts_with("oxbase_test under the server: listed"),
             "{detail}"
         );
     }
