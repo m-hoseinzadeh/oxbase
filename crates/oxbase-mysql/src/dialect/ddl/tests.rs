@@ -185,7 +185,15 @@ fn create_on_mariadb_and_old_servers() {
     doc.extras.insert(props::CHARSET, "utf8mb4");
     t.columns.push(doc);
     let script = create(mariadb(), "11.8.9-MariaDB", &ObjectDef::Table(t.clone())).unwrap();
-    // MariaDB's JSON is written `json` (it adds the json_valid check itself).
+    // MariaDB's JSON is written `json` (it adds the json_valid check itself), and a generated
+    // column has no NULL / NOT NULL.
+    assert!(
+        script.steps[0]
+            .sql
+            .contains("\n  `total` decimal(13,2) GENERATED ALWAYS AS (amount * 2) STORED,\n"),
+        "{}",
+        script.steps[0].sql
+    );
     assert!(
         script.steps[0].sql.contains("\n  `doc` json NULL,\n"),
         "{}",

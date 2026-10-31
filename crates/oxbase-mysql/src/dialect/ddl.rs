@@ -482,7 +482,17 @@ impl Gen {
                 ") VIRTUAL"
             });
         }
-        s.push_str(if c.nullable { " NULL" } else { " NOT NULL" });
+        if c.generated.is_some() && self.f.mariadb {
+            // MariaDB takes no NULL / NOT NULL on a generated column (it is always nullable).
+            if !c.nullable {
+                return Err(Error::unsupported(format!(
+                    "column {}: MariaDB generated columns cannot be NOT NULL",
+                    c.name
+                )));
+            }
+        } else {
+            s.push_str(if c.nullable { " NULL" } else { " NOT NULL" });
+        }
         if c.generated.is_none()
             && !c.auto_increment
             && let Some(default) = c.default.as_deref().filter(|d| !d.trim().is_empty())

@@ -188,10 +188,10 @@ impl Ctx {
             .c
             .execute(sql, params, CancellationToken::new())
             .await
-            .unwrap_or_else(|e| panic!("{}: {sql}: {e}", self.key));
+            .unwrap_or_else(|e| panic!("{}: {e}\n{sql}", self.key));
         collect(stream)
             .await
-            .unwrap_or_else(|e| panic!("{}: {sql}: {e}", self.key))
+            .unwrap_or_else(|e| panic!("{}: {e}\n{sql}", self.key))
     }
 
     /// Runs every step of `script` in execution order.
@@ -873,7 +873,7 @@ async fn apply(tx: &dyn Tx, plan: &DmlPlan) -> (u64, Option<ResultSet>) {
             .unwrap(),
     )
     .await
-    .unwrap_or_else(|e| panic!("{}: {e}", read_back.sql));
+    .unwrap_or_else(|e| panic!("{e}\n{}", read_back.sql));
     (affected, rows.result_sets.into_iter().next())
 }
 
@@ -997,7 +997,7 @@ async fn dml_primary_key_body(t: &Ctx, codes: &str) {
         other
             .execute(
                 "DELETE FROM m3_edit_pk WHERE id = ?",
-                &[id_value.clone()],
+                std::slice::from_ref(&id_value),
                 CancellationToken::new(),
             )
             .await
