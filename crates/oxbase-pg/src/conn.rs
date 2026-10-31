@@ -669,8 +669,11 @@ fn option_value<'a>(params: &'a ConnectParams, key: &str) -> Option<&'a str> {
 }
 
 fn apply_options(cfg: &mut Config, params: &ConnectParams) -> Result<()> {
-    // Output formats the text decoder expects (users may still change them in the session).
-    let mut startup = String::from("-c DateStyle=ISO -c bytea_output=hex");
+    // Output formats the text decoder expects (users may still change them in the session), and
+    // standard string literals, which the SQL lexer (`check_expression`) and the generated DDL
+    // assume. User options come last, so a profile may still override them.
+    let mut startup =
+        String::from("-c DateStyle=ISO -c bytea_output=hex -c standard_conforming_strings=on");
     if let Some(extra) = option_value(params, "options").filter(|o| !o.trim().is_empty()) {
         startup.push(' ');
         startup.push_str(extra);

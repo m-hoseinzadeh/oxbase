@@ -218,20 +218,23 @@ jobs:
       # SSH, cancel, 200k-row stream). One thread so the cancel timings do not compete with probes.
       # Every lane also requires each M2 engine (PostgreSQL, MySQL, MariaDB, SQLite) to register
       # its tree layout and pass its fetch_list cells (all four M2 dialects are merged).
-      # M3: the roundtrip / capabilities cells (table, column, index, foreign key, check) run for
-      # every engine that registered its DdlGenerator and Comparator cells; a failing one fails
-      # the job, a pending one does not. The integrator sets OXBASE_CONFORMANCE_REQUIRE_M3_ROUNDTRIP
-      # to "1" once the pg, mysql and sqlite streams are merged, so every M3 cell must then pass.
+      # M3 exit check: the roundtrip / capabilities cells (table, column, index, foreign key,
+      # check) must pass on PostgreSQL, MySQL, MariaDB and SQLite; a pending or failing one fails
+      # the job (all three M3 dialect streams are merged).
       - name: Run conformance harness
         env:
           OXBASE_CONFORMANCE_REQUIRE_M2_FETCH: "1"
-          OXBASE_CONFORMANCE_REQUIRE_M3_ROUNDTRIP: "0"
+          OXBASE_CONFORMANCE_REQUIRE_M3_ROUNDTRIP: "1"
         run: cargo test -p oxbase-conformance --locked -- --include-ignored --nocapture --test-threads 1
 
       # Driver, tunnel and connection-manager live tests (SSH bastion, TLS-only users, cancel),
       # M2 dialect fetcher tests (pg, mysql/mariadb, sqlite) and query-run tests (services).
       # oxbase-sql has no ignored tests, so it runs in the Linux test job only.
-      - name: Run M1/M2 live tests
+      # M3: the dialect DDL / DML live tests and the services edit and designer live tests on
+      # every M3 engine; a missing engine cell or seed table fails instead of being pending.
+      - name: Run M1/M2/M3 live tests
+        env:
+          OXBASE_SERVICES_REQUIRE_M3_CELLS: "1"
         run: cargo test -p oxbase-net -p oxbase-pg -p oxbase-mysql -p oxbase-sqlite -p oxbase-services --locked -- --include-ignored --test-threads 1
 
       - name: Dump fixture logs
@@ -244,14 +247,15 @@ jobs:
 
   # The built app driven through its real webview (docs/m3-contracts.md §9, ui/e2e/README.md):
   # a debug app serving ui/dist, tauri-driver in front of WebKitWebDriver under Xvfb, the
-  # PostgreSQL fixture only. Full lane, plus the fast lane of the e2e and app workstreams
-  # (wip/*-e2e, wip/*-app). macOS has no WebDriver for WKWebView, so there is no macOS job.
+  # PostgreSQL fixture only. Full lane, plus the fast lane of the e2e, app and integration
+  # branches (wip/*-e2e, wip/*-app, wip/*-integrate). macOS has no WebDriver for WKWebView, so there is no macOS job.
   webview-smoke:
     name: Webview smoke (Linux)
     if: >-
       !startsWith(github.ref, 'refs/heads/wip/')
       || endsWith(github.ref, '-e2e')
       || endsWith(github.ref, '-app')
+      || endsWith(github.ref, '-integrate')
     runs-on: ubuntu-latest
     timeout-minutes: 40
     env:
@@ -311,9 +315,11 @@ jobs:
       - name: Start the PostgreSQL fixture
         run: bash scripts/e2e-fixtures.sh up
 
+      # M3: the table-data edit step is mandatory (a skip fails the job).
       - name: Webview smoke test
         env:
           OXBASE_E2E_OUT: ${{ runner.temp }}/e2e
+          OXBASE_E2E_REQUIRE_EDIT: "1"
         run: bash scripts/e2e-smoke.sh
 
       - name: Upload e2e results
