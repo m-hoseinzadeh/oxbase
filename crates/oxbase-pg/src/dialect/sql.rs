@@ -134,7 +134,10 @@ macro_rules! columns {
             "a.attidentity::text AS identity, ",
             $generated,
             " AS generated, ",
-            "CASE WHEN a.attcollation <> t.typcollation THEN co.collname::text END ",
+            "CASE WHEN a.attcollation <> t.typcollation THEN ",
+            "CASE WHEN pg_catalog.pg_collation_is_visible(co.oid) THEN co.collname::text ",
+            "ELSE '\"' || pg_catalog.replace(cn.nspname::text, '\"', '\"\"') || '\".\"' || ",
+            "pg_catalog.replace(co.collname::text, '\"', '\"\"') || '\"' END END ",
             "AS collation_name, ",
             "pg_catalog.col_description(a.attrelid, a.attnum) AS comment, ",
             "EXISTS (SELECT 1 FROM pg_catalog.pg_constraint k WHERE k.conrelid = a.attrelid ",
@@ -151,6 +154,7 @@ macro_rules! columns {
             "JOIN pg_catalog.pg_type t ON t.oid = a.atttypid ",
             "LEFT JOIN pg_catalog.pg_attrdef ad ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum ",
             "LEFT JOIN pg_catalog.pg_collation co ON co.oid = a.attcollation ",
+            "LEFT JOIN pg_catalog.pg_namespace cn ON cn.oid = co.collnamespace ",
             "LEFT JOIN LATERAL (SELECT s.seqstart, s.seqincrement ",
             "FROM pg_catalog.pg_depend dep ",
             "JOIN pg_catalog.pg_sequence s ON s.seqrelid = dep.objid ",
@@ -259,10 +263,19 @@ macro_rules! indexes {
             "(SELECT pg_catalog.pg_get_constraintdef(k.oid, true) FROM pg_catalog.pg_constraint k ",
             "WHERE k.conindid = ci.oid AND k.conrelid = i.indrelid AND k.contype = 'x' ",
             "LIMIT 1) AS exclusion, ",
+            "COALESCE((SELECT k.condeferrable FROM pg_catalog.pg_constraint k ",
+            "WHERE k.conindid = ci.oid AND k.conrelid = i.indrelid AND k.contype IN ('u', 'x') ",
+            "LIMIT 1), false) AS con_deferrable, ",
+            "COALESCE((SELECT k.condeferred FROM pg_catalog.pg_constraint k ",
+            "WHERE k.conindid = ci.oid AND k.conrelid = i.indrelid AND k.contype IN ('u', 'x') ",
+            "LIMIT 1), false) AS con_deferred, ",
+            "pg_catalog.array_to_json(ci.reloptions)::text AS reloptions, ",
+            "its.spcname::text AS tablespace, ",
             "pg_catalog.obj_description(ci.oid, 'pg_class') AS comment ",
             "FROM pg_catalog.pg_index i ",
             "JOIN pg_catalog.pg_class ci ON ci.oid = i.indexrelid ",
             "JOIN pg_catalog.pg_am am ON am.oid = ci.relam ",
+            "LEFT JOIN pg_catalog.pg_tablespace its ON its.oid = ci.reltablespace ",
             "WHERE i.indrelid = $1 ",
             "ORDER BY ci.relname"
         )
@@ -279,17 +292,44 @@ pub(crate) const INDEXES_10: &str = indexes!("i.indnatts", "false");
 /// Every column of every index of relation `$1` (oid), key columns first, then `INCLUDE`
 /// columns. `name` is NULL for an expression; `expr` is the column or expression text;
 /// `descending` and `nulls_first` are the `indoption` bits (only key columns have them).
+/// `opclass` is a key's operator class when it is not the default one, `collation_name` its
+/// collation when it differs from the column's, both as a bare name when visible on the search
+/// path, else as `"schema"."name"`; `has_options` is set when the operator class has parameters
+/// (13+). An expression key takes the collation of its expression (`lower(c)` of a `"C"` column
+/// is `"C"`), which the catalog does not tell apart from an explicit one: its collation is only
+/// reported when the index definition has a `COLLATE` clause somewhere (then it may be written
+/// out although it was implied, which means the same).
 pub(crate) const INDEX_COLUMNS: &str = "\
 SELECT i.indexrelid::int8 AS idx, \
        k.n AS ord, \
        a.attname::text AS name, \
        pg_catalog.pg_get_indexdef(i.indexrelid, k.n, true) AS expr, \
        COALESCE((i.indoption[k.n - 1]::int4 & 1) = 1, false) AS descending, \
-       COALESCE((i.indoption[k.n - 1]::int4 & 2) = 2, false) AS nulls_first \
+       COALESCE((i.indoption[k.n - 1]::int4 & 2) = 2, false) AS nulls_first, \
+       CASE WHEN oc.oid IS NOT NULL AND NOT oc.opcdefault THEN \
+            CASE WHEN pg_catalog.pg_opclass_is_visible(oc.oid) THEN oc.opcname::text \
+            ELSE '\"' || pg_catalog.replace(ocn.nspname::text, '\"', '\"\"') || '\".\"' || \
+                 pg_catalog.replace(oc.opcname::text, '\"', '\"\"') || '\"' END \
+       END AS opclass, \
+       CASE WHEN kc.oid IS NOT NULL AND kc.oid <> COALESCE(a.attcollation, it.typcollation) \
+                 AND (a.attnum IS NOT NULL \
+                      OR pg_catalog.strpos(pg_catalog.pg_get_indexdef(i.indexrelid), ' COLLATE ') > 0) \
+            THEN \
+            CASE WHEN pg_catalog.pg_collation_is_visible(kc.oid) THEN kc.collname::text \
+            ELSE '\"' || pg_catalog.replace(kcn.nspname::text, '\"', '\"\"') || '\".\"' || \
+                 pg_catalog.replace(kc.collname::text, '\"', '\"\"') || '\"' END \
+       END AS collation_name, \
+       ia.attoptions IS NOT NULL AS has_options \
 FROM pg_catalog.pg_index i \
 CROSS JOIN LATERAL pg_catalog.generate_series(1, i.indnatts::int4) AS k(n) \
 LEFT JOIN pg_catalog.pg_attribute a \
        ON a.attrelid = i.indrelid AND a.attnum = i.indkey[k.n - 1] AND i.indkey[k.n - 1] <> 0 \
+LEFT JOIN pg_catalog.pg_attribute ia ON ia.attrelid = i.indexrelid AND ia.attnum = k.n \
+LEFT JOIN pg_catalog.pg_type it ON it.oid = ia.atttypid \
+LEFT JOIN pg_catalog.pg_opclass oc ON oc.oid = i.indclass[k.n - 1] \
+LEFT JOIN pg_catalog.pg_namespace ocn ON ocn.oid = oc.opcnamespace \
+LEFT JOIN pg_catalog.pg_collation kc ON kc.oid = i.indcollation[k.n - 1] \
+LEFT JOIN pg_catalog.pg_namespace kcn ON kcn.oid = kc.collnamespace \
 WHERE i.indrelid = $1 \
 ORDER BY 1, 2";
 
@@ -671,6 +711,11 @@ mod tests {
             "pg_get_indexdef",
             "pg_get_constraintdef",
             "pg_options_to_table",
+            "pg_collation_is_visible",
+            "pg_opclass_is_visible",
+            "array_to_json",
+            "replace",
+            "strpos",
             "unnest",
             "generate_series",
             "array_length",

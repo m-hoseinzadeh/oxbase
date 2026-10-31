@@ -59,6 +59,21 @@ pub const EXCLUSION: PropId = PropId::from_static("exclusion");
 /// `NULLS FIRST` for descending columns).
 pub const NULLS_FIRST: PropId = PropId::from_static("nulls_first");
 
+/// Extra: per key column of an index, its operator class when it is not the default one (a
+/// JSON array in key order, `null` for the default). Bare names are on the search path; other
+/// names are written `"schema"."name"`. Only set when a key has one.
+pub const OPCLASSES: PropId = PropId::from_static("opclasses");
+/// Extra: per key column of an index, its collation when it differs from the column's (a JSON
+/// array in key order, `null` for the column's own), written like [`OPCLASSES`]. Only set when a
+/// key has one.
+pub const KEY_COLLATIONS: PropId = PropId::from_static("key_collations");
+/// Extra: an index's storage parameters (`WITH (...)`), a JSON array of `name=value` texts as
+/// `pg_class.reloptions` lists them. Only set when there are some.
+pub const INDEX_OPTIONS: PropId = PropId::from_static("index_options");
+/// Extra: an operator class of an index has parameters (`opclass (siglen = 32)`, 13+). The
+/// designer cannot write them, so such an index cannot be recreated.
+pub const OPCLASS_OPTIONS: PropId = PropId::from_static("opclass_options");
+
 /// Every kind with a PostgreSQL fetcher.
 pub(crate) const KINDS: [ObjectKind; 15] = [
     ObjectKind::Database,
@@ -1058,14 +1073,11 @@ async fn constraints(cx: &Cx<'_>, oid: i64, catalog: Option<&str>) -> Result<Vec
         let name = row.string("name")?;
         let key = cols.remove(&(con_oid, false)).unwrap_or_default();
         let mut extras = Extras::new();
-        // NOT ENFORCED constraints are never validated; NOT VALID is about enforced ones.
-        if row.flag("is_enforced")? {
-            if !row.flag("is_validated")? {
-                extras.insert(NOT_VALID, true);
-            }
-        } else {
-            extras.insert(NOT_ENFORCED, true);
-        }
+        // NOT ENFORCED constraints are never validated; NOT VALID is about enforced ones. Both
+        // are always reported (false included), so a comparison sees them change.
+        let enforced = row.flag("is_enforced")?;
+        extras.insert(NOT_ENFORCED, !enforced);
+        extras.insert(NOT_VALID, enforced && !row.flag("is_validated")?);
         let def = match row.code("contype")? {
             "p" => Constraint::PrimaryKey(PrimaryKeyDef {
                 name: Some(name.clone()),
@@ -1075,15 +1087,14 @@ async fn constraints(cx: &Cx<'_>, oid: i64, catalog: Option<&str>) -> Result<Vec
             "f" => {
                 extras.insert(props::DEFERRABLE, row.flag("is_deferrable")?);
                 extras.insert(props::INITIALLY_DEFERRED, row.flag("is_deferred")?);
-                match row.code("match_type")? {
-                    "f" => {
-                        extras.insert(MATCH_TYPE, "full");
-                    }
-                    "p" => {
-                        extras.insert(MATCH_TYPE, "partial");
-                    }
-                    _ => {}
-                }
+                extras.insert(
+                    MATCH_TYPE,
+                    match row.code("match_type")? {
+                        "f" => "full",
+                        "p" => "partial",
+                        _ => "simple",
+                    },
+                );
                 Constraint::ForeignKey(ForeignKeyDef {
                     name: Some(name.clone()),
                     columns: key,
@@ -1099,9 +1110,7 @@ async fn constraints(cx: &Cx<'_>, oid: i64, catalog: Option<&str>) -> Result<Vec
                 })
             }
             _ => {
-                if row.flag("no_inherit")? {
-                    extras.insert(NO_INHERIT, true);
-                }
+                extras.insert(NO_INHERIT, row.flag("no_inherit")?);
                 Constraint::Check(CheckDef {
                     name: Some(name.clone()),
                     expression: row.opt_string("check_expr")?.unwrap_or_default(),
@@ -1128,6 +1137,12 @@ struct IndexPart {
     text: String,
     descending: bool,
     nulls_first: bool,
+    /// A non-default operator class.
+    opclass: Option<String>,
+    /// A collation other than the column's.
+    collation: Option<String>,
+    /// The operator class has parameters.
+    has_options: bool,
 }
 
 /// One index with listing facts.
@@ -1151,6 +1166,9 @@ async fn indexes(cx: &Cx<'_>, oid: i64) -> Result<Vec<Index>> {
             text: row.opt_string("expr")?.unwrap_or_default(),
             descending: row.flag("descending")?,
             nulls_first: row.flag("nulls_first")?,
+            opclass: row.opt_string("opclass")?,
+            collation: row.opt_string("collation_name")?,
+            has_options: row.flag("has_options")?,
         });
     }
     let mut out = Vec::new();
@@ -1159,12 +1177,18 @@ async fn indexes(cx: &Cx<'_>, oid: i64) -> Result<Vec<Index>> {
         let mut columns = Vec::new();
         let mut include = Vec::new();
         let mut nulls_first = Vec::new();
+        let mut opclasses = Vec::new();
+        let mut collations = Vec::new();
+        let mut has_options = false;
         for part in cols.remove(&row.i64("oid")?).unwrap_or_default() {
             if part.ord > key_count {
                 include.push(part.column.unwrap_or(part.text));
                 continue;
             }
             nulls_first.push((part.nulls_first, part.descending));
+            opclasses.push(part.opclass);
+            collations.push(part.collation);
+            has_options |= part.has_options;
             columns.push(IndexColumn {
                 is_expression: part.column.is_none(),
                 name: part.column.unwrap_or(part.text),
@@ -1176,24 +1200,43 @@ async fn indexes(cx: &Cx<'_>, oid: i64) -> Result<Vec<Index>> {
         if let Some(method) = row.opt_string("method")? {
             extras.insert(props::INDEX_METHOD, method);
         }
-        if !include.is_empty() {
-            extras.insert(
-                props::INCLUDE_COLUMNS,
-                Value::Json(serde_json::Value::from(include)),
-            );
-        }
+        // Flags the designer edits are always reported (false and empty included), so a
+        // comparison sees them change.
+        extras.insert(
+            props::INCLUDE_COLUMNS,
+            Value::Json(serde_json::Value::from(include)),
+        );
         if nulls_first.iter().any(|(first, desc)| first != desc) {
             let flags: Vec<bool> = nulls_first.iter().map(|(first, _)| *first).collect();
             extras.insert(NULLS_FIRST, Value::Json(serde_json::Value::from(flags)));
         }
+        for (prop, names) in [(OPCLASSES, opclasses), (KEY_COLLATIONS, collations)] {
+            if names.iter().any(Option::is_some) {
+                extras.insert(prop, Value::Json(serde_json::Value::from(names)));
+            }
+        }
+        if has_options {
+            extras.insert(OPCLASS_OPTIONS, true);
+        }
+        if let Some(text) = row.opt_string("reloptions")? {
+            let options: Vec<String> = serde_json::from_str(&text).map_err(|e| {
+                Error::internal(format!("unreadable index storage parameters: {e}"))
+            })?;
+            if !options.is_empty() {
+                extras.insert(INDEX_OPTIONS, Value::Json(serde_json::Value::from(options)));
+            }
+        }
+        if let Some(space) = row.opt_string("tablespace")? {
+            extras.insert(props::TABLESPACE, space);
+        }
         if let Some(exclusion) = row.opt_string("exclusion")? {
             extras.insert(EXCLUSION, exclusion);
         }
-        if row.flag("nulls_not_distinct")? {
-            extras.insert(NULLS_NOT_DISTINCT, true);
-        }
-        if !row.flag("is_valid")? {
-            extras.insert(NOT_VALID, true);
+        extras.insert(NULLS_NOT_DISTINCT, row.flag("nulls_not_distinct")?);
+        extras.insert(NOT_VALID, !row.flag("is_valid")?);
+        if row.flag("is_constraint")? {
+            extras.insert(props::DEFERRABLE, row.flag("con_deferrable")?);
+            extras.insert(props::INITIALLY_DEFERRED, row.flag("con_deferred")?);
         }
         out.push(Index {
             def: IndexDef {
