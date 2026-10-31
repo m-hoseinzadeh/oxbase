@@ -10,6 +10,11 @@
 //! All are `#[ignore]`d: run them with
 //! `cargo test -p oxbase-pg --test m3_live -- --include-ignored --test-threads 1`.
 
+#![allow(
+    clippy::many_single_char_names,
+    reason = "the fixture, connection and version are used everywhere as f, c and v"
+)]
+
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;

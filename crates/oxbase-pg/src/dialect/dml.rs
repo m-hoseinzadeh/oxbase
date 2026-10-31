@@ -7,6 +7,11 @@
 //! other types without a neutral equivalent) arrive as text; their placeholder is cast in SQL:
 //! `CAST($n::text AS <native type>)`.
 
+#![allow(
+    clippy::many_single_char_names,
+    reason = "plans, keys and versions read best with short names in the tests"
+)]
+
 use std::collections::HashSet;
 
 use oxbase_dialect::sql::SqlWriter;
