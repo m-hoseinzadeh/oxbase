@@ -12,6 +12,11 @@
 //!
 //! An unreachable fixture fails the test with the engine name and port. Set
 //! `OXBASE_CONFORMANCE_ALLOW_MISSING=1` to report it as skipped instead.
+//!
+//! `OXBASE_CONFORMANCE_REQUIRE_M2_FETCH=1` (set by the full CI lane: pull requests and main)
+//! also requires every M2 engine (PostgreSQL, MySQL, MariaDB, SQLite) to have registered its
+//! tree layout in `oxbase_services::default_dialects`, so a registration left out fails the
+//! job instead of leaving its cells pending.
 
 use oxbase_conformance::adapter::{self, Engine};
 use oxbase_conformance::fixtures::Fixtures;
@@ -20,8 +25,9 @@ use oxbase_conformance::{fetch, fixtures, report, runner};
 
 /// M0 exit criterion (the harness runs against all engines), the M1 connection checks (every
 /// applicable check of the M1 engines passes, engines without a driver report pending) and the
-/// M2 `fetch_list` cells: every cell with a registered Fetcher and a seed object passes, the
-/// rest stay pending (or n/a when the server version lacks the kind).
+/// M2 `fetch_list` cells ([`fetch::gate`]): every cell with a registered Fetcher and a seed
+/// object passes, every kind of a registered tree layout passes or is n/a, each engine with a
+/// layout passes at least one cell, and n/a never hides a seeded kind.
 #[test]
 #[ignore = "needs the Docker fixtures (scripts/fixtures-up.sh); run with --include-ignored"]
 fn harness_runs_against_all_engines_and_m1_connection_checks_pass() {
@@ -47,37 +53,43 @@ fn harness_runs_against_all_engines_and_m1_connection_checks_pass() {
     let fx = Fixtures::from_path(&path).unwrap();
     let resolved = fx.resolve().unwrap();
     let registry = adapter::registry();
-    let skipped_ok = opts.allow_missing || opts.skip_fetch;
-    for c in &report.cells {
-        if c.check != Check::FetchList {
-            // roundtrip and capabilities have no runner before M3.
-            assert!(
-                !matches!(c.status, CellStatus::Pass | CellStatus::Fail),
-                "{} {} {}: {:?} {:?}",
-                c.engine,
-                c.object_kind,
-                c.check,
-                c.status,
-                c.detail
-            );
-            continue;
-        }
-        let e = resolved.iter().find(|e| e.name == c.engine).unwrap();
-        let must_run = fetch::runnable_kinds(&registry, e.engine).contains(&c.object_kind)
-            && !fetch::groups_for(&fx, e, c.object_kind).is_empty();
-        let ok = match c.status {
-            CellStatus::Pass => must_run,
-            CellStatus::Pending => !must_run,
-            CellStatus::NotApplicable => true,
-            CellStatus::Skipped => skipped_ok,
-            CellStatus::Fail => false,
-        };
+    for c in report.cells.iter().filter(|c| c.check != Check::FetchList) {
+        // roundtrip and capabilities have no runner before M3.
         assert!(
-            ok,
-            "{} {} fetch_list: {:?} {:?} (registered fetcher and seed: {must_run})",
-            c.engine, c.object_kind, c.status, c.detail
+            !matches!(c.status, CellStatus::Pass | CellStatus::Fail),
+            "{} {} {}: {:?} {:?}",
+            c.engine,
+            c.object_kind,
+            c.check,
+            c.status,
+            c.detail
         );
     }
+    let gate = fetch::GateOptions {
+        skipped_ok: opts.allow_missing || opts.skip_fetch,
+        require_m2: std::env::var("OXBASE_CONFORMANCE_REQUIRE_M2_FETCH")
+            .is_ok_and(|v| matches!(v.trim(), "1" | "true" | "yes" | "on")),
+    };
+    let problems = fetch::gate(&report.cells, &fx, &resolved, &registry, gate);
+    assert!(
+        problems.is_empty(),
+        "fetch_list gate ({gate:?}):\n  {}",
+        problems.join("\n  ")
+    );
+    let registered: Vec<&str> = fetch::M2_ENGINES
+        .iter()
+        .filter(|&&e| registry.tree_layout(e).is_ok())
+        .map(|e| e.as_str())
+        .collect();
+    println!(
+        "M2 engines with a registered tree layout: {} (OXBASE_CONFORMANCE_REQUIRE_M2_FETCH: {})",
+        if registered.is_empty() {
+            "none".to_owned()
+        } else {
+            registered.join(", ")
+        },
+        gate.require_m2
+    );
     let passed = report
         .cells
         .iter()

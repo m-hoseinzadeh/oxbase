@@ -22,6 +22,7 @@
 //! | `OXBASE_CONFORMANCE_TCP_ONLY=1` | Skip protocol handshakes; a TCP connect is enough |
 //! | `OXBASE_CONFORMANCE_SKIP_CONNECT=1` | Skip the M1 connection checks (reported as skipped) |
 //! | `OXBASE_CONFORMANCE_SKIP_FETCH=1` | Skip the M2 `fetch_list` cells (reported as skipped) |
+//! | `OXBASE_CONFORMANCE_REQUIRE_M2_FETCH=1` | Live test only: every M2 engine must register its tree layout ([`fetch::gate`]); set by the full CI lane |
 //! | `CARGO_TARGET_DIR` | Where `conformance/report.json` is written (default `<workspace>/target`) |
 
 pub mod adapter;

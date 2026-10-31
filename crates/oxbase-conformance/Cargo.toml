@@ -38,3 +38,7 @@ pretty_assertions.workspace = true
 # Fake fetchers in the fetch_list unit tests, over a mock connection.
 async-trait.workspace = true
 oxbase-driver = { workspace = true, features = ["mock"] }
+# The fetch_list run on a real SQLite session (src/fetch.rs tests): seed scripts in a temp dir,
+# names read from the Arrow batches.
+tempfile.workspace = true
+arrow-array.workspace = true

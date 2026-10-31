@@ -216,7 +216,12 @@ jobs:
       # Prints the object-kind matrix (M2: fetch_list cells list and load the [m2] seed objects
       # through every registered Fetcher) and the M1 connection table (plain, TLS, SSH, TLS over
       # SSH, cancel, 200k-row stream). One thread so the cancel timings do not compete with probes.
+      # The full lane (pull requests, main) also requires every M2 engine (PostgreSQL, MySQL,
+      # MariaDB, SQLite) to register its tree layout and pass its fetch_list cells; on wip/**
+      # branches an engine whose stream has not landed stays pending.
       - name: Run conformance harness
+        env:
+          OXBASE_CONFORMANCE_REQUIRE_M2_FETCH: ${{ (github.event_name == 'pull_request' || github.ref == 'refs/heads/main') && '1' || '0' }}
         run: cargo test -p oxbase-conformance --locked -- --include-ignored --nocapture --test-threads 1
 
       # Driver, tunnel and connection-manager live tests (SSH bastion, TLS-only users, cancel),
