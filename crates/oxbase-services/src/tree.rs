@@ -35,10 +35,13 @@ use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 
-use oxbase_dialect::DialectRegistry;
+use oxbase_dialect::{ChildGroup, DatabaseScope, DialectRegistry, TreeLayout};
 use oxbase_types::{Error, ErrorCategory, ObjectDef, ObjectKind, ObjectRef, ObjectSummary, Result};
 
-use crate::{CancellationToken, ConnectionManager, SessionHandle, SessionId};
+use crate::{
+    CancellationToken, ConnectionManager, SessionHandle, SessionId, check_cancelled,
+    until_cancelled,
+};
 
 /// Addresses one node of the object tree. Sent by the UI to `tree_children`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -145,7 +148,6 @@ impl TreeService {
     /// The children of `node` in the tree of the base session `session`. Cancelled calls
     /// return `Error::Cancelled` and nothing else. An unknown session is `NotFound`; an engine
     /// without a tree layout or a fetcher for a listed kind is `Unsupported`.
-    #[allow(clippy::unused_async)] // m2: services fills the body
     pub async fn children(
         &self,
         session: SessionId,
@@ -153,35 +155,200 @@ impl TreeService {
         options: &TreeOptions,
         cancel: CancellationToken,
     ) -> Result<Vec<TreeNode>> {
-        let _ = (self, session, node, options, cancel);
-        unimplemented!("m2: services")
+        check_cancelled(&cancel)?;
+        let nodes = until_cancelled(
+            &cancel,
+            self.children_inner(session, node, options, &cancel),
+        )
+        .await?;
+        // Nothing partial: a cancel that raced the last fetch still wins.
+        check_cancelled(&cancel)?;
+        Ok(nodes)
+    }
+
+    async fn children_inner(
+        &self,
+        session: SessionId,
+        node: &TreeNodeRef,
+        options: &TreeOptions,
+        cancel: &CancellationToken,
+    ) -> Result<Vec<TreeNode>> {
+        let base = self.base(session)?;
+        let engine = base.summary().engine;
+        let layout = self.dialects.tree_layout(engine)?;
+        let version = base.info().server_version.clone();
+        let (parent, groups): (ObjectRef, Vec<ChildGroup>) = match node {
+            TreeNodeRef::Folder { parent, kind } => {
+                return self
+                    .list_objects(&base, &layout, parent, *kind, options, cancel)
+                    .await;
+            }
+            TreeNodeRef::Connection => (ObjectRef::root(), layout.root().to_vec()),
+            TreeNodeRef::Object { object } => {
+                (object.clone(), layout.children(object.kind).to_vec())
+            }
+        };
+        let mut out = Vec::new();
+        for group in groups {
+            if !self.dialects.supports_kind(engine, group.kind, &version) {
+                continue;
+            }
+            if group.folder {
+                out.push(TreeNode::folder(parent.clone(), group.kind));
+            } else {
+                out.extend(
+                    self.list_objects(&base, &layout, &parent, group.kind, options, cancel)
+                        .await?,
+                );
+            }
+        }
+        Ok(out)
+    }
+
+    /// The objects of `kind` under `parent`, as tree nodes.
+    async fn list_objects(
+        &self,
+        base: &SessionHandle,
+        layout: &TreeLayout,
+        parent: &ObjectRef,
+        kind: ObjectKind,
+        options: &TreeOptions,
+        cancel: &CancellationToken,
+    ) -> Result<Vec<TreeNode>> {
+        let engine = base.summary().engine;
+        let fetcher = self.dialects.fetcher(engine, kind)?;
+        let database = if parent.is_root() {
+            None
+        } else {
+            parent.database_name()
+        };
+        let reader = self.reader(base, layout, database, cancel).await?;
+        let rows = {
+            let _guard = until_cancelled(cancel, async { Ok(reader.exclusive().await) }).await?;
+            fetcher
+                .list(reader.connection().as_ref(), parent, cancel.clone())
+                .await?
+        };
+        Ok(rows
+            .into_iter()
+            .filter(|row| options.show_system || !row.system)
+            .map(|row| {
+                let expandable = layout.is_expandable(row.obj.kind);
+                TreeNode::object(row, expandable)
+            })
+            .collect())
     }
 
     /// The full definition of `object` (`Fetcher::load` of its kind), read on the session
     /// [`TreeService::session_for`] picks.
-    #[allow(clippy::unused_async)] // m2: services fills the body
     pub async fn load(
         &self,
         session: SessionId,
         object: &ObjectRef,
         cancel: CancellationToken,
     ) -> Result<ObjectDef> {
-        let _ = (self, session, object, cancel);
-        unimplemented!("m2: services")
+        check_cancelled(&cancel)?;
+        let def = until_cancelled(&cancel, async {
+            let base = self.base(session)?;
+            let engine = base.summary().engine;
+            let fetcher = self.dialects.fetcher(engine, object.kind)?;
+            let reader = match self.dialects.tree_layout(engine) {
+                Ok(layout) => {
+                    self.reader(&base, &layout, object.database_name(), &cancel)
+                        .await?
+                }
+                Err(_) => base,
+            };
+            let _guard = reader.exclusive().await;
+            fetcher
+                .load(reader.connection().as_ref(), object, cancel.clone())
+                .await
+        })
+        .await?;
+        check_cancelled(&cancel)?;
+        Ok(def)
     }
 
     /// The session that reads objects of `database` for the base session `base`: the base
     /// itself, or (on `DatabaseScope::Session` engines, for another database) a cached metadata
     /// child. See the module docs.
-    #[allow(clippy::unused_async)] // m2: services fills the body
     pub async fn session_for(
         &self,
         base: SessionId,
         database: Option<&str>,
         cancel: CancellationToken,
     ) -> Result<SessionHandle> {
-        let _ = (self, base, database, cancel);
-        unimplemented!("m2: services")
+        let handle = self.base(base)?;
+        match self.dialects.tree_layout(handle.summary().engine) {
+            Ok(layout) => self.reader(&handle, &layout, database, &cancel).await,
+            Err(_) => Ok(handle),
+        }
+    }
+
+    /// The open base session `id` (`NotFound` otherwise).
+    fn base(&self, id: SessionId) -> Result<SessionHandle> {
+        self.manager
+            .get(id)
+            .ok_or_else(|| Error::not_found(format!("no open session {id}")))
+    }
+
+    /// See [`TreeService::session_for`].
+    async fn reader(
+        &self,
+        base: &SessionHandle,
+        layout: &TreeLayout,
+        database: Option<&str>,
+        cancel: &CancellationToken,
+    ) -> Result<SessionHandle> {
+        let Some(database) = database else {
+            return Ok(base.clone());
+        };
+        if layout.scope != DatabaseScope::Session {
+            return Ok(base.clone());
+        }
+        let current = base
+            .current_database()
+            .or_else(|| base.summary().database.clone());
+        if current.as_deref() == Some(database) {
+            return Ok(base.clone());
+        }
+        let key = (base.id(), database.to_owned());
+        let cached = self.lock_metadata()?.get(&key).cloned();
+        if let Some(child) = cached {
+            if self.manager.get(child.id()).is_some() {
+                return Ok(child);
+            }
+            // Closed behind our back (the base was closed and reopened, ...): reopen.
+            self.lock_metadata()?.remove(&key);
+        }
+        let child = self
+            .manager
+            .open_child(base.id(), Some(database), cancel.clone())
+            .await?;
+        let existing = {
+            let mut metadata = self.lock_metadata()?;
+            match metadata.get(&key) {
+                Some(other) if self.manager.get(other.id()).is_some() => Some(other.clone()),
+                _ => {
+                    metadata.insert(key, child.clone());
+                    None
+                }
+            }
+        };
+        if let Some(other) = existing {
+            // Another call opened one at the same time: keep that one.
+            let _ = self.manager.close(child.id()).await;
+            return Ok(other);
+        }
+        Ok(child)
+    }
+
+    fn lock_metadata(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, HashMap<(SessionId, String), SessionHandle>>> {
+        self.metadata
+            .lock()
+            .map_err(|_| Error::internal("tree session table lock poisoned"))
     }
 
     /// Closes and forgets the metadata children of `base`. Unknown bases are fine.

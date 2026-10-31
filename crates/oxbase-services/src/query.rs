@@ -13,6 +13,20 @@
 //! editor: starting a second one while the first is running is `InvalidInput`. Unless
 //! [`RunOptions::keep_previous`], starting a run closes the editor's earlier (finished) runs.
 //!
+//! The run is registered before its editor session is opened: closing the run or the editor,
+//! or dropping the service, stops a connect that hangs, and the connect gives up after
+//! `EDITOR_CONNECT_DEADLINE` (60 s) when the profile sets no connect timeout. A session lost
+//! during a run (a `Connection` error) is replaced on the editor's next run. When a stopped
+//! statement's stream does not wind down within `STOP_GRACE`, the driver may still close the
+//! session over it (MySQL/MariaDB do when `KILL QUERY` does not take effect in time); the
+//! editor's next statement that finds the session closed *before it started* then gets a new
+//! session (on the same database) and a warning notice, once.
+//!
+//! Exception: a base session on a private in-memory database (SQLite `:memory:`) cannot have
+//! useful children (each would be a separate, empty database), so its editors run on the base
+//! session itself, taking turns with the object tree on that connection; closing an editor
+//! then leaves the session open.
+//!
 //! # Execution
 //!
 //! 1. Split the script with `oxbase_sql::split` (dialect from the session's engine); emit
@@ -28,12 +42,19 @@
 //!    - `Notice` → [`RunEvent::Notice`].
 //!
 //!    A result set ends with [`RunEvent::ResultDone`] (exact row count, `truncated`). When a
-//!    result reaches [`RunOptions::max_rows`] or the disk cap, the run drops the statement's
-//!    stream (the driver cancels it), marks the result truncated, emits a warning
-//!    [`RunEvent::Notice`] and goes on with the next statement.
+//!    result reaches [`RunOptions::max_rows`] or the disk cap, the run marks the result
+//!    truncated, emits a warning [`RunEvent::Notice`] and stops storing it. For a query (the
+//!    splitter's `StatementKind::Query` hint) it drops the statement's stream (the driver
+//!    cancels it on the server) and goes on with the next statement. Any other statement
+//!    (`INSERT/UPDATE/DELETE ... RETURNING`, `CALL`, ...) is *not* cancelled: cancelling would
+//!    roll its changes back, or on PostgreSQL abort an open transaction, while it is reported
+//!    as done. It runs to its end, the rest of that result is read and discarded, and later
+//!    result sets of the statement are stored as usual.
 //! 3. A failing statement emits [`RunEvent::StatementFailed`]; with
 //!    [`RunOptions::stop_on_error`] (the default) the run then ends with [`RunEvent::Failed`],
-//!    otherwise it continues. A run that loses its session ends with `Failed`.
+//!    otherwise it continues. A run that loses its session (an error of category
+//!    `Connection`) ends with `Failed`, and the editor forgets that session: its next run opens
+//!    a new one.
 //! 4. The last event is exactly one of [`RunEvent::Finished`], [`RunEvent::Failed`],
 //!    [`RunEvent::Cancelled`].
 //!
@@ -61,25 +82,47 @@
 //!
 //! Owner of the bodies: the **services** stream (`docs/m2-contracts.md`).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
-use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::Duration;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use arrow_schema::{Field, Schema};
+use chrono::Utc;
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use uuid::Uuid;
 
-use oxbase_dialect::DialectRegistry;
-use oxbase_driver::{Notice, NoticeSeverity};
+use oxbase_dialect::{DatabaseScope, DialectRegistry};
+use oxbase_driver::{Notice, NoticeSeverity, ResultItem, ResultStream};
 use oxbase_sql::{SqlDialect, StatementKind};
+use oxbase_store::HistoryStatus;
 use oxbase_types::{Engine, Error, ErrorCategory, Result};
 
-use crate::history::HistoryService;
-use crate::results::ByteBudget;
-use crate::{ConnectionManager, SessionId};
+use crate::history::{HistoryRecord, HistoryService};
+use crate::results::{AppendOutcome, ByteBudget, ResultStore, RunDir};
+use crate::{CancellationToken, ConnectionManager, SessionHandle, SessionId};
+
+#[cfg(test)]
+mod live_tests;
+#[cfg(test)]
+mod service_tests;
+#[cfg(test)]
+pub(crate) mod test_split;
+
+/// How long a stopped statement's stream may take to wind down (server-side cancel, drain)
+/// before it is dropped. Keeps "cancel ends the run within 2 s".
+const STOP_GRACE: Duration = Duration::from_millis(1000);
+/// Longest wait for an editor's session to open when the profile sets no connect timeout
+/// (the connect is also stopped by cancelling or closing the run).
+const EDITOR_CONNECT_DEADLINE: Duration = Duration::from_secs(60);
+/// How long `close` waits for a cancelled run to end before forgetting it anyway.
+const CLOSE_WAIT: Duration = Duration::from_secs(3);
+/// Spill directories older than this are left over from a crash and removed on start.
+const STALE_RUN_DIR_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Identifies one run inside a [`QueryService`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -474,6 +517,67 @@ pub struct QueryService {
     history: Arc<HistoryService>,
     config: QueryConfig,
     disk: Arc<ByteBudget>,
+    registry: Arc<Registry>,
+}
+
+/// Runs and editors of a service, shared with the run tasks.
+#[derive(Default)]
+struct Registry {
+    runs: Mutex<HashMap<RunId, Arc<Run>>>,
+    editors: Mutex<HashMap<EditorId, Editor>>,
+}
+
+impl Registry {
+    fn run(&self, id: RunId) -> Option<Arc<Run>> {
+        lock(&self.runs).get(&id).cloned()
+    }
+
+    /// Frees `editor` for its next run if `run` is the one holding it.
+    fn release_editor(&self, editor: &EditorId, run: RunId) {
+        if let Some(e) = lock(&self.editors).get_mut(editor)
+            && e.busy == Some(run)
+        {
+            e.busy = None;
+        }
+    }
+}
+
+/// One query editor: its child session and its runs.
+struct Editor {
+    /// The base session the child belongs to.
+    base: SessionId,
+    child: Option<SessionHandle>,
+    /// The database the child was opened on (`None`: the base's).
+    database: Option<String>,
+    /// The run that holds the editor (also while its session is being opened).
+    busy: Option<RunId>,
+    /// The last run had to drop a statement that did not wind down (see `RunContext::stop`).
+    unclean: bool,
+    /// Open runs, oldest first.
+    runs: Vec<RunId>,
+}
+
+/// One run.
+struct Run {
+    id: RunId,
+    editor: EditorId,
+    token: CancellationToken,
+    state: watch::Sender<RunState>,
+    statements: Mutex<Vec<StatementSpan>>,
+    results: Mutex<Vec<RunResult>>,
+    /// Taken by `close` (and the service's drop), which delete the directory right away.
+    dir: Mutex<Option<Arc<RunDir>>>,
+}
+
+impl Run {
+    fn state(&self) -> RunState {
+        *self.state.borrow()
+    }
+}
+
+struct RunResult {
+    statement_index: usize,
+    store: Arc<ResultStore>,
 }
 
 impl QueryService {
@@ -484,12 +588,14 @@ impl QueryService {
         config: QueryConfig,
     ) -> Self {
         let disk = Arc::new(ByteBudget::new(config.disk_cap_bytes));
+        remove_stale_run_dirs(&config.spill_dir, STALE_RUN_DIR_AGE);
         Self {
             manager,
             dialects,
             history,
             config,
             disk,
+            registry: Arc::new(Registry::default()),
         }
     }
 
@@ -516,29 +622,232 @@ impl QueryService {
 
     /// Starts running `script` (see the module docs) and returns once the run is registered
     /// and its editor session is ready; events follow on the handle. Fails before starting
-    /// with `NotFound` (unknown session), `InvalidInput` (bad editor id, editor busy) or the
-    /// error of opening the editor's session.
-    #[allow(clippy::unused_async)] // m2: services fills the body
+    /// with `NotFound` (unknown session), `InvalidInput` (bad editor id, editor busy), the
+    /// error of opening the editor's session, or `Cancelled` when the run or its editor was
+    /// closed meanwhile.
     pub async fn run(
         &self,
         target: RunTarget,
         script: &str,
         options: RunOptions,
     ) -> Result<RunHandle> {
-        let _ = (self, target, script, options);
-        unimplemented!("m2: services")
+        target.editor.validate()?;
+        let base = self
+            .manager
+            .get(target.session)
+            .ok_or_else(|| Error::not_found(format!("no open session {}", target.session)))?;
+        let engine = base.summary().engine;
+        let dialect = SqlDialect::for_engine(engine).ok_or_else(|| {
+            Error::unsupported(format!("{} has no SQL editor", engine.display_name()))
+        })?;
+        let run_id = RunId::new();
+
+        // Reserve the editor.
+        let (previous, earlier) = {
+            let mut editors = lock(&self.registry.editors);
+            let editor = editors
+                .entry(target.editor.clone())
+                .or_insert_with(|| Editor {
+                    base: target.session,
+                    child: None,
+                    database: None,
+                    busy: None,
+                    unclean: false,
+                    runs: Vec::new(),
+                });
+            if editor.busy.is_some() {
+                return Err(Error::invalid_input(
+                    "this editor is already running a query; cancel it or wait for it to end",
+                ));
+            }
+            editor.busy = Some(run_id);
+            let earlier = if options.keep_previous {
+                Vec::new()
+            } else {
+                std::mem::take(&mut editor.runs)
+            };
+            let previous = (editor.base, editor.child.clone(), editor.database.clone());
+            (previous, earlier)
+        };
+        for id in earlier {
+            if let Err(e) = self.close(id).await {
+                tracing::debug!(run = %id, error = %e, "closing an earlier run failed");
+            }
+        }
+
+        let dir = match RunDir::create(&self.config.spill_dir) {
+            Ok(dir) => Arc::new(dir),
+            Err(e) => {
+                self.registry.release_editor(&target.editor, run_id);
+                return Err(e);
+            }
+        };
+        // The run is registered (with its token) before its session is opened, so `cancel`,
+        // `close`, `close_editor` and dropping the service also stop a connect that hangs.
+        let run = Arc::new(Run {
+            id: run_id,
+            editor: target.editor.clone(),
+            token: CancellationToken::new(),
+            state: watch::Sender::new(RunState::Running),
+            statements: Mutex::new(Vec::new()),
+            results: Mutex::new(Vec::new()),
+            dir: Mutex::new(Some(Arc::clone(&dir))),
+        });
+        lock(&self.registry.runs).insert(run_id, Arc::clone(&run));
+        if let Some(editor) = lock(&self.registry.editors).get_mut(&target.editor) {
+            editor.runs.push(run_id);
+        }
+
+        let opened = match self
+            .editor_session(&target, engine, previous, &options, &run.token)
+            .await
+        {
+            // Closed (or cancelled) while the session was opening.
+            Ok((session, _)) if run.token.is_cancelled() => {
+                if session.summary().parent.is_some() {
+                    close_session(&self.manager, session.id()).await;
+                }
+                Err(Error::Cancelled)
+            }
+            other => other,
+        };
+        let (session, database) = match opened {
+            Ok(ready) => ready,
+            Err(e) => {
+                run.state.send_replace(RunState::Failed);
+                lock(&self.registry.runs).remove(&run_id);
+                if let Some(editor) = lock(&self.registry.editors).get_mut(&target.editor) {
+                    editor.runs.retain(|id| *id != run_id);
+                }
+                self.registry.release_editor(&target.editor, run_id);
+                delete_run_dir(&run);
+                return Err(e);
+            }
+        };
+        let unclean = {
+            let mut editors = lock(&self.registry.editors);
+            let editor = editors
+                .entry(target.editor.clone())
+                .or_insert_with(|| Editor {
+                    base: target.session,
+                    child: None,
+                    database: None,
+                    busy: Some(run_id),
+                    unclean: false,
+                    runs: vec![run_id],
+                });
+            editor.base = target.session;
+            editor.child = Some(session.clone());
+            editor.database.clone_from(&database);
+            std::mem::take(&mut editor.unclean)
+        };
+
+        let (tx, rx) = mpsc::channel(self.config.event_capacity.max(1));
+        let context = RunContext {
+            run: Arc::clone(&run),
+            registry: Arc::clone(&self.registry),
+            manager: Arc::clone(&self.manager),
+            base: target.session,
+            database: session.current_database().or_else(|| database.clone()),
+            opened_on: database,
+            reopen_if_closed: AtomicBool::new(unclean),
+            profile_id: base.summary().profile_id,
+            session: Mutex::new(session),
+            dialect,
+            script: script.to_owned(),
+            options,
+            dir,
+            memory: Arc::new(ByteBudget::new(self.config.memory_budget_bytes)),
+            disk: Arc::clone(&self.disk),
+            history: Arc::clone(&self.history),
+            rows_interval: self.config.rows_event_interval,
+            tx,
+        };
+        tokio::spawn(supervise(context));
+        Ok(RunHandle {
+            id: run_id,
+            events: rx,
+        })
+    }
+
+    /// The editor's session for this run, reopened when it is gone, belongs to another base,
+    /// or sits on another database than the one asked for. Returns it with the database it
+    /// was opened on. Stops when `cancel` fires and after [`EDITOR_CONNECT_DEADLINE`].
+    ///
+    /// When a child would not see the base's data (a private in-memory database, see
+    /// `ConnectionManager::children_share_data`), the editor runs on the **base session**
+    /// itself: statements then take turns with the object tree and the other editors on that
+    /// one connection (`SessionHandle::exclusive`), and closing the editor leaves it open.
+    async fn editor_session(
+        &self,
+        target: &RunTarget,
+        engine: Engine,
+        (old_base, old_child, old_database): (SessionId, Option<SessionHandle>, Option<String>),
+        options: &RunOptions,
+        cancel: &CancellationToken,
+    ) -> Result<(SessionHandle, Option<String>)> {
+        let same_base = old_base == target.session;
+        let use_base = !self.manager.children_share_data(target.session);
+        // On `Attached` engines every database is visible from one session.
+        let attached = self
+            .dialects
+            .tree_layout(engine)
+            .is_ok_and(|layout| layout.scope == DatabaseScope::Attached);
+        let wanted = if attached {
+            None
+        } else {
+            options.database.clone()
+        };
+        // A base session used as the editor's session is never closed here.
+        if let Some(child) = &old_child
+            && child.summary().parent.is_some()
+        {
+            let alive = same_base && self.manager.get(child.id()).is_some();
+            let on_wanted = wanted.as_deref().is_none_or(|w| {
+                old_database.as_deref() == Some(w) || child.current_database().as_deref() == Some(w)
+            });
+            if alive && on_wanted && !use_base {
+                return Ok((child.clone(), old_database));
+            }
+            close_session(&self.manager, child.id()).await;
+        }
+        if use_base {
+            let base = self
+                .manager
+                .get(target.session)
+                .ok_or_else(|| Error::not_found(format!("no open session {}", target.session)))?;
+            return Ok((base, None));
+        }
+        let database = wanted.or(if same_base { old_database } else { None });
+        let open = self
+            .manager
+            .open_child(target.session, database.as_deref(), cancel.clone());
+        let child = tokio::time::timeout(EDITOR_CONNECT_DEADLINE, open)
+            .await
+            .unwrap_or_else(|_| {
+                Err(Error::timeout(format!(
+                    "opening the editor's session took longer than {} s",
+                    EDITOR_CONNECT_DEADLINE.as_secs()
+                )))
+            })?;
+        Ok((child, database))
     }
 
     /// Cancels a running run. `false` when it is unknown or already ended.
     pub fn cancel(&self, run: RunId) -> bool {
-        let _ = (self, run);
-        unimplemented!("m2: services")
+        let Some(run) = self.registry.run(run) else {
+            return false;
+        };
+        if run.state() != RunState::Running {
+            return false;
+        }
+        run.token.cancel();
+        true
     }
 
     /// Rows `[offset, offset + limit)` of result `result_index` of `run` (limit clamped to
     /// [`QueryConfig::max_page_rows`]), also while the result is still arriving. `NotFound`
     /// for an unknown or closed run or result index.
-    #[allow(clippy::unused_async)] // m2: services fills the body
     pub async fn page(
         &self,
         run: RunId,
@@ -546,8 +855,23 @@ impl QueryService {
         offset: u64,
         limit: usize,
     ) -> Result<arrow_array::RecordBatch> {
-        let _ = (self, run, result_index, offset, limit);
-        unimplemented!("m2: services")
+        let store = {
+            let found = self
+                .registry
+                .run(run)
+                .ok_or_else(|| Error::not_found(format!("no open query run {run}")))?;
+            let results = lock(&found.results);
+            results
+                .get(result_index)
+                .map(|r| Arc::clone(&r.store))
+                .ok_or_else(|| {
+                    Error::not_found(format!("query run {run} has no result {result_index}"))
+                })?
+        };
+        let limit = limit.min(self.config.max_page_rows);
+        tokio::task::spawn_blocking(move || store.page(offset, limit))
+            .await
+            .map_err(|_| Error::internal("reading a result page stopped unexpectedly"))?
     }
 
     /// [`QueryService::page`] encoded as an Arrow IPC stream (what `query_page` returns).
@@ -564,22 +888,75 @@ impl QueryService {
 
     /// Snapshot of a run; `NotFound` when unknown or closed.
     pub fn info(&self, run: RunId) -> Result<RunInfo> {
-        let _ = (self, run);
-        unimplemented!("m2: services")
+        let found = self
+            .registry
+            .run(run)
+            .ok_or_else(|| Error::not_found(format!("no open query run {run}")))?;
+        let statements = lock(&found.statements).clone();
+        let results = lock(&found.results)
+            .iter()
+            .enumerate()
+            .map(|(result_index, r)| ResultInfo {
+                result_index,
+                statement_index: r.statement_index,
+                columns: ColumnInfo::from_schema(r.store.schema()),
+                rows: r.store.row_count(),
+                complete: r.store.is_complete(),
+                truncated: r.store.is_truncated(),
+            })
+            .collect();
+        Ok(RunInfo {
+            run_id: found.id,
+            editor_id: found.editor.clone(),
+            state: found.state(),
+            statements,
+            results,
+        })
     }
 
     /// Cancels (if running) and forgets a run, deleting its spill files. Unknown runs are fine.
-    #[allow(clippy::unused_async)] // m2: services fills the body
     pub async fn close(&self, run: RunId) -> Result<()> {
-        let _ = (self, run);
-        unimplemented!("m2: services")
+        let Some(found) = self.registry.run(run) else {
+            return Ok(());
+        };
+        found.token.cancel();
+        let mut state = found.state.subscribe();
+        // A run whose driver does not stop is forgotten anyway; its task ends on its own.
+        let _ = tokio::time::timeout(CLOSE_WAIT, state.wait_for(|s| *s != RunState::Running)).await;
+        lock(&self.registry.runs).remove(&run);
+        if let Some(editor) = lock(&self.registry.editors).get_mut(&found.editor) {
+            editor.runs.retain(|id| *id != run);
+        }
+        // Drops the stores (their files go now) and the directory, even if a run task that
+        // did not stop in time still holds a reference to it.
+        lock(&found.results).clear();
+        delete_run_dir(&found);
+        Ok(())
     }
 
     /// Closes every run of `editor` and its child session. Unknown editors are fine.
-    #[allow(clippy::unused_async)] // m2: services fills the body
     pub async fn close_editor(&self, editor: &EditorId) -> Result<()> {
-        let _ = (self, editor);
-        unimplemented!("m2: services")
+        let runs: Vec<RunId> = lock(&self.registry.runs)
+            .values()
+            .filter(|r| r.editor == *editor)
+            .map(|r| r.id)
+            .collect();
+        for run in runs {
+            self.close(run).await?;
+        }
+        let removed = lock(&self.registry.editors).remove(editor);
+        // A base session the editor ran on (see `editor_session`) belongs to its owner.
+        if let Some(child) = removed
+            .and_then(|e| e.child)
+            .filter(|c| c.summary().parent.is_some())
+        {
+            match self.manager.close(child.id()).await {
+                Ok(()) => {}
+                Err(e) if e.category() == ErrorCategory::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
     }
 
     /// The statement under the cursor for "run current statement": `utf16_offset` is the
@@ -612,6 +989,667 @@ impl fmt::Debug for QueryService {
             .field("disk_used", &self.disk.used())
             .finish_non_exhaustive()
     }
+}
+
+impl Drop for QueryService {
+    /// Cancels every run and deletes every run directory now (running tasks wind down on
+    /// their own).
+    fn drop(&mut self) {
+        let runs: Vec<Arc<Run>> = lock(&self.registry.runs)
+            .drain()
+            .map(|(_, run)| run)
+            .collect();
+        for run in runs {
+            run.token.cancel();
+            lock(&run.results).clear();
+            delete_run_dir(&run);
+        }
+    }
+}
+
+/// Everything a run task needs.
+struct RunContext {
+    run: Arc<Run>,
+    registry: Arc<Registry>,
+    manager: Arc<ConnectionManager>,
+    /// The base session the editor belongs to.
+    base: SessionId,
+    /// The session statements run on (replaced by `RunContext::reopen_session`).
+    session: Mutex<SessionHandle>,
+    /// The database the editor's session was opened on (`None`: the base's).
+    opened_on: Option<String>,
+    /// A statement of this editor was dropped without winding down (see `RunContext::stop`):
+    /// the next statement that finds the session closed may replace it.
+    reopen_if_closed: AtomicBool,
+    /// The database the statements run in, for history.
+    database: Option<String>,
+    profile_id: Uuid,
+    dialect: SqlDialect,
+    script: String,
+    options: RunOptions,
+    dir: Arc<RunDir>,
+    memory: Arc<ByteBudget>,
+    disk: Arc<ByteBudget>,
+    history: Arc<HistoryService>,
+    rows_interval: Duration,
+    tx: mpsc::Sender<RunEvent>,
+}
+
+/// How a statement ended.
+enum Outcome {
+    Done {
+        rows_affected: Option<u64>,
+        /// Rows stored over its result sets, when it had any.
+        rows_returned: Option<u64>,
+    },
+    Failed(Error),
+    Cancelled {
+        rows_returned: Option<u64>,
+    },
+}
+
+/// How the run ends.
+enum Terminal {
+    Finished,
+    Failed(Error),
+    Cancelled,
+}
+
+/// The result set a statement is currently reading.
+struct Current {
+    result_index: usize,
+    store: Arc<ResultStore>,
+    last_rows_event: Option<Instant>,
+}
+
+/// Runs the run task and turns a panic inside it into a `Failed` end, so the UI never waits
+/// for a terminal event that does not come.
+async fn supervise(context: RunContext) {
+    let run = Arc::clone(&context.run);
+    let registry = Arc::clone(&context.registry);
+    let tx = context.tx.clone();
+    let started = Instant::now();
+    if tokio::spawn(execute(context)).await.is_err() {
+        tracing::error!(run = %run.id, "a query run stopped unexpectedly");
+        lock(&run.results)
+            .iter()
+            .filter(|r| !r.store.is_complete())
+            .for_each(|r| r.store.finish(true));
+        run.state.send_replace(RunState::Failed);
+        registry.release_editor(&run.editor, run.id);
+        let _ = tx
+            .send(RunEvent::Failed {
+                error: ErrorInfo {
+                    category: ErrorCategory::Internal,
+                    message: "the query run stopped unexpectedly".to_owned(),
+                },
+                elapsed_ms: millis(started.elapsed()),
+            })
+            .await;
+    }
+}
+
+/// The run task: see the module docs.
+async fn execute(context: RunContext) {
+    let started = Instant::now();
+    let statements = split_script(context.dialect, &context.script);
+    let spans: Vec<StatementSpan> = statements
+        .iter()
+        .enumerate()
+        .map(|(i, s)| StatementSpan::new(i, s))
+        .collect();
+    (*lock(&context.run.statements)).clone_from(&spans);
+    context
+        .emit(RunEvent::Started {
+            run_id: context.run.id,
+            statements: spans.clone(),
+        })
+        .await;
+
+    let mut terminal = Terminal::Finished;
+    for (index, (statement, span)) in statements.iter().zip(&spans).enumerate() {
+        if context.run.token.is_cancelled() {
+            terminal = Terminal::Cancelled;
+            break;
+        }
+        context
+            .emit(RunEvent::StatementStarted {
+                statement_index: index,
+            })
+            .await;
+        let started_at = Utc::now();
+        let clock = Instant::now();
+        let outcome = context.run_statement(index, span, &statement.text).await;
+        let elapsed = clock.elapsed();
+        context
+            .record_history(&statement.text, started_at, elapsed, &outcome)
+            .await;
+        let elapsed_ms = millis(elapsed);
+        match outcome {
+            Outcome::Done { rows_affected, .. } => {
+                context
+                    .emit(RunEvent::StatementDone {
+                        statement_index: index,
+                        rows_affected,
+                        elapsed_ms,
+                    })
+                    .await;
+            }
+            Outcome::Failed(error) => {
+                context
+                    .emit(RunEvent::StatementFailed {
+                        statement_index: index,
+                        error: ErrorInfo::from(&error),
+                        elapsed_ms,
+                    })
+                    .await;
+                // A lost session cannot run the rest.
+                let lost = error.category() == ErrorCategory::Connection;
+                if lost {
+                    context.forget_lost_session();
+                }
+                if context.options.stop_on_error || lost {
+                    terminal = Terminal::Failed(error);
+                    break;
+                }
+            }
+            Outcome::Cancelled { .. } => {
+                context
+                    .emit(RunEvent::StatementFailed {
+                        statement_index: index,
+                        error: ErrorInfo::from(&Error::Cancelled),
+                        elapsed_ms,
+                    })
+                    .await;
+                terminal = Terminal::Cancelled;
+                break;
+            }
+        }
+    }
+
+    let elapsed_ms = millis(started.elapsed());
+    let (state, event) = match terminal {
+        Terminal::Finished => (RunState::Finished, RunEvent::Finished { elapsed_ms }),
+        Terminal::Failed(error) => (
+            RunState::Failed,
+            RunEvent::Failed {
+                error: ErrorInfo::from(&error),
+                elapsed_ms,
+            },
+        ),
+        Terminal::Cancelled => (RunState::Cancelled, RunEvent::Cancelled { elapsed_ms }),
+    };
+    // State and editor first, so a caller that sees the terminal event can start the next run.
+    context.run.state.send_replace(state);
+    context
+        .registry
+        .release_editor(&context.run.editor, context.run.id);
+    context.emit(event).await;
+}
+
+impl RunContext {
+    /// The session statements run on now.
+    fn session(&self) -> SessionHandle {
+        lock(&self.session).clone()
+    }
+
+    /// Stops a statement (see the free function `stop`). When its stream did not wind down in
+    /// time, the driver may still be stopping it, or may close the session over it: the
+    /// editor's next statement may then replace a session it finds closed (see
+    /// `run_statement`).
+    async fn stop(&self, session: &SessionHandle, stream: ResultStream, token: &CancellationToken) {
+        if !stop(stream, token).await && session.summary().parent.is_some() {
+            tracing::debug!("a stopped statement did not wind down in time");
+            self.reopen_if_closed.store(true, Ordering::SeqCst);
+            if let Some(editor) = lock(&self.registry.editors).get_mut(&self.run.editor)
+                && editor
+                    .child
+                    .as_ref()
+                    .is_some_and(|c| c.id() == session.id())
+            {
+                editor.unclean = true;
+            }
+        }
+    }
+
+    /// Whether a statement that found `session` closed may replace it (once).
+    fn may_reopen(&self, session: &SessionHandle) -> bool {
+        session.summary().parent.is_some() && self.reopen_if_closed.swap(false, Ordering::SeqCst)
+    }
+
+    /// Opens a new editor session in place of `old` (on the same database), makes it the
+    /// editor's and the run's session, and closes `old` in the background.
+    async fn reopen_session(&self, old: &SessionHandle) -> Result<SessionHandle> {
+        let open =
+            self.manager
+                .open_child(self.base, self.opened_on.as_deref(), self.run.token.clone());
+        let new = tokio::time::timeout(EDITOR_CONNECT_DEADLINE, open)
+            .await
+            .unwrap_or_else(|_| {
+                Err(Error::timeout(format!(
+                    "opening the editor's session took longer than {} s",
+                    EDITOR_CONNECT_DEADLINE.as_secs()
+                )))
+            })?;
+        if let Some(editor) = lock(&self.registry.editors).get_mut(&self.run.editor)
+            && editor.child.as_ref().is_some_and(|c| c.id() == old.id())
+        {
+            editor.child = Some(new.clone());
+            editor.unclean = false;
+        }
+        *lock(&self.session) = new.clone();
+        let manager = Arc::clone(&self.manager);
+        let id = old.id();
+        tokio::spawn(async move { close_session(&manager, id).await });
+        Ok(new)
+    }
+
+    /// The run's session failed with a connection error: the editor forgets it, so its next
+    /// run opens a new one, and it is closed in the background. A base session the editor ran
+    /// on is left to its owner.
+    fn forget_lost_session(&self) {
+        let session = self.session();
+        let id = session.id();
+        if session.summary().parent.is_none() {
+            return;
+        }
+        if let Some(editor) = lock(&self.registry.editors).get_mut(&self.run.editor)
+            && editor.child.as_ref().is_some_and(|c| c.id() == id)
+        {
+            // `database` stays: the next session opens on the same database.
+            editor.child = None;
+        }
+        let manager = Arc::clone(&self.manager);
+        tokio::spawn(async move { close_session(&manager, id).await });
+    }
+
+    /// Sends a structural event, waiting while the channel is full. A gone receiver is fine.
+    async fn emit(&self, event: RunEvent) {
+        let _ = self.tx.send(event).await;
+    }
+
+    /// Runs one statement: see the module docs.
+    async fn run_statement(&self, index: usize, span: &StatementSpan, sql: &str) -> Outcome {
+        let token = &self.run.token;
+        let statement_token = token.child_token();
+        let mut session = self.session();
+        let mut reopened = false;
+        let (_guard, executed) = loop {
+            let guard = tokio::select! {
+                biased;
+                () = token.cancelled() => return Outcome::Cancelled { rows_returned: None },
+                guard = session.exclusive() => guard,
+            };
+            let executed = tokio::select! {
+                biased;
+                () = token.cancelled() => return Outcome::Cancelled { rows_returned: None },
+                executed = session.connection().execute(sql, &[], statement_token.clone()) => executed,
+            };
+            match executed {
+                // The session was found closed before the statement started, after an earlier
+                // statement had to be dropped without winding down (see `RunContext::stop`):
+                // replace it once and start the statement on the new one.
+                Err(e)
+                    if !reopened
+                        && e.category() == ErrorCategory::Connection
+                        && self.may_reopen(&session) =>
+                {
+                    drop(guard);
+                    reopened = true;
+                    match self.reopen_session(&session).await {
+                        Ok(new) => {
+                            session = new;
+                            self.emit(RunEvent::Notice {
+                                statement_index: Some(index),
+                                level: NoticeLevel::Warning,
+                                message: "the editor's session was closed after the last \
+                                          cancelled statement; a new session was opened (its \
+                                          temporary tables, settings and open transaction are \
+                                          gone)"
+                                    .to_owned(),
+                                code: None,
+                            })
+                            .await;
+                        }
+                        Err(reopen) => {
+                            tracing::debug!(
+                                category = %reopen.category(),
+                                "replacing a closed editor session failed"
+                            );
+                            break (None, Err(e));
+                        }
+                    }
+                }
+                other => break (Some(guard), other),
+            }
+        };
+        let mut stream = match executed {
+            Ok(stream) => stream,
+            Err(e) if token.is_cancelled() && e.is_cancelled() => {
+                return Outcome::Cancelled {
+                    rows_returned: None,
+                };
+            }
+            Err(e) => return Outcome::Failed(e),
+        };
+
+        let mut current: Option<Current> = None;
+        let mut rows_affected: Option<u64> = None;
+        let mut rows_returned: Option<u64> = None;
+        // A full result of a statement that is not a plain query: its remaining rows are read
+        // and discarded (see `store_batch`'s caller).
+        let mut discarding = false;
+        loop {
+            let item = tokio::select! {
+                biased;
+                () = token.cancelled() => None,
+                item = stream.next() => Some(item),
+            };
+            let Some(item) = item else {
+                // Cancelled: stop the statement, keep what arrived.
+                self.stop(&session, stream, &statement_token).await;
+                self.end_result(current.take(), true, &mut rows_returned)
+                    .await;
+                return Outcome::Cancelled { rows_returned };
+            };
+            match item {
+                None => {
+                    self.end_result(current.take(), false, &mut rows_returned)
+                        .await;
+                    return Outcome::Done {
+                        rows_affected,
+                        rows_returned,
+                    };
+                }
+                Some(Err(e)) => {
+                    self.end_result(current.take(), true, &mut rows_returned)
+                        .await;
+                    if token.is_cancelled() {
+                        return Outcome::Cancelled { rows_returned };
+                    }
+                    return Outcome::Failed(e);
+                }
+                Some(Ok(ResultItem::Notice(notice))) => {
+                    self.emit(RunEvent::notice(Some(index), &notice)).await;
+                }
+                Some(Ok(ResultItem::RowsAffected(n))) => {
+                    rows_affected = Some(rows_affected.unwrap_or(0).saturating_add(n));
+                }
+                Some(Ok(ResultItem::Schema(schema))) => {
+                    discarding = false;
+                    self.end_result(current.take(), false, &mut rows_returned)
+                        .await;
+                    let store = Arc::new(ResultStore::new(
+                        Arc::clone(&schema),
+                        Arc::clone(&self.dir),
+                        Arc::clone(&self.memory),
+                        Arc::clone(&self.disk),
+                    ));
+                    let result_index = {
+                        let mut results = lock(&self.run.results);
+                        // Earlier results give their memory up first (see `results`).
+                        store.set_evictable(
+                            results.iter().map(|r| Arc::downgrade(&r.store)).collect(),
+                        );
+                        results.push(RunResult {
+                            statement_index: index,
+                            store: Arc::clone(&store),
+                        });
+                        results.len() - 1
+                    };
+                    self.emit(RunEvent::ResultSet {
+                        result_index,
+                        statement_index: index,
+                        statement_range: span.clone(),
+                        columns: ColumnInfo::from_schema(&schema),
+                    })
+                    .await;
+                    current = Some(Current {
+                        result_index,
+                        store,
+                        last_rows_event: None,
+                    });
+                }
+                Some(Ok(ResultItem::Batch(_))) if discarding => {}
+                Some(Ok(ResultItem::Batch(batch))) => {
+                    let Some(open) = current.as_mut() else {
+                        self.stop(&session, stream, &statement_token).await;
+                        return Outcome::Failed(Error::internal(
+                            "the driver sent rows before their columns",
+                        ));
+                    };
+                    match self.store_batch(index, open, batch).await {
+                        Ok(true) => {}
+                        Ok(false) if span.returns_rows => {
+                            // Row limit or disk cap on a query: drop the rest of it (the
+                            // driver cancels it on the server).
+                            self.stop(&session, stream, &statement_token).await;
+                            self.end_result(current.take(), true, &mut rows_returned)
+                                .await;
+                            return Outcome::Done {
+                                rows_affected,
+                                rows_returned,
+                            };
+                        }
+                        Ok(false) => {
+                            // Row limit or disk cap on a statement that may change data
+                            // (`... RETURNING`, `CALL`): cancelling it would roll its changes
+                            // back (or abort the transaction) while it is reported as done, so
+                            // it runs to its end and the rest of this result is discarded.
+                            self.end_result(current.take(), true, &mut rows_returned)
+                                .await;
+                            discarding = true;
+                        }
+                        Err(e) => {
+                            self.stop(&session, stream, &statement_token).await;
+                            self.end_result(current.take(), true, &mut rows_returned)
+                                .await;
+                            return Outcome::Failed(e);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Stores `batch` in the current result. `Ok(false)`: the result is full (row limit or
+    /// disk cap; a warning notice was sent) and the statement must stop.
+    async fn store_batch(
+        &self,
+        index: usize,
+        open: &mut Current,
+        mut batch: arrow_array::RecordBatch,
+    ) -> Result<bool> {
+        let mut limit_reached = false;
+        if let Some(max) = self.options.max_rows {
+            let room = max.saturating_sub(open.store.row_count());
+            let rows = u64::try_from(batch.num_rows()).unwrap_or(u64::MAX);
+            if rows > room {
+                batch = batch.slice(0, usize::try_from(room).unwrap_or(usize::MAX));
+                limit_reached = true;
+            }
+        }
+        let outcome = if batch.num_rows() == 0 {
+            AppendOutcome::Stored
+        } else {
+            let store = Arc::clone(&open.store);
+            tokio::task::spawn_blocking(move || store.append(batch))
+                .await
+                .map_err(|_| Error::internal("storing result rows stopped unexpectedly"))??
+        };
+        let total = open.store.row_count();
+        let due = open
+            .last_rows_event
+            .is_none_or(|last| last.elapsed() >= self.rows_interval);
+        if due {
+            // Lossy: the next one carries the new total.
+            let _ = self.tx.try_send(RunEvent::Rows {
+                result_index: open.result_index,
+                total_so_far: total,
+            });
+            open.last_rows_event = Some(Instant::now());
+        }
+        let message = match outcome {
+            AppendOutcome::DiskFull => format!(
+                "result {} stopped after {total} rows: the disk space for query results ({} MiB) \
+                 is used up; close other results or lower the row count",
+                open.result_index + 1,
+                self.disk.limit() / (1024 * 1024)
+            ),
+            AppendOutcome::Stored if limit_reached => format!(
+                "result {} stopped after {total} rows: the row limit was reached",
+                open.result_index + 1
+            ),
+            AppendOutcome::Stored => return Ok(true),
+        };
+        self.emit(RunEvent::Notice {
+            statement_index: Some(index),
+            level: NoticeLevel::Warning,
+            message,
+            code: None,
+        })
+        .await;
+        Ok(false)
+    }
+
+    /// Completes the result set being read, if any, and emits its `ResultDone`.
+    async fn end_result(
+        &self,
+        current: Option<Current>,
+        truncated: bool,
+        rows_returned: &mut Option<u64>,
+    ) {
+        let Some(current) = current else {
+            return;
+        };
+        current.store.finish(truncated);
+        let total_rows = current.store.row_count();
+        *rows_returned = Some(rows_returned.unwrap_or(0).saturating_add(total_rows));
+        self.emit(RunEvent::ResultDone {
+            result_index: current.result_index,
+            total_rows,
+            truncated: current.store.is_truncated(),
+        })
+        .await;
+    }
+
+    /// One history entry for a statement that started. Failures (and panics) of the history
+    /// are logged without SQL text and never fail the run.
+    async fn record_history(
+        &self,
+        sql: &str,
+        started_at: chrono::DateTime<Utc>,
+        duration: Duration,
+        outcome: &Outcome,
+    ) {
+        if !self.options.record_history {
+            return;
+        }
+        let (status, rows, error) = match outcome {
+            Outcome::Done {
+                rows_affected,
+                rows_returned,
+            } => (HistoryStatus::Ok, rows_returned.or(*rows_affected), None),
+            Outcome::Failed(e) => (HistoryStatus::Error, None, Some(ErrorInfo::from(e).message)),
+            Outcome::Cancelled { rows_returned } => {
+                (HistoryStatus::Cancelled, *rows_returned, None)
+            }
+        };
+        let record = HistoryRecord {
+            profile_id: self.profile_id,
+            database: self.database.clone(),
+            dialect: self.dialect,
+            sql: sql.to_owned(),
+            started_at,
+            duration,
+            status,
+            rows,
+            error,
+        };
+        let history = Arc::clone(&self.history);
+        match tokio::spawn(async move { history.record(record).await }).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
+                tracing::warn!(category = %e.category(), "recording query history failed");
+            }
+            Err(_) => tracing::warn!("recording query history stopped unexpectedly"),
+        }
+    }
+}
+
+/// Stops a statement: cancels its token (the driver cancels it on the server), lets the
+/// stream wind down for at most [`STOP_GRACE`], then drops it. Returns whether it ended within
+/// the grace period.
+async fn stop(mut stream: ResultStream, token: &CancellationToken) -> bool {
+    token.cancel();
+    let ended = tokio::time::timeout(STOP_GRACE, async { while stream.next().await.is_some() {} })
+        .await
+        .is_ok();
+    drop(stream);
+    ended
+}
+
+/// Closes session `id`; already closed is fine, other failures are only logged.
+async fn close_session(manager: &ConnectionManager, id: SessionId) {
+    match manager.close(id).await {
+        Ok(()) => {}
+        Err(e) if e.category() == ErrorCategory::NotFound => {}
+        Err(e) => tracing::debug!(error = %e, "closing an editor session failed"),
+    }
+}
+
+/// The statements of `script`.
+fn split_script(dialect: SqlDialect, script: &str) -> Vec<oxbase_sql::Statement> {
+    // Unit tests of this crate run before the splitter of the `sql` stream may be merged; they
+    // fall back to a minimal splitter when `oxbase_sql::split` is not implemented yet.
+    #[cfg(test)]
+    if let Some(statements) = test_split::fallback_split(dialect, script) {
+        return statements;
+    }
+    oxbase_sql::split(dialect, script)
+}
+
+/// Deletes the spill directory of `run` now.
+fn delete_run_dir(run: &Run) {
+    if let Some(dir) = lock(&run.dir).take() {
+        let path = dir.path().to_owned();
+        drop(dir);
+        if path.exists() {
+            let _ = std::fs::remove_dir_all(&path);
+        }
+    }
+}
+
+/// Removes `run-*` directories under `base` that were last modified at least `age` ago.
+fn remove_stale_run_dirs(base: &Path, age: Duration) {
+    let Ok(entries) = std::fs::read_dir(base) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if !entry.file_name().to_string_lossy().starts_with("run-") {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        let stale = meta.is_dir()
+            && meta
+                .modified()
+                .ok()
+                .and_then(|m| m.elapsed().ok())
+                .is_some_and(|elapsed| elapsed >= age);
+        if stale && std::fs::remove_dir_all(entry.path()).is_ok() {
+            tracing::debug!("removed a stale query result directory");
+        }
+    }
+}
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn millis(d: Duration) -> u64 {
+    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]
@@ -712,7 +1750,7 @@ mod tests {
 
     #[test]
     fn column_info_from_arrow_fields() {
-        let mut meta = std::collections::HashMap::new();
+        let mut meta = HashMap::new();
         meta.insert("oxbase.pg.type".to_owned(), "int8".to_owned());
         let schema = Schema::new(vec![
             Field::new("id", DataType::Int64, false).with_metadata(meta),

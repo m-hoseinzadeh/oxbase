@@ -75,11 +75,11 @@ impl HistoryService {
         if !settings.enabled {
             return Ok(None);
         }
-        let sql = truncate(&redact_secrets(record.dialect, &record.sql), MAX_SQL_BYTES);
+        let sql = truncate(&redact(record.dialect, &record.sql), MAX_SQL_BYTES);
         let error = record
             .error
             .as_deref()
-            .map(|e| truncate(&redact_secrets(record.dialect, e), MAX_ERROR_BYTES));
+            .map(|e| truncate(&redact(record.dialect, e), MAX_ERROR_BYTES));
         let entry = HistoryEntry {
             id: Uuid::now_v7(),
             profile_id: record.profile_id,
@@ -125,6 +125,17 @@ impl HistoryService {
         }
         Ok(())
     }
+}
+
+/// `oxbase_sql::redact_secrets`. In this crate's unit tests, while the `sql` stream's
+/// implementation is not on the branch, a minimal stand-in (`query::test_split`) is used so
+/// the recording path can still be tested.
+fn redact(dialect: SqlDialect, text: &str) -> String {
+    #[cfg(test)]
+    if let Some(redacted) = crate::query::test_split::fallback_redact(text) {
+        return redacted;
+    }
+    redact_secrets(dialect, text).into_owned()
 }
 
 /// `text` cut to at most `max` bytes at a character boundary, with `…` appended when cut.
