@@ -803,7 +803,7 @@ impl GateOptions {
     /// The options of a run with `opts`: unreachable fixtures (`allow_missing`) may leave
     /// cells skipped; `OXBASE_CONFORMANCE_SKIP_ROUNDTRIP` may too, but not when `require_m3`
     /// (both set is an error, so the required gate cannot be passed by skipping every cell).
-    pub fn for_run(opts: &RunOptions, require_m3: bool) -> std::result::Result<Self, String> {
+    pub fn for_run(opts: &RunOptions, require_m3: bool) -> Result<Self, String> {
         if require_m3 && opts.skip_roundtrip {
             return Err(format!(
                 "{REQUIRE_ENV} and OXBASE_CONFORMANCE_SKIP_ROUNDTRIP are both set: the required \

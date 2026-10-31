@@ -61,7 +61,7 @@ fn token_ages_survive_the_wrap_of_the_seconds_field() {
 
 #[test]
 fn gate_options_never_let_skipping_pass_the_required_gate() {
-    let mut opts = crate::runner::RunOptions::default();
+    let mut opts = RunOptions::default();
     let plain = GateOptions::for_run(&opts, false).unwrap();
     assert!(!plain.skipped_ok);
     opts.skip_roundtrip = true;
@@ -803,6 +803,7 @@ fn a_broken_generator_fails_the_round_trip_and_still_cleans_up() {
     let reg = toy_registry(
         ToyDdl {
             drop_defaults: true,
+            ..ToyDdl::default()
         },
         toy_caps(),
     );
