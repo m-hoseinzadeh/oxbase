@@ -38,6 +38,7 @@
 )]
 
 use std::collections::HashSet;
+use std::fmt::Write as _;
 
 use oxbase_dialect::compare::{CompareRules, diff_checks, diff_foreign_keys, diff_indexes};
 use oxbase_dialect::sql::check_expression;
@@ -648,7 +649,7 @@ fn column_sql(v: &ServerVersion, c: &ColumnDef) -> Result<String> {
             &format!("generation expression of column {}", c.name),
             &generated.expression,
         )?;
-        s.push_str(&format!(" GENERATED ALWAYS AS ({expr}) {kind}"));
+        let _ = write!(s, " GENERATED ALWAYS AS ({expr}) {kind}");
     } else if let Some(identity) = &c.identity {
         need(v, 10, "an identity column")?;
         if c.default.is_some() {
@@ -741,11 +742,11 @@ fn unique_constraint_sql(v: &ServerVersion, idx: &IndexDef) -> Result<String> {
         need(v, 15, "NULLS NOT DISTINCT")?;
         s.push_str(" NULLS NOT DISTINCT");
     }
-    s.push_str(&format!(" ({})", column_list(&names)));
+    let _ = write!(s, " ({})", column_list(&names));
     let include = include_columns(&idx.extras)?;
     if !include.is_empty() {
         need(v, 11, "INCLUDE columns")?;
-        s.push_str(&format!(" INCLUDE ({})", column_list(&include)));
+        let _ = write!(s, " INCLUDE ({})", column_list(&include));
     }
     Ok(s)
 }
@@ -802,11 +803,11 @@ fn create_index_sql(v: &ServerVersion, table: &ObjectRef, idx: &IndexDef) -> Res
         s.push_str(" USING ");
         s.push_str(&ident(method));
     }
-    s.push_str(&format!(" ({})", keys.join(", ")));
+    let _ = write!(s, " ({})", keys.join(", "));
     let include = include_columns(&idx.extras)?;
     if !include.is_empty() {
         need(v, 11, "INCLUDE columns")?;
-        s.push_str(&format!(" INCLUDE ({})", column_list(&include)));
+        let _ = write!(s, " INCLUDE ({})", column_list(&include));
     }
     if flag(&idx.extras, &NULLS_NOT_DISTINCT) {
         need(v, 15, "NULLS NOT DISTINCT")?;
@@ -916,7 +917,7 @@ fn fk_sql(v: &ServerVersion, table: &ObjectRef, fk: &ForeignKeyDef) -> Result<St
         table_sql(&target)
     );
     if !fk.ref_columns.is_empty() {
-        s.push_str(&format!(" ({})", column_list(&fk.ref_columns)));
+        let _ = write!(s, " ({})", column_list(&fk.ref_columns));
     }
     match text_extra(&fk.extras, &MATCH_TYPE) {
         None | Some("simple") => {}
@@ -1780,7 +1781,7 @@ fn column_changes(
             sql.push_str(&ident(collation));
         }
         if type_changed && new.generated.is_none() {
-            sql.push_str(&format!(" USING {}::{ty}", ident(name)));
+            let _ = write!(sql, " USING {}::{ty}", ident(name));
         }
         let mut step = ScriptStep::new(sql).described(if type_changed {
             format!("Change the type of column {name} to {ty}")
@@ -2022,7 +2023,7 @@ mod tests {
         assert!(s.is_atomic());
         assert!(!s.is_destructive());
         assert_eq!(s.steps[0].description, "Create table order");
-        assert!(s.warnings.is_empty());
+        assert_eq!(s.warnings, Vec::<String>::new());
     }
 
     #[test]

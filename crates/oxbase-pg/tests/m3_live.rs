@@ -224,15 +224,12 @@ fn assert_same(source: &ObjectDef, fetched: &ObjectDef, script: &Script) {
         .comparator(Engine::Postgres, source.kind())
         .expect("comparator")
         .diff(source, fetched);
-    assert!(
-        diffs.is_empty(),
-        "fetched {} differs from its source:\n{}\n--- script ---\n{script}\n--- fetched ---\n{fetched:#?}",
-        source.kind(),
-        diffs
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join("\n")
+    let text: Vec<String> = diffs.iter().map(ToString::to_string).collect();
+    assert_eq!(
+        text,
+        Vec::<String>::new(),
+        "fetched {} differs from its source\n--- script ---\n{script}\n--- fetched ---\n{fetched:#?}",
+        source.kind()
     );
 }
 

@@ -305,7 +305,7 @@ mod tests {
             p.write.sql,
             "INSERT INTO \"m3\".\"m3_edit_pk\" DEFAULT VALUES"
         );
-        assert!(p.write.params.is_empty());
+        assert_eq!(p.write.params, Vec::<Value>::new());
         assert!(!p.returning);
         let p = plan(&RowEdit::Insert { values: vec![] }, &["id"], &["id"]).unwrap();
         assert_eq!(
