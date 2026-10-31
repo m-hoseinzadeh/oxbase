@@ -337,7 +337,7 @@ async fn catalog_queries_shape() {
         .unwrap();
     assert_empty(&listed, "tables");
     let calls = c.calls();
-    assert!(!calls.is_empty());
+    calls.first().expect("the table list ran a query");
     assert!(
         calls.iter().all(|(sql, _)| !sql.contains("TEMPORARY")),
         "{calls:?}"
