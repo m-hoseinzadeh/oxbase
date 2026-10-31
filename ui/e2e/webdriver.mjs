@@ -5,7 +5,7 @@
 // Request bodies are never logged: `sendKeys` carries the fixture password.
 
 /** The W3C web element identifier key. */
-const ELEMENT_KEY = "element-6066-11e4-a07c-4c0f6cbc39ec";
+const ELEMENT_KEY = "element-6066-11e4-a52e-4f735466cecf";
 
 /** W3C key codes used by the smoke test. */
 export const Keys = {
