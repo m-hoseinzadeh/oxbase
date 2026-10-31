@@ -648,6 +648,8 @@ pub struct PgConnection {
     version: ServerVersion,
     tls_in_use: bool,
     server: Endpoint,
+    /// The connected database: `ConnectParams::database`, or the user name (the server default).
+    database: String,
 }
 
 impl std::fmt::Debug for PgConnection {
@@ -656,6 +658,7 @@ impl std::fmt::Debug for PgConnection {
             .field("server", &self.server)
             .field("version", &self.version.raw())
             .field("tls_in_use", &self.tls_in_use)
+            .field("database", &self.database)
             .finish_non_exhaustive()
     }
 }
@@ -769,9 +772,13 @@ impl PgConnection {
         if let Some(password) = &params.password {
             cfg.password(password.expose());
         }
-        if let Some(db) = params.database.as_deref().filter(|d| !d.trim().is_empty()) {
+        let database = if let Some(db) = params.database.as_deref().filter(|d| !d.trim().is_empty())
+        {
             cfg.dbname(db);
-        }
+            db.to_owned()
+        } else {
+            user.to_owned()
+        };
         cfg.application_name(params.application_name.as_deref().unwrap_or("oxbase"));
         if let Some(t) = params.connect_timeout {
             cfg.connect_timeout(t);
@@ -841,6 +848,7 @@ impl PgConnection {
             version,
             tls_in_use: tls_used.load(Ordering::Acquire),
             server,
+            database,
         })
     }
 }
@@ -857,6 +865,12 @@ impl Connection for PgConnection {
 
     fn tls_in_use(&self) -> bool {
         self.tls_in_use
+    }
+
+    /// The connected database (`ConnectParams::database`, or the user name, which is the
+    /// server's default).
+    fn current_database(&self) -> Option<String> {
+        Some(self.database.clone())
     }
 
     async fn execute(

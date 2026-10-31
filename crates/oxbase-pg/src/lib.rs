@@ -28,9 +28,15 @@
 //!
 //! See [`types`] for the type mapping and `conn.rs` for how statements are sent. Results are
 //! streamed in batches of at most [`BATCH_ROWS`] rows (fewer when rows are wide).
+//!
+//! # Dialect (M2)
+//!
+//! [`dialect::register`] adds the PostgreSQL catalog fetchers, object-tree layout, capabilities
+//! and quoting to an `oxbase_dialect::DialectRegistry`.
 
 mod conn;
 mod decode;
+pub mod dialect;
 mod encode;
 mod error;
 mod split;
