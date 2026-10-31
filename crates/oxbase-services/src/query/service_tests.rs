@@ -36,6 +36,8 @@ type Log = Arc<Mutex<Vec<String>>>;
 /// - `update N`: `RowsAffected(N)`; `notice text`: a warning notice and `RowsAffected(0)`;
 /// - `fail`: an SQL error from `execute`; `midfail`: one batch, then an SQL error;
 /// - `lose`: a connection error; `hang`: nothing until cancelled;
+/// - `stuck`: a result set, then nothing; a cancel closes the connection and the stream never
+///   ends (a driver that gives up on a statement it cannot stop);
 /// - `select <any of the above>`: the same (the splitter calls it a query);
 /// - anything else: `RowsAffected(0)`.
 ///
@@ -65,7 +67,7 @@ impl Driver for ScriptDriver {
             database,
             version: ServerVersion::new(16, 0, 0),
             log: self.log.clone(),
-            closed: AtomicBool::new(false),
+            closed: Arc::new(AtomicBool::new(false)),
         }))
     }
 }
@@ -74,7 +76,7 @@ struct ScriptConnection {
     database: Option<String>,
     version: ServerVersion,
     log: Log,
-    closed: AtomicBool,
+    closed: Arc<AtomicBool>,
 }
 
 fn schema() -> SchemaRef {
@@ -104,6 +106,7 @@ enum Step {
     Rows { start: u64, n: u64 },
     Fail(Error),
     Hang,
+    Stuck,
 }
 
 fn arg(words: &[&str], i: usize, default: u64) -> u64 {
@@ -183,12 +186,18 @@ impl Connection for ScriptConnection {
                 steps.push_back(Step::Fail(Error::sql(Some("22012"), "division by zero")));
             }
             "hang" => steps.push_back(Step::Hang),
+            "stuck" => {
+                steps.push_back(Step::Item(ResultItem::Schema(schema())));
+                steps.push_back(Step::Stuck);
+            }
             _ => steps.push_back(Step::Item(ResultItem::RowsAffected(0))),
         }
         let log = self.log.clone();
+        let closed = Arc::clone(&self.closed);
         Ok(
             stream::unfold((steps, cancel, false), move |(mut steps, cancel, done)| {
                 let log = log.clone();
+                let closed = Arc::clone(&closed);
                 async move {
                     if done {
                         return None;
@@ -210,6 +219,12 @@ impl Connection for ScriptConnection {
                         Step::Fail(e) => Err(e),
                         Step::Hang => {
                             cancel.cancelled().await;
+                            Err(Error::Cancelled)
+                        }
+                        Step::Stuck => {
+                            cancel.cancelled().await;
+                            closed.store(true, Ordering::SeqCst);
+                            std::future::pending::<()>().await;
                             Err(Error::Cancelled)
                         }
                     };
@@ -1165,4 +1180,47 @@ async fn editors_of_a_private_in_memory_database_run_on_the_base_session() {
     assert!(h.manager.get(h.session).is_some());
     let (_, events) = h.run("a", "update 3", no_history()).await;
     assert_eq!(shape(&events).last().unwrap(), "finished");
+}
+
+#[tokio::test]
+async fn a_session_closed_by_an_unfinished_cancel_is_replaced_on_the_next_statement() {
+    let h = Harness::new(|_| {}).await;
+    let handle = h.start("a", "stuck", no_history()).await;
+    let mut events = handle.events;
+    loop {
+        if matches!(events.recv().await.unwrap(), RunEvent::ResultSet { .. }) {
+            break;
+        }
+    }
+    let clock = Instant::now();
+    assert!(h.service.cancel(handle.id));
+    let rest = drain(events).await;
+    assert!(
+        clock.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        clock.elapsed()
+    );
+    assert_eq!(shape(&rest).last().unwrap(), "cancelled");
+
+    // The driver closed the session over the statement it could not stop: the next statement
+    // finds it closed before starting, gets a new session and runs.
+    let (_, events) = h.run("a", "update 1", no_history()).await;
+    let seen = shape(&events);
+    assert!(
+        seen.iter()
+            .any(|s| s.starts_with("notice Warning: the editor's session was closed")),
+        "{seen:?}"
+    );
+    assert_eq!(seen.last().unwrap(), "finished");
+    assert_eq!(
+        connects(&h),
+        3,
+        "base + the first session + its replacement"
+    );
+    assert_eq!(h.statements_run().last().unwrap(), "db1: update 1");
+
+    // Without an unfinished stop, a closed session is not replaced mid-run.
+    let (_, events) = h.run("a", "lose", no_history()).await;
+    assert_eq!(shape(&events).last().unwrap(), "run failed Connection");
+    assert_eq!(connects(&h), 3);
 }

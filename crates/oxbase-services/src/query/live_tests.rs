@@ -462,8 +462,14 @@ async fn cancel_mid_stream(key: &str, engine: Engine) {
     let clock_next = Instant::now();
     let handle = live.start("SELECT 1 AS one", RunOptions::default()).await;
     let mut events = handle.events;
+    let mut replaced = false;
     loop {
         let event = next_event(&mut events, engine).await;
+        if let RunEvent::Notice { message, .. } = &event
+            && message.contains("a new session was opened")
+        {
+            replaced = true;
+        }
         if event.is_terminal() {
             assert!(
                 matches!(event, RunEvent::Finished { .. }),
@@ -476,9 +482,14 @@ async fn cancel_mid_stream(key: &str, engine: Engine) {
     assert_eq!(one.num_rows(), 1, "{engine}");
     report(&format!(
         "{engine} cancel: cancelled after {received} rows ({kept} kept), run ended {:.0} ms \
-         after cancel, next SELECT 1 took {:.0} ms",
+         after cancel, next SELECT 1 took {:.0} ms{}",
         ms(stopped),
-        ms(clock_next.elapsed())
+        ms(clock_next.elapsed()),
+        if replaced {
+            " (the driver had closed the editor's session after the cancel; it was replaced)"
+        } else {
+            " on the same session"
+        }
     ));
     assert!(stopped < Duration::from_secs(2), "{engine}: {stopped:?}");
 }
