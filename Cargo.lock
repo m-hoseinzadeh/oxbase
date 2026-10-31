@@ -3713,6 +3713,8 @@ dependencies = [
 name = "oxbase-conformance"
 version = "0.0.1"
 dependencies = [
+ "arrow-array",
+ "async-trait",
  "futures",
  "oxbase-dialect",
  "oxbase-driver",
@@ -3723,6 +3725,7 @@ dependencies = [
  "pretty_assertions",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "toml 1.1.8+spec-1.1.0",
