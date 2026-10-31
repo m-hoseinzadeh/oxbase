@@ -2,8 +2,13 @@
  * The result grid: Glide Data Grid (canvas, virtualized) over a {@link ResultPager}. The grid
  * asks for cells of the visible rows only; cells whose page is not loaded yet draw as loading
  * placeholders and are redrawn when the page arrives.
+ *
+ * With `edit` (table data, M3) the grid also shows rows past the stored ones (new rows), cell
+ * values that differ from the store (pending or applied edits), highlights changed, new,
+ * deleted and failed rows, and opens the caller's typed editor in the cell overlay.
  */
 import {
+  CompactSelection,
   DataEditor,
   type DataEditorRef,
   type DrawHeaderCallback,
@@ -11,15 +16,29 @@ import {
   GridCellKind,
   type GridColumn,
   GridColumnIcon,
+  type GridSelection,
   type Item,
+  type ProvideEditorCallback,
+  type ProvideEditorComponent,
   type Rectangle,
   type Theme,
 } from "@glideapps/glide-data-grid";
-import { type RefObject, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  createContext,
+  type ReactNode,
+  type RefObject,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import type { ColumnInfo } from "../../api";
 import { type CopyNotify, cellsForSelection, NULL_COPY_TEXT } from "./copy";
 import { cellDisplayText, columnTypeLabel, formatCell, initialColumnWidth } from "./format";
 import type { ResultPager } from "./pager";
+import { fromGridSelection, type GridRowSelection, toGridSelection } from "./rowSelection";
 
 /** Rows assumed visible before the grid reports its real viewport. */
 const MIN_VIEWPORT_ROWS = 60;
@@ -85,6 +104,52 @@ function readTheme(): Partial<Theme> {
   };
 }
 
+/** Cell highlight colours of the editable grid. */
+interface EditColours {
+  changed: string;
+  inserted: string;
+  deleted: string;
+  error: string;
+}
+
+function readEditColours(): EditColours {
+  const style = getComputedStyle(document.documentElement);
+  return {
+    changed: cssVar(style, "--grid-changed-bg", "#fff4d6"),
+    inserted: cssVar(style, "--grid-inserted-bg", "#e6f6ec"),
+    deleted: cssVar(style, "--grid-deleted-bg", "#fdecea"),
+    error: cssVar(style, "--grid-error-bg", "#f9d6d2"),
+  };
+}
+
+export type CellHighlight = "changed" | "inserted" | "deleted" | "error";
+
+/** What an edited cell shows instead of its stored value. */
+export interface CellOverride {
+  /** `null` = NULL. */
+  text: string | null;
+  /** Drawn faded (e.g. DEFAULT of a new row). */
+  placeholder?: string | undefined;
+}
+
+export type { GridRowSelection } from "./rowSelection";
+
+export interface GridEditing {
+  /** Rows shown after the stored ones (new rows). */
+  extraRows: number;
+  /** A cell's shown value when it differs from the store (or the row is not stored). */
+  override(row: number, col: number): CellOverride | undefined;
+  highlight(row: number, col: number): CellHighlight | undefined;
+  canEdit(row: number, col: number): boolean;
+  /** The typed editor of the cell overlay; `finish(move)` closes it (moving down on Enter). */
+  renderEditor(args: {
+    row: number;
+    col: number;
+    initialText?: string | undefined;
+    finish: (move: boolean) => void;
+  }): ReactNode;
+}
+
 function useGridTheme(): Partial<Theme> {
   const [theme, setTheme] = useState(readTheme);
   useEffect(() => {
@@ -99,21 +164,76 @@ function useGridTheme(): Partial<Theme> {
 
 const LOADING: GridCell = { kind: GridCellKind.Loading, allowOverlay: false };
 
+interface OverlayContext {
+  edit: RefObject<GridEditing | undefined>;
+  target: RefObject<Item | null>;
+}
+
+const OverlayTarget = createContext<OverlayContext | null>(null);
+
+/** The cell overlay of the editable grid: the caller's typed editor for the target cell. */
+const OverlayEditor: ProvideEditorComponent<GridCell> = ({ initialValue, onFinishedEditing }) => {
+  const context = useContext(OverlayTarget);
+  const [target] = useState(() => context?.target.current ?? null);
+  const editing = context?.edit.current;
+  if (!editing || !target) return null;
+  const [col, row] = target;
+  return (
+    <>
+      {editing.renderEditor({
+        row,
+        col,
+        ...(initialValue === undefined ? {} : { initialText: initialValue }),
+        finish: (move) => onFinishedEditing(undefined, move ? [0, 1] : [0, 0]),
+      })}
+    </>
+  );
+};
+
 export interface ResultGridProps {
   pager: ResultPager;
   columns: ColumnInfo[];
   /** Rows stored so far; grows while the result streams. */
   rowCount: number;
   /** Tells the user about a copy that was cut short or failed. */
-  onNotice?: CopyNotify;
+  onNotice?: CopyNotify | undefined;
+  /** Editing (table data); absent = read-only result. */
+  edit?: GridEditing | undefined;
+  /** The selected row(s) changed (the exact rows, gaps included). */
+  onSelectRows?: ((selection: GridRowSelection) => void) | undefined;
+  /**
+   * The row selection the caller holds. When it changes to something the grid did not report
+   * itself (a new row, Prev / Next in the form view, a remount), the grid shows it and scrolls
+   * the current row into view.
+   */
+  selectedRows?: GridRowSelection | undefined;
 }
 
-export function ResultGrid({ pager, columns, rowCount, onNotice }: ResultGridProps) {
+const NO_SELECTION: GridSelection = {
+  columns: CompactSelection.empty(),
+  rows: CompactSelection.empty(),
+};
+
+export function ResultGrid({
+  pager,
+  columns,
+  rowCount,
+  onNotice,
+  edit,
+  onSelectRows,
+  selectedRows,
+}: ResultGridProps) {
   const gridRef = useRef<DataEditorRef>(null);
   const portalRef = useRef<HTMLDivElement>(null);
   const region = useRef<Rectangle>({ x: 0, y: 0, width: 0, height: 0 });
   const theme = useGridTheme();
   const [widths, setWidths] = useState<Record<number, number>>({});
+  const [selection, setSelection] = useState<GridSelection>(() =>
+    selectedRows ? toGridSelection(selectedRows) : NO_SELECTION,
+  );
+  const colours = useMemo(readEditColours, []);
+  const editRef = useRef(edit);
+  editRef.current = edit;
 
   useEffect(() => {
     pager.setRowCount(rowCount);
@@ -147,8 +267,8 @@ export function ResultGrid({ pager, columns, rowCount, onNotice }: ResultGridPro
     [columns, widths],
   );
 
-  const getCellContent = useCallback(
-    ([col, row]: Item): GridCell => {
+  const storedCell = useCallback(
+    (col: number, row: number): GridCell => {
       const ref = pager.cell(row, col);
       if (!ref) return LOADING;
       const value = formatCell(ref.vector, ref.index, columns[col]);
@@ -174,6 +294,77 @@ export function ResultGrid({ pager, columns, rowCount, onNotice }: ResultGridPro
     },
     [pager, columns],
   );
+
+  const getCellContent = useCallback(
+    ([col, row]: Item): GridCell => {
+      if (!edit) return storedCell(col, row);
+      const override = edit.override(row, col);
+      let cell: GridCell;
+      if (override) {
+        const isNull = override.text === null;
+        const text = override.text ?? "";
+        cell = {
+          kind: GridCellKind.Text,
+          data: text,
+          displayData: override.placeholder ?? (isNull ? "NULL" : cellDisplayText(text)),
+          copyData: isNull ? NULL_COPY_TEXT : text,
+          allowOverlay: true,
+          ...(isNull || override.placeholder ? { style: "faded" as const } : {}),
+        };
+      } else {
+        cell = storedCell(col, row);
+        if (cell.kind === GridCellKind.Loading) return cell;
+      }
+      const editable = edit.canEdit(row, col);
+      const highlight = edit.highlight(row, col);
+      return {
+        ...cell,
+        allowOverlay: true,
+        readonly: !editable,
+        ...(highlight ? { themeOverride: { bgCell: colours[highlight] } } : {}),
+      } as GridCell;
+    },
+    [edit, storedCell, colours],
+  );
+
+  // The overlay editor is one stable component; the cell it edits is recorded when Glide asks
+  // for it (just before rendering it) and read from context.
+  const editTarget = useRef<Item | null>(null);
+  const overlay = useMemo<OverlayContext>(() => ({ edit: editRef, target: editTarget }), []);
+  const provideEditor = useCallback<ProvideEditorCallback<GridCell>>((cell) => {
+    const editing = editRef.current;
+    const location = cell.location;
+    if (!editing || !location) return undefined;
+    if (!editing.canEdit(location[1], location[0])) return undefined;
+    editTarget.current = location;
+    return { editor: OverlayEditor, disablePadding: true };
+  }, []);
+
+  const selectRef = useRef(onSelectRows);
+  selectRef.current = onSelectRows;
+  /** The selection last reported to (or received from) the caller; unset so a remount scrolls. */
+  const reported = useRef<GridRowSelection | undefined>(undefined);
+  const onGridSelectionChange = useCallback((next: GridSelection) => {
+    setSelection(next);
+    const notify = selectRef.current;
+    if (!notify) return;
+    const rows = fromGridSelection(next);
+    reported.current = rows;
+    notify(rows);
+  }, []);
+
+  // A selection made by the caller: show it and bring its current row into view.
+  useEffect(() => {
+    if (!selectedRows || selectedRows === reported.current) return;
+    reported.current = selectedRows;
+    setSelection((prev) => {
+      const col = prev.current?.cell[0] ?? 0;
+      return toGridSelection(selectedRows, col);
+    });
+    if (selectedRows.current !== null) {
+      gridRef.current?.scrollTo(0, selectedRows.current, "vertical");
+    }
+  }, [selectedRows]);
 
   // The column's type, right-aligned in its header when there is room for it.
   const drawHeader = useCallback<DrawHeaderCallback>(
@@ -228,26 +419,37 @@ export function ResultGrid({ pager, columns, rowCount, onNotice }: ResultGridPro
   const columnSummary = columns.map((c) => `${c.name} (${columnTypeLabel(c)})`).join(", ");
 
   return (
-    <div className="result-grid">
-      <DataEditor
-        ref={gridRef}
-        columns={gridColumns}
-        rows={rowCount}
-        getCellContent={getCellContent}
-        drawHeader={drawHeader}
-        onVisibleRegionChanged={onVisibleRegionChanged}
-        onColumnResize={(_column, newSize, index) =>
-          setWidths((current) => ({ ...current, [index]: newSize }))
-        }
-        getCellsForSelection={getCellsForSelection}
-        rowMarkers="number"
-        smoothScrollX
-        smoothScrollY
-        theme={theme}
-        width="100%"
-        height="100%"
-        portalElementRef={portalRef as RefObject<HTMLElement>}
-      />
+    <div className="result-grid" data-testid="result-grid">
+      <OverlayTarget.Provider value={overlay}>
+        <DataEditor
+          ref={gridRef}
+          columns={gridColumns}
+          rows={rowCount + (edit?.extraRows ?? 0)}
+          getCellContent={getCellContent}
+          drawHeader={drawHeader}
+          onVisibleRegionChanged={onVisibleRegionChanged}
+          onColumnResize={(_column, newSize, index) =>
+            setWidths((current) => ({ ...current, [index]: newSize }))
+          }
+          getCellsForSelection={getCellsForSelection}
+          gridSelection={selection}
+          onGridSelectionChange={onGridSelectionChange}
+          {...(edit
+            ? {
+                provideEditor,
+                onDelete: () => false,
+                onPaste: false,
+              }
+            : {})}
+          rowMarkers="number"
+          smoothScrollX
+          smoothScrollY
+          theme={theme}
+          width="100%"
+          height="100%"
+          portalElementRef={portalRef as RefObject<HTMLElement>}
+        />
+      </OverlayTarget.Provider>
       <div ref={portalRef} className="result-grid__portal" />
       <span className="visually-hidden">Columns: {columnSummary}</span>
     </div>

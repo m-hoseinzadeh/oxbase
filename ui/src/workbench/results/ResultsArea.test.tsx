@@ -94,6 +94,12 @@ describe("ResultsArea", () => {
       expect(resultIndex).toBe(0);
       expect(Number(offset) + Number(limit)).toBeLessThanOrEqual(1000);
     }
+    // Every page fetch is timed for the webview smoke test.
+    await waitFor(() => expect(window.__oxbasePerf?.pages.length ?? 0).toBeGreaterThan(0));
+    const entry = window.__oxbasePerf?.pages.at(-1);
+    expect(entry).toMatchObject({ offset: 0 });
+    expect(entry?.ipcMs).toBeGreaterThanOrEqual(0);
+    expect(entry?.decodeMs).toBeGreaterThanOrEqual(0);
   });
 
   it("has one tab per result set and a messages tab", async () => {

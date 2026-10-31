@@ -3,9 +3,9 @@
  * and needs a browser), behind a small handle the query panel drives.
  */
 import { lazy, type RefObject, Suspense } from "react";
+import type { SqlLanguage } from "./language";
 
-/** Monaco language id. */
-export type SqlLanguage = "pgsql" | "mysql" | "sql";
+export type { SqlLanguage };
 
 /** Commands bound to editor keys. */
 export type EditorCommand = "runAll" | "runCurrent";
@@ -27,8 +27,13 @@ export interface SqlEditorProps {
   language: SqlLanguage;
   /** Filled once the editor is ready; cleared when it goes away. */
   editorRef: RefObject<SqlEditorHandle | null>;
-  onCommand?: (command: EditorCommand) => void;
-  ariaLabel?: string;
+  onCommand?: ((command: EditorCommand) => void) | undefined;
+  ariaLabel?: string | undefined;
+  /** A read-only viewer (DDL preview). */
+  readOnly?: boolean | undefined;
+  /** Controlled text: the editor shows it whenever it changes. */
+  value?: string | undefined;
+  testId?: string | undefined;
 }
 
 const MonacoSqlEditor = lazy(() => import("./MonacoSqlEditor"));

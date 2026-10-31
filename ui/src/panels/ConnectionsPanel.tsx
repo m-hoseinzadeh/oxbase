@@ -64,13 +64,18 @@ function PromptSecretsDialog({
           <button type="button" className="button" onClick={onCancel}>
             Cancel
           </button>
-          <button type="submit" form={formId} className="button button--primary">
+          <button
+            type="submit"
+            form={formId}
+            className="button button--primary"
+            data-testid="password-prompt-submit"
+          >
             Connect
           </button>
         </>
       }
     >
-      <form id={formId} onSubmit={submit}>
+      <form id={formId} onSubmit={submit} data-testid="password-prompt">
         <p className="field__hint">These are not saved. They are used for this connection only.</p>
         {fields.map((field, index) => (
           <div className="field" key={field}>
@@ -238,6 +243,7 @@ export function ConnectionsPanel() {
         <button
           type="button"
           className="button button--primary"
+          data-testid="connect-button"
           disabled={!selected || busyId !== null}
           onClick={() => {
             if (!selected) return;
@@ -291,6 +297,7 @@ export function ConnectionsPanel() {
         <div
           id={listId}
           className="connection-list"
+          data-testid="connection-list"
           role="listbox"
           aria-label="Saved connections"
           tabIndex={0}

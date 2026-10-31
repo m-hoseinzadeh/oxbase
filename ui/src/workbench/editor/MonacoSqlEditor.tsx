@@ -13,13 +13,16 @@ export default function MonacoSqlEditor({
   editorRef,
   onCommand,
   ariaLabel,
+  readOnly,
+  value,
+  testId,
 }: SqlEditorProps) {
   const host = useRef<HTMLDivElement>(null);
   const editor = useRef<monaco.editor.IStandaloneCodeEditor | null>(null);
   // Commands read the latest callback without re-creating the editor.
   const command = useRef(onCommand);
   command.current = onCommand;
-  const initial = useRef({ value: initialValue, language });
+  const initial = useRef({ value: value ?? initialValue, language, readOnly: readOnly ?? false });
 
   useEffect(() => {
     const element = host.current;
@@ -36,6 +39,8 @@ export default function MonacoSqlEditor({
       tabSize: 2,
       renderLineHighlight: "line",
       ariaLabel: ariaLabel ?? "SQL editor",
+      readOnly: initial.current.readOnly,
+      domReadOnly: initial.current.readOnly,
     });
     editor.current = instance;
     instance.addAction({
@@ -97,5 +102,12 @@ export default function MonacoSqlEditor({
     if (model) monaco.editor.setModelLanguage(model, language);
   }, [language]);
 
-  return <div ref={host} className="sql-editor" data-testid="sql-editor" />;
+  // A controlled viewer follows `value`.
+  useEffect(() => {
+    const instance = editor.current;
+    if (value === undefined || !instance) return;
+    if (instance.getValue() !== value) instance.setValue(value);
+  }, [value]);
+
+  return <div ref={host} className="sql-editor" data-testid={testId ?? "sql-editor"} />;
 }

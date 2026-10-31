@@ -9,14 +9,19 @@ import { type FunctionComponent, useEffect, useState } from "react";
 import { ConnectionsPanel } from "./panels/ConnectionsPanel";
 import { WelcomePanel } from "./panels/WelcomePanel";
 import { StatusBar } from "./StatusBar";
+import { TableDataPanel } from "./workbench/data/TableDataPanel";
+import { TableDesignerPanel } from "./workbench/designer/TableDesignerPanel";
 import { QueryEditorPanel } from "./workbench/editor/QueryEditorPanel";
 import { HistoryPanel } from "./workbench/history/HistoryPanel";
 import {
+  type DesignerPanelParams,
+  designerTitle,
   newEditorId,
   openQueryEditor,
   type QueryEditorParams,
   setDockviewApi,
   showHistory,
+  type TableDataPanelParams,
 } from "./workbench/layout";
 import { ObjectTreePanel } from "./workbench/tree/ObjectTreePanel";
 
@@ -26,12 +31,42 @@ function QueryPanel({ params }: IDockviewPanelProps<QueryEditorParams>) {
   return <QueryEditorPanel {...params} editorId={editorId} />;
 }
 
+function TableDataTab({ params }: IDockviewPanelProps<TableDataPanelParams>) {
+  const [editorId] = useState(() => params.editorId || newEditorId());
+  if (!params.sessionId || !params.table) {
+    return <p className="results__empty">This tab lost its table. Open it again from the tree.</p>;
+  }
+  return <TableDataPanel editorId={editorId} sessionId={params.sessionId} table={params.table} />;
+}
+
+function DesignerTab({ params, api }: IDockviewPanelProps<DesignerPanelParams>) {
+  if (!params.sessionId || !params.table) {
+    return <p className="results__empty">This tab lost its table. Open it again from the tree.</p>;
+  }
+  return (
+    <TableDesignerPanel
+      sessionId={params.sessionId}
+      table={params.table}
+      isNew={params.isNew}
+      onTableChanged={(table) => {
+        // The tab now designs the created or renamed table: found (and reloaded) by that name.
+        // dockview merges params: `isNew` is set explicitly, not left out.
+        const next: DesignerPanelParams = { sessionId: params.sessionId, table, isNew: false };
+        api.updateParameters(next);
+        api.setTitle(designerTitle(next));
+      }}
+    />
+  );
+}
+
 const components: Record<string, FunctionComponent<IDockviewPanelProps>> = {
   connections: () => <ConnectionsPanel />,
   objects: () => <ObjectTreePanel />,
   welcome: () => <WelcomePanel />,
   history: () => <HistoryPanel />,
   query: QueryPanel,
+  tableData: TableDataTab,
+  designer: DesignerTab,
 };
 
 // Structural variables come from dockview's light theme; colours are overridden in
