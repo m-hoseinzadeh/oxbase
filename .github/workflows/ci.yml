@@ -242,6 +242,97 @@ jobs:
         if: always()
         run: bash scripts/ci-fixtures.sh down
 
+  # The built app driven through its real webview (docs/m3-contracts.md §9, ui/e2e/README.md):
+  # a debug app serving ui/dist, tauri-driver in front of WebKitWebDriver under Xvfb, the
+  # PostgreSQL fixture only. Full lane, plus the fast lane of the e2e and app workstreams
+  # (wip/*-e2e, wip/*-app). macOS has no WebDriver for WKWebView, so there is no macOS job.
+  webview-smoke:
+    name: Webview smoke (Linux)
+    if: >-
+      !startsWith(github.ref, 'refs/heads/wip/')
+      || endsWith(github.ref, '-e2e')
+      || endsWith(github.ref, '-app')
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      # Apache-2.0 OR MIT; a binary tool, not a dependency of the workspace.
+      TAURI_DRIVER_VERSION: "2.1.0"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Tauri Linux system libraries, WebKitWebDriver and Xvfb
+        run: |
+          bash scripts/ci-install-linux-deps.sh
+          sudo apt-get install -y -q --no-install-recommends webkit2gtk-driver xvfb xauth dbus
+          command -v WebKitWebDriver
+
+      # Restores the Linux test job's dependency cache (debug profile); never saves its own.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test
+          save-if: false
+
+      - uses: pnpm/action-setup@v6
+        with:
+          version: ${{ env.PNPM_VERSION }}
+          package_json_file: ui/package.json
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+          cache-dependency-path: ui/pnpm-lock.yaml
+
+      - name: Build the UI
+        working-directory: ui
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm run build
+
+      - name: Cache tauri-driver
+        id: tauri-driver-cache
+        uses: actions/cache@v6
+        with:
+          path: ~/.cargo/bin/tauri-driver
+          key: tauri-driver-${{ runner.os }}-${{ env.TAURI_DRIVER_VERSION }}
+
+      - name: Install tauri-driver
+        if: steps.tauri-driver-cache.outputs.cache-hit != 'true'
+        run: cargo install tauri-driver --locked --version "$TAURI_DRIVER_VERSION"
+
+      # What `tauri build --debug --no-bundle` builds: a debug app with ui/dist embedded.
+      - name: Build the debug app
+        run: cargo build -p app-tauri --locked --features tauri/custom-protocol
+
+      - name: Start the PostgreSQL fixture
+        run: bash scripts/e2e-fixtures.sh up
+
+      - name: Webview smoke test
+        env:
+          OXBASE_E2E_OUT: ${{ runner.temp }}/e2e
+        run: bash scripts/e2e-smoke.sh
+
+      - name: Upload e2e results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: webview-smoke-linux
+          path: ${{ runner.temp }}/e2e
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Dump fixture logs
+        if: failure()
+        run: bash scripts/e2e-fixtures.sh logs
+
+      - name: Tear down the fixture
+        if: always()
+        run: bash scripts/e2e-fixtures.sh down
+
   cargo-deny:
     name: cargo-deny (${{ matrix.checks }})
     runs-on: ubuntu-latest
