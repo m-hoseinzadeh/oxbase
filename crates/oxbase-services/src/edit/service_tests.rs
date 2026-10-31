@@ -606,8 +606,8 @@ fn statuses(report: &ApplyReport) -> Vec<EditStatus> {
     report.outcomes.iter().map(|o| o.status).collect()
 }
 
-fn texts(values: &[&str]) -> Option<Vec<Option<String>>> {
-    Some(values.iter().map(|v| Some((*v).to_owned())).collect())
+fn texts(values: &[&str]) -> Vec<Option<String>> {
+    values.iter().map(|v| Some((*v).to_owned())).collect()
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -914,9 +914,9 @@ async fn edits_apply_in_one_transaction_with_read_back_and_the_overlay() {
     assert_eq!(
         report.outcomes,
         [
-            applied(0, texts(&["1", "read", "42"])),
+            applied(0, Some(texts(&["1", "read", "42"]))),
             // The new row is numbered after the 3 stored rows.
-            applied(3, texts(&["100", "read", "42"])),
+            applied(3, Some(texts(&["100", "read", "42"]))),
             applied(2, None),
         ]
     );
@@ -1080,7 +1080,7 @@ async fn returning_writers_count_returned_rows() {
     let run = h.open("t").await;
     let report = h.apply(run, vec![update(0, "code", "x")]).await;
     assert!(report.committed);
-    assert_eq!(report.outcomes[0].values, texts(&["7", "ret", "14"]));
+    assert_eq!(report.outcomes[0].values, Some(texts(&["7", "ret", "14"])));
     lock(&h.state).affected.push_back(2);
     let report = h.apply(run, vec![update(1, "code", "x")]).await;
     assert_eq!(statuses(&report), [EditStatus::Conflict]);

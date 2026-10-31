@@ -1251,28 +1251,24 @@ fn record_applied(
             }
         }
         EditKind::Update | EditKind::Insert => {
-            let row = match prepared.row {
-                Some(row) => row,
-                None => {
-                    let row = stored_rows.saturating_add(overlay.inserted);
-                    overlay.inserted += 1;
-                    row
-                }
+            let row = if let Some(row) = prepared.row {
+                row
+            } else {
+                let row = stored_rows.saturating_add(overlay.inserted);
+                overlay.inserted += 1;
+                row
             };
             report.row = Some(row);
-            let stored = match read {
-                Some(read) => {
-                    report.values = Some(read.texts.clone());
-                    read
-                }
-                None => {
-                    report.warning = Some(
-                        "the row was saved but could not be read back; it shows the values as \
-                         entered until the data is reloaded"
-                            .to_owned(),
-                    );
-                    typed_row(prepared.before, &prepared.written, names.len())
-                }
+            let stored = if let Some(read) = read {
+                report.values = Some(read.texts.clone());
+                read
+            } else {
+                report.warning = Some(
+                    "the row was saved but could not be read back; it shows the values as \
+                     entered until the data is reloaded"
+                        .to_owned(),
+                );
+                typed_row(prepared.before, &prepared.written, names.len())
             };
             overlay.rows.insert(row, stored);
         }

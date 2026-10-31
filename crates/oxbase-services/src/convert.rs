@@ -534,9 +534,12 @@ fn parse_text(text: &str, column: &ColumnDef) -> Result<Value> {
                 Err(bad(column, text, "a decimal number"))
             }
         }
-        DataType::Char { .. } | DataType::VarChar { .. } | DataType::Text => {
-            Ok(Value::Text(text.to_owned()))
-        }
+        DataType::Char { .. }
+        | DataType::VarChar { .. }
+        | DataType::Text
+        | DataType::Interval
+        | DataType::Array { .. }
+        | DataType::Other { .. } => Ok(Value::Text(text.to_owned())),
         DataType::Binary { .. } | DataType::VarBinary { .. } => {
             parse_bytes(trimmed).map(Value::Bytes).ok_or_else(|| {
                 bad(
@@ -581,9 +584,6 @@ fn parse_text(text: &str, column: &ColumnDef) -> Result<Value> {
                     labels.join(", ")
                 )))
             }
-        }
-        DataType::Interval | DataType::Array { .. } | DataType::Other { .. } => {
-            Ok(Value::Text(text.to_owned()))
         }
     }
 }
@@ -662,7 +662,7 @@ fn is_decimal(s: &str) -> bool {
 }
 
 fn parse_hex(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return None;
     }
     let bytes = s.as_bytes();
@@ -805,8 +805,14 @@ mod tests {
         let value = parse(text, data_type.clone())
             .unwrap_or_else(|e| panic!("{text:?} as {data_type}: {e}"));
         assert_eq!(value_text(&value).as_deref(), Some(expected), "{text:?}");
-        // The written form parses to the same value.
-        assert_eq!(parse(expected, data_type).unwrap(), value, "{expected:?}");
+        // The written form parses to a value written the same way (NaN is not equal to itself).
+        let again = parse(expected, data_type).unwrap();
+        assert_eq!(
+            value_text(&again).as_deref(),
+            Some(expected),
+            "{expected:?}"
+        );
+        assert_eq!(again.type_name(), value.type_name());
     }
 
     fn one<T: Array + 'static>(array: T) -> ArrayRef {

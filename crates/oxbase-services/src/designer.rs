@@ -498,18 +498,17 @@ impl DesignerService {
                 .iter()
                 .find(|(r, _)| *r == target)
                 .map(|(_, d)| d.clone());
-            let def = match cached {
-                Some(def) => def,
-                None => {
-                    let def = match self.tree.load(session, &target, cancel.clone()).await {
-                        Ok(ObjectDef::Table(def)) => Some(def),
-                        Ok(_) => None,
-                        Err(e) if e.category() == ErrorCategory::NotFound => None,
-                        Err(e) => return Err(e),
-                    };
-                    loaded.push((target.clone(), def.clone()));
-                    def
-                }
+            let def = if let Some(def) = cached {
+                def
+            } else {
+                let def = match self.tree.load(session, &target, cancel.clone()).await {
+                    Ok(ObjectDef::Table(def)) => Some(def),
+                    Ok(_) => None,
+                    Err(e) if e.category() == ErrorCategory::NotFound => None,
+                    Err(e) => return Err(e),
+                };
+                loaded.push((target.clone(), def.clone()));
+                def
             };
             let Some(def) = def else {
                 issues.push(DesignIssue::error(
