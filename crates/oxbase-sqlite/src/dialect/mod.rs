@@ -1,5 +1,6 @@
-//! SQLite dialect cells (M2): the object-tree layout, the [`Fetcher`]s, [`Capabilities`] and
-//! [`Quoting`].
+//! SQLite dialect cells: the object-tree layout, the [`Fetcher`]s, [`Capabilities`] and
+//! [`Quoting`] (M2); the [`DdlGenerator`] and [`Comparator`] of the table designer and the
+//! [`DmlWriter`] of grid editing (M3).
 //!
 //! Call [`register`] once on the app's [`DialectRegistry`] (`oxbase_services::default_dialects`
 //! does).
@@ -38,19 +39,41 @@
 //! - Foreign keys: [`props::DEFERRABLE`], [`props::INITIALLY_DEFERRED`].
 //! - Checks: [`COLUMN`] for a check declared on a column.
 //! - Listings: unnamed foreign keys and checks carry [`UNNAMED`] (see `fetch`).
+//!
+//! # Designer and grid editing (M3)
+//!
+//! - [`SqliteDdl`] (registered for `Table`, `Column`, `Index`, `ForeignKey` and `Check`):
+//!   native `ALTER TABLE` where SQLite has it, else the documented table rebuild in one
+//!   transaction (see the `ddl` module docs).
+//! - `RulesComparator(`[`SqliteRules`]`)` for the same kinds (declared types, defaults and
+//!   expressions as SQLite stores them).
+//! - [`SqliteCapabilities::designer`]: [`designer_capabilities`] by library version.
+//! - [`SqliteDmlWriter`]: bound `INSERT` / `UPDATE` / `DELETE`, `RETURNING` on 3.35+, else a
+//!   read-back `SELECT` (`last_insert_rowid()` for new rows); a rowid table without a key may be
+//!   edited by its `rowid` (see the `dml` module docs).
 
+mod caps;
 mod catalog;
+mod compare;
+mod ddl;
+mod dml;
 mod fetch;
 mod parse;
 mod types;
 
 use std::sync::Arc;
 
+use oxbase_dialect::compare::RulesComparator;
 use oxbase_dialect::{
-    AnsiQuoting, Capabilities, ChildGroup, DatabaseScope, DialectRegistry, Fetcher, Quoting,
-    TreeLayout,
+    AnsiQuoting, Capabilities, ChildGroup, Comparator, DESIGNER_KINDS, DatabaseScope, DdlGenerator,
+    DesignerCapabilities, DialectRegistry, DmlWriter, Fetcher, Quoting, TreeLayout,
 };
 use oxbase_types::{Engine, ObjectKind, PropId, ServerVersion, props};
+
+pub use caps::designer_capabilities;
+pub use compare::SqliteRules;
+pub use ddl::{REBUILD_SUFFIX, SqliteDdl};
+pub use dml::SqliteDmlWriter;
 
 /// Column extra: declared with the `AUTOINCREMENT` keyword (bool).
 pub const AUTOINCREMENT: PropId = PropId::from_static("autoincrement");
@@ -60,6 +83,10 @@ pub const COLUMN: PropId = PropId::from_static("column");
 pub const HIDDEN: PropId = PropId::from_static("hidden");
 /// Table extra: the module of a virtual table (`fts5`, `rtree`, ...).
 pub const MODULE: PropId = PropId::from_static("module");
+/// Table and index extra: clauses of the stored `CREATE` text the object model cannot hold
+/// (`ON CONFLICT`, `COLLATE` on a key), so re-creating the object from its definition would drop
+/// them (text). The DDL generator refuses to re-create such an object, and comparisons skip it.
+pub const REBUILD_LOSES: PropId = PropId::from_static("rebuild_loses");
 /// Listing extra: a foreign key or check declared without a name, listed under a synthetic one
 /// (bool).
 pub const UNNAMED: PropId = PropId::from_static("unnamed");
@@ -137,6 +164,7 @@ const ALWAYS: &[PropId] = &[
     COLUMN,
     HIDDEN,
     MODULE,
+    REBUILD_LOSES,
 ];
 
 impl Capabilities for SqliteCapabilities {
@@ -161,11 +189,16 @@ impl Capabilities for SqliteCapabilities {
     fn supports_kind(&self, kind: ObjectKind, _v: &ServerVersion) -> bool {
         APPLICABLE.contains(&kind)
     }
+
+    fn designer(&self, v: &ServerVersion) -> DesignerCapabilities {
+        designer_capabilities(v)
+    }
 }
 
 /// Registers the SQLite cells: a fetcher per [`APPLICABLE`] kind, the [`tree_layout`],
 /// [`SqliteCapabilities`], ANSI quoting (`"ident"`, `X'..'`) and not-applicable marks for
-/// every other kind.
+/// every other kind (M2); a [`SqliteDdl`] generator and a `RulesComparator(SqliteRules)` for
+/// every kind of [`DESIGNER_KINDS`] and the [`SqliteDmlWriter`] (M3).
 pub fn register(reg: &mut DialectRegistry) {
     let engine = Engine::Sqlite;
     let fetchers: [(ObjectKind, Arc<dyn Fetcher>); 8] = [
@@ -181,10 +214,18 @@ pub fn register(reg: &mut DialectRegistry) {
     for (kind, fetcher) in fetchers {
         reg.register_fetcher(engine, kind, fetcher);
     }
+    let ddl: Arc<dyn DdlGenerator> = Arc::new(SqliteDdl);
+    let comparator: Arc<dyn Comparator> = Arc::new(RulesComparator(SqliteRules));
+    for kind in DESIGNER_KINDS {
+        reg.register_ddl(engine, kind, Arc::clone(&ddl))
+            .register_comparator(engine, kind, Arc::clone(&comparator));
+    }
     let quoting: Arc<dyn Quoting> = Arc::new(AnsiQuoting);
+    let dml: Arc<dyn DmlWriter> = Arc::new(SqliteDmlWriter);
     reg.register_tree_layout(engine, tree_layout())
         .register_capabilities(engine, Arc::new(SqliteCapabilities))
         .register_quoting(engine, quoting)
+        .register_dml_writer(engine, dml)
         .mark_not_applicable_except(engine, APPLICABLE);
 }
 
@@ -221,6 +262,17 @@ mod tests {
             "\"a\"\"b\""
         );
         assert!(reg.capabilities(Engine::Sqlite).is_ok());
+        // M3: every designer role and the grid writer.
+        assert_eq!(
+            reg.missing_designer_roles(Engine::Sqlite),
+            Vec::<String>::new()
+        );
+        assert!(reg.dml_writer(Engine::Sqlite).is_ok());
+        let designer = reg
+            .capabilities(Engine::Sqlite)
+            .unwrap()
+            .designer(&"3.51.0".parse().unwrap());
+        assert!(designer.transactional_ddl);
     }
 
     #[test]

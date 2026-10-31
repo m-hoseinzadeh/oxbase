@@ -180,6 +180,11 @@ impl Lexed<'_> {
         unquote(self.text(i))
     }
 
+    /// `true` when a token in `from..to` is the bare word `kw`.
+    fn has_word(&self, from: usize, to: usize, kw: &str) -> bool {
+        (from..to.min(self.toks.len())).any(|i| self.is(i, kw))
+    }
+
     /// Index of the `)` matching the `(` at `open`, or the token count when unterminated.
     fn close_of(&self, open: usize) -> usize {
         let mut depth = 0usize;
@@ -305,6 +310,9 @@ pub(crate) struct ParsedTable {
     pub strict: bool,
     /// `CREATE VIRTUAL TABLE ... USING <module>`.
     pub module: Option<String>,
+    /// Clauses the object model cannot hold, so re-creating the table from its definition would
+    /// drop them: `ON CONFLICT` clauses and `COLLATE` on a `PRIMARY KEY` / `UNIQUE` key.
+    pub lossy: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -366,6 +374,9 @@ pub(crate) fn parse_create_table(sql: &str) -> ParsedTable {
         } else if lx.is_name(a) {
             column_def(&lx, a, b, &mut out);
         }
+    }
+    if (i + 1..close).any(|k| lx.is(k, "ON") && lx.is(k + 1, "CONFLICT")) {
+        out.lossy.push("an ON CONFLICT clause".to_owned());
     }
     // Table options: `WITHOUT ROWID`, `STRICT`, comma separated.
     i = close + 1;
@@ -469,9 +480,25 @@ fn table_constraints(lx: &Lexed<'_>, a: usize, b: usize, out: &mut ParsedTable) 
         if lx.is(i, "CONSTRAINT") {
             pending = lx.is_name(i + 1).then(|| lx.name(i + 1));
             i += 2;
-        } else if lx.is(i, "PRIMARY") {
-            out.pk_name = pending.take();
-            i += 1;
+        } else if lx.is_any(i, &["PRIMARY", "UNIQUE"]) {
+            if lx.is(i, "PRIMARY") {
+                out.pk_name = pending.take();
+            } else {
+                pending = None;
+            }
+            let open = if lx.is(i + 1, "KEY") { i + 2 } else { i + 1 };
+            if lx.kind(open) == Some(Tok::LParen) {
+                let close = lx.close_of(open);
+                if lx.has_word(open, close, "COLLATE") {
+                    let what = "a COLLATE on a PRIMARY KEY or UNIQUE key".to_owned();
+                    if !out.lossy.contains(&what) {
+                        out.lossy.push(what);
+                    }
+                }
+                i = close + 1;
+            } else {
+                i += 1;
+            }
         } else if lx.is(i, "CHECK") && lx.kind(i + 1) == Some(Tok::LParen) {
             let (expr, next) = lx.group(i + 1);
             out.checks.push(ParsedCheck {
@@ -546,6 +573,8 @@ pub(crate) struct ParsedIndex {
     pub parts: Vec<String>,
     /// The partial-index predicate after `WHERE`.
     pub predicate: Option<String>,
+    /// A key part carries `COLLATE x`, which the object model cannot hold.
+    pub collated: bool,
 }
 
 /// Reads a stored `CREATE [UNIQUE] INDEX` statement.
@@ -570,6 +599,7 @@ pub(crate) fn parse_create_index(sql: &str) -> ParsedIndex {
             if end > a + 1 && lx.is_any(end - 1, &["ASC", "DESC"]) {
                 end -= 1;
             } else if end > a + 2 && lx.is(end - 2, "COLLATE") {
+                out.collated = true;
                 end -= 2;
             } else {
                 break;
@@ -739,6 +769,70 @@ pub(crate) fn parse_create_trigger(sql: &str) -> Option<ParsedTrigger> {
         condition,
         body: lx.rest(begin).to_owned(),
     })
+}
+
+// --- M3: rewriting stored text for the table rebuild ---------------------------------------
+
+/// `true` when `sql` names `ident`: a bare word or a quoted identifier equal to it (ASCII
+/// case-insensitive, as SQLite compares names). String literals do not count. Used to decide
+/// whether a column is referenced by an expression or a trigger (a conservative, lexical test).
+pub(crate) fn mentions_identifier(sql: &str, ident: &str) -> bool {
+    let lx = lex(sql);
+    (0..lx.toks.len()).any(|i| {
+        matches!(lx.kind(i), Some(Tok::Word | Tok::Quoted))
+            && lx.name(i).eq_ignore_ascii_case(ident)
+    })
+}
+
+/// `expr` (an expression over one table's columns: a check, a generated column, an index key or
+/// predicate) with column names replaced by `pairs` (`(from, to)`, ASCII case-insensitive, all at
+/// once, so a swap works). A bare or quoted word counts as a column unless it is followed by `(`
+/// (a function) or `.` (a table qualifier) or follows `COLLATE`; string literals never count.
+/// Replaced names are written with `quote`.
+pub(crate) fn rename_columns(
+    expr: &str,
+    pairs: &[(String, String)],
+    quote: &dyn Fn(&str) -> String,
+) -> String {
+    if pairs.is_empty() {
+        return expr.to_owned();
+    }
+    let lx = lex(expr);
+    let mut edits: Vec<(usize, usize, String)> = Vec::new();
+    for (i, tok) in lx.toks.iter().enumerate() {
+        if !matches!(tok.kind, Tok::Word | Tok::Quoted)
+            || matches!(lx.kind(i + 1), Some(Tok::LParen | Tok::Dot))
+            || (i > 0 && lx.is(i - 1, "COLLATE"))
+        {
+            continue;
+        }
+        let value = lx.name(i);
+        if let Some((_, to)) = pairs
+            .iter()
+            .find(|(from, _)| from.eq_ignore_ascii_case(&value))
+        {
+            edits.push((tok.start, tok.end, quote(to)));
+        }
+    }
+    let mut out = expr.to_owned();
+    for (start, end, text) in edits.into_iter().rev() {
+        out.replace_range(start..end, &text);
+    }
+    out
+}
+
+/// A stored `CREATE TRIGGER` statement with its name qualified by `schema` (already quoted), so
+/// it is re-created in that attached database; unchanged when the name is already qualified or
+/// the text is not a `CREATE TRIGGER`.
+pub(crate) fn qualify_trigger_name(sql: &str, schema: &str) -> String {
+    let lx = lex(sql);
+    match lx.after_create("TRIGGER") {
+        Some(name_at) if lx.kind(name_at + 1) != Some(Tok::Dot) && name_at < lx.toks.len() => {
+            let at = lx.toks[name_at].start;
+            format!("{}{schema}.{}", &sql[..at], &sql[at..])
+        }
+        _ => sql.to_owned(),
+    }
 }
 
 #[cfg(test)]
@@ -960,6 +1054,29 @@ mod tests {
         let plain = parse_create_index("CREATE INDEX m2_child_parent_idx ON m2_child (parent_id)");
         assert_eq!(plain.parts, ["parent_id"]);
         assert_eq!(plain.predicate, None);
+        assert!(i.collated);
+        assert!(!plain.collated);
+    }
+
+    #[test]
+    fn m3_notes_clauses_the_model_cannot_hold() {
+        let plain = parse_create_table(
+            "CREATE TABLE t (a TEXT COLLATE NOCASE UNIQUE, b INT REFERENCES p ON DELETE CASCADE, \
+             PRIMARY KEY (a), UNIQUE (b))",
+        );
+        assert_eq!(plain.lossy, Vec::<String>::new());
+        let t = parse_create_table(
+            "CREATE TABLE t (a TEXT NOT NULL ON CONFLICT IGNORE, b TEXT, \
+             CONSTRAINT k UNIQUE (b COLLATE NOCASE), PRIMARY KEY (a COLLATE BINARY))",
+        );
+        assert_eq!(
+            t.lossy,
+            [
+                "a COLLATE on a PRIMARY KEY or UNIQUE key",
+                "an ON CONFLICT clause"
+            ]
+        );
+        assert_eq!(t.pk_name, None);
     }
 
     #[test]
@@ -1019,5 +1136,41 @@ mod tests {
         assert_eq!(t.table_schema.as_deref(), Some("main"));
         assert_eq!(t.condition.as_deref(), Some("NEW.begin > 0 AND (begin)"));
         assert_eq!(t.body, "BEGIN SELECT NEW.begin; END");
+    }
+
+    #[test]
+    fn m3_identifier_helpers() {
+        assert!(mentions_identifier("qty >= 0 AND \"Note\" <> ''", "note"));
+        assert!(mentions_identifier("[qty] > 1", "QTY"));
+        assert!(!mentions_identifier("'qty' = x", "qty"));
+        assert!(!mentions_identifier("quantity > 0", "qty"));
+
+        let quote = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
+        let pairs = [
+            ("qty".to_owned(), "amount".to_owned()),
+            ("a".to_owned(), "b".to_owned()),
+            ("b".to_owned(), "a".to_owned()),
+        ];
+        assert_eq!(
+            rename_columns(
+                "qty > 0 AND [QTY] <> 'qty' AND qty(x) AND t.qty AND a < b AND c COLLATE a",
+                &pairs,
+                &quote
+            ),
+            "\"amount\" > 0 AND \"amount\" <> 'qty' AND qty(x) AND t.\"amount\" AND \"b\" < \"a\" \
+             AND c COLLATE a"
+        );
+        assert_eq!(rename_columns("x > 0", &[], &quote), "x > 0");
+
+        assert_eq!(
+            qualify_trigger_name(
+                "CREATE TRIGGER tr AFTER INSERT ON t BEGIN SELECT 1; END",
+                "\"aux\""
+            ),
+            "CREATE TRIGGER \"aux\".tr AFTER INSERT ON t BEGIN SELECT 1; END"
+        );
+        let qualified = "CREATE TRIGGER IF NOT EXISTS x.tr AFTER INSERT ON t BEGIN SELECT 1; END";
+        assert_eq!(qualify_trigger_name(qualified, "\"aux\""), qualified);
+        assert_eq!(qualify_trigger_name("SELECT 1", "\"aux\""), "SELECT 1");
     }
 }
