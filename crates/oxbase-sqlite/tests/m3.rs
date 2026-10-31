@@ -170,8 +170,8 @@ async fn run_step(
         return Ok(());
     }
     let got = match on {
-        On::Conn(c) => exec_on(c, &step.sql, &[]).await?,
-        On::Tx(tx) => exec_tx(tx, &step.sql, &[]).await?,
+        On::Conn(c) => exec_on(*c, &step.sql, &[]).await?,
+        On::Tx(tx) => exec_tx(*tx, &step.sql, &[]).await?,
     };
     let rows = rows_of(&got);
     if let Some(name) = &step.capture {
