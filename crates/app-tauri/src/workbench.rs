@@ -25,7 +25,7 @@ use uuid::Uuid;
 use crate::connections::{ConnectionsState, isolated};
 use crate::error::CommandError;
 
-type CommandResult<T> = std::result::Result<T, CommandError>;
+type CommandResult<T> = Result<T, CommandError>;
 
 /// The services behind the workbench commands, managed as Tauri state.
 #[derive(Clone)]
