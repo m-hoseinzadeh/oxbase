@@ -59,9 +59,15 @@
 //!
 //! Every field is nullable. A field whose column has a declared type carries it in the field
 //! metadata under [`DECL_TYPE_METADATA_KEY`].
+//!
+//! # Dialect (M2)
+//!
+//! [`dialect::register`] adds the SQLite object-tree layout, fetchers, capabilities and quoting
+//! to a `DialectRegistry`.
 
 mod connection;
 mod convert;
+pub mod dialect;
 mod error;
 mod options;
 mod worker;
