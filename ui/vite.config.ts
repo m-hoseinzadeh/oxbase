@@ -22,7 +22,14 @@ export default defineConfig({
     target: process.env.TAURI_ENV_PLATFORM === "windows" ? "chrome120" : "safari16",
     minify: !process.env.TAURI_ENV_DEBUG,
     sourcemap: Boolean(process.env.TAURI_ENV_DEBUG),
-    chunkSizeWarningLimit: 1500,
+    // Monaco is one lazily loaded chunk of a few MB (src/workbench/editor/MonacoSqlEditor.tsx).
+    chunkSizeWarningLimit: 5000,
+  },
+  // Monaco's editor worker (`monaco-editor/editor/editor.worker?worker` in
+  // src/workbench/editor/monacoSetup.ts) is emitted as a same-origin module file, so the CSP's
+  // `script-src 'self'` covers it: no blob: or data: worker source is needed.
+  worker: {
+    format: "es",
   },
   test: {
     environment: "jsdom",
