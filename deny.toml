@@ -22,6 +22,18 @@ yanked = "deny"
 ignore = [
     # { id = "RUSTSEC-YYYY-NNNN", reason = "why it does not apply / tracking issue" },
     { id = "RUSTSEC-2024-0370", reason = "proc-macro-error (unmaintained) is a build-time proc macro pulled in only by gtk3-macros, part of Tauri's Linux webview stack; no alternative until Tauri moves off gtk-rs 0.18" },
+    # M1. No fixed `rsa` release exists (0.9.x and 0.10.0-rc both affected). It comes in through
+    # russh's `rsa` feature, which Oxbase needs so users can authenticate with RSA SSH keys. The
+    # client only signs the SSH auth challenge with the user's own key on the user's machine; it
+    # never decrypts attacker-chosen ciphertexts, which is what the Marvin timing attack needs.
+    # Revisit when `rsa` ships a constant-time release or russh drops it.
+    { id = "RUSTSEC-2023-0071", reason = "rsa via russh RSA key auth: client-side signing only, no decryption oracle; no fixed release exists" },
+    # M1. keyring 4 (Linux/BSD Secret Service backend) depends on zbus 5, whose helper crates
+    # were folded into zbus 6. Nothing is wrong with the code; it is just no longer released
+    # separately. Remove once keyring moves to zbus 6.
+    { id = "RUSTSEC-2026-0370", reason = "zvariant: merged into zbus 6; pulled in by keyring 4's Secret Service backend (zbus 5), no keyring release on zbus 6 yet" },
+    { id = "RUSTSEC-2026-0371", reason = "zbus_names: merged into zbus 6; pulled in by keyring 4's Secret Service backend (zbus 5), no keyring release on zbus 6 yet" },
+    { id = "RUSTSEC-2026-0372", reason = "zvariant_derive: merged into zbus 6; pulled in by keyring 4's Secret Service backend (zbus 5), no keyring release on zbus 6 yet" },
 ]
 
 [licenses]
@@ -40,13 +52,16 @@ allow = [
     "MPL-2.0",
     "CC0-1.0",
 ]
+exceptions = [
+    # Mozilla's root store as data. mysql_async's rustls feature always links it; Oxbase turns
+    # the built-in roots off when a CA file is configured (docs/m1-contracts.md section 3).
+    { allow = ["CDLA-Permissive-2.0"], crate = "webpki-roots" },
+]
 confidence-threshold = 0.9
 # The allow-list is policy, not a mirror of today's tree: don't warn about entries
 # that no current dependency uses.
 unused-allowed-license = "allow"
-exceptions = [
-    # { allow = ["LICENSE-ID"], crate = "crate-name" },
-]
+# Crate-specific exceptions are listed under `exceptions` above.
 
 [licenses.private]
 # Workspace crates are Apache-2.0 and `publish = false`; skip them so this

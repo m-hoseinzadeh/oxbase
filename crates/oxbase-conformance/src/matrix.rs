@@ -8,8 +8,26 @@ use oxbase_dialect::DialectRegistry;
 
 use crate::adapter::{self, Engine, ObjectKind};
 
-/// Detail attached to every applicable cell until the engine's driver exists.
-pub const PENDING_NO_DRIVER: &str = "no driver yet";
+/// Detail attached to every applicable cell of an engine whose driver exists (M1) but whose
+/// dialect cells (Fetcher, DdlGenerator, ...) do not yet: they land in M2/M3.
+pub const PENDING_NO_DIALECT: &str = "pending (M2: no dialect cells yet)";
+
+/// The milestone that brings `engine`'s driver, for engines that have none yet.
+pub const fn driver_milestone(engine: Engine) -> Option<&'static str> {
+    match engine {
+        Engine::Postgres | Engine::MySql | Engine::MariaDb | Engine::Sqlite => None,
+        Engine::MsSql => Some("M4"),
+        Engine::MongoDb | Engine::Redis => Some("M7"),
+    }
+}
+
+/// Why an applicable matrix cell of `engine` is still pending.
+pub fn pending_detail(engine: Engine) -> String {
+    driver_milestone(engine).map_or_else(
+        || PENDING_NO_DIALECT.to_owned(),
+        |m| format!("pending ({m}: no driver yet)"),
+    )
+}
 
 /// What one matrix cell verifies for an (engine, object kind) pair.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -123,7 +141,7 @@ pub fn plan_engine_in(registry: &DialectRegistry, name: &str, engine: Engine) ->
         let applies = adapter::applies(registry, engine, kind);
         for check in Check::ALL {
             let (status, detail) = if applies {
-                (CellStatus::Pending, Some(PENDING_NO_DRIVER.to_owned()))
+                (CellStatus::Pending, Some(pending_detail(engine)))
             } else {
                 (CellStatus::NotApplicable, None)
             };
@@ -167,7 +185,12 @@ mod tests {
             .find(|c| c.object_kind == ObjectKind::Table && c.check == Check::Roundtrip)
             .unwrap();
         assert_eq!(table.status, CellStatus::Pending);
-        assert_eq!(table.detail.as_deref(), Some(PENDING_NO_DRIVER));
+        assert_eq!(table.detail.as_deref(), Some(PENDING_NO_DIALECT));
+        let redis = plan_engine("r", Engine::Redis);
+        assert_eq!(
+            redis[0].detail.as_deref(),
+            Some("pending (M7: no driver yet)")
+        );
         let user = cells
             .iter()
             .find(|c| c.object_kind == ObjectKind::User)

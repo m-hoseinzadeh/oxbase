@@ -1,8 +1,16 @@
 name: CI
 
+# Two lanes:
+# - Fast lane: pushes to `wip/**` branches (work in progress, one branch per workstream). Linux
+#   only: lint, Linux tests, Linux keychain, UI, live Docker conformance, cargo-deny. About 10-15
+#   minutes. macOS and Windows are skipped.
+# - Full lane: pull requests (each milestone lands from a `milestone/<id>` branch as one
+#   squash-merged PR), pushes to main, the weekly schedule and manual runs. Everything on Linux,
+#   macOS and Windows.
+# scripts/ci-wait.mjs pushes a branch and waits for this workflow's result on that commit.
 on:
   push:
-    branches: [main]
+    branches: [main, "wip/**"]
   pull_request:
   workflow_dispatch:
   # Weekly run of everything on main, mainly so new RUSTSEC advisories and new stable
@@ -66,7 +74,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        # wip/** pushes (fast lane) run Linux only.
+        os: ${{ fromJSON(startsWith(github.ref, 'refs/heads/wip/') && '["ubuntu-latest"]' || '["ubuntu-latest", "macos-latest", "windows-latest"]') }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -90,6 +99,41 @@ jobs:
       # run only in the `conformance` job with `--include-ignored`.
       - name: cargo test
         run: cargo test --workspace --locked --no-fail-fast
+
+  # The real OS keychain behind KeyringSecretStore (and the connection manager on top of it):
+  # macOS login keychain, Windows Credential Manager (including values split across entries) and,
+  # on Linux, the Secret Service of a private gnome-keyring in its own D-Bus session. These tests
+  # are `#[ignore]`d in `rust-test`; scripts/keychain-tests.sh runs them with `--ignored`.
+  keychain:
+    name: OS keychain (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        # wip/** pushes (fast lane) run Linux only.
+        os: ${{ fromJSON(startsWith(github.ref, 'refs/heads/wip/') && '["ubuntu-latest"]' || '["ubuntu-latest", "macos-latest", "windows-latest"]') }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install D-Bus and gnome-keyring
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends dbus gnome-keyring
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: keychain
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Keychain tests (oxbase-store, oxbase-services)
+        shell: bash
+        run: bash scripts/keychain-tests.sh
 
   ui:
     name: UI (lint, typecheck, test, build)
@@ -154,14 +198,29 @@ jobs:
 
       # Compile before the containers start so their startup overlaps nothing slow
       # and a compile error does not leave a stack running.
-      - name: Build conformance harness
-        run: cargo test -p oxbase-conformance --locked --no-run
+      - name: Build conformance harness and M1 live tests
+        run: cargo test -p oxbase-conformance -p oxbase-net -p oxbase-pg -p oxbase-mysql -p oxbase-sqlite -p oxbase-services --locked --no-run
 
+      # Test CA, server/client certificates and SSH keys for the TLS/SSH fixtures (openssl and
+      # ssh-keygen ship with the runner image). Compose bind-mounts these files and refuses to
+      # start without them.
+      - name: Generate fixture TLS PKI and SSH keys
+        run: bash scripts/fixtures-certs.sh
+
+      # The kernel version matters for some images (MongoDB 8.x refuses kernel 6.19+).
       - name: Start database fixtures
-        run: bash scripts/ci-fixtures.sh up
+        run: |
+          echo "kernel: $(uname -r)"
+          bash scripts/ci-fixtures.sh up
 
+      # Prints the object-kind matrix and the M1 connection table (plain, TLS, SSH, TLS over SSH,
+      # cancel, 200k-row stream). One thread so the cancel timings do not compete with probes.
       - name: Run conformance harness
-        run: cargo test -p oxbase-conformance --locked -- --include-ignored
+        run: cargo test -p oxbase-conformance --locked -- --include-ignored --nocapture --test-threads 1
+
+      # Driver, tunnel and connection-manager live tests (SSH bastion, TLS-only users, cancel).
+      - name: Run M1 live tests
+        run: cargo test -p oxbase-net -p oxbase-pg -p oxbase-mysql -p oxbase-sqlite -p oxbase-services --locked -- --include-ignored --test-threads 1
 
       - name: Dump fixture logs
         if: failure()

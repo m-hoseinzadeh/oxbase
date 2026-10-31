@@ -1,7 +1,19 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Main window. Deliberately grants nothing: the UI only invokes the app's own commands (app_info, demo_arrow_page), which need no permission while the app defines no ACL manifest. Add core:*/plugin permissions here only when a feature uses them.",
+  "description": "Main window. Grants exactly the app commands the UI calls (each declared in build.rs) and the dialog plugin's file-open picker (SQLite database, TLS certificate and key, SSH key files). No other core or plugin permission is granted.",
   "windows": ["main"],
-  "permissions": []
+  "permissions": [
+    "allow-app-info",
+    "allow-demo-arrow-page",
+    "allow-list-profiles",
+    "allow-save-profile",
+    "allow-delete-profile",
+    "allow-test-connection",
+    "allow-open-connection",
+    "allow-cancel-request",
+    "allow-close-connection",
+    "allow-list-open-connections",
+    "dialog:allow-open"
+  ]
 }

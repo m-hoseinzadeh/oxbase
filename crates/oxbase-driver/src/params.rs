@@ -2,140 +2,11 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use oxbase_types::{Engine, Error, Result};
-
-/// A secret string (password, passphrase, token).
-///
-/// It never appears in `Debug` output, has no `Display` and no `Serialize`, so it cannot leak
-/// into logs or saved documents by accident. Read it with [`Secret::expose`] only at the point of
-/// use. On drop the buffer is overwritten (best effort, without `unsafe`).
-#[derive(Clone, Default)]
-pub struct Secret(String);
-
-impl Secret {
-    pub fn new(value: impl Into<String>) -> Self {
-        Self(value.into())
-    }
-
-    /// The secret text. Call only where the value is handed to a library or the network.
-    pub fn expose(&self) -> &str {
-        &self.0
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-}
-
-impl fmt::Debug for Secret {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("Secret(***)")
-    }
-}
-
-impl From<String> for Secret {
-    fn from(s: String) -> Self {
-        Self(s)
-    }
-}
-
-impl From<&str> for Secret {
-    fn from(s: &str) -> Self {
-        Self(s.to_owned())
-    }
-}
-
-impl Drop for Secret {
-    fn drop(&mut self) {
-        let mut bytes = std::mem::take(&mut self.0).into_bytes();
-        bytes.fill(0);
-        // Keep the zeroing store from being optimised away.
-        std::hint::black_box(&bytes);
-    }
-}
-
-/// How TLS is negotiated.
-///
-/// The default, [`TlsMode::Prefer`], matches libpq: it encrypts when the server offers TLS but
-/// verifies nothing and silently falls back to plaintext. It is kept for parity and so local
-/// servers without TLS work out of the box. The UI must show the effective mode on every
-/// connection profile, and should steer remote connections to [`TlsMode::VerifyFull`].
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
-pub enum TlsMode {
-    /// Never use TLS.
-    Disable,
-    /// Use TLS if the server offers it, without verifying the certificate.
-    #[default]
-    Prefer,
-    /// Require TLS, without verifying the certificate.
-    Require,
-    /// Require TLS and verify the certificate chain against the CA.
-    VerifyCa,
-    /// Require TLS, verify the chain and check the host name.
-    VerifyFull,
-}
-
-impl TlsMode {
-    /// `true` when the certificate chain must be verified.
-    pub fn verifies_certificate(self) -> bool {
-        matches!(self, Self::VerifyCa | Self::VerifyFull)
-    }
-}
-
-/// TLS settings.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct TlsOptions {
-    pub mode: TlsMode,
-    /// PEM file with CA certificates; `None` uses the platform trust store.
-    pub ca_cert: Option<PathBuf>,
-    /// PEM client certificate for mutual TLS.
-    pub client_cert: Option<PathBuf>,
-    /// PEM private key for `client_cert`.
-    pub client_key: Option<PathBuf>,
-    /// Name to verify instead of the host (SNI override).
-    pub server_name: Option<String>,
-}
-
-/// How to authenticate to the SSH server.
-#[derive(Debug, Clone)]
-pub enum SshAuth {
-    Password(Secret),
-    PrivateKey {
-        path: PathBuf,
-        passphrase: Option<Secret>,
-    },
-    /// Use the running SSH agent.
-    Agent,
-}
-
-/// An SSH tunnel to reach the database host.
-#[derive(Debug, Clone)]
-pub struct SshOptions {
-    pub host: String,
-    pub port: u16,
-    pub user: String,
-    pub auth: SshAuth,
-    /// known_hosts file; `None` uses the user's default.
-    pub known_hosts: Option<PathBuf>,
-    /// Refuse unknown or changed host keys (the default).
-    pub strict_host_key: bool,
-}
-
-impl SshOptions {
-    pub fn new(host: impl Into<String>, user: impl Into<String>, auth: SshAuth) -> Self {
-        Self {
-            host: host.into(),
-            port: 22,
-            user: user.into(),
-            auth,
-            known_hosts: None,
-            strict_host_key: true,
-        }
-    }
-}
+use oxbase_types::{Endpoint, Engine, Error, Result, Secret, SshOptions, TlsOptions};
 
 /// Everything a [`crate::Driver`] needs to open a connection.
 ///
@@ -145,12 +16,30 @@ impl SshOptions {
 /// `Debug` never prints secrets: the password is a [`Secret`], and the values of
 /// [`ConnectParams::options`] whose key looks sensitive (see [`is_sensitive_option`]) are shown as
 /// `***`.
+///
+/// # Addressing (server endpoint vs dial endpoint)
+///
+/// `host` / `port` are the **server endpoint**: the logical server the user configured. Drivers
+/// use it for TLS server-name verification and SNI (via [`ConnectParams::tls_server_name`]),
+/// for display and in error messages. `dial_addr`, when set, is where sockets are actually
+/// opened (the local end of an SSH tunnel). Drivers must:
+///
+/// - open **every** socket of the session at [`ConnectParams::dial_endpoint`], including
+///   out-of-band ones (PostgreSQL cancel requests, the MySQL `KILL QUERY` side connection);
+/// - never open SSH tunnels themselves and never dial `ssh` (the connection manager opens the
+///   tunnel and sets `dial_addr`; [`ConnectParams::validate`] rejects `ssh` without it);
+/// - verify TLS against [`ConnectParams::tls_server_name`], never against the dial address, so
+///   `VerifyFull` keeps working through a tunnel.
 #[derive(Clone)]
 pub struct ConnectParams {
     pub engine: Engine,
+    /// Server host (DNS name or IP literal) as configured by the user.
     pub host: Option<String>,
-    /// `None` uses [`Engine::default_port`].
+    /// Server port. `None` uses [`Engine::default_port`].
     pub port: Option<u16>,
+    /// Where to open sockets instead of `host:port`. Set by the connection manager to the local
+    /// address of the SSH tunnel; `None` dials the server endpoint directly.
+    pub dial_addr: Option<SocketAddr>,
     pub user: Option<String>,
     pub password: Option<Secret>,
     /// Initial database (Redis: logical DB index as text).
@@ -158,6 +47,8 @@ pub struct ConnectParams {
     /// Database file for SQLite.
     pub file: Option<PathBuf>,
     pub tls: TlsOptions,
+    /// The SSH tunnel this connection goes through. Informational for drivers: the tunnel is
+    /// already open and reachable at `dial_addr`.
     pub ssh: Option<SshOptions>,
     pub connect_timeout: Option<Duration>,
     /// Reported to the server where supported (PostgreSQL `application_name`, ...).
@@ -211,6 +102,7 @@ impl fmt::Debug for ConnectParams {
             .field("engine", &self.engine)
             .field("host", &self.host)
             .field("port", &self.port)
+            .field("dial_addr", &self.dial_addr)
             .field("user", &self.user)
             .field("password", &self.password)
             .field("database", &self.database)
@@ -231,6 +123,7 @@ impl ConnectParams {
             engine,
             host: None,
             port: None,
+            dial_addr: None,
             user: None,
             password: None,
             database: None,
@@ -293,13 +186,53 @@ impl ConnectParams {
         self
     }
 
-    /// The port to use: the explicit one or the engine default.
+    /// Dials `addr` (the local end of a tunnel) instead of the server endpoint.
+    #[must_use]
+    pub fn with_dial_addr(mut self, addr: SocketAddr) -> Self {
+        self.dial_addr = Some(addr);
+        self
+    }
+
+    /// The server port: the explicit one or the engine default.
     pub fn effective_port(&self) -> Option<u16> {
         self.port.or(self.engine.default_port())
     }
 
-    /// Checks the parameters make sense for the engine (a host for network engines, a file for
-    /// SQLite, a client key with a client certificate).
+    /// The logical server endpoint (`host` + effective port). `None` for SQLite or when the host
+    /// or port is missing. This is what an SSH tunnel forwards to.
+    pub fn server_endpoint(&self) -> Option<Endpoint> {
+        let host = self
+            .host
+            .as_deref()
+            .map(str::trim)
+            .filter(|h| !h.is_empty())?;
+        Some(Endpoint::new(host, self.effective_port()?))
+    }
+
+    /// Where the driver opens sockets: `dial_addr` if set, otherwise the server endpoint.
+    pub fn dial_endpoint(&self) -> Option<Endpoint> {
+        match self.dial_addr {
+            Some(addr) => Some(Endpoint::from(addr)),
+            None => self.server_endpoint(),
+        }
+    }
+
+    /// `true` when sockets go to a tunnel instead of the server endpoint.
+    pub fn is_tunnelled(&self) -> bool {
+        self.dial_addr.is_some()
+    }
+
+    /// The name TLS must verify and send as SNI: `tls.server_name` if set, otherwise the server
+    /// `host`. Never the dial (tunnel) address.
+    pub fn tls_server_name(&self) -> Option<&str> {
+        let host = self.host.as_deref().map(str::trim).unwrap_or_default();
+        let name = self.tls.effective_server_name(host);
+        (!name.is_empty()).then_some(name)
+    }
+
+    /// Checks the parameters make sense for the engine: a host for network engines, a file for
+    /// SQLite, a client key with a client certificate, and an already-opened tunnel
+    /// (`dial_addr`) whenever `ssh` is set.
     pub fn validate(&self) -> Result<()> {
         if self.engine.is_networked() {
             if self
@@ -320,10 +253,21 @@ impl ConnectParams {
         {
             return Err(Error::invalid_input("SQLite needs a database file"));
         }
-        if self.tls.client_cert.is_some() != self.tls.client_key.is_some() {
-            return Err(Error::invalid_input(
-                "TLS client certificate and key must be given together",
-            ));
+        self.tls.validate()?;
+        if let Some(ssh) = &self.ssh {
+            if !self.engine.is_networked() {
+                return Err(Error::invalid_input(format!(
+                    "{} cannot be reached through an SSH tunnel",
+                    self.engine.display_name()
+                )));
+            }
+            ssh.validate()?;
+            if self.dial_addr.is_none() {
+                return Err(Error::invalid_input(
+                    "SSH tunnel is not open: connect through the connection manager, which \
+                     opens the tunnel and sets dial_addr",
+                ));
+            }
         }
         Ok(())
     }
@@ -332,6 +276,7 @@ impl ConnectParams {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use oxbase_types::{KeySource, PemSource, SshAuth, TlsMode};
 
     #[test]
     fn secret_never_debug_prints() {
@@ -342,7 +287,7 @@ mod tests {
                 "bastion",
                 "ops",
                 SshAuth::PrivateKey {
-                    path: "/home/ops/.ssh/id_ed25519".into(),
+                    key: KeySource::File("/home/ops/.ssh/id_ed25519".into()),
                     passphrase: Some(Secret::new("key-passphrase-xyz")),
                 },
             ));
@@ -400,7 +345,38 @@ mod tests {
                 .is_err()
         );
         let mut bad = ConnectParams::network(Engine::Postgres, "h");
-        bad.tls.client_cert = Some("c.pem".into());
+        bad.tls.client_cert = Some(PemSource::File("c.pem".into()));
         assert!(bad.validate().is_err());
+    }
+
+    #[test]
+    fn dial_and_server_endpoints_are_separate() {
+        let tunnel: SocketAddr = "127.0.0.1:41234".parse().unwrap();
+        let ssh = SshOptions::new("bastion", "ops", SshAuth::Agent);
+        let p = ConnectParams::network(Engine::Postgres, "db.internal")
+            .with_tls(TlsOptions::new(TlsMode::VerifyFull))
+            .with_ssh(ssh);
+        assert!(p.validate().is_err(), "ssh without an opened tunnel");
+        let p = p.with_dial_addr(tunnel);
+        p.validate().unwrap();
+        assert!(p.is_tunnelled());
+        assert_eq!(
+            p.server_endpoint(),
+            Some(Endpoint::new("db.internal", 5432))
+        );
+        assert_eq!(p.dial_endpoint(), Some(Endpoint::new("127.0.0.1", 41234)));
+        assert_eq!(p.tls_server_name(), Some("db.internal"));
+        let p = p.with_tls(TlsOptions::new(TlsMode::VerifyFull).with_server_name("pg.example"));
+        assert_eq!(p.tls_server_name(), Some("pg.example"));
+
+        let direct = ConnectParams::network(Engine::MySql, "db").with_port(3307);
+        assert_eq!(direct.dial_endpoint(), direct.server_endpoint());
+        assert_eq!(direct.dial_endpoint(), Some(Endpoint::new("db", 3307)));
+        assert_eq!(ConnectParams::sqlite("x.db").server_endpoint(), None);
+        assert_eq!(ConnectParams::sqlite("x.db").tls_server_name(), None);
+
+        let mut sqlite_ssh = ConnectParams::sqlite("x.db").with_dial_addr(tunnel);
+        sqlite_ssh.ssh = Some(SshOptions::new("b", "u", SshAuth::Agent));
+        assert!(sqlite_ssh.validate().is_err());
     }
 }

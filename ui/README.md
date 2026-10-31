@@ -5,7 +5,8 @@ shell in [`../crates/app-tauri`](../crates/app-tauri). All database logic lives 
 core; this package only renders and calls Tauri commands.
 
 Stack: pnpm, Vite, React 19, TypeScript, Biome (lint + format), Vitest + Testing Library,
-dockview (layout), `@tauri-apps/api` v2, `apache-arrow` (decodes result pages).
+dockview (layout), `@tauri-apps/api` v2, `@tauri-apps/plugin-dialog` (file pickers),
+`apache-arrow` (decodes result pages).
 
 ## Prerequisites
 
@@ -38,7 +39,24 @@ Rust shell is not inside `ui/`.
 ## Layout
 
 - `src/App.tsx`: dockview layout. Left "Connections" panel, main "Welcome" tab, status bar.
-- `src/ipc.ts`: typed wrappers for the Tauri commands `app_info` and `demo_arrow_page`.
+- `src/panels/ConnectionsPanel.tsx`: saved connections (engine, host, TLS mode, open state) with
+  New / Edit / Delete / Connect. The list is a keyboard listbox: arrow keys, Home/End, Enter
+  connects or disconnects, Delete asks to delete. Profiles whose password is "ask every time"
+  get a password prompt on connect.
+- `src/connections/`: the connection feature.
+  - `ConnectionDialog.tsx`: the New/Edit dialog with General, SSL/TLS and SSH tabs, form
+    validation (jumps to the tab of the first error) and "Test connection", which shows the
+    server version, TLS, SSH and connect time, or the error category and message.
+  - `form.ts`: the form model, validation and profile conversion (pure, unit-tested). Secrets
+    are never put in a profile: the profile only says "keychain" or "ask every time", and the
+    typed values travel separately to `save_profile` / `test_connection`.
+  - `api.ts`: typed wrappers for the connection commands and the native file picker
+    (`@tauri-apps/plugin-dialog`). Failures are normalised to `{ category, message }`.
+  - `store.ts`: profiles and open sessions shared by the panel and the status bar.
+  - `types.ts`: mirrors of the Rust JSON shapes.
+- `src/components/Modal.tsx`: accessible modal (focus trap, Escape, focus restore).
+- `src/ipc.ts`: typed wrappers for the Tauri commands `app_info` and `demo_arrow_page`
+  (connection commands are in `src/connections/api.ts`).
   Result pages arrive as raw Arrow IPC stream bytes (`tauri::ipc::Response`) and are decoded
   with `apache-arrow`, never as JSON.
 - `src/theme.css`: design tokens as CSS variables. Light by default, dark under

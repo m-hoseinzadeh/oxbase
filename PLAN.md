@@ -156,6 +156,27 @@ Every milestone ships as a working app on all three platforms through CI. The "D
 | M12 | **AI**: chat with schema attach, explain/optimize/fix SQL, dialect conversion, natural language → SQL, "fill with AI" | Works with OpenAI, Anthropic, Gemini and Ollama |
 | M13 | Hardening: crash reporting (opt-in), perf passes, accessibility, i18n scaffolding, installers, auto-update (Tauri updater), docs | Release candidate |
 
+**M1 as built (notes, 2026-10-31).** The exit check passed on Linux against the Docker fixtures
+(see README, *Conformance harness*). Where the build differs from the text above:
+
+- Connection profiles are stored in one versioned JSON file in the platform config directory
+  (`oxbase-store::FileProfileRepository`), not yet in the SQLite app DB of §5. Secrets are in the
+  OS keychain as planned.
+- The conformance harness gained a second table of per-engine connection checks (plain, TLS
+  VerifyFull, SSH, TLS over SSH, cancel within 2 s, 200k-row streaming). The object-kind matrix
+  of §3 stays pending until the dialect cells of M2.
+- SSH tunnels are shared only between requests with the same SSH endpoint, user, target,
+  host-key policy and credential, so a stricter profile never reuses a tunnel checked more
+  loosely. Details: `docs/m1-contracts.md` §11.
+- `mysql_async` trusts its bundled webpki roots (not the platform store) when no CA file is
+  set.
+- Saving profiles with their keychain secrets is in `oxbase-services::profiles` (shared by the app
+  and the CLI). A stored database or SSH password stays with the destination it was saved for: an
+  edit that changes the server, user, TLS or SSH route must retype it.
+- The OS keychain backend is proven by its own tests (`scripts/keychain-tests.sh`, CI job
+  `keychain` on Linux, macOS and Windows; Linux uses a private gnome-keyring), not by the Docker
+  conformance run, which uses an in-memory secret store.
+
 Order of work: M0–M3 prove the architecture. M4 and M7 are where the per-database matrix gets tested for real. M8 and M10 reuse the Comparator and DdlGenerator cells and get much cheaper if M3 is done right.
 
 ## 7. Main risks

@@ -4,19 +4,25 @@
 //! `scripts/fixtures-up.sh`, then run:
 //!
 //! ```text
-//! cargo test -p oxbase-conformance -- --include-ignored --nocapture
+//! cargo test -p oxbase-conformance -- --include-ignored --nocapture --test-threads 1
 //! ```
+//!
+//! `--test-threads 1` keeps the connection checks (which time cancellation) from competing with
+//! the reachability probes.
 //!
 //! An unreachable fixture fails the test with the engine name and port. Set
 //! `OXBASE_CONFORMANCE_ALLOW_MISSING=1` to report it as skipped instead.
 
 use oxbase_conformance::adapter::Engine;
+use oxbase_conformance::matrix::CellStatus;
 use oxbase_conformance::{fixtures, report, runner};
 
-/// M0 exit criterion: the harness runs empty against all engines.
+/// M0 exit criterion (the harness runs against all engines) plus the M1 connection checks:
+/// every applicable check of the M1 engines passes, and the engines without an M1 driver report
+/// pending.
 #[test]
 #[ignore = "needs the Docker fixtures (scripts/fixtures-up.sh); run with --include-ignored"]
-fn m0_harness_runs_empty_against_all_engines() {
+fn harness_runs_against_all_engines_and_m1_connection_checks_pass() {
     let opts = runner::RunOptions::from_env();
     let path = fixtures::fixtures_path();
     let report =
@@ -34,7 +40,7 @@ fn m0_harness_runs_empty_against_all_engines() {
     if let Err(msg) = report.gate() {
         panic!("{msg}");
     }
-    // No drivers exist at M0, so no cell may have run.
+    // Object-kind cells need dialect cells (M2+), so none may have run.
     assert_eq!(
         report.summary.pass + report.summary.fail,
         0,
@@ -42,6 +48,26 @@ fn m0_harness_runs_empty_against_all_engines() {
         report.summary
     );
     assert!(report.summary.pending + report.summary.skipped > 0);
+
+    for c in &report.connections {
+        let m1 = matches!(
+            c.engine_kind,
+            Engine::Postgres | Engine::MySql | Engine::MariaDb | Engine::Sqlite
+        );
+        let ok = match c.status {
+            CellStatus::Pass => m1,
+            CellStatus::Pending => !m1,
+            CellStatus::NotApplicable => true,
+            // Only with OXBASE_CONFORMANCE_ALLOW_MISSING / SKIP_CONNECT.
+            CellStatus::Skipped => opts.allow_missing || opts.skip_connect,
+            CellStatus::Fail => false,
+        };
+        assert!(
+            ok,
+            "{} {}: {:?} {:?}",
+            c.engine, c.check, c.status, c.detail
+        );
+    }
 }
 
 macro_rules! fixture_reachable {

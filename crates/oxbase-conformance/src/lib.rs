@@ -3,9 +3,11 @@
 //! Reads connection parameters from `tests/fixtures.toml` (the single source of truth) and runs
 //! the create -> fetch -> alter -> diff -> drop round-trip matrix against every engine.
 //!
-//! The matrix is `engine x object kind x check` (see [`matrix`]). At M0 there are no drivers, so
-//! the harness only proves each fixture is reachable ([`probe`]) and reports every applicable
-//! cell as `pending (no driver yet)`. Results go to stdout as a table and to
+//! The matrix is `engine x object kind x check` (see [`matrix`]). Its cells need dialect cells
+//! (Fetcher, DdlGenerator, ...), which start in M2, so every applicable cell is still pending;
+//! the harness proves each fixture is reachable ([`probe`]). Since M1 it also runs the
+//! connection checks of [`connect`] (plain, TLS, SSH, TLS over SSH, cancel, streaming) through
+//! the real drivers and connection manager, as a second table. Results go to stdout and to
 //! `target/conformance/report.json` ([`report`]).
 //!
 //! Environment:
@@ -16,9 +18,11 @@
 //! | `OXBASE_CONFORMANCE_ALLOW_MISSING=1` | Unreachable fixtures are reported as skipped instead of failing |
 //! | `OXBASE_CONFORMANCE_PROBE_TIMEOUT_MS` | Per-engine connect/handshake timeout (default 3000) |
 //! | `OXBASE_CONFORMANCE_TCP_ONLY=1` | Skip protocol handshakes; a TCP connect is enough |
+//! | `OXBASE_CONFORMANCE_SKIP_CONNECT=1` | Skip the M1 connection checks (reported as skipped) |
 //! | `CARGO_TARGET_DIR` | Where `conformance/report.json` is written (default `<workspace>/target`) |
 
 pub mod adapter;
+pub mod connect;
 pub mod fixtures;
 pub mod matrix;
 pub mod probe;

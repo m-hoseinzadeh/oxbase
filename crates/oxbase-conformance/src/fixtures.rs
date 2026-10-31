@@ -74,6 +74,12 @@ pub struct Fixtures {
     pub defaults: Defaults,
     #[serde(default)]
     pub engines: BTreeMap<String, EngineFixture>,
+    /// M1: the test PKI (`[tls]`).
+    #[serde(default)]
+    pub tls: Option<TlsFixture>,
+    /// M1: the SSH bastion (`[ssh]`).
+    #[serde(default)]
+    pub ssh: Option<SshFixture>,
     /// Where the file came from, for error messages. Not part of the TOML.
     #[serde(skip)]
     pub origin: String,
@@ -101,8 +107,94 @@ pub struct EngineFixture {
     pub path: Option<String>,
     pub version_query: Option<String>,
     pub version_prefix: Option<String>,
+    /// M1: a user the server accepts only over TLS (`[engines.<name>.tls_user]`).
+    #[serde(default)]
+    pub tls_user: Option<Credentials>,
     #[serde(flatten)]
     pub extra: toml::Table,
+}
+
+/// A user, password and database (`[engines.<name>.tls_user]`).
+#[derive(Clone, Deserialize)]
+pub struct Credentials {
+    pub user: String,
+    pub password: String,
+    pub database: Option<String>,
+}
+
+impl std::fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Credentials")
+            .field("user", &self.user)
+            .field("password", &"<redacted>")
+            .field("database", &self.database)
+            .finish()
+    }
+}
+
+/// The `[tls]` table: the test PKI. File names are relative to `dir`, which is relative to the
+/// workspace root.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TlsFixture {
+    pub dir: String,
+    pub ca_cert: String,
+    #[serde(flatten)]
+    pub extra: toml::Table,
+}
+
+impl TlsFixture {
+    /// Absolute path of the CA certificate.
+    pub fn ca_cert_path(&self) -> PathBuf {
+        in_workspace(&self.dir).join(&self.ca_cert)
+    }
+}
+
+/// The `[ssh]` table: the OpenSSH bastion and its key material.
+#[derive(Clone, Deserialize)]
+pub struct SshFixture {
+    pub host: String,
+    pub port: u16,
+    pub user: String,
+    pub password: String,
+    pub key_dir: String,
+    pub client_key: String,
+    pub client_key_encrypted: String,
+    pub client_key_passphrase: String,
+    pub known_hosts: String,
+    pub host_key_fingerprint: Option<String>,
+    /// In-network address of each engine fixture, by fixture name.
+    #[serde(default)]
+    pub targets: BTreeMap<String, SshTarget>,
+    #[serde(flatten)]
+    pub extra: toml::Table,
+}
+
+impl SshFixture {
+    /// Absolute path of a file in `key_dir`.
+    pub fn key_file(&self, name: &str) -> PathBuf {
+        in_workspace(&self.key_dir).join(name)
+    }
+}
+
+impl std::fmt::Debug for SshFixture {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SshFixture")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("user", &self.user)
+            .field("password", &"<redacted>")
+            .field("key_dir", &self.key_dir)
+            .field("client_key_passphrase", &"<redacted>")
+            .field("targets", &self.targets)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Where the bastion reaches an engine (`[ssh.targets]`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct SshTarget {
+    pub host: String,
+    pub port: u16,
 }
 
 // Hand-written so the password never ends up in a panic message or log line.
@@ -117,6 +209,7 @@ impl std::fmt::Debug for EngineFixture {
             .field("password", &self.password.as_ref().map(|_| "<redacted>"))
             .field("database", &self.database)
             .field("path", &self.path)
+            .field("tls_user", &self.tls_user)
             .finish_non_exhaustive()
     }
 }
@@ -367,6 +460,18 @@ path = "target/fixtures/t.sqlite"
             "no fixture for {missing:?} in {}",
             path.display()
         );
+        let fx = Fixtures::from_path(&path).unwrap();
+        let ssh = fx.ssh.as_ref().expect("[ssh]");
+        for name in ["postgres", "mysql", "mariadb"] {
+            assert!(ssh.targets.contains_key(name), "[ssh.targets] lacks {name}");
+            assert!(
+                fx.engines[name].tls_user.is_some(),
+                "{name} has no tls_user"
+            );
+        }
+        assert!(fx.tls.is_some(), "[tls]");
+        let dbg = format!("{ssh:?} {:?}", fx.engines["postgres"]);
+        assert!(!dbg.contains(&ssh.password), "{dbg}");
         for e in &engines {
             if let Target::Tcp { port, .. } = e.target {
                 assert!(port > 1024, "{} uses privileged port {port}", e.name);

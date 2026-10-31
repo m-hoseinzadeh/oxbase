@@ -12,5 +12,21 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
+oxbase-types.workspace = true
+oxbase-driver.workspace = true
+# Bundled SQLite. `column_decltype` gives declared column types (type mapping by affinity);
+# `hooks` gives the progress handler that makes cancellation race-free (see src/worker.rs).
+rusqlite = { workspace = true, features = ["column_decltype", "hooks"] }
+arrow-array.workspace = true
+arrow-schema.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+# Result channel (bounded mpsc, filled from the worker thread through a cancellable send),
+# oneshot replies and the cancel watcher.
+tokio.workspace = true
 
 [dev-dependencies]
+tokio.workspace = true
+tempfile.workspace = true
+chrono.workspace = true
+uuid.workspace = true

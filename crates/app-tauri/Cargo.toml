@@ -23,11 +23,21 @@ workspace = true
 tauri-build.workspace = true
 
 [dependencies]
+oxbase-types.workspace = true
+oxbase-net.workspace = true
+oxbase-store.workspace = true
+oxbase-services.workspace = true
 tauri.workspace = true
+# Native file pickers (SQLite file, CA / client certificate / key files).
+tauri-plugin-dialog.workspace = true
 serde.workspace = true
+uuid.workspace = true
 arrow-array.workspace = true
 arrow-schema.workspace = true
 arrow-ipc.workspace = true
 
 [dev-dependencies]
+async-trait.workspace = true
+oxbase-driver = { workspace = true, features = ["mock"] }
 serde_json.workspace = true
+tokio.workspace = true
