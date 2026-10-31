@@ -651,11 +651,13 @@ mod tests {
         );
     }
 
+    const NO_KINDS: Vec<ObjectKind> = Vec::new();
+
     #[test]
     fn engines_without_a_driver_or_fetchers_run_nothing() {
         let reg = adapter::provisional_registry();
         for engine in Engine::ALL {
-            assert!(runnable_kinds(&reg, engine).is_empty(), "{engine}");
+            assert_eq!(runnable_kinds(&reg, engine), NO_KINDS, "{engine}");
         }
         let mut reg = adapter::provisional_registry();
         reg.register_fetcher(
@@ -669,7 +671,7 @@ mod tests {
             Arc::new(Fake::new(Vec::new())),
         );
         // Redis has no driver before M7.
-        assert!(runnable_kinds(&reg, Engine::Redis).is_empty());
+        assert_eq!(runnable_kinds(&reg, Engine::Redis), NO_KINDS);
         assert_eq!(runnable_kinds(&reg, Engine::Sqlite), [ObjectKind::View]);
     }
 

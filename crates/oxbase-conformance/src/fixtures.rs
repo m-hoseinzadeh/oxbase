@@ -234,7 +234,7 @@ pub struct M2Fixture {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 pub enum M2Entry {
-    Engine(M2EngineSeed),
+    Engine(Box<M2EngineSeed>),
     Other(toml::Value),
 }
 
@@ -265,7 +265,7 @@ impl M2Fixture {
     /// The `[m2.<name>]` table, if there is one.
     pub fn engine(&self, name: &str) -> Option<&M2EngineSeed> {
         match self.engines.get(name)? {
-            M2Entry::Engine(e) => Some(e),
+            M2Entry::Engine(e) => Some(&**e),
             M2Entry::Other(_) => None,
         }
     }

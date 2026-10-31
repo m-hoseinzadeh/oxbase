@@ -137,6 +137,9 @@ mod tests {
             .collect()
     }
 
+    /// No groups, in the shape `groups` returns.
+    const NONE: Vec<(String, Vec<String>)> = Vec::new();
+
     fn v(names: &[&str]) -> Vec<String> {
         owned_names(names)
     }
@@ -196,7 +199,7 @@ mod tests {
             ]
         );
         assert_eq!(g(ObjectKind::Column).len(), 2);
-        assert!(g(ObjectKind::Extension).is_empty());
+        assert_eq!(g(ObjectKind::Extension), NONE);
     }
 
     #[test]
@@ -217,9 +220,9 @@ mod tests {
                 v(&["m2_child_parent_idx"])
             )]
         );
-        assert!(g(ObjectKind::Sequence).is_empty());
-        assert!(g(ObjectKind::Schema).is_empty());
-        assert!(g(ObjectKind::MatView).is_empty());
+        assert_eq!(g(ObjectKind::Sequence), NONE);
+        assert_eq!(g(ObjectKind::Schema), NONE);
+        assert_eq!(g(ObjectKind::MatView), NONE);
         let maria = |k| groups(&fx, "mariadb", k);
         assert_eq!(
             maria(ObjectKind::Sequence),
@@ -253,7 +256,7 @@ mod tests {
             ObjectKind::Procedure,
             ObjectKind::Sequence,
         ] {
-            assert!(g(k).is_empty(), "{k}");
+            assert_eq!(g(k), NONE, "{k}");
         }
         assert_eq!(g(ObjectKind::View)[0].1, v(&["m2_view"]));
     }
@@ -282,6 +285,9 @@ mod tests {
             objects: v(&["a"]),
             ..M2EngineSeed::default()
         };
-        assert!(seed_groups(&m2, &seed, ObjectKind::Table).is_empty());
+        assert_eq!(
+            seed_groups(&m2, &seed, ObjectKind::Table),
+            Vec::<SeedGroup>::new()
+        );
     }
 }
