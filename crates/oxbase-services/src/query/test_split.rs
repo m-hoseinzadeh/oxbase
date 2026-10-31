@@ -3,8 +3,10 @@
 //! The query service is built against `oxbase_sql::split` and `oxbase_sql::redact_secrets`,
 //! which another M2 stream implements. Until that lands on a branch, both are
 //! `unimplemented!`; the unit tests then split with the minimal splitter below (`;` outside
-//! quotes and `--` comments) so the run machinery can still be tested. Once the real splitter
-//! works it is used and this module does nothing.
+//! quotes and `--` comments) and redact with the minimal redactor below (a quoted literal
+//! after `PASSWORD`, `BY`, `KEY` or `SECRET`), so the run and history machinery can still be
+//! tested. Neither is used outside tests. Once the real functions work they are used and this
+//! module does nothing; tests that check the real redaction rules belong to `oxbase-sql`.
 
 use std::sync::OnceLock;
 
@@ -27,6 +29,40 @@ pub(crate) fn redaction_available() -> bool {
         })
         .is_ok()
     })
+}
+
+/// The minimal redaction of `text`, or `None` when the real `redact_secrets` is available.
+pub(crate) fn fallback_redact(text: &str) -> Option<String> {
+    if redaction_available() {
+        return None;
+    }
+    Some(simple_redact(text))
+}
+
+/// Replaces each `'...'` literal that follows `PASSWORD`, `BY`, `KEY` or `SECRET` (optionally
+/// with `=`), case-insensitively, by `'***'`.
+pub(crate) fn simple_redact(text: &str) -> String {
+    const KEYWORDS: [&str; 4] = ["PASSWORD", "BY", "KEY", "SECRET"];
+    let upper = text.to_ascii_uppercase();
+    let mut out = String::with_capacity(text.len());
+    let mut copied = 0;
+    let mut i = 0;
+    while let Some(found) = text[i..].find('\'') {
+        let open = i + found;
+        let end = text[open + 1..]
+            .find('\'')
+            .map_or(text.len(), |close| open + 1 + close + 1);
+        let before = upper[..open].trim_end();
+        let before = before.strip_suffix('=').unwrap_or(before).trim_end();
+        if KEYWORDS.iter().any(|k| before.ends_with(k)) {
+            out.push_str(&text[copied..open]);
+            out.push_str("'***'");
+            copied = end;
+        }
+        i = end;
+    }
+    out.push_str(&text[copied..]);
+    out
 }
 
 /// The minimal split of `script`, or `None` when the real splitter is available.
@@ -115,4 +151,19 @@ fn simple_split_respects_quotes_and_comments() {
     assert_eq!(s[0].kind, StatementKind::Query);
     assert_eq!(s[1].kind, StatementKind::Other);
     assert_eq!(s[2].range.end, s[2].segment_end);
+}
+
+#[test]
+fn simple_redact_hides_literals_after_secret_keywords() {
+    assert_eq!(
+        simple_redact("ALTER USER x PASSWORD 'p1' VALID UNTIL 'infinity'"),
+        "ALTER USER x PASSWORD '***' VALID UNTIL 'infinity'"
+    );
+    assert_eq!(
+        simple_redact("alter user 'u'@'%' identified by 'p2'"),
+        "alter user 'u'@'%' identified by '***'"
+    );
+    assert_eq!(simple_redact("PRAGMA key = 'p3'"), "PRAGMA key = '***'");
+    assert_eq!(simple_redact("SELECT 'a', 'b"), "SELECT 'a', 'b");
+    assert_eq!(simple_redact("PASSWORD 'unterminated"), "PASSWORD '***'");
 }

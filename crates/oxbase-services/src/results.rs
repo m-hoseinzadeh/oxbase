@@ -7,8 +7,11 @@
 //!   directory, deleted when the last reference to it drops (run closed, editor closed,
 //!   service dropped). Nothing a run writes lives outside it.
 //! - Every result set of a run is one [`ResultStore`]. Appended batches stay in memory while
-//!   the run's [`ByteBudget`] (memory) allows. When an append does not fit, the store writes
-//!   its in-memory batches, oldest first, to a new **segment**: one complete Arrow IPC *file*
+//!   the run's [`ByteBudget`] (memory) allows. When an append does not fit, the store first
+//!   makes room by spilling the in-memory batches of the run's *earlier, complete* result sets
+//!   (oldest first; see `ResultStore::set_evictable`), so a later large result is not left
+//!   with an exhausted budget and a file per batch. If that frees too little, the store writes
+//!   its own in-memory batches, oldest first, to a new **segment**: one complete Arrow IPC *file*
 //!   (`arrow_ipc::writer::FileWriter`, footer included) in the run directory, then releases
 //!   their memory. A segment covers a contiguous row range; the store keeps an index
 //!   `(first_row, rows, path, bytes)` per segment and per batch inside it, so a page reads only
@@ -35,7 +38,7 @@
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use arrow_array::{RecordBatch, RecordBatchOptions};
 use arrow_ipc::reader::FileReader;
@@ -162,6 +165,9 @@ pub struct ResultStore {
     state: Mutex<StoreState>,
     /// Recently decoded spilled batches, most recent last.
     cache: Mutex<VecDeque<CachedBatch>>,
+    /// Earlier result sets of the same run, oldest first, whose in-memory batches may be
+    /// spilled to make room for this one (see [`ResultStore::set_evictable`]).
+    evictable: Mutex<Vec<Weak<ResultStore>>>,
 }
 
 #[derive(Default)]
@@ -244,7 +250,47 @@ impl ResultStore {
             writer: Mutex::new(()),
             state: Mutex::new(StoreState::default()),
             cache: Mutex::new(VecDeque::new()),
+            evictable: Mutex::new(Vec::new()),
         }
+    }
+
+    /// The earlier result sets of the same run (oldest first). When this store's batches no
+    /// longer fit the run's memory budget, it first spills the in-memory batches of those of
+    /// them that are complete, each into one segment, before spilling its own. They share the
+    /// run's memory budget, so this keeps segments large instead of writing one file per batch
+    /// once an earlier result holds the budget.
+    pub(crate) fn set_evictable(&self, earlier: Vec<Weak<ResultStore>>) {
+        *lock(&self.evictable) = earlier;
+    }
+
+    /// Spills earlier complete result sets until `bytes` can be reserved in the memory budget;
+    /// returns whether they were reserved. A failure to spill one (disk cap, I/O) only means
+    /// it keeps its memory.
+    fn reserve_by_evicting(&self, bytes: u64) -> bool {
+        let earlier: Vec<Arc<ResultStore>> = lock(&self.evictable)
+            .iter()
+            .filter_map(Weak::upgrade)
+            .collect();
+        for store in earlier {
+            if !store.is_complete() || store.memory_bytes() == 0 {
+                continue;
+            }
+            if let Err(e) = store.spill_memory() {
+                tracing::debug!(category = %e.category(), "spilling an earlier result failed");
+            }
+            if self.memory.try_reserve(bytes) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Writes every in-memory batch of this (complete) store to one segment and frees their
+    /// memory. Nothing happens when it holds none or the disk cap refuses the segment.
+    fn spill_memory(&self) -> Result<()> {
+        let _writer = lock(&self.writer);
+        self.write_segment_from_memory(None)?;
+        Ok(())
     }
 
     pub fn schema(&self) -> &SchemaRef {
@@ -273,7 +319,7 @@ impl ResultStore {
             return Ok(AppendOutcome::Stored);
         }
         let bytes = to_u64(batch.get_array_memory_size());
-        if self.memory.try_reserve(bytes) {
+        if self.memory.try_reserve(bytes) || self.reserve_by_evicting(bytes) {
             let mut state = lock(&self.state);
             let first_row = state.rows;
             state.memory.push_back(MemBatch {
@@ -291,23 +337,40 @@ impl ResultStore {
     /// Writes every in-memory batch plus `batch` to a new segment and frees their memory.
     /// Called with `writer` held.
     fn spill(&self, batch: RecordBatch, rows: u64) -> Result<AppendOutcome> {
+        if self.write_segment_from_memory(Some((batch, rows)))? {
+            Ok(AppendOutcome::Stored)
+        } else {
+            lock(&self.state).disk_full = true;
+            Ok(AppendOutcome::DiskFull)
+        }
+    }
+
+    /// Writes the in-memory batches, followed by `extra` (a new batch and its row count) when
+    /// given, to a new segment and frees the memory of the batches it wrote. `Ok(false)`: the
+    /// disk cap refused the segment and nothing changed. Called with `writer` held.
+    fn write_segment_from_memory(&self, extra: Option<(RecordBatch, u64)>) -> Result<bool> {
         let (mut batches, first_row, segment_id) = {
             let mut state = lock(&self.state);
             let held: Vec<RecordBatch> = state.memory.iter().map(|m| m.batch.clone()).collect();
+            if held.is_empty() && extra.is_none() {
+                return Ok(true);
+            }
             let first_row = state.memory.front().map_or(state.rows, |m| m.first_row);
             let id = state.next_segment;
             state.next_segment += 1;
             (held, first_row, id)
         };
         let spilled = batches.len();
-        batches.push(batch);
+        let extra_rows = extra.as_ref().map_or(0, |(_, rows)| *rows);
+        if let Some((batch, _)) = extra {
+            batches.push(batch);
+        }
         let estimate = batches
             .iter()
             .map(|b| to_u64(b.get_array_memory_size()).saturating_add(IPC_BATCH_OVERHEAD))
             .fold(IPC_FILE_OVERHEAD, u64::saturating_add);
         if !self.disk.try_reserve(estimate) {
-            lock(&self.state).disk_full = true;
-            return Ok(AppendOutcome::DiskFull);
+            return Ok(false);
         }
         let path = self
             .dir
@@ -324,8 +387,7 @@ impl ResultStore {
             if !self.disk.try_reserve(written - estimate) {
                 self.disk.release(estimate);
                 let _ = std::fs::remove_file(&path);
-                lock(&self.state).disk_full = true;
-                return Ok(AppendOutcome::DiskFull);
+                return Ok(false);
             }
         } else {
             self.disk.release(estimate - written);
@@ -353,9 +415,9 @@ impl ResultStore {
         state.memory_bytes = state.memory_bytes.saturating_sub(freed);
         self.memory.release(freed);
         state.segments.push(segment);
-        state.rows += rows;
+        state.rows += extra_rows;
         state.disk_bytes += written;
-        Ok(AppendOutcome::Stored)
+        Ok(true)
     }
 
     /// Marks the result complete. `truncated`: rows were left unread (max rows, disk cap,
@@ -506,6 +568,12 @@ impl ResultStore {
     pub fn disk_bytes(&self) -> u64 {
         lock(&self.state).disk_bytes
     }
+
+    /// Spill files written so far.
+    #[cfg(test)]
+    pub(crate) fn segment_count(&self) -> usize {
+        lock(&self.state).segments.len()
+    }
 }
 
 impl Drop for ResultStore {
@@ -619,6 +687,87 @@ mod tests {
         drop(dir);
         assert!(!path.exists());
         assert!(nested.exists());
+    }
+
+    fn int_batch(schema: &SchemaRef, first: i64, n: i64) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::clone(schema),
+            vec![Arc::new(Int64Array::from(
+                (first..first + n).collect::<Vec<_>>(),
+            ))],
+        )
+        .unwrap()
+    }
+
+    fn page_ids(store: &ResultStore, offset: u64, limit: usize) -> Vec<i64> {
+        store
+            .page(offset, limit)
+            .unwrap()
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .values()
+            .to_vec()
+    }
+
+    #[test]
+    fn a_later_result_evicts_earlier_ones_instead_of_spilling_batch_by_batch() {
+        let base = tempfile::tempdir().unwrap();
+        let dir = Arc::new(RunDir::create(base.path()).unwrap());
+        let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
+        let one = to_u64(int_batch(&schema, 0, 100).get_array_memory_size());
+        // Room for 10 batches of 100 rows.
+        let memory = Arc::new(ByteBudget::new(one * 10));
+        let disk = Arc::new(ByteBudget::new(u64::MAX));
+        let new_store = || {
+            Arc::new(ResultStore::new(
+                Arc::clone(&schema),
+                Arc::clone(&dir),
+                Arc::clone(&memory),
+                Arc::clone(&disk),
+            ))
+        };
+
+        // The first result takes the whole budget and is complete.
+        let first = new_store();
+        for i in 0..10 {
+            first.append(int_batch(&schema, i * 100, 100)).unwrap();
+        }
+        first.finish(false);
+        assert_eq!(first.segment_count(), 0);
+        assert_eq!(memory.used(), memory.limit());
+
+        // The second one spills the first (one segment) and keeps its own batches in memory
+        // until the budget is full again, then spills them together: a few large segments,
+        // not one file per batch.
+        let second = new_store();
+        second.set_evictable(vec![Arc::downgrade(&first)]);
+        for i in 0..40 {
+            assert_eq!(
+                second.append(int_batch(&schema, i * 100, 100)).unwrap(),
+                AppendOutcome::Stored
+            );
+        }
+        second.finish(false);
+        assert_eq!(first.segment_count(), 1);
+        assert_eq!(first.memory_bytes(), 0);
+        assert!(second.segment_count() <= 4, "{}", second.segment_count());
+        assert!(memory.used() <= memory.limit());
+
+        // Both still page correctly.
+        assert_eq!(page_ids(&first, 950, 100), (950..1000).collect::<Vec<_>>());
+        assert_eq!(page_ids(&second, 0, 3), [0, 1, 2]);
+        assert_eq!(
+            page_ids(&second, 3995, 10),
+            (3995..4000).collect::<Vec<_>>()
+        );
+
+        // Dropping them gives everything back.
+        drop(first);
+        drop(second);
+        assert_eq!(memory.used(), 0);
+        assert_eq!(disk.used(), 0);
     }
 
     #[test]

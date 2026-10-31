@@ -36,15 +36,20 @@ type Log = Arc<Mutex<Vec<String>>>;
 /// - `update N`: `RowsAffected(N)`; `notice text`: a warning notice and `RowsAffected(0)`;
 /// - `fail`: an SQL error from `execute`; `midfail`: one batch, then an SQL error;
 /// - `lose`: a connection error; `hang`: nothing until cancelled;
+/// - `select <any of the above>`: the same (the splitter calls it a query);
 /// - anything else: `RowsAffected(0)`.
+///
+/// A stream that sees its statement cancelled logs `cancelled`. Connecting to the database
+/// `hang` never finishes.
 struct ScriptDriver {
     log: Log,
+    engine: Engine,
 }
 
 #[async_trait]
 impl Driver for ScriptDriver {
     fn engine(&self) -> Engine {
-        Engine::Postgres
+        self.engine
     }
 
     async fn connect(&self, params: &ConnectParams) -> Result<Box<dyn Connection>> {
@@ -53,6 +58,9 @@ impl Driver for ScriptDriver {
             .lock()
             .unwrap()
             .push(format!("connect {}", database.as_deref().unwrap_or("-")));
+        if database.as_deref() == Some("hang") {
+            std::future::pending::<()>().await;
+        }
         Ok(Box::new(ScriptConnection {
             database,
             version: ServerVersion::new(16, 0, 0),
@@ -132,7 +140,10 @@ impl Connection for ScriptConnection {
             "{}: {sql}",
             self.database.as_deref().unwrap_or("-")
         ));
-        let words: Vec<&str> = sql.split_whitespace().collect();
+        let mut words: Vec<&str> = sql.split_whitespace().collect();
+        if words.len() > 1 && words[0] == "select" {
+            words.remove(0);
+        }
         let mut steps = VecDeque::new();
         let mut delay = Duration::ZERO;
         match words.first().copied().unwrap_or("") {
@@ -174,36 +185,40 @@ impl Connection for ScriptConnection {
             "hang" => steps.push_back(Step::Hang),
             _ => steps.push_back(Step::Item(ResultItem::RowsAffected(0))),
         }
-        Ok(stream::unfold(
-            (steps, cancel, false),
-            move |(mut steps, cancel, done)| async move {
-                if done {
-                    return None;
-                }
-                let step = steps.pop_front()?;
-                if !delay.is_zero() {
-                    tokio::select! {
-                        () = cancel.cancelled() => {}
-                        () = tokio::time::sleep(delay) => {}
+        let log = self.log.clone();
+        Ok(
+            stream::unfold((steps, cancel, false), move |(mut steps, cancel, done)| {
+                let log = log.clone();
+                async move {
+                    if done {
+                        return None;
                     }
-                }
-                if cancel.is_cancelled() {
-                    return Some((Err(Error::Cancelled), (steps, cancel, true)));
-                }
-                let item = match step {
-                    Step::Item(item) => Ok(item),
-                    Step::Rows { start, n } => Ok(ResultItem::Batch(rows_batch(start, n))),
-                    Step::Fail(e) => Err(e),
-                    Step::Hang => {
-                        cancel.cancelled().await;
-                        Err(Error::Cancelled)
+                    let step = steps.pop_front()?;
+                    if !delay.is_zero() {
+                        tokio::select! {
+                            () = cancel.cancelled() => {}
+                            () = tokio::time::sleep(delay) => {}
+                        }
                     }
-                };
-                let done = item.is_err();
-                Some((item, (steps, cancel, done)))
-            },
+                    if cancel.is_cancelled() {
+                        log.lock().unwrap().push("cancelled".into());
+                        return Some((Err(Error::Cancelled), (steps, cancel, true)));
+                    }
+                    let item = match step {
+                        Step::Item(item) => Ok(item),
+                        Step::Rows { start, n } => Ok(ResultItem::Batch(rows_batch(start, n))),
+                        Step::Fail(e) => Err(e),
+                        Step::Hang => {
+                            cancel.cancelled().await;
+                            Err(Error::Cancelled)
+                        }
+                    };
+                    let done = item.is_err();
+                    Some((item, (steps, cancel, done)))
+                }
+            })
+            .boxed(),
         )
-        .boxed())
     }
 
     async fn cancel_running(&self) -> Result<()> {
@@ -235,14 +250,6 @@ struct Harness {
 
 impl Harness {
     async fn new(configure: impl FnOnce(&mut QueryConfig)) -> Self {
-        let log = Log::default();
-        let mut drivers = DriverRegistry::new();
-        drivers.register(Arc::new(ScriptDriver { log: log.clone() }));
-        let manager = Arc::new(ConnectionManager::new(
-            drivers,
-            Arc::new(MemorySecretStore::new()),
-            Arc::new(RusshTunnelProvider::new()),
-        ));
         let mut profile = ConnectionProfile::new(
             "script",
             Engine::Postgres,
@@ -252,6 +259,25 @@ impl Harness {
             },
         );
         profile.database = Some("db1".into());
+        Self::with_profile(profile, configure).await
+    }
+
+    /// A harness whose base session is opened from `profile` (on the scripted driver).
+    async fn with_profile(
+        profile: ConnectionProfile,
+        configure: impl FnOnce(&mut QueryConfig),
+    ) -> Self {
+        let log = Log::default();
+        let mut drivers = DriverRegistry::new();
+        drivers.register(Arc::new(ScriptDriver {
+            log: log.clone(),
+            engine: profile.engine,
+        }));
+        let manager = Arc::new(ConnectionManager::new(
+            drivers,
+            Arc::new(MemorySecretStore::new()),
+            Arc::new(RusshTunnelProvider::new()),
+        ));
         let base = manager
             .open(&profile, &ProvidedSecrets::none(), CancellationToken::new())
             .await
@@ -312,7 +338,7 @@ impl Harness {
             .lock()
             .unwrap()
             .iter()
-            .filter(|l| !l.starts_with("connect "))
+            .filter(|l| !l.starts_with("connect ") && *l != "cancelled")
             .cloned()
             .collect()
     }
@@ -907,15 +933,12 @@ async fn history_records_each_statement_that_started() {
     }
     h.service.cancel(handle.id);
     drain(events).await;
-    let entries = h.repo.list(&HistoryQuery::default()).await.unwrap();
     if !redaction_available() {
-        // `oxbase_sql::redact_secrets` is not on this branch yet: recording fails (and is only
-        // logged), the run is unaffected.
-        eprintln!("skipped: history redaction is not implemented on this branch");
-        assert_eq!(entries.len(), 0);
-        return;
+        // Until `oxbase_sql::redact_secrets` is on this branch, `HistoryService` redacts with
+        // the test stand-in in `test_split`; everything else below is the real path.
+        eprintln!("note: history redaction uses the test stand-in (oxbase_sql's is not here)");
     }
-    let mut entries = entries;
+    let mut entries = h.repo.list(&HistoryQuery::default()).await.unwrap();
     entries.reverse();
     assert_eq!(
         entries
@@ -1016,4 +1039,130 @@ fn events_run(events: &[RunEvent]) -> RunId {
         RunEvent::Started { run_id, .. } => *run_id,
         other => panic!("unexpected first event {other:?}"),
     }
+}
+
+fn connects(h: &Harness) -> usize {
+    h.log
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|l| l.starts_with("connect"))
+        .count()
+}
+
+#[tokio::test]
+async fn a_full_query_is_cancelled_but_other_statements_run_to_their_end() {
+    let h = Harness::new(|_| {}).await;
+    let options = RunOptions {
+        max_rows: Some(150),
+        ..no_history()
+    };
+    // A query (the splitter's hint) is stopped on the server once its result is full.
+    let (_, events) = h.run("a", "select rows 1000 100", options.clone()).await;
+    assert_eq!(
+        shape(&events),
+        [
+            "started 1",
+            "stmt 0",
+            "result 0 of 0 (2 cols)",
+            "notice Warning: result 1 stopped after 150 rows: the row limit was reached",
+            "done 0: 150 truncated",
+            "ok 0 None",
+            "finished"
+        ]
+    );
+    assert_eq!(h.log.lock().unwrap().last().unwrap(), "cancelled");
+
+    // Any other statement (it may change data) is not cancelled: it runs to its end, the rest
+    // of the full result is discarded and its later results are stored.
+    h.log.lock().unwrap().clear();
+    let (run, events) = h.run("a", "multi 3 200", options).await;
+    assert_eq!(
+        shape(&events),
+        [
+            "started 1",
+            "stmt 0",
+            "result 0 of 0 (2 cols)",
+            "notice Warning: result 1 stopped after 150 rows: the row limit was reached",
+            "done 0: 150 truncated",
+            "result 1 of 0 (2 cols)",
+            "notice Warning: result 2 stopped after 150 rows: the row limit was reached",
+            "done 1: 150 truncated",
+            "result 2 of 0 (2 cols)",
+            "notice Warning: result 3 stopped after 150 rows: the row limit was reached",
+            "done 2: 150 truncated",
+            "ok 0 None",
+            "finished"
+        ]
+    );
+    assert!(!h.log.lock().unwrap().iter().any(|l| l == "cancelled"));
+    check_rows(&h.service.page(run, 2, 0, 1000).await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn a_lost_session_is_replaced_on_the_next_run() {
+    let h = Harness::new(|_| {}).await;
+    h.run("a", "update 1", no_history()).await;
+    assert_eq!(connects(&h), 2, "base + the editor's session");
+    let (_, events) = h.run("a", "lose", no_history()).await;
+    assert_eq!(shape(&events).last().unwrap(), "run failed Connection");
+    let (_, events) = h.run("a", "update 2", no_history()).await;
+    assert_eq!(shape(&events).last().unwrap(), "finished");
+    assert_eq!(connects(&h), 3, "the lost session was replaced");
+    // On the same database, and the base is untouched.
+    assert_eq!(h.statements_run().last().unwrap(), "db1: update 2");
+    assert!(h.manager.get(h.session).is_some());
+}
+
+#[tokio::test]
+async fn closing_the_editor_stops_a_session_that_does_not_open() {
+    let h = Harness::new(|_| {}).await;
+    let options = RunOptions {
+        database: Some("hang".into()),
+        ..no_history()
+    };
+    let clock = Instant::now();
+    let (started, closed) =
+        tokio::join!(h.service.run(h.target("a"), "update 1", options), async {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            h.service.close_editor(&EditorId::new("a")).await
+        });
+    closed.unwrap();
+    assert_eq!(started.unwrap_err().category(), ErrorCategory::Cancelled);
+    assert!(
+        clock.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        clock.elapsed()
+    );
+    assert!(h.run_dirs().is_empty(), "the run's directory is gone");
+    // The editor is free again.
+    let (_, events) = h.run("a", "update 1", no_history()).await;
+    assert_eq!(shape(&events).last().unwrap(), "finished");
+}
+
+#[tokio::test]
+async fn editors_of_a_private_in_memory_database_run_on_the_base_session() {
+    let profile = ConnectionProfile::new(
+        "memory",
+        Engine::Sqlite,
+        ProfileAddress::File {
+            path: ":memory:".into(),
+        },
+    );
+    let h = Harness::with_profile(profile, |_| {}).await;
+    h.run("a", "update 1", no_history()).await;
+    h.run("b", "update 2", no_history()).await;
+    assert_eq!(
+        connects(&h),
+        1,
+        "no child: it would see another, empty database"
+    );
+    assert_eq!(h.statements_run(), ["-: update 1", "-: update 2"]);
+    // Closing an editor or losing the connection never closes the base.
+    h.service.close_editor(&EditorId::new("a")).await.unwrap();
+    h.run("b", "lose", no_history()).await;
+    tokio::task::yield_now().await;
+    assert!(h.manager.get(h.session).is_some());
+    let (_, events) = h.run("a", "update 3", no_history()).await;
+    assert_eq!(shape(&events).last().unwrap(), "finished");
 }

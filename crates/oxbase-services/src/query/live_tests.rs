@@ -31,7 +31,7 @@ use oxbase_store::{
     TlsSettings,
 };
 
-use super::test_split::redaction_available;
+use super::test_split::{real_split_available, redaction_available};
 use super::*;
 use crate::{ProvidedSecrets, default_dialects, default_drivers};
 
@@ -556,9 +556,14 @@ async fn multi_statement(key: &str, engine: Engine) {
         1
     );
     report(&format!(
-        "{engine} script: {} statements, {} result sets, rows affected {affected:?}",
+        "{engine} script: {} statements, {} result sets, rows affected {affected:?}, split by {}",
         affected.len(),
-        results.len()
+        results.len(),
+        if real_split_available() {
+            "oxbase_sql::split"
+        } else {
+            "the test stand-in (oxbase_sql::split is not on this branch)"
+        }
     ));
 }
 
@@ -591,12 +596,13 @@ async fn history_records(key: &str, engine: Engine) {
         }
     }
     let entries = history.list(&HistoryQuery::default()).await.unwrap();
-    if !redaction_available() {
-        report(&format!(
-            "{engine} history: skipped (oxbase_sql::redact_secrets is not on this branch)"
-        ));
-        return;
-    }
+    let redactor = if redaction_available() {
+        "oxbase_sql::redact_secrets"
+    } else {
+        // Until the `sql` stream's redaction is on this branch, `HistoryService` uses the test
+        // stand-in in `test_split`; the recording path to the app database is the real one.
+        "the test stand-in (oxbase_sql::redact_secrets is not on this branch)"
+    };
     assert_eq!(entries.len(), 3, "{engine}: {entries:?}");
     assert_eq!(entries[2].sql, "SELECT 'm2q-history' AS marker");
     assert_eq!(entries[2].status, HistoryStatus::Ok);
@@ -620,7 +626,7 @@ async fn history_records(key: &str, engine: Engine) {
         .unwrap();
     assert_eq!(found.len(), 1, "{engine}");
     report(&format!(
-        "{engine} history: {} entries, statuses {:?}",
+        "{engine} history: {} entries, statuses {:?}, redacted by {redactor}",
         entries.len(),
         entries.iter().map(|e| e.status).collect::<Vec<_>>()
     ));

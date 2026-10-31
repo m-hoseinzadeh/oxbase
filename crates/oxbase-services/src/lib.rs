@@ -867,6 +867,30 @@ impl ConnectionManager {
         Ok(handle)
     }
 
+    /// `false` when a child of the open base session `base` would not see the base's data:
+    /// an in-memory database private to one connection (`:memory:`, an empty file name, or a
+    /// `file:` URI with `mode=memory` or `file::memory:`, without `cache=shared`), whatever
+    /// the engine. Such a
+    /// base must be used directly instead of through children. `true` for anything else,
+    /// including unknown sessions (opening the child then reports them).
+    pub(crate) fn children_share_data(&self, base: SessionId) -> bool {
+        let Ok(bases) = self.bases.lock() else {
+            return true;
+        };
+        let Some(file) = bases.get(&base).and_then(|p| p.file.as_ref()) else {
+            return true;
+        };
+        let file = file.to_string_lossy();
+        let file = file.trim();
+        let lower = file.to_ascii_lowercase();
+        let private_memory = file.is_empty()
+            || file == ":memory:"
+            || (lower.starts_with("file:")
+                && (lower.contains("mode=memory") || lower.starts_with("file::memory:"))
+                && !lower.contains("cache=shared"));
+        !private_memory
+    }
+
     /// Unregisters and closes the session: the driver connection is closed, then the manager's
     /// tunnel reference is dropped (the tunnel closes when no other session shares it). Clones
     /// of the handle held elsewhere see a closed connection. Unknown ids are `NotFound`.
