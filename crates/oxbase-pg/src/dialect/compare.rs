@@ -1110,7 +1110,7 @@ mod tests {
         fetched.indexes[0].predicate = Some("(code IS NOT NULL)".into());
         fetched.indexes[0]
             .extras
-            .insert(oxbase_types::props::INDEX_METHOD, "btree");
+            .insert(props::INDEX_METHOD, "btree");
         assert_eq!(diff_tables(&written, &fetched, &PgRules), []);
         let cmp = RulesComparator(PgRules);
         assert_eq!(

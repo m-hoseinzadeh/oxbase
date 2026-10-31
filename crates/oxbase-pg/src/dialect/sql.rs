@@ -293,9 +293,12 @@ pub(crate) const INDEXES_10: &str = indexes!("i.indnatts", "false");
 /// columns. `name` is NULL for an expression; `expr` is the column or expression text;
 /// `descending` and `nulls_first` are the `indoption` bits (only key columns have them).
 /// `opclass` is a key's operator class when it is not the default one, `collation_name` its
-/// collation when it differs from the column's (or the key type's), both as a bare name when
-/// visible on the search path, else as `"schema"."name"`; `has_options` is set when the
-/// operator class has parameters (13+).
+/// collation when it differs from the column's, both as a bare name when visible on the search
+/// path, else as `"schema"."name"`; `has_options` is set when the operator class has parameters
+/// (13+). An expression key takes the collation of its expression (`lower(c)` of a `"C"` column
+/// is `"C"`), which the catalog does not tell apart from an explicit one: its collation is only
+/// reported when the index definition has a `COLLATE` clause somewhere (then it may be written
+/// out although it was implied, which means the same).
 pub(crate) const INDEX_COLUMNS: &str = "\
 SELECT i.indexrelid::int8 AS idx, \
        k.n AS ord, \
@@ -308,7 +311,10 @@ SELECT i.indexrelid::int8 AS idx, \
             ELSE '\"' || pg_catalog.replace(ocn.nspname::text, '\"', '\"\"') || '\".\"' || \
                  pg_catalog.replace(oc.opcname::text, '\"', '\"\"') || '\"' END \
        END AS opclass, \
-       CASE WHEN kc.oid IS NOT NULL AND kc.oid <> COALESCE(a.attcollation, it.typcollation) THEN \
+       CASE WHEN kc.oid IS NOT NULL AND kc.oid <> COALESCE(a.attcollation, it.typcollation) \
+                 AND (a.attnum IS NOT NULL \
+                      OR pg_catalog.strpos(pg_catalog.pg_get_indexdef(i.indexrelid), ' COLLATE ') > 0) \
+            THEN \
             CASE WHEN pg_catalog.pg_collation_is_visible(kc.oid) THEN kc.collname::text \
             ELSE '\"' || pg_catalog.replace(kcn.nspname::text, '\"', '\"\"') || '\".\"' || \
                  pg_catalog.replace(kc.collname::text, '\"', '\"\"') || '\"' END \
@@ -709,6 +715,7 @@ mod tests {
             "pg_opclass_is_visible",
             "array_to_json",
             "replace",
+            "strpos",
             "unnest",
             "generate_series",
             "array_length",
