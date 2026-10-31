@@ -127,14 +127,8 @@ impl HistoryService {
     }
 }
 
-/// `oxbase_sql::redact_secrets`. In this crate's unit tests, while the `sql` stream's
-/// implementation is not on the branch, a minimal stand-in (`query::test_split`) is used so
-/// the recording path can still be tested.
+/// `oxbase_sql::redact_secrets`, owned.
 fn redact(dialect: SqlDialect, text: &str) -> String {
-    #[cfg(test)]
-    if let Some(redacted) = crate::query::test_split::fallback_redact(text) {
-        return redacted;
-    }
     redact_secrets(dialect, text).into_owned()
 }
 

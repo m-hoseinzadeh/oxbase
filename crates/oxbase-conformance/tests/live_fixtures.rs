@@ -13,7 +13,7 @@
 //! An unreachable fixture fails the test with the engine name and port. Set
 //! `OXBASE_CONFORMANCE_ALLOW_MISSING=1` to report it as skipped instead.
 //!
-//! `OXBASE_CONFORMANCE_REQUIRE_M2_FETCH=1` (set by the full CI lane: pull requests and main)
+//! `OXBASE_CONFORMANCE_REQUIRE_M2_FETCH=1` (set by every CI lane since M2)
 //! also requires every M2 engine (PostgreSQL, MySQL, MariaDB, SQLite) to have registered its
 //! tree layout in `oxbase_services::default_dialects`, so a registration left out fails the
 //! job instead of leaving its cells pending.

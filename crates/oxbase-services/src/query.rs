@@ -110,8 +110,6 @@ use crate::{CancellationToken, ConnectionManager, SessionHandle, SessionId};
 mod live_tests;
 #[cfg(test)]
 mod service_tests;
-#[cfg(test)]
-pub(crate) mod test_split;
 
 /// How long a stopped statement's stream may take to wind down (server-side cancel, drain)
 /// before it is dropped. Keeps "cancel ends the run within 2 s".
@@ -1600,12 +1598,6 @@ async fn close_session(manager: &ConnectionManager, id: SessionId) {
 
 /// The statements of `script`.
 fn split_script(dialect: SqlDialect, script: &str) -> Vec<oxbase_sql::Statement> {
-    // Unit tests of this crate run before the splitter of the `sql` stream may be merged; they
-    // fall back to a minimal splitter when `oxbase_sql::split` is not implemented yet.
-    #[cfg(test)]
-    if let Some(statements) = test_split::fallback_split(dialect, script) {
-        return statements;
-    }
     oxbase_sql::split(dialect, script)
 }
 

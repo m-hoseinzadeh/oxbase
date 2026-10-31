@@ -18,7 +18,6 @@ use oxbase_store::{
 use oxbase_types::{ServerVersion, Value};
 use pretty_assertions::assert_eq;
 
-use super::test_split::redaction_available;
 use super::*;
 use crate::ProvidedSecrets;
 
@@ -948,11 +947,6 @@ async fn history_records_each_statement_that_started() {
     }
     h.service.cancel(handle.id);
     drain(events).await;
-    if !redaction_available() {
-        // Until `oxbase_sql::redact_secrets` is on this branch, `HistoryService` redacts with
-        // the test stand-in in `test_split`; everything else below is the real path.
-        eprintln!("note: history redaction uses the test stand-in (oxbase_sql's is not here)");
-    }
     let mut entries = h.repo.list(&HistoryQuery::default()).await.unwrap();
     entries.reverse();
     assert_eq!(

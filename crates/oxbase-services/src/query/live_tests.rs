@@ -11,9 +11,9 @@
 //!   one session;
 //! - (d) history records each statement of a run, redacted, in the app database.
 //!
-//! They are unit tests (not `tests/`) so they can use the crate's fallback splitter while the
-//! `sql` stream's splitter is not merged (see `test_split`). Timings go straight to stderr so
-//! the CI log shows them even when the test passes.
+//! Scripts are split by `oxbase_sql::split` and history is redacted by
+//! `oxbase_sql::redact_secrets`. Timings go straight to stderr so the CI log shows them even
+//! when the test passes.
 //!
 //! ```sh
 //! scripts/fixtures-up.sh
@@ -31,7 +31,6 @@ use oxbase_store::{
     TlsSettings,
 };
 
-use super::test_split::{real_split_available, redaction_available};
 use super::*;
 use crate::{ProvidedSecrets, default_dialects, default_drivers};
 
@@ -567,14 +566,9 @@ async fn multi_statement(key: &str, engine: Engine) {
         1
     );
     report(&format!(
-        "{engine} script: {} statements, {} result sets, rows affected {affected:?}, split by {}",
+        "{engine} script: {} statements, {} result sets, rows affected {affected:?}",
         affected.len(),
         results.len(),
-        if real_split_available() {
-            "oxbase_sql::split"
-        } else {
-            "the test stand-in (oxbase_sql::split is not on this branch)"
-        }
     ));
 }
 
@@ -607,13 +601,6 @@ async fn history_records(key: &str, engine: Engine) {
         }
     }
     let entries = history.list(&HistoryQuery::default()).await.unwrap();
-    let redactor = if redaction_available() {
-        "oxbase_sql::redact_secrets"
-    } else {
-        // Until the `sql` stream's redaction is on this branch, `HistoryService` uses the test
-        // stand-in in `test_split`; the recording path to the app database is the real one.
-        "the test stand-in (oxbase_sql::redact_secrets is not on this branch)"
-    };
     assert_eq!(entries.len(), 3, "{engine}: {entries:?}");
     assert_eq!(entries[2].sql, "SELECT 'm2q-history' AS marker");
     assert_eq!(entries[2].status, HistoryStatus::Ok);
@@ -637,7 +624,7 @@ async fn history_records(key: &str, engine: Engine) {
         .unwrap();
     assert_eq!(found.len(), 1, "{engine}");
     report(&format!(
-        "{engine} history: {} entries, statuses {:?}, redacted by {redactor}",
+        "{engine} history: {} entries, statuses {:?}, redacted",
         entries.len(),
         entries.iter().map(|e| e.status).collect::<Vec<_>>()
     ));
