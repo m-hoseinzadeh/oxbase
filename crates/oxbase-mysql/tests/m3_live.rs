@@ -1116,6 +1116,265 @@ async fn dml_unique_key_and_defaults(key: &'static str) {
     .await;
 }
 
+// ---- fetched expressions and renames they use -------------------------------------------------
+
+/// Fetched expressions with string literals are written back (MySQL escapes their quotes in its
+/// catalog: the fetchers must hand out valid SQL), and a column that a check and a generated
+/// column use is renamed together with them.
+async fn expression_round_trip(key: &'static str) {
+    let t = Ctx::new(key).await;
+    let name = format!("m3_rt_expr_{}", t.token);
+    let tables = [name.clone()];
+    guarded(key, &tables, None, async move {
+        expression_round_trip_body(&t, &name).await;
+    })
+    .await;
+}
+
+async fn expression_round_trip_body(t: &Ctx, name: &str) {
+    let tok = t.token.clone();
+    let (chk_s, chk_s2, chk_q) = (
+        format!("chk_s_{tok}"),
+        format!("chk_s2_{tok}"),
+        format!("chk_q_{tok}"),
+    );
+    let version = t.c.server_version().clone();
+    let ctx = DdlContext::new(&version);
+    let ddl = t.ddl(ObjectKind::Table);
+    let cmp = t.cmp(ObjectKind::Table);
+
+    let mut def = simple_table(t, name, vec![]);
+    def.columns.push(col("qty", "int", DataType::INT32));
+    def.columns.push(col("s", "varchar(10)", varchar(10)));
+    let mut doc = col("d", "text", DataType::Text);
+    doc.default = Some("('{}')".into());
+    def.columns.push(doc);
+    let mut gcol = col("g", "varchar(20)", varchar(20));
+    gcol.generated = Some(GeneratedColumn {
+        expression: "concat(`s`, 'x''y')".into(),
+        stored: false,
+    });
+    def.columns.push(gcol);
+    let mut wcol = col("w", "int", DataType::INT32);
+    wcol.generated = Some(GeneratedColumn {
+        expression: "`qty` * 2".into(),
+        stored: false,
+    });
+    def.columns.push(wcol);
+    def.checks.push(CheckDef {
+        name: Some(chk_s.clone()),
+        expression: "`s` <> 'it''s'".into(),
+        extras: Extras::new(),
+    });
+    def.checks.push(CheckDef {
+        name: Some(chk_q.clone()),
+        expression: "`qty` >= 0".into(),
+        extras: Extras::new(),
+    });
+    t.run(&ddl.create(&ObjectDef::Table(def.clone()), &ctx).unwrap())
+        .await;
+    let fetched = t.load_table(name).await;
+    assert_no_diff(
+        &*cmp,
+        &ObjectDef::Table(def),
+        &ObjectDef::Table(fetched.clone()),
+        "after create",
+    );
+
+    // Re-emit the fetched expressions: rename the check (drop + add with the fetched text),
+    // move the column with the expression default and comment the generated column (MODIFY
+    // with the fetched default and generation expression).
+    let pos = |t: &TableDef, n: &str| t.columns.iter().position(|c| c.name == n).unwrap();
+    let mut new = fetched.clone();
+    let moved = new.columns.remove(pos(&new, "d"));
+    new.columns.insert(1, moved);
+    let gpos = pos(&new, "g");
+    new.columns[gpos].comment = Some("it's g".into());
+    for check in &mut new.checks {
+        if check.name.as_deref() == Some(chk_s.as_str()) {
+            check.name = Some(chk_s2.clone());
+        }
+    }
+    let script = ddl
+        .alter(
+            &ObjectDef::Table(fetched.clone()),
+            &ObjectDef::Table(new.clone()),
+            &ctx.with_table(&fetched),
+        )
+        .unwrap();
+    t.run(&script).await;
+    let after = t.load_table(name).await;
+    let names: Vec<&str> = after.columns.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, ["id", "d", "qty", "s", "g", "w"]);
+    assert!(
+        after
+            .checks
+            .iter()
+            .any(|c| c.name.as_deref() == Some(chk_s2.as_str())),
+        "{:?}",
+        after.checks
+    );
+    assert_no_diff(
+        &*cmp,
+        &ObjectDef::Table(new.clone()),
+        &ObjectDef::Table(after.clone()),
+        "after re-emitting fetched expressions",
+    );
+
+    // Rename `qty`, which a check and a generated column use, and update both.
+    let renames = [Rename::new(ObjectKind::Column, "qty", "quantity")];
+    let mut renamed = after.clone();
+    let qpos = pos(&renamed, "qty");
+    renamed.columns[qpos].name = "quantity".into();
+    let wpos = pos(&renamed, "w");
+    renamed.columns[wpos].generated = Some(GeneratedColumn {
+        expression: "`quantity` * 2".into(),
+        stored: false,
+    });
+    for check in &mut renamed.checks {
+        if check.name.as_deref() == Some(chk_q.as_str()) {
+            check.expression = "`quantity` >= 0".into();
+        }
+    }
+    let rename_ctx = ctx.with_table(&after).with_renames(&renames);
+    // An expression still on the old name is refused before anything runs.
+    let mut stale = renamed.clone();
+    stale.columns[wpos].generated = Some(GeneratedColumn {
+        expression: "`qty` * 2".into(),
+        stored: false,
+    });
+    let err = ddl
+        .alter(
+            &ObjectDef::Table(after.clone()),
+            &ObjectDef::Table(stale),
+            &rename_ctx,
+        )
+        .unwrap_err();
+    assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
+    let script = ddl
+        .alter(
+            &ObjectDef::Table(after.clone()),
+            &ObjectDef::Table(renamed.clone()),
+            &rename_ctx,
+        )
+        .unwrap();
+    assert!(
+        script
+            .steps
+            .iter()
+            .any(|s| s.sql.contains("CHANGE COLUMN `qty` `quantity`")),
+        "{script}"
+    );
+    assert!(
+        !script.steps.iter().any(|s| s.sql.contains("RENAME COLUMN")),
+        "{script}"
+    );
+    t.run(&script).await;
+    let after_rename = t.load_table(name).await;
+    assert_no_diff(
+        &*cmp,
+        &ObjectDef::Table(renamed.clone()),
+        &ObjectDef::Table(after_rename.clone()),
+        "after renaming a column that expressions use",
+    );
+    let again = ddl
+        .alter(
+            &ObjectDef::Table(after_rename.clone()),
+            &ObjectDef::Table(renamed),
+            &ctx.with_table(&after_rename),
+        )
+        .unwrap();
+    assert!(again.is_empty(), "nothing left to alter: {again}");
+}
+
+// ---- BIT values -------------------------------------------------------------------------------
+
+/// `BIT(n)` cells edited as text are stored as numbers, not as the bytes of the text.
+async fn dml_bit(key: &'static str) {
+    let t = Ctx::new(key).await;
+    let scratch = format!("m3_rt_bit_{}", t.token);
+    let tables = [scratch.clone()];
+    guarded(key, &tables, None, async move {
+        let qualified = BacktickQuoting.qualify(&t.table_ref(&scratch));
+        let sql = format!(
+            "CREATE TABLE {qualified} (id int NOT NULL AUTO_INCREMENT PRIMARY KEY, \
+             b bit(8) NULL, b1 bit(1) NULL, b64 bit(64) NULL)"
+        );
+        t.exec(&sql, &[]).await;
+        let table = t.load_table(&scratch).await;
+        let key = RowKey::new(table.obj.clone(), KeyKind::Primary, vec!["id".into()]);
+        let all: Vec<String> = ["id", "b", "b1", "b64"].map(str::to_owned).to_vec();
+        let insert = RowEdit::Insert {
+            values: vec![
+                ColumnValue::new("b", "5"),
+                ColumnValue::new("b1", "1"),
+                ColumnValue::new("b64", "18446744073709551615"),
+            ],
+        };
+        let (affected, row) = apply_one(&t, &plan(&t, &table, &key, &insert, &all)).await;
+        assert_eq!(affected, 1);
+        let row = row.expect("inserted row");
+        assert_eq!(named(&row, "b").as_deref(), Some("5"));
+        assert_eq!(named(&row, "b1").as_deref(), Some("1"));
+        assert_eq!(named(&row, "b64").as_deref(), Some("18446744073709551615"));
+        let id: i64 = named(&row, "id").unwrap().parse().unwrap();
+
+        let update = RowEdit::Update {
+            key: vec![Value::Int(id)],
+            changes: vec![ColumnValue::new("b", "0xff"), ColumnValue::new("b1", "0")],
+        };
+        let (affected, row) = apply_one(&t, &plan(&t, &table, &key, &update, &all)).await;
+        assert_eq!(affected, 1);
+        let row = row.expect("updated row");
+        assert_eq!(named(&row, "b").as_deref(), Some("255"));
+        assert_eq!(named(&row, "b1").as_deref(), Some("0"));
+
+        // What the server stored: the bits of the numbers.
+        let out = t
+            .exec(
+                &format!(
+                    "SELECT CAST(HEX(b) AS CHAR), CAST(HEX(b64) AS CHAR) FROM {qualified} \
+                     WHERE id = ?"
+                ),
+                &[Value::Int(id)],
+            )
+            .await;
+        assert_eq!(cell(&out.result_sets[0], 0, 0).as_deref(), Some("FF"));
+        assert_eq!(
+            cell(&out.result_sets[0], 0, 1).as_deref(),
+            Some("FFFFFFFFFFFFFFFF")
+        );
+
+        // A BIT key is matched by its number; text that is no number is refused.
+        let by_bits = RowKey::new(table.obj.clone(), KeyKind::Unique, vec!["b".into()]);
+        let delete = RowEdit::Delete {
+            key: vec![Value::Text("255".into())],
+        };
+        let (affected, _) = apply_one(&t, &plan(&t, &table, &by_bits, &delete, &[])).await;
+        assert_eq!(affected, 1);
+        let bad = RowEdit::Update {
+            key: vec![Value::Int(id)],
+            changes: vec![ColumnValue::new("b", "five")],
+        };
+        let err = t
+            .reg
+            .dml_writer(t.engine())
+            .unwrap()
+            .plan(
+                &bad,
+                &DmlTarget {
+                    table: &table,
+                    key: &key,
+                    version: t.c.server_version(),
+                    read_back: &[],
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
+    })
+    .await;
+}
+
 macro_rules! live {
     ($($name:ident),* $(,)?) => {
         mod mysql {
@@ -1147,6 +1406,8 @@ live!(
     check_round_trip,
     dml_primary_key,
     dml_unique_key_and_defaults,
+    expression_round_trip,
+    dml_bit,
 );
 
 #[test]

@@ -11,7 +11,13 @@
 //!   1. `RENAME TABLE` (a table rename);
 //!   2. `ALTER TABLE ... RENAME COLUMN / RENAME INDEX` (designer renames; `CHANGE COLUMN` with
 //!      the full definition before MySQL 8.0 / MariaDB 10.5.2, drop + add of the index where
-//!      `RENAME INDEX` is missing; renamed foreign keys and checks are dropped and added);
+//!      `RENAME INDEX` is missing; renamed foreign keys and checks are dropped and added).
+//!      **Exception:** when a check, generated column, expression default or expression key uses
+//!      a renamed column, MySQL refuses to rename the column on its own (and the expression has
+//!      to change with it), so every column rename becomes a `CHANGE COLUMN` (full definition)
+//!      in statement 4, after statement 3 dropped the changed checks and together with the
+//!      redefined generated columns and keys. An expression of the new definition that still
+//!      names a renamed column by its old name is refused (`InvalidInput`) before anything runs;
 //!   3. `ALTER TABLE ... DROP FOREIGN KEY / DROP CHECK` for foreign keys and checks that change
 //!      or go (a separate statement, so a constraint can be re-added under the same name);
 //!   4. one `ALTER TABLE` with every other clause: index and primary-key drops, column drops,
@@ -35,7 +41,12 @@
 //!
 //! Identifiers go through `BacktickQuoting`; comments and enum labels through its `quote_str`
 //! (quotes doubled, backslashes escaped). Defaults, check, generated and `ON UPDATE`
-//! expressions are engine-native SQL from the model and are written as they are. Character set,
+//! expressions are engine-native SQL from the model and are written as they are (the fetchers
+//! un-escape MySQL's backslash-escaped catalog spelling, so fetched expressions are valid SQL).
+//!
+//! `MODIFY` keeps the character set, collation, `ON UPDATE` and visibility of the old column
+//! when the new definition does not report them (the comparator's "absent = not reported");
+//! an explicit `Value::Null` extra removes one. Character set,
 //! collation, engine and row format names must be plain words.
 //!
 //! # Not supported (`Error::Unsupported`)
@@ -57,6 +68,7 @@ use oxbase_types::{
 
 use super::caps::Features;
 use super::compare::{MySqlRules, is_fk_index, normalize_pair};
+use super::expr::uses_column;
 use super::native::{column_type, is_narrowing};
 use super::table::PRIMARY;
 use super::{ENFORCED, INVISIBLE, ON_UPDATE_EXPRESSION};
@@ -849,7 +861,30 @@ impl Gen {
             ));
         }
 
-        // 2. Column and index renames.
+        // 2. Column and index renames. A column that a check, a generated column, an expression
+        // default or an expression key uses cannot be renamed on its own (MySQL refuses, and the
+        // expression must change with it): then every column rename is a `CHANGE COLUMN` in the
+        // main statement (4), after the changed checks are dropped (3) and together with the
+        // changed generated columns, defaults and keys.
+        stale_references(new, renames)?;
+        let column_renames: Vec<&Rename> = renames
+            .iter()
+            .filter(|r| {
+                r.kind == ObjectKind::Column
+                    && r.old != r.new
+                    && old.column(&r.old).is_some()
+                    && new.column(&r.new).is_some()
+            })
+            .collect();
+        let deferred: Vec<(String, String)> =
+            if column_renames.iter().any(|r| depends_on(old, &r.old)) {
+                column_renames
+                    .iter()
+                    .map(|r| (r.new.clone(), r.old.clone()))
+                    .collect()
+            } else {
+                Vec::new()
+            };
         let mut effective = Vec::new();
         let mut rename_clauses = Vec::new();
         for r in renames.iter().filter(|r| r.old != r.new) {
@@ -859,6 +894,10 @@ impl Gen {
                         continue;
                     };
                     if new.column(&r.new).is_none() {
+                        continue;
+                    }
+                    if !deferred.is_empty() {
+                        effective.push(r.clone());
                         continue;
                     }
                     rename_clauses.push(if self.f.rename_column {
@@ -989,7 +1028,7 @@ impl Gen {
                 true,
             );
         }
-        self.column_changes(&o, &n, &mut main)?;
+        self.column_changes(&o, &n, &deferred, &mut main)?;
         if pk_changed && let Some(pk) = &n.primary_key {
             main.push(
                 format!("ADD {}", self.pk_clause(pk)?),
@@ -1011,7 +1050,8 @@ impl Gen {
                 false,
             );
         }
-        for fk in fk_pairs.added.iter().map(|&i| &n.foreign_keys[i]) {
+        // `n` has RESTRICT spelled NO ACTION (the same to InnoDB); write what the user chose.
+        for fk in fk_pairs.added.iter().map(|&i| &new.foreign_keys[i]) {
             main.push(
                 format!("ADD {}", self.fk_clause(&new.obj, fk)?),
                 format!("add foreign key {}", label(fk.name.as_deref())),
@@ -1048,8 +1088,15 @@ impl Gen {
 
     /// `MODIFY COLUMN` and `ADD COLUMN` clauses, in the new column order. Kept columns outside
     /// the longest common subsequence of the old and new orders are moved (`FIRST` / `AFTER`
-    /// the new predecessor); a new column gets a position unless it is the last one.
-    fn column_changes(&self, o: &TableDef, n: &TableDef, main: &mut Main) -> Result<()> {
+    /// the new predecessor); a new column gets a position unless it is the last one. A column in
+    /// `deferred` (`(new name, old name)`) is renamed here with `CHANGE COLUMN`.
+    fn column_changes(
+        &self,
+        o: &TableDef,
+        n: &TableDef,
+        deferred: &[(String, String)],
+        main: &mut Main,
+    ) -> Result<()> {
         let rules = self.rules();
         let old_kept: Vec<&str> = o
             .columns
@@ -1083,18 +1130,31 @@ impl Gen {
                 Some(before) => {
                     let moved = !stay.contains(&col.name.as_str());
                     let changed = !diff_columns(&n.obj, before, col, &rules).is_empty();
-                    if !moved && !changed {
+                    let renamed_from = deferred
+                        .iter()
+                        .find(|(to, _)| *to == col.name)
+                        .map(|(_, from)| from.as_str());
+                    if !moved && !changed && renamed_from.is_none() {
                         continue;
                     }
                     let merged = keep_attributes(before, col);
                     let narrowing = !rules.same_type(before, col) && is_narrowing(before, col);
-                    let mut what = format!("modify column {}", col.name);
+                    let (head, mut what) = match renamed_from {
+                        Some(from) => (
+                            format!("CHANGE COLUMN {} ", self.ident(from)),
+                            format!("rename column {from} to {}", col.name),
+                        ),
+                        None => (
+                            "MODIFY COLUMN ".to_owned(),
+                            format!("modify column {}", col.name),
+                        ),
+                    };
                     if moved {
                         what.push_str(" (move)");
                     }
                     main.push(
                         format!(
-                            "MODIFY COLUMN {}{}",
+                            "{head}{}{}",
                             self.column_def(&merged)?,
                             if moved { position.as_str() } else { "" }
                         ),
@@ -1153,19 +1213,29 @@ impl Main {
 }
 
 /// `new` with what MySQL would otherwise reset on `MODIFY` kept from `old` when `new` does not
-/// say: the character set and collation of a text column, `ON UPDATE` and visibility.
+/// report it: the character set and collation of a text column, `ON UPDATE` and visibility.
+///
+/// This follows the comparator's rule that an absent extra or collation is "not reported", not
+/// "none": a definition that leaves one out keeps the column's current one. To remove one, the
+/// new definition sets the extra to an explicit [`Value::Null`] (`ON UPDATE`, character set) or
+/// `false` (`INVISIBLE`); a new or removed character set also drops the old collation (the new
+/// one's default applies unless `collation` is set).
 fn keep_attributes(old: &ColumnDef, new: &ColumnDef) -> ColumnDef {
     let mut out = new.clone();
     let texty =
         |c: &ColumnDef| c.data_type.is_textual() || matches!(c.data_type, DataType::Enum { .. });
     if texty(old) && texty(new) {
-        if out.collation.is_none() {
+        let same_charset = match new.extras.get(&props::CHARSET) {
+            None => {
+                if let Some(cs) = old.extras.get(&props::CHARSET) {
+                    out.extras.insert(props::CHARSET, cs.clone());
+                }
+                true
+            }
+            Some(cs) => old.extras.get(&props::CHARSET) == Some(cs),
+        };
+        if out.collation.is_none() && same_charset {
             out.collation.clone_from(&old.collation);
-        }
-        if !out.extras.contains(&props::CHARSET)
-            && let Some(cs) = old.extras.get(&props::CHARSET)
-        {
-            out.extras.insert(props::CHARSET, cs.clone());
         }
     }
     for prop in [ON_UPDATE_EXPRESSION, INVISIBLE] {
@@ -1176,6 +1246,66 @@ fn keep_attributes(old: &ColumnDef, new: &ColumnDef) -> ColumnDef {
         }
     }
     out
+}
+
+/// The SQL expressions of `t` other than its checks, each with what it belongs to: generated
+/// columns, expression defaults and expression keys.
+fn expressions(t: &TableDef) -> Vec<(String, &str)> {
+    let mut out = Vec::new();
+    for c in &t.columns {
+        if let Some(generated) = &c.generated {
+            out.push((
+                format!("generated column {}", c.name),
+                generated.expression.as_str(),
+            ));
+        } else if let Some(default) = c.default.as_deref() {
+            out.push((format!("the default of column {}", c.name), default));
+        }
+    }
+    for idx in &t.indexes {
+        for part in idx.columns.iter().filter(|p| p.is_expression) {
+            out.push((format!("index {}", idx.name), part.name.as_str()));
+        }
+    }
+    out
+}
+
+/// `true` when a check, a generated column, an expression default or an expression key of `t`
+/// uses `column`.
+fn depends_on(t: &TableDef, column: &str) -> bool {
+    t.checks.iter().any(|c| uses_column(&c.expression, column))
+        || expressions(t)
+            .iter()
+            .any(|(_, expr)| uses_column(expr, column))
+}
+
+/// An error when an expression of the new definition still names a renamed column by its old
+/// name (expressions are not rewritten by renames; the server would refuse the rename or the
+/// expression).
+fn stale_references(new: &TableDef, renames: &[Rename]) -> Result<()> {
+    for r in renames.iter().filter(|r| {
+        r.kind == ObjectKind::Column
+            && r.old != r.new
+            && new.column(&r.old).is_none()
+            && new.column(&r.new).is_some()
+    }) {
+        let checks = new.checks.iter().map(|c| {
+            (
+                format!("check {}", label(c.name.as_deref())),
+                c.expression.as_str(),
+            )
+        });
+        if let Some((what, _)) = checks
+            .chain(expressions(new))
+            .find(|(_, expr)| uses_column(expr, &r.old))
+        {
+            return Err(Error::invalid_input(format!(
+                "{what} still uses column {}, which is renamed to {}: change the expression too",
+                r.old, r.new
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn same_pk(old: Option<&PrimaryKeyDef>, new: Option<&PrimaryKeyDef>) -> bool {

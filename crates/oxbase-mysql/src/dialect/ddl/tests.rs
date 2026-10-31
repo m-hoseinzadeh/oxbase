@@ -411,6 +411,104 @@ fn alter_keeps_attributes_and_moves_columns() {
 }
 
 #[test]
+fn removed_attributes_stay_removed() {
+    // An explicit NULL removes ON UPDATE and the character set (with its collation).
+    let old = table();
+    let mut new = old.clone();
+    new.columns[3]
+        .extras
+        .insert(ON_UPDATE_EXPRESSION, Value::Null);
+    new.columns[1].collation = None;
+    new.columns[1].extras.insert(props::CHARSET, Value::Null);
+    let script = alter(mysql(), "8.4.6", &old, &new, &[]).unwrap();
+    assert_eq!(
+        sqls(&script),
+        ["ALTER TABLE `db`.`order`\n  \
+             MODIFY COLUMN `select` varchar(20) NOT NULL DEFAULT 'it''s a \\\\ \"q\"' COMMENT \
+             'ünï ''c'' \\\\',\n  \
+             MODIFY COLUMN `at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP"]
+    );
+
+    // Another character set does not keep the old collation.
+    let mut new = old.clone();
+    new.columns[1].collation = None;
+    new.columns[1].extras.insert(props::CHARSET, "latin1");
+    let script = alter(mysql(), "8.4.6", &old, &new, &[]).unwrap();
+    assert!(
+        sqls(&script)[0].contains("varchar(20) CHARACTER SET latin1 NOT NULL"),
+        "{script}"
+    );
+}
+
+#[test]
+fn foreign_keys_keep_the_chosen_action() {
+    let old = table();
+    let mut new = old.clone();
+    new.foreign_keys[0].on_delete = FkAction::Restrict;
+    new.foreign_keys[0].on_update = FkAction::Restrict;
+    new.foreign_keys[0].ref_columns = vec!["code".into()];
+    let script = alter(mysql(), "8.4.6", &old, &new, &[]).unwrap();
+    assert_eq!(
+        sqls(&script)[1],
+        "ALTER TABLE `db`.`order`\n  ADD CONSTRAINT `fk_parent` FOREIGN KEY (`parent`) REFERENCES \
+         `db`.`parent` (`code`) ON DELETE RESTRICT ON UPDATE RESTRICT"
+    );
+}
+
+#[test]
+fn renames_of_columns_that_expressions_use() {
+    let old = table();
+    // `amount` is used by the check and the generated column; both change with the rename. The
+    // check is dropped first, then one statement renames the column and redefines the rest.
+    let renames = [
+        Rename::new(ObjectKind::Column, "amount", "qty"),
+        Rename::new(ObjectKind::Column, "parent", "parent_id"),
+    ];
+    let mut new = apply_renames(&old, &renames, true);
+    new.checks[0].expression = "qty >= 0".into();
+    new.columns[4].generated = Some(GeneratedColumn {
+        expression: "qty * 2".into(),
+        stored: true,
+    });
+    let script = alter(mysql(), "8.4.6", &old, &new, &renames).unwrap();
+    assert_eq!(
+        sqls(&script),
+        [
+            "ALTER TABLE `db`.`order`\n  DROP CHECK `chk_amount`",
+            "ALTER TABLE `db`.`order`\n  \
+             CHANGE COLUMN `amount` `qty` decimal(12,2) NULL DEFAULT '0',\n  \
+             MODIFY COLUMN `total` decimal(13,2) GENERATED ALWAYS AS (qty * 2) STORED NULL,\n  \
+             CHANGE COLUMN `parent` `parent_id` int NULL,\n  \
+             ADD CONSTRAINT `chk_amount` CHECK (qty >= 0)",
+        ]
+    );
+    assert_eq!(
+        script.steps[1].description,
+        "Alter table order: rename column amount to qty, modify column total, rename column \
+         parent to parent_id, add check chk_amount"
+    );
+
+    // An expression left on the old name is refused before anything runs.
+    let mut stale = new.clone();
+    stale.checks[0].expression = "`Amount` >= 0".into();
+    let err = alter(mysql(), "8.4.6", &old, &stale, &renames).unwrap_err();
+    assert!(
+        matches!(&err, Error::InvalidInput { message } if message.contains("check chk_amount")),
+        "{err}"
+    );
+    let mut stale = new;
+    stale.columns[4].generated = Some(GeneratedColumn {
+        expression: "amount * 2".into(),
+        stored: true,
+    });
+    let err = alter(mariadb(), "11.8.9-MariaDB", &old, &stale, &renames).unwrap_err();
+    assert!(
+        matches!(&err, Error::InvalidInput { message } if message.contains("generated column total")),
+        "{err}"
+    );
+}
+
+#[test]
 fn renames_on_old_servers_and_tables() {
     let old = table();
     let renames = [

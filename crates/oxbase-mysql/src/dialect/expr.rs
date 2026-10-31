@@ -77,6 +77,46 @@ pub(crate) fn render(tokens: &[Tok]) -> String {
     out
 }
 
+/// `text` as valid SQL. MySQL prints some catalog expressions (`CHECK_CONSTRAINTS.CHECK_CLAUSE`,
+/// `COLUMNS.GENERATION_EXPRESSION`, an expression `COLUMN_DEFAULT`, `STATISTICS.EXPRESSION`) with
+/// every quote backslash-escaped (`` (`s` <> _utf8mb4\'x\') ``), which cannot be written back
+/// into a statement. Such text is unescaped once; text that already reads as SQL (no backslash
+/// outside a string literal) is returned unchanged.
+pub(crate) fn catalog_sql(text: String) -> String {
+    if tokenize(&text).is_some() {
+        return text;
+    }
+    let unescaped = unescape_once(&text);
+    if tokenize(&unescaped).is_some() {
+        unescaped
+    } else {
+        text
+    }
+}
+
+/// Keywords that are never read as a column name by [`uses_column`].
+const NOT_COLUMNS: [&str; 22] = [
+    "and", "or", "xor", "not", "is", "null", "in", "like", "between", "true", "false", "div",
+    "mod", "case", "when", "then", "else", "end", "regexp", "rlike", "binary", "interval",
+];
+
+/// `true` when `expr` mentions column `column` (case-insensitive, quoted or not, maybe qualified
+/// `t.column`), outside string literals and not as a function name.
+pub(crate) fn uses_column(expr: &str, column: &str) -> bool {
+    let name = column.to_lowercase();
+    if name.is_empty() || NOT_COLUMNS.contains(&name.as_str()) {
+        return false;
+    }
+    let qualified = format!(".{name}");
+    let tokens = tokenize(expr)
+        .or_else(|| tokenize(&unescape_once(expr)))
+        .unwrap_or_default();
+    tokens.iter().enumerate().any(|(pos, tok)| {
+        matches!(tok, Tok::Word(w) if *w == name || w.ends_with(&qualified))
+            && tokens.get(pos + 1) != Some(&Tok::Open)
+    })
+}
+
 /// `\X` → `X` everywhere (one level of backslash escaping).
 fn unescape_once(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
@@ -443,5 +483,41 @@ mod tests {
         // Unbalanced input does not loop or panic.
         assert_eq!(canonical("((a"), "( ( a");
         assert_eq!(canonical("a)"), "a )");
+    }
+
+    #[test]
+    fn catalog_text_is_unescaped_once() {
+        // MySQL's CHECK_CLAUSE / GENERATION_EXPRESSION / COLUMN_DEFAULT spellings.
+        assert_eq!(
+            catalog_sql("(`s` <> _utf8mb4\\'x\\')".into()),
+            "(`s` <> _utf8mb4'x')"
+        );
+        assert_eq!(
+            catalog_sql("concat(`s`,_utf8mb4\\'it\\\\\\'s\\')".into()),
+            "concat(`s`,_utf8mb4'it\\'s')"
+        );
+        assert_eq!(catalog_sql("_utf8mb4\\'{}\\'".into()), "_utf8mb4'{}'");
+        // Valid SQL is kept as it is, backslashes inside strings included.
+        for text in ["(`qty` >= 0)", "`s` <> 'a\\\\b'", "'it\\'s'", ""] {
+            assert_eq!(catalog_sql(text.into()), text);
+        }
+        same(
+            &catalog_sql("(`s` <> _utf8mb4\\'x\\')".into()),
+            "(`s` <> _utf8mb4\\'x\\')",
+        );
+    }
+
+    #[test]
+    fn column_references() {
+        assert!(uses_column("qty >= 0", "qty"));
+        assert!(uses_column("(`Qty` >= 0)", "qty"));
+        assert!(uses_column("t.qty * 2", "QTY"));
+        assert!(uses_column("(`s` <> _utf8mb4\\'x\\')", "s"));
+        assert!(uses_column("`a b` + 1", "a b"));
+        assert!(!uses_column("note <> 'qty'", "qty"));
+        assert!(!uses_column("qty2 > 0", "qty"));
+        assert!(!uses_column("abs(x) > 0", "abs"));
+        assert!(!uses_column("a > 0 and b > 0", "and"));
+        assert!(!uses_column("", "qty"));
     }
 }

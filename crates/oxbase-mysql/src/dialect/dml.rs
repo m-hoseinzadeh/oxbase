@@ -13,13 +13,19 @@
 //! - An `UPDATE` reports *matched* rows because the driver sets `CLIENT_FOUND_ROWS`, so writing a
 //!   value a row already has still counts 1 and the edit service's "exactly one row" check holds.
 //! - Values are bound as they come: the server converts text to the column type (dates, decimals,
-//!   JSON, enums), so no placeholder needs a cast.
+//!   JSON, enums), so no placeholder needs a cast. The exception is `BIT(n)`, which reads a
+//!   string as raw bytes (`'5'` would store `0x35`): a value for a `BIT` column (to write or in a
+//!   key) is turned into an unsigned integer first, from a number, `true` / `false`, decimal text,
+//!   `0x...` / `x'...'` hex or `0b...` / `b'...'` binary text; bytes are bound as they are (the
+//!   bits themselves). Anything else is `InvalidInput`.
 
 use oxbase_dialect::sql::SqlWriter;
 use oxbase_dialect::{
     BacktickQuoting, DmlPlan, DmlTarget, DmlWriter, write_column_list, write_key_predicate,
 };
-use oxbase_types::{BoundStatement, ColumnValue, Error, Result, RowEdit, TableDef, Value};
+use oxbase_types::{
+    BoundStatement, ColumnDef, ColumnValue, DataType, Error, Result, RowEdit, TableDef, Value,
+};
 
 use super::caps::Features;
 
@@ -46,6 +52,7 @@ impl DmlWriter for MySqlDmlWriter {
         match edit {
             RowEdit::Insert { values } => {
                 check_writable(table, values)?;
+                let values = &bindable_values(table, values)?;
                 let mut w = SqlWriter::new(&q);
                 w.push("INSERT INTO ").qualified(&table.obj).push(" (");
                 let columns: Vec<String> = values.iter().map(|v| v.column.clone()).collect();
@@ -76,6 +83,8 @@ impl DmlWriter for MySqlDmlWriter {
             }
             RowEdit::Update { key, changes } => {
                 check_writable(table, changes)?;
+                let changes = &bindable_values(table, changes)?;
+                let key = &bindable_key(table, target, key)?;
                 let mut w = SqlWriter::new(&q);
                 w.push("UPDATE ").qualified(&table.obj).push(" SET ");
                 for (pos, change) in changes.iter().enumerate() {
@@ -115,6 +124,7 @@ impl DmlWriter for MySqlDmlWriter {
                 })
             }
             RowEdit::Delete { key } => {
+                let key = &bindable_key(table, target, key)?;
                 let mut w = SqlWriter::new(&q);
                 w.push("DELETE FROM ").qualified(&table.obj).push(" WHERE ");
                 write_key_predicate(&mut w, target.key, key)?;
@@ -122,6 +132,98 @@ impl DmlWriter for MySqlDmlWriter {
             }
         }
     }
+}
+
+/// `true` for a `BIT(n)` column.
+fn is_bit(column: &ColumnDef) -> bool {
+    let native = column.native_type.trim();
+    let head = native.split(['(', ' ']).next().unwrap_or_default();
+    matches!(&column.data_type, DataType::Other { name } if name.eq_ignore_ascii_case("bit"))
+        || head.eq_ignore_ascii_case("bit")
+}
+
+/// The value bound for `column`: a `BIT` column's value as an unsigned integer (see the module
+/// docs), anything else as it is.
+fn bindable(column: Option<&ColumnDef>, value: &Value) -> Result<Value> {
+    let Some(column) = column.filter(|c| is_bit(c)) else {
+        return Ok(value.clone());
+    };
+    let bad = |shown: &str| {
+        let shown: String = shown.chars().take(40).collect();
+        Error::invalid_input(format!(
+            "column '{}': '{shown}' is not a bit value (a number, 0x... hex or 0b... binary)",
+            column.name
+        ))
+    };
+    Ok(match value {
+        Value::Null | Value::UInt(_) | Value::Bytes(_) => value.clone(),
+        Value::Bool(b) => Value::UInt(u64::from(*b)),
+        Value::Int(i) => Value::UInt(u64::try_from(*i).map_err(|_| bad(&i.to_string()))?),
+        Value::Text(text) | Value::Decimal(text) => {
+            Value::UInt(parse_bits(text).ok_or_else(|| bad(text))?)
+        }
+        other => return Err(bad(&format!("{other:?}"))),
+    })
+}
+
+/// A bit value written as text: decimal, `0x..` / `x'..'` hex, `0b..` / `b'..'` binary,
+/// `true` / `false`.
+fn parse_bits(text: &str) -> Option<u64> {
+    let t = text.trim();
+    let lower = t.to_ascii_lowercase();
+    let quoted = |prefix: &str| {
+        lower
+            .strip_prefix(prefix)
+            .and_then(|rest| rest.strip_suffix('\''))
+            .map(str::to_owned)
+    };
+    let (digits, radix) = if let Some(hex) = lower.strip_prefix("0x") {
+        (hex.to_owned(), 16)
+    } else if let Some(hex) = quoted("x'") {
+        (hex, 16)
+    } else if let Some(bin) = lower.strip_prefix("0b") {
+        (bin.to_owned(), 2)
+    } else if let Some(bin) = quoted("b'") {
+        (bin, 2)
+    } else {
+        match lower.as_str() {
+            "true" => return Some(1),
+            "false" => return Some(0),
+            _ => (lower.clone(), 10),
+        }
+    };
+    if digits.is_empty() || !digits.chars().all(|c| c.is_digit(radix)) {
+        return None;
+    }
+    u64::from_str_radix(&digits, radix).ok()
+}
+
+/// `values` with each value [`bindable`] for its column.
+fn bindable_values(table: &TableDef, values: &[ColumnValue]) -> Result<Vec<ColumnValue>> {
+    values
+        .iter()
+        .map(|v| {
+            Ok(ColumnValue {
+                column: v.column.clone(),
+                value: bindable(table.column(&v.column), &v.value)?,
+            })
+        })
+        .collect()
+}
+
+/// The key values [`bindable`] for the key columns (in key order).
+fn bindable_key(table: &TableDef, target: &DmlTarget<'_>, key: &[Value]) -> Result<Vec<Value>> {
+    if key.len() != target.key.columns.len() {
+        // `write_key_predicate` reports the mismatch.
+        return Ok(key.to_vec());
+    }
+    target
+        .key
+        .columns
+        .iter()
+        .zip(key)
+        .map(|(column, value)| bindable(table.column(column), value))
+        .collect()
 }
 
 /// Every column exists, is named once and is not generated.
@@ -205,10 +307,7 @@ fn select_by_key(target: &DmlTarget<'_>, key: &[Value]) -> Result<BoundStatement
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oxbase_types::{
-        ColumnDef, DataType, GeneratedColumn, KeyKind, ObjectRef, PrimaryKeyDef, RowKey,
-        ServerVersion,
-    };
+    use oxbase_types::{GeneratedColumn, KeyKind, ObjectRef, PrimaryKeyDef, RowKey, ServerVersion};
 
     fn table() -> TableDef {
         let mut t = TableDef::new(ObjectRef::table(Some("db"), None, "order"));
@@ -406,6 +505,89 @@ mod tests {
         assert_eq!(p.write.sql, "DELETE FROM `db`.`order` WHERE `id` = ?");
         assert_eq!(p.write.params, [Value::Int(3)]);
         assert!(!p.returning && p.read_back.is_none());
+    }
+
+    #[test]
+    fn bit_values_are_bound_as_numbers() {
+        let mut t = table();
+        let mut bits = ColumnDef::new("b", DataType::Other { name: "bit".into() });
+        bits.native_type = "bit(8)".into();
+        t.columns.push(bits);
+        let v = ServerVersion::parse("8.4.6").unwrap();
+        let by_bits = RowKey::new(pk().table, KeyKind::Unique, vec!["b".into()]);
+        let plan = |key: &RowKey, edit: &RowEdit| {
+            MySqlDmlWriter { mariadb: false }.plan(
+                edit,
+                &DmlTarget {
+                    table: &t,
+                    key,
+                    version: &v,
+                    read_back: &[],
+                },
+            )
+        };
+        for (text, want) in [
+            ("5", 5),
+            (" 255 ", 255),
+            ("0x0F", 15),
+            ("x'ff'", 255),
+            ("0b101", 5),
+            ("B'11'", 3),
+            ("true", 1),
+            ("18446744073709551615", u64::MAX),
+        ] {
+            let edit = RowEdit::Insert {
+                values: vec![ColumnValue::new("b", text), ColumnValue::new("co`de", "5")],
+            };
+            let p = plan(&pk(), &edit).unwrap();
+            assert_eq!(
+                p.write.sql,
+                "INSERT INTO `db`.`order` (`b`, `co``de`) VALUES (?, ?)"
+            );
+            // Only the BIT column's text becomes a number.
+            assert_eq!(
+                p.write.params,
+                [Value::UInt(want), Value::Text("5".into())],
+                "{text}"
+            );
+        }
+        let edit = RowEdit::Update {
+            key: vec![Value::Text("3".into())],
+            changes: vec![
+                ColumnValue::new("b", Value::Int(7)),
+                ColumnValue::new("amount", Value::Null),
+            ],
+        };
+        let p = plan(&by_bits, &edit).unwrap();
+        assert_eq!(
+            p.write.params,
+            [Value::UInt(7), Value::Null, Value::UInt(3)]
+        );
+        let p = plan(
+            &by_bits,
+            &RowEdit::Delete {
+                key: vec![Value::Bytes(vec![0x80])],
+            },
+        )
+        .unwrap();
+        assert_eq!(p.write.params, [Value::Bytes(vec![0x80])]);
+        for bad in [
+            Value::Text("abc".into()),
+            Value::Text("0x".into()),
+            Value::Text("1.5".into()),
+            Value::Text("18446744073709551616".into()),
+            Value::Int(-1),
+            Value::Float(1.0),
+        ] {
+            let edit = RowEdit::Update {
+                key: vec![Value::Int(1)],
+                changes: vec![ColumnValue::new("b", bad.clone())],
+            };
+            assert!(
+                matches!(plan(&pk(), &edit), Err(Error::InvalidInput { .. })),
+                "{bad:?}"
+            );
+        }
     }
 
     #[test]

@@ -4,6 +4,8 @@
 use oxbase_dialect::{BacktickQuoting, Quoting};
 use oxbase_types::{ColumnDef, DataType, Error, Result, ServerVersion};
 
+use super::coltype::quoted_list;
+
 /// The type text for `col` in a column definition.
 ///
 /// The column's `native_type` when it is set (engine-native text from the model), else one
@@ -276,15 +278,61 @@ fn lob_rank(native: &str) -> Option<(bool, u8)> {
     Some(rank)
 }
 
+/// Narrowing decided by the canonical native types alone (integers by their real width,
+/// `MEDIUMINT` being 24 bits; `BIT` widths; `SET` members), `None` when they do not say.
+fn native_narrowing(old: &str, new: &str) -> Option<bool> {
+    let head = |ty: &str| ty.split(['(', ' ']).next().unwrap_or_default().to_owned();
+    let unsigned = |ty: &str| ty.split_whitespace().any(|word| word == "unsigned");
+    let int_bits = |ty: &str| match head(ty).as_str() {
+        "tinyint" if !ty.starts_with("tinyint(1)") => Some(8u8),
+        "smallint" => Some(16),
+        "mediumint" => Some(24),
+        "int" => Some(32),
+        "bigint" => Some(64),
+        _ => None,
+    };
+    if let (Some(old_bits), Some(new_bits)) = (int_bits(old), int_bits(new)) {
+        let (old_unsigned, new_unsigned) = (unsigned(old), unsigned(new));
+        let safe = (old_unsigned == new_unsigned && new_bits >= old_bits)
+            || (old_unsigned && !new_unsigned && new_bits > old_bits);
+        return Some(!safe);
+    }
+    let width = |ty: &str| {
+        ty.strip_prefix("bit(")
+            .and_then(|rest| rest.split(')').next())
+            .and_then(|digits| digits.parse::<u32>().ok())
+    };
+    if head(old) == "bit" && head(new) == "bit" {
+        return Some(match (width(old), width(new)) {
+            (Some(before), Some(after)) => after < before,
+            _ => true,
+        });
+    }
+    if head(old) == "set" && head(new) == "set" {
+        let (before, after) = (quoted_list(old), quoted_list(new));
+        return Some(!before.iter().all(|label| after.contains(label)));
+    }
+    None
+}
+
 /// `true` when changing `old`'s type to `new`'s can lose or reject data (a narrowing or a change
 /// of kind). Same type, more length, more precision, a wider integer and the like are safe.
 pub(crate) fn is_narrowing(old: &ColumnDef, new: &ColumnDef) -> bool {
     use DataType as T;
-    if !old.native_type.is_empty()
-        && !new.native_type.is_empty()
-        && canonical_type(&old.native_type) == canonical_type(&new.native_type)
-    {
-        return false;
+    let natives =
+        (!old.native_type.trim().is_empty() && !new.native_type.trim().is_empty()).then(|| {
+            (
+                canonical_type(&old.native_type),
+                canonical_type(&new.native_type),
+            )
+        });
+    if let Some((before, after)) = &natives {
+        if before == after {
+            return false;
+        }
+        if let Some(narrowing) = native_narrowing(before, after) {
+            return narrowing;
+        }
     }
     if let (Some(a), Some(b)) = (lob_rank(&old.native_type), lob_rank(&new.native_type)) {
         return a.0 != b.0 || b.1 < a.1;
@@ -295,7 +343,11 @@ pub(crate) fn is_narrowing(old: &ColumnDef, new: &ColumnDef) -> bool {
         (Some(a), Some(b)) => b >= a,
     };
     match (&old.data_type, &new.data_type) {
-        (a, b) if a == b => false,
+        // Same neutral type, different native text (checked above): `int` → `mediumint`,
+        // another `set` or `bit` width and the like are treated as narrowing.
+        (a, b) if a == b => natives.is_some(),
+        // DATETIME → TIMESTAMP (and DATE → TIMESTAMP): TIMESTAMP only holds 1970 to 2038.
+        (T::Timestamp { .. } | T::Date, T::TimestampTz { .. }) => true,
         (
             T::Int {
                 bits: b1,
@@ -308,7 +360,7 @@ pub(crate) fn is_narrowing(old: &ColumnDef, new: &ColumnDef) -> bool {
         ) => !((u1 == u2 && b2 >= b1) || (*u1 && !*u2 && b2 > b1)),
         (T::Bool, T::Int { .. })
         | (T::Char { .. } | T::VarChar { .. } | T::Enum { .. }, T::Text)
-        | (T::Date, T::Timestamp { .. } | T::TimestampTz { .. }) => false,
+        | (T::Date, T::Timestamp { .. }) => false,
         (T::Int { bits, .. }, T::Float { bits: 64 }) => *bits > 32,
         (T::Float { bits: b1 }, T::Float { bits: b2 }) => b2 < b1,
         (
@@ -496,5 +548,47 @@ mod tests {
         assert!(is_narrowing(&d2, &d1));
         assert!(is_narrowing(&v20, &int));
         assert!(!is_narrowing(&int, &col("int(11)", DataType::INT32)));
+
+        // Same neutral type, narrower native type.
+        let medium = col("mediumint", DataType::INT32);
+        assert!(is_narrowing(&int, &medium));
+        assert!(!is_narrowing(&medium, &int));
+        let unsigned_medium = col(
+            "mediumint unsigned",
+            DataType::Int {
+                bits: 32,
+                unsigned: true,
+            },
+        );
+        assert!(!is_narrowing(&unsigned_medium, &int));
+        assert!(is_narrowing(&medium, &unsigned_medium));
+        let other = |native: &str, name: &str| col(native, DataType::Other { name: name.into() });
+        assert!(is_narrowing(
+            &other("bit(16)", "bit"),
+            &other("bit(8)", "bit")
+        ));
+        assert!(!is_narrowing(
+            &other("bit(8)", "bit"),
+            &other("bit(16)", "bit")
+        ));
+        let abc = other("set('a','b','c')", "set");
+        let ab = other("set('a','b')", "set");
+        assert!(is_narrowing(&abc, &ab));
+        assert!(!is_narrowing(&ab, &abc));
+        assert!(is_narrowing(
+            &other("geometry", "geometry"),
+            &other("point", "point")
+        ));
+        assert!(is_narrowing(
+            &other("year", "year"),
+            &other("polygon", "year")
+        ));
+        // DATETIME → TIMESTAMP loses the range outside 1970-2038.
+        let datetime = col("datetime", DataType::Timestamp { precision: None });
+        let timestamp = col("timestamp", DataType::TimestampTz { precision: None });
+        assert!(is_narrowing(&datetime, &timestamp));
+        assert!(!is_narrowing(&timestamp, &datetime));
+        assert!(is_narrowing(&col("date", DataType::Date), &timestamp));
+        assert!(!is_narrowing(&col("date", DataType::Date), &datetime));
     }
 }
