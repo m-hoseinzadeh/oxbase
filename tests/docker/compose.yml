@@ -1,0 +1,251 @@
+# oxbase test-database fixtures.
+#
+# Source of truth for images, ports and credentials: tests/fixtures.toml. Keep this file in sync
+# with it. Credentials are TEST-ONLY.
+#
+# Use the wrappers instead of calling compose directly:
+#   scripts/fixtures-up.sh       start + wait until every engine is healthy and seeded
+#   scripts/fixtures-status.sh   show container / health status
+#   scripts/fixtures-down.sh     stop and delete this project's containers and volumes
+#
+# Every engine is seeded with the same small "oxbase_test" schema (see tests/docker/init/<engine>/).
+# A service only reports "healthy" once its seed has finished, so `up --wait` returning means
+# the fixtures are ready for the conformance harness.
+#
+# Memory: limits sum to ~6.1 GiB (mssql alone needs >= 2 GiB) so the stack fits next to other
+# workloads on a 15 GB machine.
+
+name: oxbase-fixtures
+
+x-common: &common
+  restart: "no"
+  stop_grace_period: 20s
+  labels:
+    dev.oxbase.fixtures: "true"
+
+services:
+  postgres:
+    <<: *common
+    image: postgres:18.6-alpine
+    container_name: oxbase-fixtures-postgres
+    environment:
+      POSTGRES_USER: oxbase
+      POSTGRES_PASSWORD: Oxbase_Fixture_Pw_2026
+      POSTGRES_DB: oxbase_test
+    ports:
+      - "127.0.0.1:15432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql
+      - ./init/postgres:/docker-entrypoint-initdb.d:ro
+    # The init-phase server listens on the unix socket only, so a TCP probe stays red until the
+    # seed scripts have run and the real server is up.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 5432 -U oxbase -d oxbase_test"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+      start_period: 120s
+      start_interval: 1s
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+
+  mysql:
+    <<: *common
+    image: mysql:8.4.13
+    container_name: oxbase-fixtures-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: Oxbase_Fixture_Pw_2026
+      MYSQL_DATABASE: oxbase_test
+      MYSQL_USER: oxbase
+      MYSQL_PASSWORD: Oxbase_Fixture_Pw_2026
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_0900_ai_ci
+      - --innodb-buffer-pool-size=128M
+      - --log-bin-trust-function-creators=1
+    ports:
+      - "127.0.0.1:15406:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./init/mysql:/docker-entrypoint-initdb.d:ro
+    # The init-phase server runs with skip-networking, so a TCP ping only succeeds once the seed
+    # has finished and the real server is listening.
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -P 3306 -uroot -pOxbase_Fixture_Pw_2026 --silent"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+      start_period: 120s
+      start_interval: 1s
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+
+  mariadb:
+    <<: *common
+    image: mariadb:11.8.9
+    container_name: oxbase-fixtures-mariadb
+    environment:
+      MARIADB_ROOT_PASSWORD: Oxbase_Fixture_Pw_2026
+      MARIADB_DATABASE: oxbase_test
+      MARIADB_USER: oxbase
+      MARIADB_PASSWORD: Oxbase_Fixture_Pw_2026
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --innodb-buffer-pool-size=128M
+    ports:
+      - "127.0.0.1:15407:3306"
+    volumes:
+      - mariadb-data:/var/lib/mysql
+      - ./init/mariadb:/docker-entrypoint-initdb.d:ro
+    # healthcheck.sh ships with the image; --connect only passes after init (networking on).
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+      start_period: 120s
+      start_interval: 1s
+    deploy:
+      resources:
+        limits:
+          memory: 768m
+
+  mssql:
+    <<: *common
+    image: mcr.microsoft.com/mssql/server:2025-CU10-ubuntu-24.04
+    # The image is published for linux/amd64 only. On Apple Silicon, Docker Desktop runs it under
+    # emulation: enable "Use Rosetta for x86_64/amd64 emulation on Apple Silicon" in its settings.
+    platform: linux/amd64
+    container_name: oxbase-fixtures-mssql
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_PID: Developer
+      MSSQL_SA_PASSWORD: Oxbase_Fixture_Pw_2026
+      MSSQL_MEMORY_LIMIT_MB: "2048"
+      # sqlcmd location for this image (mssql-tools18; older 2019 images used /opt/mssql-tools).
+      OXBASE_SQLCMD: /opt/mssql-tools18/bin/sqlcmd
+    # The image has no init-script hook: the wrapper starts sqlservr, applies init/mssql/*.sql
+    # once (rebuilding oxbase_test if an earlier seed did not finish), then marks the container as
+    # seeded.
+    entrypoint: ["/bin/bash", "/oxbase-init/entrypoint.sh"]
+    ports:
+      - "127.0.0.1:15433:1433"
+    volumes:
+      - mssql-data:/var/opt/mssql
+      - ./init/mssql:/oxbase-init:ro
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          test -f /tmp/oxbase-fixture-seeded &&
+          /opt/mssql-tools18/bin/sqlcmd -C -S 127.0.0.1 -U sa -P Oxbase_Fixture_Pw_2026
+          -d oxbase_test -b -h -1 -Q "SET NOCOUNT ON; SELECT 1"
+      interval: 5s
+      timeout: 10s
+      retries: 30
+      start_period: 120s
+      start_interval: 2s
+    deploy:
+      resources:
+        limits:
+          memory: 2560m
+
+  mongodb:
+    <<: *common
+    image: mongo:8.0.34
+    container_name: oxbase-fixtures-mongodb
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: oxbase
+      MONGO_INITDB_ROOT_PASSWORD: Oxbase_Fixture_Pw_2026
+      MONGO_INITDB_DATABASE: oxbase_test
+    command: ["mongod", "--wiredTigerCacheSizeGB", "0.25"]
+    ports:
+      - "127.0.0.1:15417:27017"
+    volumes:
+      - mongodb-data:/data/db
+      - mongodb-config:/data/configdb
+      - ./init/mongodb:/docker-entrypoint-initdb.d:ro
+    # The init-phase mongod also listens on 127.0.0.1:27017, so a plain ping would go green too
+    # early. Require the final server (--bind_ip_all, reported as
+    # net.bindIp "*") and the seed's completion marker.
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          mongosh --quiet --host 127.0.0.1 --port 27017 -u oxbase -p Oxbase_Fixture_Pw_2026
+          --authenticationDatabase admin --eval
+          'const o = db.adminCommand({getCmdLineOpts: 1}).parsed;
+          const ok = db.adminCommand({ping: 1}).ok === 1
+          && o.net && (o.net.bindIpAll === true || o.net.bindIp === "*")
+          && db.getSiblingDB("oxbase_test").fixture_meta.countDocuments({_id: "seed"}) === 1;
+          if (!ok) quit(1);'
+      interval: 3s
+      timeout: 10s
+      retries: 40
+      start_period: 120s
+      start_interval: 1s
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+
+  redis:
+    <<: *common
+    image: redis:8.10.3-alpine
+    container_name: oxbase-fixtures-redis
+    environment:
+      OXBASE_REDIS_PASSWORD: Oxbase_Fixture_Pw_2026
+    # The image has no init-script hook: the wrapper starts redis-server, loads the seed once
+    # (when the marker key is absent), and forwards stop signals.
+    entrypoint: ["/bin/sh", "/oxbase-init/entrypoint.sh"]
+    command:
+      - redis-server
+      - --requirepass
+      - Oxbase_Fixture_Pw_2026
+      - --appendonly
+      - "yes"
+      - --maxmemory
+      - 128mb
+      - --maxmemory-policy
+      - noeviction
+    ports:
+      - "127.0.0.1:15479:6379"
+    volumes:
+      - redis-data:/data
+      - ./init/redis:/oxbase-init:ro
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          redis-cli --no-auth-warning -a Oxbase_Fixture_Pw_2026 ping | grep -q PONG &&
+          [ "$$(redis-cli --no-auth-warning -a Oxbase_Fixture_Pw_2026 EXISTS oxbase_test:fixture:seeded)" = "1" ]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+      start_period: 60s
+      start_interval: 1s
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+
+volumes:
+  postgres-data:
+    name: oxbase-fixtures-postgres-data
+  mysql-data:
+    name: oxbase-fixtures-mysql-data
+  mariadb-data:
+    name: oxbase-fixtures-mariadb-data
+  mssql-data:
+    name: oxbase-fixtures-mssql-data
+  mongodb-data:
+    name: oxbase-fixtures-mongodb-data
+  mongodb-config:
+    name: oxbase-fixtures-mongodb-config
+  redis-data:
+    name: oxbase-fixtures-redis-data

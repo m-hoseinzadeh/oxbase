@@ -1,0 +1,16 @@
+[package]
+name = "oxbase-insight"
+description = "oxbase: Code insight engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+
+[dev-dependencies]

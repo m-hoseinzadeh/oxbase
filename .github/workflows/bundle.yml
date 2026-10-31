@@ -1,0 +1,208 @@
+name: Bundle
+
+# Dev bundles of the Tauri desktop app for Linux, macOS and Windows, uploaded as
+# workflow artifacts (no GitHub release is created).
+#
+# Signing secrets (missing ones are skipped by the build itself):
+#   macOS signing      APPLE_CERTIFICATE (base64 .p12), APPLE_CERTIFICATE_PASSWORD,
+#                      APPLE_SIGNING_IDENTITY (optional; derived from the cert by Tauri)
+#   macOS notarization APPLE_ID, APPLE_PASSWORD (app-specific password), APPLE_TEAM_ID
+#   Windows signing    WINDOWS_CERTIFICATE (base64 .pfx), WINDOWS_CERTIFICATE_PASSWORD
+#   Updater signatures TAURI_SIGNING_PRIVATE_KEY, TAURI_SIGNING_PRIVATE_KEY_PASSWORD
+# Without an Apple certificate, macOS bundles are ad-hoc signed ("-").
+#
+# Signing is OPT-IN until the project has Apple/Windows signing certificates.
+# When enforced, scripts/ci-verify-signing.mjs fails the job before the build when the secrets
+# are missing and after it when a bundle is unsigned, ad-hoc signed, unnotarized or has a
+# broken signature. Enforce it on push to main by setting the repository variable
+# OXBASE_REQUIRE_SIGNING to "true", or on a manual run by ticking `require_signing`.
+# A signature that is present but broken always fails, even when not enforced.
+# Linux has no OS code signing; its bundles are listed with their SHA-256.
+#
+# Secret handling: secrets are passed only through `env:` of the one step that needs
+# them, never written to $GITHUB_ENV. The UI is built in its own step without secrets,
+# and scripts/ci-tauri.mjs (tauri-action's `tauriScript`) drops empty/partial signing
+# variables and skips `beforeBuildCommand`, so vite and its npm plugins never see them.
+# Third-party actions are pinned to commit SHAs (Dependabot updates the pins).
+#
+# Linux bundles are built on ubuntu-24.04, so the AppImage/deb need glibc >= 2.39.
+# That is fine for dev bundles; release bundles should use the oldest supported runner.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      require_signing:
+        description: Fail unless macOS bundles are Developer ID signed + notarized and Windows bundles are Authenticode signed
+        type: boolean
+        default: false
+
+# Superseded runs on other refs are cancelled; every main commit gets its own bundle.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_NET_RETRY: "10"
+  RUSTUP_MAX_RETRIES: "10"
+  NODE_VERSION: "24"
+  PNPM_VERSION: "12.15.0"
+  OXBASE_REQUIRE_SIGNING: ${{ (github.event_name == 'workflow_dispatch' && inputs.require_signing) || (github.event_name != 'workflow_dispatch' && vars.OXBASE_REQUIRE_SIGNING == 'true') }}
+
+jobs:
+  bundle:
+    name: Bundle (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-24.04
+            rust-target: x86_64-unknown-linux-gnu
+            args: ""
+          - name: windows-x86_64
+            os: windows-latest
+            rust-target: x86_64-pc-windows-msvc
+            args: ""
+          - name: macos-aarch64
+            os: macos-latest
+            rust-target: aarch64-apple-darwin
+            args: --target aarch64-apple-darwin
+          - name: macos-x86_64
+            os: macos-latest
+            rust-target: x86_64-apple-darwin
+            args: --target x86_64-apple-darwin
+    env:
+      # Secrets cannot be referenced in `if:`; expose only whether they are set.
+      HAS_WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE != '' && secrets.WINDOWS_CERTIFICATE_PASSWORD != '' }}
+      HAS_APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE != '' && secrets.APPLE_CERTIFICATE_PASSWORD != '' }}
+      HAS_APPLE_NOTARIZATION: ${{ secrets.APPLE_ID != '' && secrets.APPLE_PASSWORD != '' && secrets.APPLE_TEAM_ID != '' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Fails in seconds, not after a 30-minute build, when signing is required but the
+      # secrets for this OS are missing. Reads only the HAS_* flags, never the secrets.
+      - name: Signing preflight
+        run: node scripts/ci-verify-signing.mjs --preflight
+
+      # rustup ships on every GitHub-hosted runner; no third-party action needed.
+      - name: Install Rust toolchain
+        shell: bash
+        env:
+          RUST_TARGET: ${{ matrix.rust-target }}
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update --target "$RUST_TARGET"
+          rustup default stable
+          rustc --version
+
+      - name: Install Tauri Linux system libraries
+        if: runner.os == 'Linux'
+        run: bash scripts/ci-install-linux-deps.sh
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: bundle-${{ matrix.name }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # Keep PNPM_VERSION equal to the pnpm that wrote ui/pnpm-lock.yaml. If ui/package.json
+      # gains a "packageManager" field, it must name the same version (or drop `version:`).
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+        with:
+          version: ${{ env.PNPM_VERSION }}
+          package_json_file: ui/package.json
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+          cache-dependency-path: ui/pnpm-lock.yaml
+
+      - name: Install UI dependencies
+        working-directory: ui
+        run: pnpm install --frozen-lockfile
+
+      # Built here, without secrets in the environment. The Tauri build below runs with
+      # OXBASE_UI_PREBUILT=1, which skips tauri.conf.json's beforeBuildCommand.
+      - name: Build UI
+        working-directory: ui
+        run: pnpm run build
+
+      # ---------------------------------------------------------------- signing (optional)
+
+      # Only the certificate thumbprint (not a secret) leaves this step, through a
+      # tauri.conf.json override file passed as `tauri build --config <file>`.
+      - name: Windows signing - import certificate
+        if: runner.os == 'Windows' && env.HAS_WINDOWS_CERTIFICATE == 'true'
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $pfx = Join-Path $env:RUNNER_TEMP 'oxbase-signing.pfx'
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE))
+          $password = ConvertTo-SecureString -String $env:WINDOWS_CERTIFICATE_PASSWORD -Force -AsPlainText
+          try {
+            # Returns every certificate in the PFX (leaf plus any CA chain).
+            $imported = @(Import-PfxCertificate -FilePath $pfx -CertStoreLocation Cert:\CurrentUser\My -Password $password)
+          } finally {
+            Remove-Item $pfx -ErrorAction SilentlyContinue
+          }
+          # The signing certificate is the one with a private key; prefer the one with the
+          # Code Signing EKU (1.3.6.1.5.5.7.3.3) if the PFX holds several keyed certificates.
+          $keyed = @($imported | Where-Object { $_.HasPrivateKey })
+          $cert = $keyed | Where-Object { $_.EnhancedKeyUsageList.ObjectId -contains '1.3.6.1.5.5.7.3.3' } | Select-Object -First 1
+          if ($null -eq $cert) { $cert = $keyed | Select-Object -First 1 }
+          if ($null -eq $cert) {
+            throw "WINDOWS_CERTIFICATE: none of the $($imported.Count) certificate(s) in the PFX has a private key"
+          }
+          Write-Host "Signing with $($cert.Subject) ($($cert.Thumbprint)); PFX held $($imported.Count) certificate(s)"
+          $override = @{ bundle = @{ windows = @{
+            certificateThumbprint = [string]$cert.Thumbprint
+            digestAlgorithm       = 'sha256'
+            timestampUrl          = 'http://timestamp.digicert.com'
+          } } } | ConvertTo-Json -Depth 5
+          $conf = Join-Path $env:RUNNER_TEMP 'oxbase-windows-signing.json'
+          Set-Content -Path $conf -Value $override -Encoding utf8
+          "OXBASE_SIGNING_ARGS=--config $conf" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      # ---------------------------------------------------------------- build + upload
+
+      - name: Build bundles
+        uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1.0.0
+        env:
+          OXBASE_UI_PREBUILT: "1"
+          TAURI_APP_PATH: ${{ github.workspace }}/crates/app-tauri
+          TAURI_FRONTEND_PATH: ${{ github.workspace }}/ui
+          # Unset secrets arrive empty; scripts/ci-tauri.mjs unsets empty and partial sets
+          # and falls back to ad-hoc signing on macOS.
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          projectPath: .
+          tauriScript: node scripts/ci-tauri.mjs
+          args: ${{ matrix.args }} ${{ env.OXBASE_SIGNING_ARGS }}
+          uploadWorkflowArtifacts: true
+          workflowArtifactNamePattern: oxbase-dev-[platform]-[arch]-[bundle]
+          retryAttempts: 1
+
+      # A green build does not prove the bundles are signed (see the header). Runs without
+      # secrets; checks codesign/spctl/stapler on macOS and Authenticode on Windows.
+      - name: Verify bundle signatures
+        run: node scripts/ci-verify-signing.mjs

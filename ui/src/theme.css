@@ -1,0 +1,160 @@
+/*
+ * oxbase design tokens. Light by default; dark when the OS prefers it.
+ * Components use only these variables, never raw colours.
+ */
+:root {
+  color-scheme: light dark;
+
+  --font-ui: system-ui, -apple-system, "Segoe UI", Roboto, Ubuntu, Cantarell, sans-serif;
+  --font-mono:
+    ui-monospace, "SF Mono", "Cascadia Code", "JetBrains Mono", Menlo, Consolas, monospace;
+  --font-size-ui: 13px;
+
+  --color-bg: #ffffff;
+  --color-bg-subtle: #f4f5f7;
+  --color-bg-muted: #e9ebef;
+  --color-fg: #1d2129;
+  --color-fg-muted: #5c6370;
+  --color-fg-faint: #8a919c;
+  --color-border: #d8dbe1;
+  --color-accent: #2563eb;
+  --color-accent-fg: #ffffff;
+  --color-status-bg: #2563eb;
+  --color-status-fg: #ffffff;
+
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-6: 24px;
+  --status-bar-height: 24px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --color-bg: #1b1d22;
+    --color-bg-subtle: #22252b;
+    --color-bg-muted: #2b2f36;
+    --color-fg: #e3e5e9;
+    --color-fg-muted: #a3a9b4;
+    --color-fg-faint: #6f7682;
+    --color-border: #353a42;
+    --color-accent: #5b8def;
+    --color-accent-fg: #0d1117;
+    --color-status-bg: #2b2f36;
+    --color-status-fg: #c9cdd4;
+  }
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--color-bg);
+  color: var(--color-fg);
+  font-family: var(--font-ui);
+  font-size: var(--font-size-ui);
+  overflow: hidden;
+}
+
+.app {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+.app__workspace {
+  flex: 1;
+  min-height: 0;
+}
+
+/* dockview: keep its structural light theme, drive colours from our tokens. */
+.app .dockview-theme-light {
+  color-scheme: inherit;
+  --dv-group-view-background-color: var(--color-bg);
+  --dv-tabs-and-actions-container-background-color: var(--color-bg-subtle);
+  --dv-activegroup-visiblepanel-tab-background-color: var(--color-bg);
+  --dv-activegroup-hiddenpanel-tab-background-color: var(--color-bg-subtle);
+  --dv-inactivegroup-visiblepanel-tab-background-color: var(--color-bg);
+  --dv-inactivegroup-hiddenpanel-tab-background-color: var(--color-bg-subtle);
+  --dv-tab-divider-color: var(--color-border);
+  --dv-activegroup-visiblepanel-tab-color: var(--color-fg);
+  --dv-activegroup-hiddenpanel-tab-color: var(--color-fg-muted);
+  --dv-inactivegroup-visiblepanel-tab-color: var(--color-fg-muted);
+  --dv-inactivegroup-hiddenpanel-tab-color: var(--color-fg-faint);
+  --dv-separator-border: var(--color-border);
+  --dv-paneview-header-border-color: var(--color-border);
+  --dv-active-sash-color: var(--color-accent);
+  --dv-paneview-active-outline-color: var(--color-accent);
+}
+
+.panel {
+  height: 100%;
+  overflow: auto;
+  padding: var(--space-4);
+  background: var(--color-bg);
+}
+
+.panel--connections {
+  background: var(--color-bg-subtle);
+  padding: var(--space-3);
+}
+
+.panel--welcome h1 {
+  margin: 0 0 var(--space-2);
+  font-size: 20px;
+  font-weight: 600;
+}
+
+.panel--welcome p {
+  margin: 0 0 var(--space-3);
+  color: var(--color-fg-muted);
+}
+
+.welcome__demo {
+  font-family: var(--font-mono);
+}
+
+.empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  text-align: center;
+  color: var(--color-fg-muted);
+}
+
+.empty-state__title {
+  margin: 0 0 var(--space-1);
+  color: var(--color-fg);
+  font-weight: 600;
+}
+
+.empty-state__hint {
+  margin: 0;
+  max-width: 220px;
+  color: var(--color-fg-faint);
+}
+
+.status-bar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-4);
+  height: var(--status-bar-height);
+  padding: 0 var(--space-3);
+  background: var(--color-status-bg);
+  color: var(--color-status-fg);
+  font-size: 12px;
+  flex-shrink: 0;
+}

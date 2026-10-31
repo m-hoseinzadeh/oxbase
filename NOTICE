@@ -1,0 +1,8 @@
+Oxbase
+Copyright 2026 Mohammad Hoseinzadeh and the Oxbase contributors.
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+Oxbase depends on third-party open-source software. Each dependency is
+distributed under its own license, as recorded in Cargo.lock and
+ui/pnpm-lock.yaml, and checked in CI by cargo-deny (see deny.toml).

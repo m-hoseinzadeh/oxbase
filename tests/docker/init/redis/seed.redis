@@ -1,0 +1,22 @@
+# oxbase_test fixture keys (Redis, logical DB 0). Mirrors the SQL engines' rows with one key per
+# record plus index structures. Piped to redis-cli by entrypoint.sh on an empty data volume.
+# The marker key oxbase_test:fixture:seeded is NOT set here: entrypoint.sh sets it after this file
+# loaded without errors, and the compose healthcheck waits for it.
+SELECT 0
+HSET oxbase_test:customer:1 id 1 email alice@example.com name "Alice Anders" created_at 2026-01-15T10:00:00
+HSET oxbase_test:customer:2 id 2 email bob@example.com name "Bob Brown" created_at 2026-01-16T11:30:00
+HSET oxbase_test:customer:3 id 3 email carol@example.com name "Carol Chen" created_at 2026-01-17T09:15:00
+SADD oxbase_test:customers 1 2 3
+HSET oxbase_test:customers:by_email alice@example.com 1 bob@example.com 2 carol@example.com 3
+HSET oxbase_test:order:1 id 1 order_no 1000 customer_id 1 status paid total 120.50 ordered_at 2026-02-01T08:00:00
+HSET oxbase_test:order:2 id 2 order_no 1001 customer_id 1 status shipped total 35.00 ordered_at 2026-02-03T14:20:00
+HSET oxbase_test:order:3 id 3 order_no 1002 customer_id 2 status new total 999.99 ordered_at 2026-02-05T16:45:00
+HSET oxbase_test:order:4 id 4 order_no 1003 customer_id 2 status cancelled total 0.00 ordered_at 2026-02-06T10:10:00
+HSET oxbase_test:order:5 id 5 order_no 1004 customer_id 3 status paid total 15.25 ordered_at 2026-02-07T12:00:00
+RPUSH oxbase_test:customer:1:orders 1 2
+RPUSH oxbase_test:customer:2:orders 3 4
+RPUSH oxbase_test:customer:3:orders 5
+ZADD oxbase_test:customer_order_totals 155.50 1 999.99 2 15.25 3
+SET oxbase_test:order_no_seq 1004
+XADD oxbase_test:events 1767261600000-0 type customer_created customer_id 1
+XADD oxbase_test:events 1767261600000-1 type order_created order_id 1

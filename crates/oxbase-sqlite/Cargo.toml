@@ -1,0 +1,16 @@
+[package]
+name = "oxbase-sqlite"
+description = "oxbase: SQLite driver and dialect"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+
+[dev-dependencies]

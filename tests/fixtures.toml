@@ -1,0 +1,112 @@
+# Test database fixtures — SINGLE SOURCE OF TRUTH.
+#
+# Read by:
+#   * the Docker fixtures (tests/docker/compose.yml must match this file)
+#   * the conformance harness (crates/oxbase-conformance), located via $OXBASE_FIXTURES
+#     (set in .cargo/config.toml) or <repo>/tests/fixtures.toml.
+#
+# All containers publish on 127.0.0.1 only, host ports in 15400-15499 (verified free with
+# `ss -ltn` on 2026-10-31). The last digits mirror each engine's default port.
+#
+# Credentials are TEST-ONLY. The password satisfies the SQL Server complexity policy
+# (>= 8 chars, upper + lower + digit + symbol) and avoids characters that need escaping in
+# URLs or shells, so it is shared by every engine.
+#
+# Image tags are pinned and were verified with `docker manifest inspect` on 2026-10-31.
+# `version_query` is what the harness runs to prove the engine is up; `version_prefix` is the
+# expected start of the reported server version.
+
+schema_version = 1
+
+[defaults]
+host = "127.0.0.1"
+compose_project = "oxbase-fixtures"
+# Seconds the harness / compose healthchecks wait for an engine to accept connections.
+startup_timeout_secs = 120
+
+[engines.postgres]
+kind = "postgres"
+image = "postgres:18.6-alpine"
+host = "127.0.0.1"
+port = 15432
+container_port = 5432
+user = "oxbase"
+password = "Oxbase_Fixture_Pw_2026"
+database = "oxbase_test"
+version_query = "SELECT version()"
+version_prefix = "PostgreSQL 18.6"
+
+[engines.mysql]
+kind = "mysql"
+image = "mysql:8.4.13"            # 8.4 LTS
+host = "127.0.0.1"
+port = 15406
+container_port = 3306
+user = "oxbase"
+password = "Oxbase_Fixture_Pw_2026"
+root_password = "Oxbase_Fixture_Pw_2026"
+database = "oxbase_test"
+version_query = "SELECT VERSION()"
+version_prefix = "8.4.13"
+
+[engines.mariadb]
+kind = "mariadb"
+image = "mariadb:11.8.9"          # 11.8 LTS
+host = "127.0.0.1"
+port = 15407
+container_port = 3306
+user = "oxbase"
+password = "Oxbase_Fixture_Pw_2026"
+root_password = "Oxbase_Fixture_Pw_2026"
+database = "oxbase_test"
+version_query = "SELECT VERSION()"
+version_prefix = "11.8.9-MariaDB"
+
+[engines.mssql]
+kind = "mssql"
+image = "mcr.microsoft.com/mssql/server:2025-CU10-ubuntu-24.04"
+host = "127.0.0.1"
+port = 15433
+container_port = 1433
+# SQL auth as `sa`; the fixture init creates `database` after startup (the image has no
+# env var for it). Developer edition, EULA accepted in compose (ACCEPT_EULA=Y, MSSQL_PID=Developer).
+user = "sa"
+password = "Oxbase_Fixture_Pw_2026"
+database = "oxbase_test"
+trust_server_certificate = true
+version_query = "SELECT @@VERSION"
+version_prefix = "Microsoft SQL Server 2025"
+
+[engines.mongodb]
+kind = "mongodb"
+image = "mongo:8.0.34"
+host = "127.0.0.1"
+port = 15417
+container_port = 27017
+user = "oxbase"
+password = "Oxbase_Fixture_Pw_2026"
+database = "oxbase_test"
+auth_source = "admin"
+# Admin command document (JSON); read `version` from the reply.
+version_query = '{"buildInfo": 1}'
+version_prefix = "8.0.34"
+
+[engines.redis]
+kind = "redis"
+image = "redis:8.10.3-alpine"
+host = "127.0.0.1"
+port = 15479
+container_port = 6379
+# ACL default user with `requirepass`; `database` is the logical DB index.
+user = "default"
+password = "Oxbase_Fixture_Pw_2026"
+database = "0"
+# Read `redis_version` from the reply.
+version_query = "INFO server"
+version_prefix = "8.10.3"
+
+[engines.sqlite]
+kind = "sqlite"
+# No container: a file created by the harness under the target dir (gitignored).
+path = "target/fixtures/oxbase_test.sqlite"
+version_query = "SELECT sqlite_version()"

@@ -1,0 +1,28 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# Node / UI
+node_modules/
+ui/dist/
+*.tsbuildinfo
+
+# Tauri generated
+crates/app-tauri/gen/
+
+# Local env / secrets
+.env.local
+.env.*.local
+
+# Local databases (SQLite fixtures, app DBs)
+*.db
+*.sqlite
+*.sqlite-journal
+*.db-wal
+*.db-shm
+
+# Editors / OS
+.idea/
+.vscode/*
+!.vscode/extensions.json
+.DS_Store

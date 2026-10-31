@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Main window. Deliberately grants nothing: the UI only invokes the app's own commands (app_info, demo_arrow_page), which need no permission while the app defines no ACL manifest. Add core:*/plugin permissions here only when a feature uses them.",
+  "windows": ["main"],
+  "permissions": []
+}

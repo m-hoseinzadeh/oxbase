@@ -1,0 +1,7 @@
+# Thresholds for workspace clippy lints (see [workspace.lints.clippy] in Cargo.toml).
+msrv = "1.90"
+too-many-arguments-threshold = 8
+cognitive-complexity-threshold = 30
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-dbg-in-tests = true

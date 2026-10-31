@@ -1,0 +1,194 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  # Weekly run of everything on main, mainly so new RUSTSEC advisories and new stable
+  # toolchain lints surface even when nothing is being merged.
+  schedule:
+    - cron: "17 5 * * 1"
+
+# Cancel superseded runs of the same PR/branch. Pushes to main are never cancelled so
+# every main commit gets a full result.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_NET_RETRY: "10"
+  RUST_BACKTRACE: short
+  RUSTUP_MAX_RETRIES: "10"
+  NODE_VERSION: "24"
+  PNPM_VERSION: "12.15.0"
+
+jobs:
+  rust-lint:
+    name: Rust lint (fmt + clippy)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Install Tauri Linux system libraries
+        run: bash scripts/ci-install-linux-deps.sh
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: lint
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Ensure Tauri frontendDist exists (UI is not built in this job)
+        run: node scripts/ci-ensure-frontend-dist.mjs
+
+      - name: cargo fmt --check
+        run: cargo fmt --all --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  rust-test:
+    name: Rust test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Tauri Linux system libraries
+        if: runner.os == 'Linux'
+        run: bash scripts/ci-install-linux-deps.sh
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Ensure Tauri frontendDist exists (UI is not built in this job)
+        run: node scripts/ci-ensure-frontend-dist.mjs
+
+      # Docker-backed conformance tests are `#[ignore]`d, so they are skipped here and
+      # run only in the `conformance` job with `--include-ignored`.
+      - name: cargo test
+        run: cargo test --workspace --locked --no-fail-fast
+
+  ui:
+    name: UI (lint, typecheck, test, build)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: ui
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      # Keep PNPM_VERSION equal to the pnpm that wrote ui/pnpm-lock.yaml. If ui/package.json
+      # gains a "packageManager" field, it must name the same version (or drop `version:`).
+      - uses: pnpm/action-setup@v6
+        with:
+          version: ${{ env.PNPM_VERSION }}
+          package_json_file: ui/package.json
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+          cache-dependency-path: ui/pnpm-lock.yaml
+
+      - name: pnpm install
+        run: pnpm install --frozen-lockfile
+
+      # `tauri build` (Bundle workflow, main only) refuses mismatched Tauri crate/npm
+      # major.minor versions; catch one-sided bumps here, on the PR.
+      - name: Tauri crate/npm versions match
+        run: node ../scripts/ci-check-tauri-versions.mjs
+
+      - name: Lint
+        run: pnpm run lint
+
+      - name: Typecheck
+        run: pnpm run typecheck
+
+      - name: Test
+        run: pnpm run test
+
+      - name: Build
+        run: pnpm run build
+
+  conformance:
+    name: Conformance (Docker fixtures)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: conformance
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # Compile before the containers start so their startup overlaps nothing slow
+      # and a compile error does not leave a stack running.
+      - name: Build conformance harness
+        run: cargo test -p oxbase-conformance --locked --no-run
+
+      - name: Start database fixtures
+        run: bash scripts/ci-fixtures.sh up
+
+      - name: Run conformance harness
+        run: cargo test -p oxbase-conformance --locked -- --include-ignored
+
+      - name: Dump fixture logs
+        if: failure()
+        run: bash scripts/ci-fixtures.sh logs
+
+      - name: Tear down database fixtures
+        if: always()
+        run: bash scripts/ci-fixtures.sh down
+
+  cargo-deny:
+    name: cargo-deny (${{ matrix.checks }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        checks: [advisories, "bans licenses sources"]
+    # New RUSTSEC advisories appear without any change in this repo, so on pull requests
+    # they are reported without blocking unrelated work. On main (push, schedule,
+    # dispatch) they fail the run. Licenses/bans/sources always block.
+    continue-on-error: ${{ matrix.checks == 'advisories' && github.event_name == 'pull_request' }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check ${{ matrix.checks }}
+          arguments: --all-features

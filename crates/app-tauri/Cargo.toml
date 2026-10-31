@@ -1,0 +1,33 @@
+[package]
+name = "app-tauri"
+description = "oxbase: Tauri 2 desktop shell (thin command layer; no business logic)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+authors.workspace = true
+
+[lib]
+name = "app_tauri"
+path = "src/lib.rs"
+
+[[bin]]
+name = "app-tauri"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[build-dependencies]
+tauri-build.workspace = true
+
+[dependencies]
+tauri.workspace = true
+serde.workspace = true
+arrow-array.workspace = true
+arrow-schema.workspace = true
+arrow-ipc.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

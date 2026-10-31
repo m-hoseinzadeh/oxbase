@@ -1,0 +1,11 @@
+# Do NOT set build.target-dir here; the shared target dir is <repo>/target.
+
+[alias]
+# Check everything except the Tauri shell (which needs webkit2gtk/gtk on Linux).
+check-core = "check --workspace --exclude app-tauri --all-targets"
+test-core = "test --workspace --exclude app-tauri"
+lint = "clippy --workspace --exclude app-tauri --all-targets -- -D warnings"
+
+[env]
+# Lets tests and the conformance harness find tests/fixtures.toml regardless of cwd.
+OXBASE_FIXTURES = { value = "tests/fixtures.toml", relative = true }

@@ -1,0 +1,73 @@
+# cargo-deny configuration. Run locally with `cargo deny check`.
+# Docs: https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+# Check the dependency graph of every target CI builds for.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+]
+all-features = true
+
+[output]
+feature-depth = 1
+
+[advisories]
+# RUSTSEC advisory DB. Vulnerabilities, unsound and unmaintained crates are errors
+# unless listed in `ignore` with a reason and a tracking note.
+unmaintained = "all"
+yanked = "deny"
+ignore = [
+    # { id = "RUSTSEC-YYYY-NNNN", reason = "why it does not apply / tracking issue" },
+    { id = "RUSTSEC-2024-0370", reason = "proc-macro-error (unmaintained) is a build-time proc macro pulled in only by gtk3-macros, part of Tauri's Linux webview stack; no alternative until Tauri moves off gtk-rs 0.18" },
+]
+
+[licenses]
+# Permissive licenses only. Anything else (GPL, LGPL-only, AGPL, SSPL, BUSL, ...)
+# fails the check and needs an explicit, reviewed exception below.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    # target-lexicon (via cfg-expr/system-deps, Tauri Linux build scripts). Permissive.
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "MPL-2.0",
+    "CC0-1.0",
+]
+confidence-threshold = 0.9
+# The allow-list is policy, not a mirror of today's tree: don't warn about entries
+# that no current dependency uses.
+unused-allowed-license = "allow"
+exceptions = [
+    # { allow = ["LICENSE-ID"], crate = "crate-name" },
+]
+
+[licenses.private]
+# Workspace crates are Apache-2.0 and `publish = false`; skip them so this
+# check only judges third-party dependencies.
+ignore = true
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Path dependencies inside the workspace are fine without a version.
+allow-wildcard-paths = true
+highlight = "all"
+deny = [
+    # Candidate once drivers land (PLAN.md prefers rustls):
+    # { crate = "openssl-sys", reason = "use rustls; native OpenSSL complicates 3-OS builds" },
+]
+skip = []
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

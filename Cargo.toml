@@ -1,0 +1,178 @@
+# oxbase — Rust database client. Workspace root.
+# Owned by the Scaffold step. Workstreams: add crate-local deps in your own
+# crate's Cargo.toml and report them for hoisting here.
+
+[workspace]
+resolver = "3"
+members = [
+    "crates/oxbase-types",
+    "crates/oxbase-driver",
+    "crates/oxbase-dialect",
+    "crates/oxbase-pg",
+    "crates/oxbase-mysql",
+    "crates/oxbase-sqlite",
+    "crates/oxbase-mssql",
+    "crates/oxbase-mongo",
+    "crates/oxbase-redis",
+    "crates/oxbase-net",
+    "crates/oxbase-sql",
+    "crates/oxbase-insight",
+    "crates/oxbase-schema-cache",
+    "crates/oxbase-designer",
+    "crates/oxbase-diff",
+    "crates/oxbase-transfer",
+    "crates/oxbase-io",
+    "crates/oxbase-backup",
+    "crates/oxbase-model",
+    "crates/oxbase-bi",
+    "crates/oxbase-ai",
+    "crates/oxbase-jobs",
+    "crates/oxbase-store",
+    "crates/oxbase-services",
+    "crates/oxbase-cli",
+    "crates/oxbase-conformance",
+    "crates/app-tauri",
+]
+# `cargo build` / `cargo check` with no -p skips the Tauri shell, which needs
+# webkit2gtk/gtk system libraries on Linux. Use `-p app-tauri` explicitly.
+default-members = [
+    "crates/oxbase-types",
+    "crates/oxbase-driver",
+    "crates/oxbase-dialect",
+    "crates/oxbase-pg",
+    "crates/oxbase-mysql",
+    "crates/oxbase-sqlite",
+    "crates/oxbase-mssql",
+    "crates/oxbase-mongo",
+    "crates/oxbase-redis",
+    "crates/oxbase-net",
+    "crates/oxbase-sql",
+    "crates/oxbase-insight",
+    "crates/oxbase-schema-cache",
+    "crates/oxbase-designer",
+    "crates/oxbase-diff",
+    "crates/oxbase-transfer",
+    "crates/oxbase-io",
+    "crates/oxbase-backup",
+    "crates/oxbase-model",
+    "crates/oxbase-bi",
+    "crates/oxbase-ai",
+    "crates/oxbase-jobs",
+    "crates/oxbase-store",
+    "crates/oxbase-services",
+    "crates/oxbase-cli",
+    "crates/oxbase-conformance",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+# tauri 2.12 requires 1.90; arrow 60 requires 1.88.
+rust-version = "1.90"
+license = "Apache-2.0"
+publish = false
+authors = ["Mohammad Hoseinzadeh <hoseinzadeh.ashraf@gmail.com>", "Oxbase contributors"]
+repository = "https://github.com/m-hoseinzadeh/oxbase"
+homepage = "https://github.com/m-hoseinzadeh/oxbase"
+
+[workspace.lints.rust]
+# Forbidden everywhere. A crate that truly needs `unsafe` must drop
+# `lints.workspace = true`, copy these tables, relax this one line, and
+# justify every `unsafe` block with a `// SAFETY:` comment.
+unsafe_code = "forbid"
+rust_2018_idioms = { level = "warn", priority = -1 }
+unused_qualifications = "warn"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+# Pedantic lints that are noisy for this codebase:
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+doc_markdown = "allow"
+similar_names = "allow"
+too_many_lines = "allow"
+struct_excessive_bools = "allow"
+# Hard rules:
+dbg_macro = "warn"
+todo = "warn"
+
+[workspace.dependencies]
+# --- internal crates (path + version so `x.workspace = true` works) ---
+oxbase-types = { path = "crates/oxbase-types", version = "0.0.1" }
+oxbase-driver = { path = "crates/oxbase-driver", version = "0.0.1" }
+oxbase-dialect = { path = "crates/oxbase-dialect", version = "0.0.1" }
+oxbase-pg = { path = "crates/oxbase-pg", version = "0.0.1" }
+oxbase-mysql = { path = "crates/oxbase-mysql", version = "0.0.1" }
+oxbase-sqlite = { path = "crates/oxbase-sqlite", version = "0.0.1" }
+oxbase-mssql = { path = "crates/oxbase-mssql", version = "0.0.1" }
+oxbase-mongo = { path = "crates/oxbase-mongo", version = "0.0.1" }
+oxbase-redis = { path = "crates/oxbase-redis", version = "0.0.1" }
+oxbase-net = { path = "crates/oxbase-net", version = "0.0.1" }
+oxbase-sql = { path = "crates/oxbase-sql", version = "0.0.1" }
+oxbase-insight = { path = "crates/oxbase-insight", version = "0.0.1" }
+oxbase-schema-cache = { path = "crates/oxbase-schema-cache", version = "0.0.1" }
+oxbase-designer = { path = "crates/oxbase-designer", version = "0.0.1" }
+oxbase-diff = { path = "crates/oxbase-diff", version = "0.0.1" }
+oxbase-transfer = { path = "crates/oxbase-transfer", version = "0.0.1" }
+oxbase-io = { path = "crates/oxbase-io", version = "0.0.1" }
+oxbase-backup = { path = "crates/oxbase-backup", version = "0.0.1" }
+oxbase-model = { path = "crates/oxbase-model", version = "0.0.1" }
+oxbase-bi = { path = "crates/oxbase-bi", version = "0.0.1" }
+oxbase-ai = { path = "crates/oxbase-ai", version = "0.0.1" }
+oxbase-jobs = { path = "crates/oxbase-jobs", version = "0.0.1" }
+oxbase-store = { path = "crates/oxbase-store", version = "0.0.1" }
+oxbase-services = { path = "crates/oxbase-services", version = "0.0.1" }
+oxbase-conformance = { path = "crates/oxbase-conformance", version = "0.0.1" }
+
+# --- async runtime ---
+tokio = { version = "1.54.1", features = ["full"] }
+tokio-util = "0.7.20" # CancellationToken (tokio_util::sync)
+futures = "0.3.34"
+async-trait = "0.1.92"
+
+# --- errors ---
+thiserror = "2.0.21"
+anyhow = "1.0.104"
+
+# --- serialization / data ---
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+toml = "1.1.8"
+bytes = { version = "1.12.1", features = ["serde"] }
+uuid = { version = "1.29.0", features = ["v4", "v7", "serde"] }
+chrono = { version = "0.4.45", default-features = false, features = ["std", "clock", "serde"] }
+
+# --- arrow (keep all three on the same major) ---
+arrow-array = "60.1.0"
+arrow-schema = { version = "60.1.0", features = ["serde"] }
+arrow-ipc = "60.1.0"
+
+# --- observability ---
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+
+# --- cli ---
+clap = { version = "4.6.7", features = ["derive"] }
+
+# --- app shell (Tauri 2; 3.x is alpha, do not bump) ---
+tauri = "2.12.5"
+tauri-build = "2.7.4"
+
+# --- dev / test ---
+tokio-test = "0.4.6"
+pretty_assertions = "1.4.1"
+rstest = "0.28.0"
+
+[profile.dev]
+# Keep the shared target dir small: line tables only, no full debuginfo.
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+# Dependencies get light optimization; workspace crates stay at opt-level 0.
+opt-level = 1
+
+[profile.release]
+lto = "thin"
+codegen-units = 16

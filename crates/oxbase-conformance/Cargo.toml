@@ -1,0 +1,29 @@
+[package]
+name = "oxbase-conformance"
+description = "oxbase: Cross-engine conformance harness"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+# `cargo run -p oxbase-conformance` prints the matrix and writes target/conformance/report.json.
+name = "oxbase-conformance"
+path = "src/main.rs"
+
+[dependencies]
+# Engine/ObjectKind come from oxbase-types; cell applicability from oxbase-dialect (src/adapter.rs).
+oxbase-types.workspace = true
+oxbase-dialect.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+pretty_assertions.workspace = true

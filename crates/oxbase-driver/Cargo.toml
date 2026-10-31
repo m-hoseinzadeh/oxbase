@@ -1,0 +1,31 @@
+[package]
+name = "oxbase-driver"
+description = "oxbase: Driver traits"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# In-memory `MockDriver` for tests of higher layers (dialects, services, conformance harness).
+mock = []
+
+[dependencies]
+oxbase-types.workspace = true
+arrow-array.workspace = true
+arrow-schema.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+tokio-util.workspace = true
+# mpsc channel behind `ProgressSink`; also the timer used by the mock.
+tokio.workspace = true
+
+[dev-dependencies]
+# Self dev-dependency so `cargo test -p oxbase-driver` also builds and tests the mock.
+oxbase-driver = { path = ".", features = ["mock"] }

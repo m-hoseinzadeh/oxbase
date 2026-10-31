@@ -1,0 +1,16 @@
+[package]
+name = "oxbase-services"
+description = "oxbase: Service orchestration"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+
+[dev-dependencies]
