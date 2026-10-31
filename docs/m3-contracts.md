@@ -1,6 +1,7 @@
 # M3 contracts
 
-Status: frozen for M3 on 2026-10-31 (Design step). M3 exit check (PLAN.md §6): **round-trip
+Status: frozen for M3 on 2026-10-31 (Design step); deviations accepted at integration are marked
+**As built**. M3 exit check (PLAN.md §6): **round-trip
 conformance passes for table, column, index, FK and check** on PostgreSQL, MySQL, MariaDB and
 SQLite. Scope: grid editing (`DmlWriter`), filter and sort builder, form / JSON views, and the
 table designer with DDL preview for the three SQL engines (MySQL with MariaDB as a flavour).
@@ -119,13 +120,21 @@ Per engine:
   COLUMN`, `ALTER COLUMN ... TYPE ... USING col::type`, `SET / DROP NOT NULL`, `SET / DROP
   DEFAULT`, `ADD / DROP CONSTRAINT`, `CREATE / DROP INDEX`, `COMMENT ON`), identity (10+),
   stored generated columns (12+), `INCLUDE` (11+). A type change that may fail or truncate is
-  destructive.
+  destructive. **As built:** sessions start with `standard_conforming_strings=on`, and literals that contain
+  a backslash are written as `E'...'`, so a script means the same with the setting off. Index
+  operator classes, key collations, storage parameters, tablespaces and `DEFERRABLE` unique
+  constraints are fetched as index extras and kept when an index is recreated.
 - **MySQL / MariaDB**: every step `transactional = false` (implicit commit); column changes with
   `MODIFY` / `CHANGE` carrying the full column definition (type, nullability, default,
   auto-increment, comment, collation); `RENAME COLUMN` on MySQL 8.0+ / MariaDB 10.5+, else
   `CHANGE`; `AFTER` / `FIRST` for positions; checks enforced on MySQL 8.0.16+ and MariaDB 10.2+
   (else `checks_enforced = false` and a warning); no `SET DEFAULT` FK action on InnoDB. Dropping
-  an FK's index needs the FK gone first.
+  an FK's index needs the FK gone first. **As built:** when a check, generated column, expression
+  default or expression key uses a renamed column, MySQL refuses a separate `RENAME COLUMN`, so
+  every column rename becomes `CHANGE COLUMN old new <definition>` in the main `ALTER`, after
+  the drops of changed checks; a new expression that still names a renamed column's old name
+  is `InvalidInput`. Character set, collation, `ON UPDATE` and `INVISIBLE` absent from the new
+  definition are kept; an explicit `Value::Null` extra (`INVISIBLE: false`) removes them.
 - **SQLite**: native `ALTER TABLE ... RENAME TO`, `RENAME COLUMN` (3.25+), `ADD COLUMN` (only a
   column SQLite accepts there: no PK / UNIQUE, constant default, NOT NULL needs a default),
   `DROP COLUMN` (3.35+, only a plain column: not PK, unique, indexed, in an FK, check, view,
@@ -133,6 +142,12 @@ Per engine:
   (§6.4). No comments (`table_comment` / `column_comment` unsupported).
 
 ### 3.4 `Comparator` and `compare`
+
+**As built:** PostgreSQL registers `PgComparator`, which first fills in PostgreSQL's defaults
+for flags the server always reports (`not_valid`, `match_type`, `nulls_not_distinct`,
+`include_columns`, ...) on both sides (`oxbase_pg::dialect::normalize_def`) and then runs the same
+shared `diff_objects` walk with `PgRules`, so ids and order are unchanged. MySQL, MariaDB and
+SQLite register `RulesComparator`.
 
 Engines register `RulesComparator(<Engine>Rules)` and only override `CompareRules`
 (`type_text`, `same_type`, `same_default`, `same_expression`, `same_table_ref`,
@@ -253,7 +268,11 @@ case rules), no columns, PK / index / FK columns that do not exist, duplicate or
 out of range, FK column count ≠ referenced count, FK action not in `fkActions`, identity /
 auto-increment on a non-integer column, any user expression (default, check, generated, index
 predicate, expression key) failing `sql::check_expression`, any change whose capability is
-`unsupported`. Warnings: unenforced checks, rebuilds (data is copied), a NOT NULL column added
+`unsupported`. **As built:** names are checked in two groups (indexes: primary key + indexes;
+constraints: primary key, unique constraints, FKs, checks), so MySQL's FK-backing index may
+share its FK's name; only names the design gives (new or renamed) are checked, and names that
+differ only in case are errors on every engine (no per-engine case flag yet). Warnings:
+unenforced checks, rebuilds (data is copied), a NOT NULL column added
 without a default to a table that may have rows, a type change that may truncate.
 
 ### 6.3 Preview and apply
@@ -299,6 +318,18 @@ dropped (SQLite does not drop them with the table), and the stream must prove wi
 that a view on the table still works after a rebuild (use `PRAGMA legacy_alter_table` with the
 same capture / restore pattern if the rename needs it). New columns get their default (or
 NULL); dropped columns are not copied; a type change copies with `CAST`.
+
+**As built:** values are copied as they are (`INSERT ... SELECT "col"`, never `CAST`: a cast to a
+NUMERIC-affinity type such as `DATE` or `DECIMAL` loses data); the new column's affinity converts
+only what it can without loss, and a `STRICT` table rejects the rest (the script rolls back). The
+new table is created under the current names; renames run natively after the rebuild
+(`legacy_alter_table = OFF`), so SQLite itself rewrites triggers, views and child foreign keys
+(before 3.25 a column rename is copied and refused when a trigger uses it). A first main step
+fails when the table has a trigger missing from `DdlContext::triggers`. The foreign-key check
+covers the whole database filtered to rows where the table is child or parent
+(`pragma_foreign_key_check(NULL, '<db>')`, 3.16+; the per-table pragma before). Clauses the
+model cannot hold (`ON CONFLICT`, `COLLATE` on key columns) are recorded in the `REBUILD_LOSES`
+extra and make a rebuild `Unsupported`. Swapping two column names is `Unsupported`.
 
 ## 7. Tauri commands and TS (`app-tauri`, `ui/src/api`)
 
@@ -366,6 +397,16 @@ Closes the M2 gap (PLAN.md, *M2 as built*): nothing launched the built app.
   cancel of a running large query ends with "cancelled" within 2 s. When the M3 UI lands:
   open `m3.m3_edit_pk` table data, edit a cell, apply, see it after reopen.
 - **Artifacts:** screenshot and the WebDriver log on failure, `e2e-perf.json` always.
+
+**As built:** the edit step is mandatory from M3 (`OXBASE_E2E_REQUIRE_EDIT=1` in CI; a skip
+fails). Hooks it uses beyond the list above: `section.table-data` with `aria-label="Table
+<schema>.<name>"`, `apply-edits`, `table-data-status` (contains `pending` while edits are
+pending), `apply-errors`, `read-only-banner`, `cell-editor` with `.value-input`, the tab's
+**Refresh** button, the Grid / Form tabs (`role=tab`), and double-click on a tree table opening
+its data tab. The job also runs on the fast lane of `wip/*-integrate`. No Windows job: the
+PostgreSQL fixture is a Linux container that Windows runners cannot start (waived for M3).
+`tauri-driver` 2.1.0 and `WebKitWebDriver` have no verbose log, so failures upload
+`failure.png` and `failure-dom.html` instead.
 
 ## 10. Invariants every stream keeps
 

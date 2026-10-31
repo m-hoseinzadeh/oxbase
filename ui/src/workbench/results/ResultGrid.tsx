@@ -37,6 +37,7 @@ import {
 import type { ColumnInfo } from "../../api";
 import { type CopyNotify, cellsForSelection, NULL_COPY_TEXT } from "./copy";
 import { cellDisplayText, columnTypeLabel, formatCell, initialColumnWidth } from "./format";
+import { dataCellOf } from "./gridCoords";
 import type { ResultPager } from "./pager";
 import { fromGridSelection, type GridRowSelection, toGridSelection } from "./rowSelection";
 
@@ -333,7 +334,8 @@ export function ResultGrid({
   const overlay = useMemo<OverlayContext>(() => ({ edit: editRef, target: editTarget }), []);
   const provideEditor = useCallback<ProvideEditorCallback<GridCell>>((cell) => {
     const editing = editRef.current;
-    const location = cell.location;
+    // Glide reports the overlay's location in grid columns (row markers included).
+    const location = cell.location ? dataCellOf(cell.location) : null;
     if (!editing || !location) return undefined;
     if (!editing.canEdit(location[1], location[0])) return undefined;
     editTarget.current = location;
