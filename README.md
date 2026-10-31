@@ -5,6 +5,28 @@ React + TypeScript UI. v1 targets PostgreSQL, MySQL, MariaDB, SQLite, SQL Server
 Redis on Linux, macOS and Windows. The core is headless, so every feature also works from
 `oxbase-cli` and from tests. See [PLAN.md](PLAN.md) for the architecture and milestones.
 
+## What works (M2)
+
+On PostgreSQL, MySQL, MariaDB and SQLite (M1 connections: plain, TLS, SSH, keychain secrets):
+
+- **Object tree**: connection, databases, schemas (PostgreSQL), then folders for tables, views,
+  materialized views, functions, procedures and sequences; under a table its columns, indexes,
+  foreign keys, check constraints and triggers. Children load when a node is first expanded
+  and loading can be cancelled. System objects are hidden unless you turn them on. Other
+  PostgreSQL databases are read on their own metadata session.
+- **Query editor** (Monaco): run the whole script, the selection, or the statement at the cursor
+  (`oxbase-sql` splits the script for each dialect: dollar quotes, `DELIMITER`, compound
+  `BEGIN ... END` bodies, SQLite trigger bodies). Each editor tab has its own session, so a long
+  query never blocks the tree.
+- **Streaming results grid** (Glide Data Grid): rows stream into a server-side result store
+  that spills to Arrow IPC files past 64 MiB; the grid fetches only the visible pages as Arrow
+  IPC bytes, never JSON. Several result sets per run each get a tab, with a messages tab for
+  notices, rows affected and errors. Stop cancels the server-side statement and keeps the rows
+  already received.
+- **History**: every statement is recorded in the app database with its status, duration and
+  row count. Password and key literals are masked first. You can search, reopen, delete, clear,
+  or turn history off.
+
 ## Layout
 
 ```
@@ -44,8 +66,11 @@ docs/                                             frozen contracts per milestone
 
 ## Checks
 
-These are the commands CI runs (`.github/workflows/ci.yml`). All of them were run and passed on
-Linux x86_64 (Ubuntu, WebKitGTK 4.1 installed) on 2026-10-31, last for the M1 integration
+These are the checks of `.github/workflows/ci.yml`, plus a few manual ones. For the M2
+integration (2026-10-31) the CI ones passed in GitHub Actions on Linux x86_64 (fmt, clippy,
+`cargo test --workspace`, keychain, UI lint/typecheck/test/build, Docker conformance,
+`cargo deny`). `cargo doc`, `cargo build -p app-tauri`, `cargo run -p oxbase-cli` and the
+`cargo tree` checks are not CI jobs; they were last run locally for the M1 integration
 (`cargo deny` 0.20.2).
 
 ```sh
@@ -123,10 +148,14 @@ project.
 `target/conformance/report.json` (report schema 2):
 
 1. **Object-kind matrix** (engine x object kind x check, PLAN.md §3). Rows and columns are
-   `oxbase_types::ObjectKind` and `oxbase_types::Engine`; a cell is n/a when the
-   `oxbase_dialect::DialectRegistry` marks it not applicable. Its cells need dialect cells
-   (Fetcher, DdlGenerator, ...), so every applicable cell stays pending until M2 (M4 for mssql,
-   M7 for mongodb and redis). The harness still proves each fixture answers its handshake.
+   `oxbase_types::ObjectKind` and `oxbase_types::Engine`; a cell is n/a when the registry of
+   `oxbase_services::default_dialects()` (the one the app uses) marks it not applicable. Each
+   cell shows three checks: `roundtrip` / `fetch_list` / `capabilities`. From M2, `fetch_list`
+   runs the registered `Fetcher` of every (engine, kind): it lists the `[m2]` seed objects of
+   `tests/fixtures.toml` under their parent, checks the refs, the order and `system = false`,
+   and loads each one (the definition must survive a JSON round trip). `roundtrip` and
+   `capabilities` stay pending until M3; mssql waits for M4, mongodb and redis for M7. The
+   harness also proves each fixture answers its handshake.
 2. **Connection checks** (M1), through the real drivers, `ConnectionManager` and russh provider:
    `connect` (plain, server version equals `version_prefix`), `tls` (`VerifyFull` with the
    fixture CA as `oxbase_tls`, `tls_in_use`; plaintext and a wrong server name refused), `ssh`
@@ -144,8 +173,11 @@ cargo run -p oxbase-conformance                  # same tables, writes target/co
 scripts/fixtures-down.sh
 ```
 
-The other M1 live tests (driver, tunnel and connection-manager scenarios) also need the
-fixtures:
+The other live tests also need the fixtures: driver, tunnel and connection-manager scenarios
+(M1), the dialect fetcher tests of each engine crate, and the query-run tests of
+`oxbase-services` (M2: a 1 000 000-row query that spills to disk, random pages, cancel
+mid-stream, multi-statement scripts, history). The query-run tests print their timings to stderr
+with a `[m2 query]` prefix:
 
 ```sh
 cargo test -p oxbase-net -p oxbase-pg -p oxbase-mysql -p oxbase-sqlite -p oxbase-services \
@@ -170,12 +202,28 @@ command can follow the script name, e.g.
 runs the services live tests with the keychain test included. CI runs the script on Linux, macOS
 and Windows (`keychain` job).
 
-Last verified 2026-10-31 on Linux x86_64 (M1 integration) with all 7 fixtures up
-(`scripts/fixtures-up.sh`): every fixture reachable (PostgreSQL 18.6, MySQL 8.4.13, MariaDB
-11.8.9, SQL Server 2025, MongoDB 8.0.34 (the fixture is now 7.0.45, see tests/fixtures.toml), Redis 8.10, SQLite file); object-kind matrix of 420
-cells = 237 pending, 183 n/a, 0 fail; connection checks 42 = 21 pass (postgres, mysql, mariadb,
-sqlite 3.54.1), 18 pending (mssql M4, mongodb/redis M7), 3 n/a (SQLite TLS/SSH), 0 fail. The
-other M1 live tests and the keychain tests (Linux, private gnome-keyring) passed in the same run.
+Last verified 2026-10-31 in the GitHub Actions conformance job (Linux x86_64, M2 integration)
+with all 7 fixtures up: every fixture reachable (PostgreSQL 18.6, MySQL 8.4.13, MariaDB 11.8.9,
+SQL Server 2025, MongoDB 7.0.45, Redis, SQLite 3.54.1 file).
+
+- Object-kind matrix, 420 cells: **42 pass, 0 fail**, 198 pending, 180 n/a. The 42 passes
+  are every M2 `fetch_list` cell: PostgreSQL 13 (database, schema, table, column, index,
+  foreign key, check, view, materialized view, function, procedure, trigger, sequence), MySQL
+  10 and MariaDB 11 (the same without schema and materialized view; sequence on MariaDB only),
+  SQLite 8 (database, table, column, index, foreign key, check, view, trigger).
+- Connection checks, 42: 21 pass (postgres, mysql, mariadb, sqlite), 18 pending (mssql M4,
+  mongodb/redis M7), 3 n/a (SQLite TLS/SSH), 0 fail.
+- Query runs (`oxbase-services` live tests, 8 MiB memory budget so the result spills):
+
+  | Engine | 1M rows streamed | first page | random 200-row page p95 | spill | peak batch memory | cancel after ~230-250k rows: run ended |
+  |---|---|---|---|---|---|---|
+  | PostgreSQL | 1698 ms | 9 ms | 0.17 ms | 28 MiB | 7.6 MiB | 1 ms after cancel |
+  | MySQL | 1885 ms | 52 ms | 0.23 ms | 28 MiB | 7.8 MiB | 1013 ms after cancel |
+  | MariaDB | 1625 ms | 36 ms | 0.28 ms | 28 MiB | 7.8 MiB | 1001 ms after cancel |
+  | SQLite | 885 ms | 3 ms | 0.29 ms | 21 MiB | 6.6 MiB | 0 ms after cancel |
+
+The dialect, driver, tunnel and connection-manager live tests and the keychain tests passed in
+the same CI run.
 
 Disk: the full stack needs about 4-5 GB on top of the images already present (the SQL Server,
 MongoDB and Redis images alone are about 4 GB, and SQL Server keeps writing while it runs).
@@ -211,6 +259,23 @@ pnpm tauri dev                            # dev app with hot reload
 pnpm tauri build --debug --no-bundle      # debug binary, no installers
 pnpm tauri build                          # release bundles for the current OS
 ```
+
+### Trying the query editor
+
+1. Start a fixture (`scripts/fixtures-up.sh postgres`) or use any reachable server or SQLite
+   file. In **Connections**, add a profile (the PostgreSQL fixture is `127.0.0.1:15432`,
+   database `oxbase_test`, user `oxbase`; see `tests/fixtures.toml`) and click **Connect**.
+2. **Objects** shows the open connection. Expand it to browse databases, schemas and the
+   per-kind folders (the fixture seeds schema `m2`). F5 refreshes, and **System objects**
+   shows the catalog schemas and other system objects.
+3. Click **New query** in the top toolbar, or in the **Objects** panel with a node selected, so
+   the editor opens on that connection and database. The editor toolbar can switch both.
+4. Run with **Run** (Ctrl+Shift+Enter, whole script), **Run current** (Ctrl+Enter, the
+   statement at the cursor) or **Run selection**. To see streaming and spilling, run
+   `SELECT g FROM generate_series(1, 1000000) g;` on PostgreSQL and scroll the grid while rows
+   arrive. **Stop** cancels it and keeps the rows already received.
+5. **History** lists past statements. Search them, **Open in editor**, **Delete**, clear them
+   all, or turn history off.
 
 ## CI
 
