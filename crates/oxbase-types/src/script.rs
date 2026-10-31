@@ -347,7 +347,7 @@ mod tests {
             "CREATE TABLE t (id int);\nDROP TABLE old;\nCOMMENT ON TABLE t IS 'x';\n"
         );
         assert_eq!(Script::single("SELECT 1").to_sql("\nGO"), "SELECT 1\nGO\n");
-        assert!(Script::new().is_empty());
+        assert_eq!(Script::new().len(), 0);
         assert!(Script::new().is_atomic());
     }
 

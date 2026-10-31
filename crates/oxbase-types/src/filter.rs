@@ -455,10 +455,13 @@ mod tests {
 
     #[test]
     fn empty_groups_add_nothing() {
-        assert!(Filter::and(vec![]).is_empty());
-        assert!(Filter::or(vec![Filter::and(vec![])]).is_empty());
-        assert!(Filter::negate(Filter::or(vec![])).is_empty());
-        assert!(!Filter::and(vec![Filter::raw_sql("x > 1")]).is_empty());
+        let filters = [
+            Filter::and(vec![]),
+            Filter::or(vec![Filter::and(vec![])]),
+            Filter::negate(Filter::or(vec![])),
+            Filter::and(vec![Filter::raw_sql("x > 1")]),
+        ];
+        assert_eq!(filters.map(|f| f.is_empty()), [true, true, true, false]);
     }
 
     #[test]

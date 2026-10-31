@@ -488,7 +488,7 @@ mod tests {
     #[test]
     fn pending_changes_merge_per_row() {
         let mut changes = PendingChanges::new();
-        assert!(changes.is_empty());
+        assert_eq!(changes.edits, []);
         changes.set_cell(3, "name", CellInput::text("a")).unwrap();
         changes.set_cell(3, "name", CellInput::text("b")).unwrap();
         changes.set_cell(3, "note", CellInput::Null).unwrap();

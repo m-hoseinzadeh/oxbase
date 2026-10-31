@@ -30,6 +30,13 @@ On PostgreSQL, MySQL, MariaDB and SQLite (M1 connections: plain, TLS, SSH, keych
   row count. Password and key literals are masked first. You can search, reopen, delete, clear,
   or turn history off.
 
+## In progress (M3)
+
+Grid editing, the filter and sort builder, form and JSON views, and the table designer with DDL
+preview for PostgreSQL, MySQL, MariaDB and SQLite. The contracts are in
+[docs/m3-contracts.md](docs/m3-contracts.md); the exit check is the round-trip conformance for
+tables, columns, indexes, foreign keys and checks.
+
 ## Layout
 
 ```
@@ -49,10 +56,10 @@ crates/
   oxbase-conformance                              cross-engine conformance harness
   app-tauri                                       Tauri 2 shell (no logic)
 ui/                                               React + TS + Vite front end
-tests/fixtures.toml                               test DB connection params and M2 seed object names
-                                                  (single source of truth)
+tests/fixtures.toml                               test DB connection params and M2/M3 seed object
+                                                  names (single source of truth)
 docs/                                             frozen contracts per milestone (m1-contracts.md,
-                                                  m2-contracts.md)
+                                                  m2-contracts.md, m3-contracts.md)
 ```
 
 ## Prerequisites

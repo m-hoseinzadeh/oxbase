@@ -718,7 +718,7 @@ mod tests {
             pg.sql,
             "SELECT * FROM \"public\".\"t\" ORDER BY \"id\" DESC, \"name\" ASC NULLS LAST LIMIT 500"
         );
-        assert!(pg.params.is_empty());
+        assert_eq!(pg.params, []);
         let my = select_table_data(&BacktickQuoting, &q, Some(&t)).unwrap();
         assert_eq!(
             my.sql,

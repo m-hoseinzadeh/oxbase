@@ -228,6 +228,18 @@ received stayed pageable. All 42 `fetch_list` cells pass. Where the build differ
 - The Glide Data Grid is pinned to `6.0.4-alpha24`, the first line that declares React 19
   (`docs/m2-contracts.md` §9).
 
+**M3 contracts (Design step, 2026-10-31).** `docs/m3-contracts.md` fixes the M3 contracts:
+DDL scripts as `ScriptStep`s with phases, transactionality, destructive flags and
+capture/condition steps (for the SQLite table rebuild); the `DdlGenerator` (with a
+`DdlContext`), `Comparator` (one shared structural comparison, `oxbase_dialect::compare`, with
+per-engine normalization rules and fixed property ids), `Capabilities::designer` and
+`DmlWriter` (bound parameters, key-only match, `RETURNING` or a read-back query) roles and
+their registration; the typed filter and sort model and the table-data `SELECT` with bound
+values; the edit service (editable key or a read-only reason, a UI-held pending-changes buffer
+applied in one transaction where every update and delete must hit exactly one row); the table
+designer model, preview and apply; the Tauri commands; the `[m3]` fixtures; and the webview
+smoke test that closes the M2 gap (Linux, `tauri-driver`, full lane).
+
 Order of work: M0–M3 prove the architecture. M4 and M7 are where the per-database matrix gets tested for real. M8 and M10 reuse the Comparator and DdlGenerator cells and get much cheaper if M3 is done right.
 
 ## 7. Main risks
