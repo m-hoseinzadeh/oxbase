@@ -6,17 +6,20 @@ use std::process::ExitCode;
 
 use oxbase_conformance::{fixtures, report, runner};
 
-const USAGE: &str = "usage: oxbase-conformance [--allow-missing] [--tcp-only] [--skip-connect]
+const USAGE: &str =
+    "usage: oxbase-conformance [--allow-missing] [--tcp-only] [--skip-connect] [--skip-fetch]
 
 Probes every engine in tests/fixtures.toml ($OXBASE_FIXTURES), runs the M1
-connection checks (plain, TLS, SSH, TLS over SSH, cancel, 200k-row stream),
-prints the object-kind x engine matrix and the connection table, and writes
-target/conformance/report.json.
+connection checks (plain, TLS, SSH, TLS over SSH, cancel, 200k-row stream) and
+the M2 fetch_list cells (list and load the [m2] seed objects through the
+registered Fetchers), prints the object-kind x engine matrix and the connection
+table, and writes target/conformance/report.json.
 
   --allow-missing  report unreachable fixtures as skipped instead of failing
                    (same as OXBASE_CONFORMANCE_ALLOW_MISSING=1)
   --tcp-only       skip protocol handshakes (same as OXBASE_CONFORMANCE_TCP_ONLY=1)
-  --skip-connect   skip the connection checks (same as OXBASE_CONFORMANCE_SKIP_CONNECT=1)";
+  --skip-connect   skip the connection checks (same as OXBASE_CONFORMANCE_SKIP_CONNECT=1)
+  --skip-fetch     skip the fetch_list cells (same as OXBASE_CONFORMANCE_SKIP_FETCH=1)";
 
 fn main() -> ExitCode {
     let mut opts = runner::RunOptions::from_env();
@@ -25,6 +28,7 @@ fn main() -> ExitCode {
             "--allow-missing" => opts.allow_missing = true,
             "--tcp-only" => opts.probe.handshake = false,
             "--skip-connect" => opts.skip_connect = true,
+            "--skip-fetch" => opts.skip_fetch = true,
             "-h" | "--help" => {
                 return match write_stdout(&format!("{USAGE}\n")) {
                     Ok(()) => ExitCode::SUCCESS,

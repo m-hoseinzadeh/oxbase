@@ -148,6 +148,8 @@ chrono = { version = "0.4.45", default-features = false, features = ["std", "clo
 arrow-array = "60.1.0"
 arrow-schema = { version = "60.1.0", features = ["serde"] }
 arrow-ipc = "60.1.0"
+# M2: `concat_batches` for result pages that span stored batches (oxbase-services).
+arrow-select = "60.1.0"
 
 # --- observability ---
 tracing = "0.1.44"
@@ -204,6 +206,8 @@ pretty_assertions = "1.4.1"
 rstest = "0.28.0"
 # Test certificates (ring backend, matches the workspace provider).
 rcgen = "0.14.10"
+# Temp dirs in tests; from M2 also a normal dependency of oxbase-services (per-run result
+# spill directories, deleted on drop).
 tempfile = "3.27.0"
 
 [profile.dev]

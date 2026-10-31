@@ -2,7 +2,9 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "Main window. Grants exactly the app commands the UI calls (each declared in build.rs) and the dialog plugin's file-open picker (SQLite database, TLS certificate and key, SSH key files). No other core or plugin permission is granted.",
-  "windows": ["main"],
+  "windows": [
+    "main"
+  ],
   "permissions": [
     "allow-app-info",
     "allow-demo-arrow-page",
@@ -14,6 +16,19 @@
     "allow-cancel-request",
     "allow-close-connection",
     "allow-list-open-connections",
+    "allow-tree-children",
+    "allow-object-load",
+    "allow-query-run",
+    "allow-query-page",
+    "allow-query-cancel",
+    "allow-query-close",
+    "allow-query-close-editor",
+    "allow-statement-at",
+    "allow-history-list",
+    "allow-history-delete",
+    "allow-history-clear",
+    "allow-history-get-settings",
+    "allow-history-set-settings",
     "dialog:allow-open"
   ]
 }

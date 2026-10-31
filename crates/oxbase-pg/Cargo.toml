@@ -14,6 +14,8 @@ workspace = true
 [dependencies]
 oxbase-types.workspace = true
 oxbase-driver.workspace = true
+# M2: Fetcher / TreeLayout cells registered by `dialect::register`.
+oxbase-dialect.workspace = true
 # rustls client configuration (ring) shared by every driver; also re-exports `rustls`.
 oxbase-net.workspace = true
 arrow-array.workspace = true
@@ -29,8 +31,9 @@ tokio-postgres-rustls.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
 uuid.workspace = true
+# M2: JSON-array extras of the dialect (index `include_columns`).
+serde_json.workspace = true
 
 [dev-dependencies]
-serde_json.workspace = true
 toml.workspace = true
 tokio.workspace = true

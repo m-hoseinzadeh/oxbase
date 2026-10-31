@@ -20,6 +20,7 @@ use uuid::Uuid;
 
 use crate::error::CommandError;
 use crate::profiles::SecretInput;
+use crate::workbench::WorkbenchState;
 
 /// Everything the connection commands need, managed as Tauri state.
 #[derive(Clone)]
@@ -40,6 +41,11 @@ impl ConnectionsState {
 
     pub fn manager(&self) -> &Arc<ConnectionManager> {
         &self.manager
+    }
+
+    /// Registers a cancellable request (M2 workbench commands share `cancel_request`).
+    pub(crate) fn start_request(&self, id: Option<String>) -> Result<PendingGuard> {
+        self.pending.start(id)
     }
 
     fn secrets(&self) -> Arc<dyn SecretStore> {
@@ -86,10 +92,17 @@ impl PendingRequests {
     }
 }
 
-struct PendingGuard {
+pub(crate) struct PendingGuard {
     pending: Arc<PendingRequests>,
     id: Option<String>,
     token: CancellationToken,
+}
+
+impl PendingGuard {
+    /// The request's cancellation token.
+    pub(crate) fn token(&self) -> CancellationToken {
+        self.token.clone()
+    }
 }
 
 impl Drop for PendingGuard {
@@ -104,7 +117,10 @@ impl Drop for PendingGuard {
 
 /// Runs `fut` on its own task. Errors become [`CommandError`]s with `secrets` masked; a panic
 /// becomes a generic internal error.
-async fn isolated<T, F>(secrets: Vec<Secret>, fut: F) -> std::result::Result<T, CommandError>
+pub(crate) async fn isolated<T, F>(
+    secrets: Vec<Secret>,
+    fut: F,
+) -> std::result::Result<T, CommandError>
 where
     T: Send + 'static,
     F: Future<Output = Result<T>> + Send + 'static,
@@ -241,14 +257,24 @@ pub fn cancel_request(state: State<'_, ConnectionsState>, request_id: &str) -> b
     state.pending.cancel(request_id)
 }
 
-/// Closes an open session.
+/// Closes an open session (with its child sessions) and drops the object tree's cached
+/// metadata sessions of it.
 #[tauri::command]
 pub async fn close_connection(
     state: State<'_, ConnectionsState>,
+    workbench: State<'_, WorkbenchState>,
     session_id: SessionId,
 ) -> std::result::Result<(), CommandError> {
     let manager = Arc::clone(&state.manager);
-    isolated(Vec::new(), async move { manager.close(session_id).await }).await
+    let tree = Arc::clone(workbench.tree());
+    isolated(Vec::new(), async move {
+        let closed = manager.close(session_id).await;
+        // The children are closed with the base; this only forgets them. Its error never hides
+        // the close result.
+        let _ = tree.forget(session_id).await;
+        closed
+    })
+    .await
 }
 
 /// Every open session, oldest first.

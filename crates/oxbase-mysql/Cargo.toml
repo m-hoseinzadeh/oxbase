@@ -14,6 +14,8 @@ workspace = true
 [dependencies]
 oxbase-types.workspace = true
 oxbase-driver.workspace = true
+# M2: Fetcher / TreeLayout cells registered by `dialect::register`.
+oxbase-dialect.workspace = true
 # TLS material loaders and the ring crypto provider (mysql_async builds its own rustls config).
 oxbase-net.workspace = true
 # rustls + ring, no OpenSSL / aws-lc (see the workspace manifest).

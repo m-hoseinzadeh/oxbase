@@ -14,6 +14,8 @@ workspace = true
 [dependencies]
 oxbase-types.workspace = true
 oxbase-driver.workspace = true
+# M2: Fetcher / TreeLayout cells registered by `dialect::register`.
+oxbase-dialect.workspace = true
 # Bundled SQLite. `column_decltype` gives declared column types (type mapping by affinity);
 # `hooks` gives the progress handler that makes cancellation race-free (see src/worker.rs).
 rusqlite = { workspace = true, features = ["column_decltype", "hooks"] }

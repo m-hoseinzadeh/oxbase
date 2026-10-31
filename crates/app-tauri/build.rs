@@ -13,6 +13,20 @@ const COMMANDS: &[&str] = &[
     "cancel_request",
     "close_connection",
     "list_open_connections",
+    // M2 workbench (src/workbench.rs).
+    "tree_children",
+    "object_load",
+    "query_run",
+    "query_page",
+    "query_cancel",
+    "query_close",
+    "query_close_editor",
+    "statement_at",
+    "history_list",
+    "history_delete",
+    "history_clear",
+    "history_get_settings",
+    "history_set_settings",
 ];
 
 fn main() {

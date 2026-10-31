@@ -6,15 +6,16 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::adapter::{self, Engine};
 use crate::connect::{self, ConnCell, ConnCheck};
+use crate::fetch::{self, FetchOutcome};
 use crate::fixtures::{Fixtures, FixturesError, ResolvedEngine};
-use crate::matrix::{CellStatus, Check, plan_engine_in};
+use crate::matrix::{Cell, CellStatus, Check, plan_engine_in};
 use crate::probe::{self, ProbeOptions};
 use crate::report::{
     CheckInfo, ConnCheckInfo, EngineStatus, REPORT_SCHEMA_VERSION, Report, Summary,
 };
 
 /// The milestone this harness build implements.
-pub const MILESTONE: &str = "M1";
+pub const MILESTONE: &str = "M2";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RunOptions {
@@ -23,11 +24,14 @@ pub struct RunOptions {
     pub allow_missing: bool,
     /// Skip the M1 connection checks (they are reported as skipped).
     pub skip_connect: bool,
+    /// Skip the M2 `fetch_list` cells (cells with a fetcher are reported as skipped).
+    pub skip_fetch: bool,
 }
 
 impl RunOptions {
     /// Reads `OXBASE_CONFORMANCE_ALLOW_MISSING`, `OXBASE_CONFORMANCE_PROBE_TIMEOUT_MS`,
-    /// `OXBASE_CONFORMANCE_TCP_ONLY` and `OXBASE_CONFORMANCE_SKIP_CONNECT`.
+    /// `OXBASE_CONFORMANCE_TCP_ONLY`, `OXBASE_CONFORMANCE_SKIP_CONNECT` and
+    /// `OXBASE_CONFORMANCE_SKIP_FETCH`.
     pub fn from_env() -> Self {
         let var = |name: &str| std::env::var(name).ok();
         let mut opts = Self::from_vars(
@@ -36,6 +40,7 @@ impl RunOptions {
             var("OXBASE_CONFORMANCE_TCP_ONLY").as_deref(),
         );
         opts.skip_connect = is_truthy(var("OXBASE_CONFORMANCE_SKIP_CONNECT").as_deref());
+        opts.skip_fetch = is_truthy(var("OXBASE_CONFORMANCE_SKIP_FETCH").as_deref());
         opts
     }
 
@@ -56,6 +61,7 @@ impl RunOptions {
             },
             allow_missing: is_truthy(allow_missing),
             skip_connect: false,
+            skip_fetch: false,
         }
     }
 }
@@ -76,7 +82,8 @@ pub fn run_path(path: &Path, opts: &RunOptions) -> Result<Report, FixturesError>
     Ok(run(path, &fixtures, &engines, opts))
 }
 
-/// Probes every engine concurrently and builds the report.
+/// Probes every engine concurrently, runs the connection checks and the `fetch_list` cells, and
+/// builds the report.
 pub fn run(
     fixtures_path: &Path,
     fixtures: &Fixtures,
@@ -106,11 +113,18 @@ pub fn run(
     };
 
     let registry = adapter::registry();
+    let fetched = if opts.skip_fetch {
+        Vec::new()
+    } else {
+        fetch::run_all(fixtures, engines, &reachable, &registry)
+    };
     let mut statuses = Vec::with_capacity(engines.len());
     let mut cells = Vec::new();
     for (e, probe) in engines.iter().zip(probes) {
         let mut planned = plan_engine_in(&registry, &e.name, e.engine);
-        if !probe.reachable {
+        if probe.reachable {
+            apply_fetch(&mut planned, &fetched, opts.skip_fetch);
+        } else {
             for cell in &mut planned {
                 if cell.status == CellStatus::Pending {
                     cell.status = CellStatus::Skipped;
@@ -164,6 +178,27 @@ pub fn run(
     }
 }
 
+/// Fills the `fetch_list` cells of one engine from the outcomes of [`fetch::run_all`]. With
+/// `skip_fetch`, cells that would have run are reported as skipped.
+fn apply_fetch(cells: &mut [Cell], fetched: &[FetchOutcome], skip_fetch: bool) {
+    for cell in cells.iter_mut().filter(|c| c.check == Check::FetchList) {
+        if let Some(o) = fetched
+            .iter()
+            .find(|o| o.engine == cell.engine && o.kind == cell.object_kind)
+        {
+            cell.status = o.status;
+            cell.detail = Some(o.detail.clone());
+            cell.elapsed_ms = o.elapsed_ms;
+        } else if skip_fetch
+            && cell.status == CellStatus::Pending
+            && cell.detail.as_deref() == Some(crate::matrix::PENDING_NOT_RUN)
+        {
+            cell.status = CellStatus::Skipped;
+            cell.detail = Some("fetch checks disabled".to_owned());
+        }
+    }
+}
+
 /// Connection cells when the checks are switched off: pending/n-a cells stay as they are, the
 /// rest are skipped.
 fn skipped_connections(engines: &[ResolvedEngine]) -> Vec<ConnCell> {
@@ -203,9 +238,10 @@ pub fn check_engine(
             fixtures_path.display()
         ));
     }
-    // Reachability only: the connection checks belong to the full run.
+    // Reachability only: the connection checks and fetch cells belong to the full run.
     let opts = RunOptions {
         skip_connect: true,
+        skip_fetch: true,
         ..*opts
     };
     let report = run(fixtures_path, &fixtures, &engines, &opts);
@@ -313,5 +349,56 @@ mod tests {
         assert!(report.engines[0].probe.reachable);
         assert_eq!(report.summary.pending, redis_kinds() * Check::ALL.len());
         assert_eq!(report.summary.skipped, 0);
+        assert_eq!(report.milestone, MILESTONE);
+    }
+
+    fn fetch_cell(kind: oxbase_types::ObjectKind, detail: &str) -> Cell {
+        Cell {
+            engine: "lite".to_owned(),
+            engine_kind: Engine::Sqlite,
+            object_kind: kind,
+            check: Check::FetchList,
+            status: CellStatus::Pending,
+            detail: Some(detail.to_owned()),
+            elapsed_ms: None,
+        }
+    }
+
+    #[test]
+    fn fetch_outcomes_fill_their_cells_only() {
+        use oxbase_types::ObjectKind as K;
+        let mut cells = vec![
+            fetch_cell(K::Table, crate::matrix::PENDING_NOT_RUN),
+            fetch_cell(K::View, crate::matrix::PENDING_NOT_RUN),
+            fetch_cell(K::Trigger, crate::matrix::PENDING_NO_FETCHER),
+        ];
+        let fetched = vec![
+            FetchOutcome {
+                engine: "lite".to_owned(),
+                kind: K::Table,
+                status: CellStatus::Pass,
+                detail: "ok".to_owned(),
+                elapsed_ms: Some(3),
+            },
+            FetchOutcome {
+                engine: "other".to_owned(),
+                kind: K::View,
+                status: CellStatus::Fail,
+                detail: "not ours".to_owned(),
+                elapsed_ms: None,
+            },
+        ];
+        apply_fetch(&mut cells, &fetched, false);
+        assert_eq!(cells[0].status, CellStatus::Pass);
+        assert_eq!(cells[0].elapsed_ms, Some(3));
+        assert_eq!(cells[1].status, CellStatus::Pending);
+        assert_eq!(cells[2].status, CellStatus::Pending);
+
+        apply_fetch(&mut cells, &[], true);
+        assert_eq!(cells[0].status, CellStatus::Pass);
+        assert_eq!(cells[1].status, CellStatus::Skipped);
+        assert_eq!(cells[1].detail.as_deref(), Some("fetch checks disabled"));
+        // No fetcher: nothing would have run, so it stays pending.
+        assert_eq!(cells[2].status, CellStatus::Pending);
     }
 }

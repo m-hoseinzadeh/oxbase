@@ -10,6 +10,10 @@
 //! * Connections (`src/connections.rs`): `list_profiles`, `save_profile`, `delete_profile`,
 //!   `test_connection`, `open_connection`, `cancel_request`, `close_connection` and
 //!   `list_open_connections`, forwarded to `oxbase-services` / `oxbase-store`.
+//! * Workbench (M2, `src/workbench.rs`): `tree_children`, `object_load`, `query_run` (events
+//!   through a `Channel`), `query_page` (Arrow IPC bytes), `query_cancel`, `query_close`,
+//!   `query_close_editor`, `statement_at`, `history_list`, `history_delete`, `history_clear`,
+//!   `history_get_settings` and `history_set_settings`. Contract: `docs/m2-contracts.md` §5.
 //!
 //! Every fallible command rejects with [`error::CommandError`], serialized as
 //! `{ "category": "<snake_case ErrorCategory>", "message": "..." }`.
@@ -22,6 +26,7 @@ mod connections;
 mod demo_page;
 mod error;
 mod profiles;
+mod workbench;
 
 use serde::Serialize;
 use tauri::Manager;
@@ -74,7 +79,9 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let data_dir = app.path().app_data_dir().ok();
-            app.manage(backend::connections_state(data_dir.as_deref()));
+            let (connections, workbench) = backend::app_state(data_dir.as_deref());
+            app.manage(connections);
+            app.manage(workbench);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -88,6 +95,19 @@ pub fn run() {
             connections::cancel_request,
             connections::close_connection,
             connections::list_open_connections,
+            workbench::tree_children,
+            workbench::object_load,
+            workbench::query_run,
+            workbench::query_page,
+            workbench::query_cancel,
+            workbench::query_close,
+            workbench::query_close_editor,
+            workbench::statement_at,
+            workbench::history_list,
+            workbench::history_delete,
+            workbench::history_clear,
+            workbench::history_get_settings,
+            workbench::history_set_settings,
         ])
         .build(tauri::generate_context!())
         .expect("error while building the oxbase desktop shell");

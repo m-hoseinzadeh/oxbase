@@ -53,6 +53,30 @@
 //! [`profiles`] saves, tests and deletes profiles together with their keychain secrets, for both
 //! front ends. A stored database or SSH password only goes to the destination it was saved for:
 //! an edit that changes the server, user, TLS or SSH route must retype it.
+//!
+//! # M2: tree, query runs, history
+//!
+//! Contracts in `docs/m2-contracts.md`:
+//!
+//! - [`default_dialects`] builds the [`DialectRegistry`] (fetchers, tree layouts) of every
+//!   engine, like [`default_drivers`] for drivers.
+//! - [`tree::TreeService`] lists the children of an object-tree node and loads object
+//!   definitions through the registry.
+//! - [`query::QueryService`] runs a script statement by statement on an editor session and keeps
+//!   every result set in a [`results::ResultStore`] (memory up to a budget, then Arrow IPC spill
+//!   files) that the grid pages through, even while rows still arrive.
+//! - [`history::HistoryService`] records executed statements (redacted) in a
+//!   [`HistoryRepository`](oxbase_store::HistoryRepository).
+//!
+//! **Sessions.** A session opened with [`ConnectionManager::open`] is a *base* session: the
+//! object tree reads metadata through it. Query editors never run on a base session; each
+//! editor gets a *child* session ([`ConnectionManager::open_child`]) with the same resolved
+//! parameters and tunnel, so a long query never blocks the tree and every editor keeps its own
+//! transaction state. On PostgreSQL ([`DatabaseScope::Session`](oxbase_dialect::DatabaseScope))
+//! the tree also opens a child per other database it browses. Children are not listed by
+//! [`ConnectionManager::list_open`] and close with their base. Every user of
+//! [`SessionHandle::connection`] holds [`SessionHandle::exclusive`] while it has a statement
+//! open, because a connection runs one statement at a time.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -73,10 +97,17 @@ pub use oxbase_store::{
 use oxbase_store::{PemRef, ProfileAddress, SshAuthSettings, SshSettings, TlsSettings};
 use oxbase_types::{Engine, Error, KnownHostsPolicy, Result, Secret, ServerVersion};
 
+mod dialects;
 mod drivers;
+pub mod history;
 pub mod profiles;
+pub mod query;
+pub mod results;
+pub mod tree;
 
+pub use dialects::default_dialects;
 pub use drivers::default_drivers;
+pub use oxbase_dialect::DialectRegistry;
 
 /// Sent to servers that report a client name (PostgreSQL `application_name`, ...).
 pub const APPLICATION_NAME: &str = "Oxbase";
@@ -166,6 +197,14 @@ pub struct SessionSummary {
     pub engine: Engine,
     pub info: ConnectionInfo,
     pub opened_at: DateTime<Utc>,
+    /// M2: the database this session was opened on when it was asked for one (the profile's
+    /// database for a base session, the requested one for a child). `None`: the server default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub database: Option<String>,
+    /// M2: for a child session ([`ConnectionManager::open_child`]), the base session it belongs
+    /// to. `None` for base sessions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<SessionId>,
 }
 
 /// An open session. Cheap to clone; all clones share the connection.
@@ -179,10 +218,15 @@ pub struct SessionHandle {
 
 struct SessionInner {
     summary: SessionSummary,
+    /// Held while a statement is open on `connection` (see [`SessionHandle::exclusive`]).
+    exec: Arc<tokio::sync::Mutex<()>>,
     // Field order matters: `connection` drops before `tunnel`.
     connection: Arc<dyn Connection>,
     tunnel: Option<Arc<TunnelHandle>>,
 }
+
+/// Exclusive use of a session's connection; see [`SessionHandle::exclusive`].
+pub type SessionGuard = tokio::sync::OwnedMutexGuard<()>;
 
 impl SessionHandle {
     /// Used by the manager once a connection is up.
@@ -194,6 +238,7 @@ impl SessionHandle {
         Self {
             inner: Arc::new(SessionInner {
                 summary,
+                exec: Arc::new(tokio::sync::Mutex::new(())),
                 connection,
                 tunnel,
             }),
@@ -219,6 +264,23 @@ impl SessionHandle {
     /// The tunnel this session dials, if it goes through SSH.
     pub fn tunnel(&self) -> Option<&Arc<TunnelHandle>> {
         self.inner.tunnel.as_ref()
+    }
+
+    /// Waits for exclusive use of the connection and returns a guard that keeps it until
+    /// dropped (M2).
+    ///
+    /// A connection runs one statement at a time, so every caller of
+    /// [`SessionHandle::connection`] (tree fetchers, query runs) holds this guard from
+    /// `execute` until the result stream is drained or dropped. Waiting is fair (FIFO). Wrap
+    /// the wait in the caller's cancellation token.
+    pub async fn exclusive(&self) -> SessionGuard {
+        Arc::clone(&self.inner.exec).lock_owned().await
+    }
+
+    /// The session's current database as the driver reports it
+    /// ([`Connection::current_database`]).
+    pub fn current_database(&self) -> Option<String> {
+        self.inner.connection.current_database()
     }
 }
 
@@ -258,6 +320,10 @@ pub struct ConnectionManager {
     /// Tunnels opened outside the pools (tests, provided SSH secrets), for `open_tunnel_count`.
     dedicated: Mutex<Vec<Weak<TunnelHandle>>>,
     sessions: Mutex<HashMap<SessionId, SessionHandle>>,
+    /// M2: the resolved parameters (secrets included) of every base session opened by
+    /// [`ConnectionManager::open`], for [`ConnectionManager::open_child`]. Dropped when the base
+    /// closes; never serialized or logged.
+    bases: Mutex<HashMap<SessionId, ConnectParams>>,
 }
 
 impl ConnectionManager {
@@ -273,6 +339,7 @@ impl ConnectionManager {
             pools: Mutex::new(HashMap::new()),
             dedicated: Mutex::new(Vec::new()),
             sessions: Mutex::new(HashMap::new()),
+            bases: Mutex::new(HashMap::new()),
         }
     }
 
@@ -420,9 +487,10 @@ impl ConnectionManager {
         cancel: CancellationToken,
     ) -> Result<ConnectionInfo> {
         // A test always authenticates for real: never reuse a pooled tunnel.
-        let (connection, tunnel, info) = self
+        let (connection, tunnel, info, params) = self
             .connect(profile, provided, cancel, Sharing::Dedicated)
             .await?;
+        drop(params);
         if let Err(e) = connection.close().await {
             tracing::debug!(profile = %profile.id, error = %e, "closing test connection failed");
         }
@@ -439,7 +507,7 @@ impl ConnectionManager {
         provided: &ProvidedSecrets,
         cancel: CancellationToken,
     ) -> Result<SessionHandle> {
-        let (connection, tunnel, info) = self
+        let (connection, tunnel, info, params) = self
             .connect(profile, provided, cancel, Sharing::Pooled)
             .await?;
         let summary = SessionSummary {
@@ -449,11 +517,22 @@ impl ConnectionManager {
             engine: profile.engine,
             info,
             opened_at: Utc::now(),
+            database: profile.database.clone(),
+            parent: None,
         };
         let handle = SessionHandle::new(summary, Arc::from(connection), tunnel);
         if let Err(e) = self.register(handle.clone()) {
             let _ = handle.connection().close().await;
             return Err(e);
+        }
+        let stored = self
+            .bases
+            .lock()
+            .map(|mut bases| bases.insert(handle.id(), params))
+            .is_ok();
+        if !stored {
+            let _ = self.close(handle.id()).await;
+            return Err(Error::internal("session parameter table lock poisoned"));
         }
         tracing::debug!(
             session = %handle.id(),
@@ -479,6 +558,7 @@ impl ConnectionManager {
         Box<dyn Connection>,
         Option<Arc<TunnelHandle>>,
         ConnectionInfo,
+        ConnectParams,
     )> {
         let started = Instant::now();
         let (params, ssh) = self.prepare(profile, provided, &cancel).await?;
@@ -497,8 +577,7 @@ impl ConnectionManager {
                 .attach_tunnel(profile, provided, params, ssh, sharing, &cancel)
                 .await?;
             let connection = self.drivers.connect(&params).await?;
-            drop(params);
-            Ok::<_, Error>((connection, tunnel))
+            Ok::<_, Error>((connection, tunnel, params))
         };
         let bounded = async {
             match deadline {
@@ -514,11 +593,12 @@ impl ConnectionManager {
                 None => network.await,
             }
         };
-        let (connection, tunnel) = until_cancelled(&cancel, bounded).await?;
+        let (connection, tunnel, params) = until_cancelled(&cancel, bounded).await?;
         if cancel.is_cancelled() {
             // Connected in the same instant the caller gave up.
             let _ = connection.close().await;
             drop(connection);
+            drop(params);
             drop(tunnel);
             return Err(Error::Cancelled);
         }
@@ -528,7 +608,7 @@ impl ConnectionManager {
             via_ssh: tunnel.is_some(),
             latency_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         };
-        Ok((connection, tunnel, info))
+        Ok((connection, tunnel, info, params))
     }
 
     /// Step 1: every secret the profile needs, from the caller or the store.
@@ -677,24 +757,190 @@ impl ConnectionManager {
         })
     }
 
+    /// Opens a child session of the open base session `base` (M2): a new connection with the
+    /// base's resolved parameters (its secrets are not asked for again) and the same SSH tunnel,
+    /// on `database` when given (else the base's database).
+    ///
+    /// The child is tracked under its base: [`ConnectionManager::get`] finds it,
+    /// [`ConnectionManager::list_open`] does not list it, [`ConnectionManager::close`] on the
+    /// child closes only the child, and closing the base closes its children first. Its
+    /// [`SessionSummary`] has `parent = Some(base)` and `database` set. Opening a child of a
+    /// child is `InvalidInput`; an unknown base is `NotFound`. Honours `cancel` like
+    /// [`ConnectionManager::open`].
+    ///
+    /// To do this the manager keeps each base session's resolved [`ConnectParams`] (secrets
+    /// included, redacted in `Debug`) in memory for as long as the base is open, and drops them
+    /// when it closes. They are never serialized or logged.
+    pub async fn open_child(
+        &self,
+        base: SessionId,
+        database: Option<&str>,
+        cancel: CancellationToken,
+    ) -> Result<SessionHandle> {
+        check_cancelled(&cancel)?;
+        let base_handle = self
+            .get(base)
+            .ok_or_else(|| Error::not_found(format!("no open session {base}")))?;
+        if base_handle.summary().parent.is_some() {
+            return Err(Error::invalid_input(
+                "a session can only be opened from a base session, not from another child",
+            ));
+        }
+        let mut params = self
+            .bases
+            .lock()
+            .map_err(|_| Error::internal("session parameter table lock poisoned"))?
+            .get(&base)
+            .cloned()
+            .ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "session {base} was not opened by the connection manager; it has no \
+                     parameters to open another session with"
+                ))
+            })?;
+        if let Some(db) = database {
+            params.database = Some(db.to_owned());
+        }
+        let base_summary = base_handle.summary();
+        let started = Instant::now();
+        // The tunnel is already open: only the driver connect is bounded.
+        let deadline = params
+            .connect_timeout
+            .map(|limit| limit.saturating_add(CONNECT_GRACE));
+        let connect = self.drivers.connect(&params);
+        let bounded = async {
+            match deadline {
+                Some(deadline) => tokio::time::timeout(deadline, connect)
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(Error::timeout(format!(
+                            "connecting to '{}' took longer than {} s",
+                            base_summary.profile_name,
+                            deadline.as_secs()
+                        )))
+                    }),
+                None => connect.await,
+            }
+        };
+        let connection = until_cancelled(&cancel, bounded).await?;
+        let opened_on = params.database.clone();
+        drop(params);
+        if cancel.is_cancelled() {
+            let _ = connection.close().await;
+            return Err(Error::Cancelled);
+        }
+        let summary = SessionSummary {
+            id: SessionId::new(),
+            profile_id: base_summary.profile_id,
+            profile_name: base_summary.profile_name.clone(),
+            engine: base_summary.engine,
+            info: ConnectionInfo {
+                server_version: connection.server_version().clone(),
+                tls_in_use: connection.tls_in_use(),
+                via_ssh: base_handle.tunnel().is_some(),
+                latency_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            },
+            opened_at: Utc::now(),
+            database: opened_on,
+            parent: Some(base),
+        };
+        let handle = SessionHandle::new(
+            summary,
+            Arc::from(connection),
+            base_handle.tunnel().cloned(),
+        );
+        let registered = {
+            let mut sessions = self.lock()?;
+            // The base may have closed while the child was connecting.
+            if sessions.contains_key(&base) {
+                sessions.insert(handle.id(), handle.clone());
+                true
+            } else {
+                false
+            }
+        };
+        if !registered {
+            let _ = handle.connection().close().await;
+            return Err(Error::not_found(format!("session {base} was closed")));
+        }
+        tracing::debug!(session = %handle.id(), base = %base, "child session opened");
+        Ok(handle)
+    }
+
+    /// `false` when a child of the open base session `base` would not see the base's data:
+    /// an in-memory database private to one connection (`:memory:`, an empty file name, or a
+    /// `file:` URI with `mode=memory` or `file::memory:`, without `cache=shared`), whatever
+    /// the engine. Such a
+    /// base must be used directly instead of through children. `true` for anything else,
+    /// including unknown sessions (opening the child then reports them).
+    pub(crate) fn children_share_data(&self, base: SessionId) -> bool {
+        let Ok(bases) = self.bases.lock() else {
+            return true;
+        };
+        let Some(file) = bases.get(&base).and_then(|p| p.file.as_ref()) else {
+            return true;
+        };
+        let file = file.to_string_lossy();
+        let file = file.trim();
+        let lower = file.to_ascii_lowercase();
+        let private_memory = file.is_empty()
+            || file == ":memory:"
+            || (lower.starts_with("file:")
+                && (lower.contains("mode=memory") || lower.starts_with("file::memory:"))
+                && !lower.contains("cache=shared"));
+        !private_memory
+    }
+
     /// Unregisters and closes the session: the driver connection is closed, then the manager's
     /// tunnel reference is dropped (the tunnel closes when no other session shares it). Clones
     /// of the handle held elsewhere see a closed connection. Unknown ids are `NotFound`.
+    ///
+    /// Closing a base session closes its child sessions first.
     pub async fn close(&self, id: SessionId) -> Result<()> {
-        let handle = self
-            .lock()?
-            .remove(&id)
-            .ok_or_else(|| Error::not_found(format!("no open session {id}")))?;
+        let (handle, children) = {
+            let mut sessions = self.lock()?;
+            let handle = sessions
+                .remove(&id)
+                .ok_or_else(|| Error::not_found(format!("no open session {id}")))?;
+            let child_ids: Vec<SessionId> = sessions
+                .values()
+                .filter(|s| s.summary().parent == Some(id))
+                .map(SessionHandle::id)
+                .collect();
+            let children: Vec<SessionHandle> = child_ids
+                .iter()
+                .filter_map(|c| sessions.remove(c))
+                .collect();
+            (handle, children)
+        };
+        if let Ok(mut bases) = self.bases.lock() {
+            bases.remove(&id);
+        }
+        for child in children {
+            if let Err(e) = child.connection().close().await {
+                tracing::debug!(session = %child.id(), error = %e, "closing child session failed");
+            }
+        }
         handle.connection().close().await
     }
 
     /// Closes every open session; returns the first error after trying all of them.
     pub async fn close_all(&self) -> Result<()> {
-        let ids: Vec<SessionId> = self.lock()?.keys().copied().collect();
+        // Bases first: closing one also closes its children.
+        let mut ids: Vec<(bool, SessionId)> = self
+            .lock()?
+            .values()
+            .map(|s| (s.summary().parent.is_some(), s.id()))
+            .collect();
+        ids.sort();
         let mut first_error = None;
-        for id in ids {
-            if let Err(e) = self.close(id).await {
-                first_error.get_or_insert(e);
+        for (_, id) in ids {
+            match self.close(id).await {
+                Ok(()) => {}
+                Err(e) if e.category() == oxbase_types::ErrorCategory::NotFound => {}
+                Err(e) => {
+                    first_error.get_or_insert(e);
+                }
             }
         }
         first_error.map_or(Ok(()), Err)
@@ -705,12 +951,16 @@ impl ConnectionManager {
         self.lock().ok()?.get(&id).cloned()
     }
 
-    /// Every open session, oldest first.
+    /// Every open base session, oldest first (child sessions are not listed).
     pub fn list_open(&self) -> Vec<SessionSummary> {
         let Ok(sessions) = self.lock() else {
             return Vec::new();
         };
-        let mut all: Vec<_> = sessions.values().map(|s| s.summary().clone()).collect();
+        let mut all: Vec<_> = sessions
+            .values()
+            .filter(|s| s.summary().parent.is_none())
+            .map(|s| s.summary().clone())
+            .collect();
         all.sort_by_key(|s| (s.opened_at, s.id));
         all
     }
@@ -854,6 +1104,8 @@ mod tests {
                 latency_ms: 1,
             },
             opened_at: Utc::now(),
+            database: None,
+            parent: None,
         };
         let handle = SessionHandle::new(summary.clone(), conn, None);
         mgr.register(handle.clone()).unwrap();
@@ -868,5 +1120,48 @@ mod tests {
         mgr.close_all().await.unwrap();
         let json = serde_json::to_value(&summary.info).unwrap();
         assert_eq!(json["via_ssh"], false);
+        // M2 fields are omitted when unset, so older readers see the M1 shape.
+        let json = serde_json::to_value(&summary).unwrap();
+        assert!(json.get("database").is_none() && json.get("parent").is_none());
+    }
+
+    #[tokio::test]
+    async fn exclusive_serialises_users_of_a_session() {
+        use oxbase_driver::Driver;
+        let conn: Arc<dyn Connection> = Arc::from(
+            MockDriver::new(Engine::Postgres)
+                .connect(&ConnectParams::network(Engine::Postgres, "mock"))
+                .await
+                .unwrap(),
+        );
+        let summary = SessionSummary {
+            id: SessionId::new(),
+            profile_id: Uuid::nil(),
+            profile_name: "mock".into(),
+            engine: Engine::Postgres,
+            info: ConnectionInfo {
+                server_version: conn.server_version().clone(),
+                tls_in_use: false,
+                via_ssh: false,
+                latency_ms: 1,
+            },
+            opened_at: Utc::now(),
+            database: Some("db".into()),
+            parent: None,
+        };
+        let handle = SessionHandle::new(summary, conn, None);
+        assert_eq!(handle.current_database(), None);
+        let guard = handle.exclusive().await;
+        let other = handle.clone();
+        let waiter = tokio::spawn(async move {
+            let _g = other.exclusive().await;
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!waiter.is_finished(), "second user waits for the first");
+        drop(guard);
+        tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("second user proceeds")
+            .unwrap();
     }
 }

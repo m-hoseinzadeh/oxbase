@@ -7,9 +7,14 @@
 //!
 //! Roles per (engine, object kind): [`Fetcher`], [`DdlGenerator`], [`Comparator`].
 //! Roles per engine: [`Capabilities`], [`Quoting`], [`DmlWriter`].
+//! Data per engine (M2): the object-tree [`TreeLayout`] and its [`DatabaseScope`].
+//!
+//! How engine crates register their cells: see [`DialectRegistry`] (*Registration*). The M2
+//! contracts are in `docs/m2-contracts.md`.
 
 mod quoting;
 mod registry;
+mod tree;
 
 use async_trait::async_trait;
 use oxbase_driver::{CancellationToken, Connection};
@@ -22,6 +27,7 @@ pub use quoting::{AnsiQuoting, BacktickQuoting, BracketQuoting, PgQuoting, Quoti
 pub use registry::{
     CellRole, CellStatus, CoverageMatrix, DialectRegistry, EngineRole, MissingCell,
 };
+pub use tree::{ChildGroup, DatabaseScope, TreeLayout};
 
 /// Reads objects of one kind from a live connection. One implementation per (engine, kind).
 ///
@@ -29,6 +35,31 @@ pub use registry::{
 /// [`CancellationToken`] (PLAN §1, rule 4). Implementations pass it on to every
 /// [`Connection::execute`] they make and check it between round trips; once it is cancelled they
 /// return `Err(Error::Cancelled)` and no partial result.
+///
+/// # M2 rules for implementations
+///
+/// - **Catalog queries only, with bound parameters.** Names from `parent` / `obj` are passed as
+///   parameters (`$1` / `?`), never interpolated into SQL text, so no name can change the
+///   query. Only fixed SQL text is concatenated (for example a version-specific column list).
+/// - **Version-aware.** Pick the catalog query from [`Connection::server_version`] (PostgreSQL
+///   `prokind` is 11+, MariaDB sequences 10.3+, SQLite `pragma_table_list` 3.37+, ...). A kind
+///   the server version does not have is answered by [`Capabilities::supports_kind`], not by a
+///   failing query.
+/// - **Parents** (what `list` receives): `Database` → [`ObjectRef::root`]; `Schema` → a
+///   `Database` ref; schema-level kinds (Table, View, MatView, Function, Procedure, Sequence) → a
+///   `Schema` ref (PostgreSQL) or a `Database` ref (MySQL, MariaDB, SQLite, where the database
+///   name is the `ObjectRef` name and children get it as `catalog`); table children (Column,
+///   Index, ForeignKey, Check, Trigger) → the owning table, view or materialized view.
+/// - **Refs** of listed objects are built with [`ObjectRef::child`] from `parent` (so `catalog`
+///   is always set on engines with [`DatabaseScope::Session`] / [`DatabaseScope::Catalog`]),
+///   plus [`ObjectRef::with_signature`] for PostgreSQL routines.
+/// - **Order**: `list` returns objects sorted by name (byte order of the server's collation is
+///   fine); columns in ordinal order.
+/// - **System objects** (`pg_catalog`, `information_schema`, MySQL `mysql` / `sys` /
+///   `performance_schema`, SQLite `sqlite_*` tables) are listed with `system = true`; the tree
+///   hides them unless asked.
+/// - `load` returns the [`ObjectDef`] variant documented on [`ObjectDef`] for the kind and
+///   fails with `Error::NotFound` when the object is gone.
 #[async_trait]
 pub trait Fetcher: Send + Sync {
     /// Lists the objects of this fetcher's kind directly under `parent` (for example the tables

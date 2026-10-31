@@ -1166,3 +1166,126 @@ async fn the_deadline_covers_a_slow_driver() {
     assert!(h.tunnels.all_closed());
     assert_eq!(h.driver.open(), 0);
 }
+
+// ---------------------------------------------------------------------------------------------
+// M2: child sessions
+// ---------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn children_reuse_params_and_tunnel_and_close_with_their_base() {
+    let hx = harness();
+    let p = ssh_profile();
+    store(&hx, &p, SecretSlot::Password, DB_PW).await;
+    store(&hx, &p, SecretSlot::SshPassword, SSH_PW).await;
+    let base = hx
+        .mgr
+        .open(&p, &ProvidedSecrets::none(), token())
+        .await
+        .unwrap();
+    let base_params = hx.driver.last();
+    // The keychain is emptied: a child must not ask for the secrets again.
+    hx.secrets
+        .delete(&p.secret_key(SecretSlot::Password))
+        .await
+        .unwrap();
+
+    let child = hx
+        .mgr
+        .open_child(base.id(), Some("other_db"), token())
+        .await
+        .unwrap();
+    let params = hx.driver.last();
+    assert_eq!(params.database.as_deref(), Some("other_db"));
+    assert_eq!(params.password, base_params.password);
+    assert_eq!(params.dial_addr, base_params.dial_addr);
+    assert_eq!(params.host, base_params.host);
+    assert_eq!(
+        hx.tunnels.opened(),
+        1,
+        "the child rides on the base's tunnel"
+    );
+    assert!(Arc::ptr_eq(base.tunnel().unwrap(), child.tunnel().unwrap()));
+    assert_eq!(child.summary().parent, Some(base.id()));
+    assert_eq!(child.summary().database.as_deref(), Some("other_db"));
+    assert_eq!(child.summary().profile_id, p.id);
+    assert!(child.info().via_ssh);
+
+    // Without a database the child goes to the base's.
+    let same = hx.mgr.open_child(base.id(), None, token()).await.unwrap();
+    assert_eq!(hx.driver.last().database.as_deref(), Some("appdb"));
+    assert_eq!(same.summary().database.as_deref(), Some("appdb"));
+
+    // Children are found but not listed.
+    assert!(hx.mgr.get(child.id()).is_some());
+    assert_eq!(
+        hx.mgr.list_open().iter().map(|s| s.id).collect::<Vec<_>>(),
+        vec![base.id()]
+    );
+    assert_eq!(hx.driver.open(), 3);
+
+    // A child of a child, and of an unknown session, are refused.
+    let err = hx
+        .mgr
+        .open_child(child.id(), None, token())
+        .await
+        .unwrap_err();
+    assert_eq!(err.category(), ErrorCategory::InvalidInput);
+    let err = hx
+        .mgr
+        .open_child(SessionId::new(), None, token())
+        .await
+        .unwrap_err();
+    assert_eq!(err.category(), ErrorCategory::NotFound);
+
+    // Closing a child closes only the child.
+    hx.mgr.close(same.id()).await.unwrap();
+    assert_eq!(hx.driver.open(), 2);
+    assert!(hx.mgr.get(base.id()).is_some());
+
+    // Closing the base closes its children first.
+    hx.mgr.close(base.id()).await.unwrap();
+    assert_eq!(hx.driver.open(), 0);
+    assert!(hx.mgr.get(child.id()).is_none());
+    let err = hx.mgr.close(child.id()).await.unwrap_err();
+    assert_eq!(err.category(), ErrorCategory::NotFound);
+    let err = hx
+        .mgr
+        .open_child(base.id(), None, token())
+        .await
+        .unwrap_err();
+    assert_eq!(err.category(), ErrorCategory::NotFound);
+    drop((base, child, same));
+    assert!(
+        hx.tunnels.all_closed(),
+        "the tunnel closes with its last user"
+    );
+}
+
+#[tokio::test]
+async fn children_honour_cancel_and_close_all() {
+    let hx = harness();
+    let mut p = direct_profile();
+    p.password = None;
+    let base = hx
+        .mgr
+        .open(&p, &ProvidedSecrets::none(), token())
+        .await
+        .unwrap();
+    let cancelled = token();
+    cancelled.cancel();
+    let err = hx
+        .mgr
+        .open_child(base.id(), None, cancelled)
+        .await
+        .unwrap_err();
+    assert!(err.is_cancelled());
+    assert_eq!(hx.driver.open(), 1);
+
+    let _child = hx.mgr.open_child(base.id(), None, token()).await.unwrap();
+    assert_eq!(hx.driver.open(), 2);
+    hx.mgr.close_all().await.unwrap();
+    assert_eq!(hx.driver.open(), 0);
+    assert_eq!(hx.mgr.list_open(), Vec::<SessionSummary>::new());
+    // Secrets of the base are never in the manager's Debug output.
+    assert!(!format!("{:?}", hx.mgr).contains(DB_PW));
+}

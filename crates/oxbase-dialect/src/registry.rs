@@ -4,9 +4,9 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Write as _};
 use std::sync::Arc;
 
-use oxbase_types::{Engine, Error, ObjectKind, Result};
+use oxbase_types::{Engine, Error, ObjectKind, Result, ServerVersion};
 
-use crate::{Capabilities, Comparator, DdlGenerator, DmlWriter, Fetcher, Quoting};
+use crate::{Capabilities, Comparator, DdlGenerator, DmlWriter, Fetcher, Quoting, TreeLayout};
 
 /// Roles filled per (engine, object kind).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -207,6 +207,9 @@ struct EngineEntry {
     capabilities: Option<Arc<dyn Capabilities>>,
     quoting: Option<Arc<dyn Quoting>>,
     dml: Option<Arc<dyn DmlWriter>>,
+    /// M2: the object-tree layout. Not an [`EngineRole`]: it is data, not a matrix role, so the
+    /// conformance matrix does not change.
+    tree: Option<Arc<TreeLayout>>,
 }
 
 /// Holds every dialect implementation, keyed by (engine, object kind) for per-kind roles and by
@@ -214,6 +217,22 @@ struct EngineEntry {
 ///
 /// Engine crates register their cells at startup; services look them up. Lookups of a missing
 /// role fail with `Error::Unsupported`, so a half-filled engine degrades instead of panicking.
+///
+/// # Registration (M2)
+///
+/// Each engine crate exposes `pub fn register(reg: &mut DialectRegistry)` in a `dialect`
+/// module (`oxbase_pg::dialect::register`, `oxbase_mysql::dialect::register` for both MySQL and
+/// MariaDB, `oxbase_sqlite::dialect::register`). It registers, for its engine(s):
+///
+/// - a [`Fetcher`] for every kind its [`TreeLayout`] mentions ([`DialectRegistry::missing_layout_fetchers`]
+///   must be empty), plus any other kind it can read;
+/// - its [`TreeLayout`] ([`DialectRegistry::register_tree_layout`]);
+/// - [`Capabilities`] and [`Quoting`];
+/// - not-applicable marks for kinds the engine does not have
+///   ([`DialectRegistry::mark_not_applicable_except`]).
+///
+/// `oxbase_services::default_dialects()` calls every engine's `register`, the way
+/// `default_drivers()` registers drivers; the app, the CLI and the conformance harness use it.
 #[derive(Default, Clone)]
 pub struct DialectRegistry {
     cells: HashMap<(Engine, ObjectKind), Cell>,
@@ -292,6 +311,27 @@ impl DialectRegistry {
         self
     }
 
+    /// Marks every kind of [`ObjectKind::ALL`] that is not in `applicable` as not applicable on
+    /// `engine` (see [`DialectRegistry::mark_not_applicable`]).
+    pub fn mark_not_applicable_except(
+        &mut self,
+        engine: Engine,
+        applicable: &[ObjectKind],
+    ) -> &mut Self {
+        for kind in ObjectKind::ALL {
+            if !applicable.contains(&kind) {
+                self.not_applicable.insert((engine, kind));
+            }
+        }
+        self
+    }
+
+    /// Registers the object-tree layout of `engine` (M2), replacing an earlier one.
+    pub fn register_tree_layout(&mut self, engine: Engine, layout: TreeLayout) -> &mut Self {
+        self.engine_mut(engine).tree = Some(Arc::new(layout));
+        self
+    }
+
     // --- lookup ---
 
     fn missing(engine: Engine, kind: ObjectKind, role: CellRole) -> Error {
@@ -347,6 +387,56 @@ impl DialectRegistry {
             .get(&engine)
             .and_then(|e| e.dml.clone())
             .ok_or_else(|| Self::missing_engine(engine, EngineRole::DmlWriter))
+    }
+
+    /// The object-tree layout of `engine`; `Error::Unsupported` when none is registered.
+    pub fn tree_layout(&self, engine: Engine) -> Result<Arc<TreeLayout>> {
+        self.engines
+            .get(&engine)
+            .and_then(|e| e.tree.clone())
+            .ok_or_else(|| {
+                Error::unsupported(format!(
+                    "{} has no object tree layout",
+                    engine.display_name()
+                ))
+            })
+    }
+
+    /// `true` if objects of `kind` exist on `engine` at server version `v`: the engine's
+    /// [`Capabilities::supports_kind`], or `true` when it registered no capabilities.
+    pub fn supports_kind(&self, engine: Engine, kind: ObjectKind, v: &ServerVersion) -> bool {
+        self.engines
+            .get(&engine)
+            .and_then(|e| e.capabilities.as_ref())
+            .is_none_or(|c| c.supports_kind(kind, v))
+    }
+
+    /// Kinds that `engine`'s tree layout mentions but that have no [`Fetcher`]. Empty when
+    /// the engine has no layout. Engine streams assert this is empty.
+    pub fn missing_layout_fetchers(&self, engine: Engine) -> Vec<ObjectKind> {
+        let Ok(layout) = self.tree_layout(engine) else {
+            return Vec::new();
+        };
+        layout
+            .kinds()
+            .into_iter()
+            .filter(|&k| self.fetcher(engine, k).is_err())
+            .collect()
+    }
+
+    /// Engines that registered anything (a cell, an engine role, a layout or a
+    /// not-applicable mark), sorted.
+    pub fn engines(&self) -> Vec<Engine> {
+        let mut out: Vec<Engine> = self
+            .cells
+            .keys()
+            .map(|(e, _)| *e)
+            .chain(self.engines.keys().copied())
+            .chain(self.not_applicable.iter().map(|(e, _)| *e))
+            .collect();
+        out.sort();
+        out.dedup();
+        out
     }
 
     // --- coverage ---

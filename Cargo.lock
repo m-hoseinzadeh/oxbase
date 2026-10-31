@@ -3713,6 +3713,8 @@ dependencies = [
 name = "oxbase-conformance"
 version = "0.0.1"
 dependencies = [
+ "arrow-array",
+ "async-trait",
  "futures",
  "oxbase-dialect",
  "oxbase-driver",
@@ -3723,6 +3725,7 @@ dependencies = [
  "pretty_assertions",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "toml 1.1.8+spec-1.1.0",
@@ -3797,6 +3800,7 @@ dependencies = [
  "chrono",
  "futures",
  "mysql_async",
+ "oxbase-dialect",
  "oxbase-driver",
  "oxbase-net",
  "oxbase-types",
@@ -3838,6 +3842,7 @@ dependencies = [
  "bytes",
  "chrono",
  "futures",
+ "oxbase-dialect",
  "oxbase-driver",
  "oxbase-net",
  "oxbase-types",
@@ -3863,17 +3868,26 @@ version = "0.0.1"
 name = "oxbase-services"
 version = "0.0.1"
 dependencies = [
+ "arrow-array",
+ "arrow-ipc",
+ "arrow-schema",
+ "arrow-select",
  "async-trait",
  "chrono",
+ "futures",
+ "oxbase-dialect",
  "oxbase-driver",
  "oxbase-mysql",
  "oxbase-net",
  "oxbase-pg",
+ "oxbase-sql",
  "oxbase-sqlite",
  "oxbase-store",
  "oxbase-types",
+ "pretty_assertions",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "toml 1.1.8+spec-1.1.0",
  "tracing",
@@ -3883,6 +3897,10 @@ dependencies = [
 [[package]]
 name = "oxbase-sql"
 version = "0.0.1"
+dependencies = [
+ "oxbase-types",
+ "pretty_assertions",
+]
 
 [[package]]
 name = "oxbase-sqlite"
@@ -3893,6 +3911,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "futures",
+ "oxbase-dialect",
  "oxbase-driver",
  "oxbase-types",
  "rusqlite",
@@ -3906,10 +3925,12 @@ name = "oxbase-store"
 version = "0.0.1"
 dependencies = [
  "async-trait",
+ "chrono",
  "dirs",
  "keyring",
  "oxbase-types",
  "pretty_assertions",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",

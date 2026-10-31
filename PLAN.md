@@ -170,12 +170,63 @@ Every milestone ships as a working app on all three platforms through CI. The "D
   loosely. Details: `docs/m1-contracts.md` §11.
 - `mysql_async` trusts its bundled webpki roots (not the platform store) when no CA file is
   set.
-- Saving profiles with their keychain secrets is in `oxbase-services::profiles` (shared by the app
-  and the CLI). A stored database or SSH password stays with the destination it was saved for: an
+- Saving profiles with their keychain secrets is in `oxbase-services::profiles` (used by the app;
+  usable by the CLI, which has no connection commands yet). A stored database or SSH password stays with the destination it was saved for: an
   edit that changes the server, user, TLS or SSH route must retype it.
 - The OS keychain backend is proven by its own tests (`scripts/keychain-tests.sh`, CI job
   `keychain` on Linux, macOS and Windows; Linux uses a private gnome-keyring), not by the Docker
   conformance run, which uses an in-memory secret store.
+
+**M2 contracts (Design step, 2026-10-31).** `docs/m2-contracts.md` fixes the object tree
+(per-engine `TreeLayout` data and `DatabaseScope` in `oxbase-dialect`; PostgreSQL reads other
+databases through child sessions), the typed models for schemas, routines, triggers and
+sequences, the `oxbase-sql` splitter API, query runs with a spilling result store
+(`oxbase-services::query` / `results`), query history in a SQLite app DB (`oxbase-store`), and the
+Tauri commands and channel events. Each query editor runs on its own child session, so a long
+query never blocks the object tree.
+
+**M2 as built (notes, 2026-10-31).** The exit check passed in the CI conformance job (Linux,
+Docker fixtures; numbers in the README, *Conformance harness*). On each of PostgreSQL, MySQL,
+MariaDB and SQLite, a 1 000 000-row query streamed in 0.9-2.3 s (two CI runs) into a result
+store with an 8 MiB budget, spilling to disk. Random 200-row pages took under 0.3 ms at p95.
+A cancel after about 250 000 rows ended the run within about 1 s, and the rows already
+received stayed pageable. All 42 `fetch_list` cells pass. Where the build differs from the text above or from
+`docs/m2-contracts.md`:
+
+- Platforms: the full CI lane (Rust tests and OS keychain tests on Linux, macOS and Windows)
+  and the Bundle workflow (Tauri builds for Linux x86_64, macOS x86_64 and aarch64, Windows
+  x86_64) passed on `milestone/m2` at a0ee957 (manual runs 41232475071 and 41232477171). An
+  earlier full-lane run found one Windows-only test failure (a test opened a directory with
+  `File::open` to set its time), fixed before that run. The bundles are built but not
+  launched: the Monaco worker, the canvas grid and the binary `query_page` responses in WebKit
+  and WebView2 have no automated smoke test yet, and the page latency through Tauri IPC plus
+  Arrow decoding in the webview is not measured (the 1M-row test times `QueryService::page`
+  in-process).
+- "Scroll smoothly" is proven by page latency in the core and by UI tests that check the grid
+  asks only for the visible row ranges. There is no automated in-webview scrolling benchmark
+  yet. That belongs with the webview smoke tests of §7.
+- Only the `fetch_list` checks of the object-kind matrix run. `roundtrip` and `capabilities`
+  stay pending until the DdlGenerator and Comparator cells of M3. The `[m2]` seed names are
+  the acceptance list. CI now requires every M2 engine to register its tree layout on every
+  lane (`OXBASE_CONFORMANCE_REQUIRE_M2_FETCH=1`).
+- PostgreSQL: the catalog queries keep separate versions for 10, 11+ and 18, but CI runs only
+  PostgreSQL 18.6. The older versions are checked by unit tests of the query text. Table
+  listings carry no `SIZE_BYTES`, because `pg_total_relation_size` waits on table locks. New
+  extras outside the contract: `NOT_ENFORCED`, `EXCLUSION` and `NULLS_FIRST`.
+- MySQL/MariaDB: session temporary tables are not listed. Events have a fetcher but no tree
+  folder. MariaDB sequences can be listed on 10.3+ but loaded only on 11.5+. Trigger
+  definitions leave out `FOLLOWS`/`PRECEDES`. After a mid-stream cancel the driver needs
+  several seconds to finish the killed stream (an earlier CI run measured 8-9 s before the
+  editor's next `SELECT 1` could start on that session). The query service no longer waits for
+  it: when the stopped stream has not wound down within 1 s, the editor's next run opens a new
+  session at once, closes the old one in the background and warns that its temporary tables,
+  settings and open transaction are gone. The live test requires that next `SELECT 1` within
+  2 s on every engine. In CI run 41231834815 it took 3 ms on MySQL and MariaDB (new session),
+  455 ms on PostgreSQL and 1 ms on SQLite (same session).
+- The query service's unit tests no longer carry a stand-in splitter or redactor. They use
+  `oxbase_sql::split` and `redact_secrets`.
+- The Glide Data Grid is pinned to `6.0.4-alpha24`, the first line that declares React 19
+  (`docs/m2-contracts.md` §9).
 
 Order of work: M0–M3 prove the architecture. M4 and M7 are where the per-database matrix gets tested for real. M8 and M10 reuse the Comparator and DdlGenerator cells and get much cheaper if M3 is done right.
 

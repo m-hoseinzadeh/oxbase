@@ -12,14 +12,22 @@
 //!
 //! An unreachable fixture fails the test with the engine name and port. Set
 //! `OXBASE_CONFORMANCE_ALLOW_MISSING=1` to report it as skipped instead.
+//!
+//! `OXBASE_CONFORMANCE_REQUIRE_M2_FETCH=1` (set by every CI lane since M2)
+//! also requires every M2 engine (PostgreSQL, MySQL, MariaDB, SQLite) to have registered its
+//! tree layout in `oxbase_services::default_dialects`, so a registration left out fails the
+//! job instead of leaving its cells pending.
 
-use oxbase_conformance::adapter::Engine;
-use oxbase_conformance::matrix::CellStatus;
-use oxbase_conformance::{fixtures, report, runner};
+use oxbase_conformance::adapter::{self, Engine};
+use oxbase_conformance::fixtures::Fixtures;
+use oxbase_conformance::matrix::{CellStatus, Check};
+use oxbase_conformance::{fetch, fixtures, report, runner};
 
-/// M0 exit criterion (the harness runs against all engines) plus the M1 connection checks:
-/// every applicable check of the M1 engines passes, and the engines without an M1 driver report
-/// pending.
+/// M0 exit criterion (the harness runs against all engines), the M1 connection checks (every
+/// applicable check of the M1 engines passes, engines without a driver report pending) and the
+/// M2 `fetch_list` cells ([`fetch::gate`]): every cell with a registered Fetcher and a seed
+/// object passes, every kind of a registered tree layout passes or is n/a, each engine with a
+/// layout passes at least one cell, and n/a never hides a seeded kind.
 #[test]
 #[ignore = "needs the Docker fixtures (scripts/fixtures-up.sh); run with --include-ignored"]
 fn harness_runs_against_all_engines_and_m1_connection_checks_pass() {
@@ -40,14 +48,54 @@ fn harness_runs_against_all_engines_and_m1_connection_checks_pass() {
     if let Err(msg) = report.gate() {
         panic!("{msg}");
     }
-    // Object-kind cells need dialect cells (M2+), so none may have run.
-    assert_eq!(
-        report.summary.pass + report.summary.fail,
-        0,
-        "{:?}",
-        report.summary
+    assert_eq!(report.summary.fail, 0, "{:?}", report.summary);
+
+    let fx = Fixtures::from_path(&path).unwrap();
+    let resolved = fx.resolve().unwrap();
+    let registry = adapter::registry();
+    for c in report.cells.iter().filter(|c| c.check != Check::FetchList) {
+        // roundtrip and capabilities have no runner before M3.
+        assert!(
+            !matches!(c.status, CellStatus::Pass | CellStatus::Fail),
+            "{} {} {}: {:?} {:?}",
+            c.engine,
+            c.object_kind,
+            c.check,
+            c.status,
+            c.detail
+        );
+    }
+    let gate = fetch::GateOptions {
+        skipped_ok: opts.allow_missing || opts.skip_fetch,
+        require_m2: std::env::var("OXBASE_CONFORMANCE_REQUIRE_M2_FETCH")
+            .is_ok_and(|v| matches!(v.trim(), "1" | "true" | "yes" | "on")),
+    };
+    let problems = fetch::gate(&report.cells, &fx, &resolved, &registry, gate);
+    assert!(
+        problems.is_empty(),
+        "fetch_list gate ({gate:?}):\n  {}",
+        problems.join("\n  ")
     );
-    assert!(report.summary.pending + report.summary.skipped > 0);
+    let registered: Vec<&str> = fetch::M2_ENGINES
+        .iter()
+        .filter(|&&e| registry.tree_layout(e).is_ok())
+        .map(|e| e.as_str())
+        .collect();
+    println!(
+        "M2 engines with a registered tree layout: {} (OXBASE_CONFORMANCE_REQUIRE_M2_FETCH: {})",
+        if registered.is_empty() {
+            "none".to_owned()
+        } else {
+            registered.join(", ")
+        },
+        gate.require_m2
+    );
+    let passed = report
+        .cells
+        .iter()
+        .filter(|c| c.check == Check::FetchList && c.status == CellStatus::Pass)
+        .count();
+    println!("fetch_list cells passed: {passed}");
 
     for c in &report.connections {
         let m1 = matches!(

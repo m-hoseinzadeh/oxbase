@@ -648,6 +648,9 @@ pub struct PgConnection {
     version: ServerVersion,
     tls_in_use: bool,
     server: Endpoint,
+    /// The connected database as the server reports it (`current_database()`); when that could
+    /// not be read, `ConnectParams::database` or the user name (the server default).
+    database: String,
 }
 
 impl std::fmt::Debug for PgConnection {
@@ -656,6 +659,7 @@ impl std::fmt::Debug for PgConnection {
             .field("server", &self.server)
             .field("version", &self.version.raw())
             .field("tls_in_use", &self.tls_in_use)
+            .field("database", &self.database)
             .finish_non_exhaustive()
     }
 }
@@ -769,9 +773,13 @@ impl PgConnection {
         if let Some(password) = &params.password {
             cfg.password(password.expose());
         }
-        if let Some(db) = params.database.as_deref().filter(|d| !d.trim().is_empty()) {
+        let database = if let Some(db) = params.database.as_deref().filter(|d| !d.trim().is_empty())
+        {
             cfg.dbname(db);
-        }
+            db.to_owned()
+        } else {
+            user.to_owned()
+        };
         cfg.application_name(params.application_name.as_deref().unwrap_or("oxbase"));
         if let Some(t) = params.connect_timeout {
             cfg.connect_timeout(t);
@@ -826,6 +834,31 @@ impl PgConnection {
             }
         });
 
+        // The database the server actually opened (a pooler alias such as pgbouncer's
+        // `[databases] app = dbname=real` connects to `real`); the requested name is the fallback.
+        let database = match tokio::time::timeout(
+            limit,
+            client.simple_query("SELECT pg_catalog.current_database()"),
+        )
+        .await
+        {
+            Ok(Ok(messages)) => messages
+                .into_iter()
+                .find_map(|m| match m {
+                    SimpleQueryMessage::Row(row) => row.get(0).map(str::to_owned),
+                    _ => None,
+                })
+                .unwrap_or(database),
+            Ok(Err(e)) => {
+                tracing::debug!(error = %from_pg(&e), "could not read current_database()");
+                database
+            }
+            Err(_) => {
+                tracing::debug!("reading current_database() timed out");
+                database
+            }
+        };
+
         let shared = Arc::new(Shared {
             cancel_token: client.cancel_token(),
             client: StdMutex::new(Some(Arc::new(client))),
@@ -841,6 +874,7 @@ impl PgConnection {
             version,
             tls_in_use: tls_used.load(Ordering::Acquire),
             server,
+            database,
         })
     }
 }
@@ -857,6 +891,12 @@ impl Connection for PgConnection {
 
     fn tls_in_use(&self) -> bool {
         self.tls_in_use
+    }
+
+    /// The connected database, read from the server right after connecting
+    /// (`ConnectParams::database` or the user name when that failed).
+    fn current_database(&self) -> Option<String> {
+        Some(self.database.clone())
     }
 
     async fn execute(

@@ -5,8 +5,9 @@ use std::sync::Arc;
 use arrow_array::cast::AsArray;
 use async_trait::async_trait;
 use oxbase_dialect::{
-    AnsiQuoting, Capabilities, CellRole, CellStatus, Comparator, DdlGenerator, DialectRegistry,
-    DmlWriter, EngineRole, Fetcher, MissingCell, PgQuoting, Quoting,
+    AnsiQuoting, Capabilities, CellRole, CellStatus, ChildGroup, Comparator, DatabaseScope,
+    DdlGenerator, DialectRegistry, DmlWriter, EngineRole, Fetcher, MissingCell, PgQuoting, Quoting,
+    TreeLayout,
 };
 use oxbase_driver::mock::MockDriver;
 use oxbase_driver::{CancellationToken, ConnectParams, Connection, Driver, collect};
@@ -363,4 +364,43 @@ async fn cells_work_through_the_registry() {
         "\"x\""
     );
     assert_eq!(driver.log(), ["SELECT name FROM tables"]);
+}
+
+#[test]
+fn tree_layouts_and_applicability_helpers() {
+    use ObjectKind as K;
+    let mut reg = full_postgres_table();
+    assert!(reg.tree_layout(Engine::Postgres).is_err());
+    assert_eq!(reg.missing_layout_fetchers(Engine::Postgres), []);
+
+    let layout = TreeLayout::new(DatabaseScope::Session)
+        .with_root(&[ChildGroup::direct(K::Database)])
+        .with_children(K::Database, &[ChildGroup::direct(K::Schema)])
+        .with_children(K::Schema, &[ChildGroup::folder(K::Table)]);
+    reg.register_tree_layout(Engine::Postgres, layout.clone());
+    assert_eq!(*reg.tree_layout(Engine::Postgres).unwrap(), layout);
+    // Only Table has a fetcher so far.
+    assert_eq!(
+        reg.missing_layout_fetchers(Engine::Postgres),
+        [K::Database, K::Schema]
+    );
+    // The layout is data, not a matrix role: the engine roles are unchanged.
+    assert_eq!(reg.engine_roles(Engine::Postgres), EngineRole::ALL.to_vec());
+
+    // ToyCaps says Event does not exist; engines without capabilities support everything.
+    let v = ServerVersion::new(16, 0, 0);
+    assert!(!reg.supports_kind(Engine::Postgres, K::Event, &v));
+    assert!(reg.supports_kind(Engine::Postgres, K::Table, &v));
+    assert!(reg.supports_kind(Engine::Sqlite, K::Event, &v));
+
+    reg.mark_not_applicable_except(Engine::Sqlite, &[K::Database, K::Table, K::View]);
+    assert_eq!(
+        reg.status(Engine::Sqlite, K::Sequence),
+        CellStatus::NotApplicable
+    );
+    assert_eq!(
+        reg.status(Engine::Sqlite, K::View),
+        CellStatus::Roles(vec![])
+    );
+    assert_eq!(reg.engines(), [Engine::Postgres, Engine::Sqlite]);
 }

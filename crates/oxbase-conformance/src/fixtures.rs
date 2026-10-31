@@ -80,6 +80,9 @@ pub struct Fixtures {
     /// M1: the SSH bastion (`[ssh]`).
     #[serde(default)]
     pub ssh: Option<SshFixture>,
+    /// M2: the seed objects the fetchers must find (`[m2]` and `[m2.<engine>]`).
+    #[serde(default)]
+    pub m2: Option<M2Fixture>,
     /// Where the file came from, for error messages. Not part of the TOML.
     #[serde(skip)]
     pub origin: String,
@@ -197,6 +200,114 @@ pub struct SshTarget {
     pub port: u16,
 }
 
+/// The `[m2]` table: names of the objects every engine's M2 seed script creates (the shape is
+/// documented next to the table in `tests/fixtures.toml`). Every field is optional so a partial
+/// table never breaks the M0/M1 checks.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct M2Fixture {
+    /// `[parent table, child table]`: the child references the parent.
+    pub tables: Vec<String>,
+    pub view: Option<String>,
+    pub trigger: Option<String>,
+    /// The table `trigger` fires on.
+    pub trigger_table: Option<String>,
+    pub function: Option<String>,
+    pub procedure: Option<String>,
+    pub sequence: Option<String>,
+    /// Check constraint on the parent table.
+    pub check_parent: Option<String>,
+    /// Check constraint on the child table.
+    pub check_child: Option<String>,
+    /// Foreign key of the child table.
+    pub foreign_key: Option<String>,
+    /// Index on the child table.
+    pub index: Option<String>,
+    pub table_comment: Option<String>,
+    pub large_result_rows: Option<u64>,
+    /// `[m2.<engine>]` tables, by fixture name (other unknown keys are kept as values).
+    #[serde(flatten)]
+    pub engines: BTreeMap<String, M2Entry>,
+}
+
+/// One unknown key of `[m2]`: an engine table, or anything else.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum M2Entry {
+    Engine(Box<M2EngineSeed>),
+    Other(toml::Value),
+}
+
+/// One `[m2.<engine>]` table. Unknown keys are rejected ([`Fixtures::parse`] names them), so a
+/// misspelt key cannot silently empty a seed and leave its cells pending.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct M2EngineSeed {
+    /// The engine's seed script, relative to the workspace root. Applied by the Docker init for
+    /// server engines; the harness applies it itself for SQLite.
+    pub init_sql: Option<String>,
+    /// The database the seed objects live in (`main` on SQLite).
+    pub database: Option<String>,
+    /// PostgreSQL: the schema the seed objects live in.
+    pub schema: Option<String>,
+    pub matview: Option<String>,
+    pub trigger_function: Option<String>,
+    /// PostgreSQL: a second database the database listing must show.
+    pub other_database: Option<String>,
+    pub other_table: Option<String>,
+    /// SQLite: the name a second file is attached under.
+    pub attached_as: Option<String>,
+    pub attached_table: Option<String>,
+    /// The seed objects that exist on this engine (tables, views, routines, triggers, ...).
+    pub objects: Vec<String>,
+}
+
+impl M2Fixture {
+    /// Every seed object name `[m2]` and `seed` define: what `objects` may list.
+    pub fn seed_names<'a>(&'a self, seed: &'a M2EngineSeed) -> Vec<&'a str> {
+        let shared = [
+            &self.view,
+            &self.trigger,
+            &self.function,
+            &self.procedure,
+            &self.sequence,
+            &self.check_parent,
+            &self.check_child,
+            &self.foreign_key,
+            &self.index,
+        ];
+        let own = [
+            &seed.matview,
+            &seed.trigger_function,
+            &seed.other_table,
+            &seed.attached_table,
+        ];
+        self.tables
+            .iter()
+            .map(String::as_str)
+            .chain(shared.into_iter().chain(own).filter_map(Option::as_deref))
+            .collect()
+    }
+
+    /// The `[m2.<name>]` table, if there is one.
+    pub fn engine(&self, name: &str) -> Option<&M2EngineSeed> {
+        match self.engines.get(name)? {
+            M2Entry::Engine(e) => Some(&**e),
+            M2Entry::Other(_) => None,
+        }
+    }
+}
+
+impl Fixtures {
+    /// The M2 seed of the fixture `name` (falling back to the engine kind's name), with the
+    /// shared `[m2]` table.
+    pub fn m2_seed(&self, name: &str, engine: Engine) -> Option<(&M2Fixture, &M2EngineSeed)> {
+        let m2 = self.m2.as_ref()?;
+        let seed = m2.engine(name).or_else(|| m2.engine(engine.as_str()))?;
+        Some((m2, seed))
+    }
+}
+
 // Hand-written so the password never ends up in a panic message or log line.
 impl std::fmt::Debug for EngineFixture {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -247,7 +358,41 @@ impl Fixtures {
                 fixtures.schema_version
             )));
         }
+        fixtures.validate_m2()?;
         Ok(fixtures)
+    }
+
+    /// Rejects an `[m2]` the M2 checks would misread instead of failing: an unknown key, an
+    /// `[m2.<name>]` table that does not parse (unknown key, wrong type), or an `objects` entry
+    /// that names no seed object.
+    fn validate_m2(&self) -> Result<(), FixturesError> {
+        let Some(m2) = &self.m2 else {
+            return Ok(());
+        };
+        for (name, entry) in &m2.engines {
+            match entry {
+                M2Entry::Engine(seed) => {
+                    let known = m2.seed_names(seed);
+                    if let Some(bad) = seed.objects.iter().find(|o| !known.contains(&o.as_str())) {
+                        return Err(self.invalid(format!(
+                            "m2.{name}.objects: {bad:?} is not a seed object named in [m2] or \
+                             [m2.{name}]"
+                        )));
+                    }
+                }
+                M2Entry::Other(toml::Value::Table(t)) => {
+                    let why = match t.clone().try_into::<M2EngineSeed>() {
+                        Ok(_) => "not a seed table".to_owned(),
+                        Err(e) => e.to_string(),
+                    };
+                    return Err(self.invalid(format!("m2.{name}: {}", why.trim())));
+                }
+                M2Entry::Other(_) => {
+                    return Err(self.invalid(format!("m2: unknown key `{name}`")));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// The compose project the fixture containers run under, if the file names one.
@@ -414,6 +559,36 @@ path = "target/fixtures/t.sqlite"
     }
 
     #[test]
+    fn rejects_m2_tables_the_checks_would_misread() {
+        let base = "schema_version = 1\n[m2]\ntables = [\"a\", \"b\"]\nview = \"v\"\n";
+        let ok = format!("{base}[m2.lite]\ndatabase = \"main\"\nobjects = [\"a\", \"v\"]\n");
+        let fx = Fixtures::parse(&ok, "t").unwrap();
+        let seed = fx.m2_seed("lite", Engine::Sqlite).unwrap().1;
+        assert_eq!(seed.objects, ["a", "v"]);
+        let cases: [(String, &[&str]); 4] = [
+            (
+                format!("{base}[m2.lite]\ndatabase = \"main\"\nobject = [\"a\"]\n"),
+                &["m2.lite: ", "unknown field `object`"],
+            ),
+            (
+                format!("{base}[m2.lite]\ndatabase = 1\n"),
+                &["m2.lite: ", "invalid type"],
+            ),
+            (
+                format!("{base}[m2.lite]\nobjects = [\"a\", \"veiw\"]\n"),
+                &["m2.lite.objects: \"veiw\" is not a seed object"],
+            ),
+            (format!("{base}veiw = \"v\"\n"), &["m2: unknown key `veiw`"]),
+        ];
+        for (text, wants) in cases {
+            let err = Fixtures::parse(&text, "t").unwrap_err().to_string();
+            for want in wants {
+                assert!(err.contains(want), "{text:?}: got {err:?}, want {want:?}");
+            }
+        }
+    }
+
+    #[test]
     fn missing_file_names_the_path() {
         let err = Fixtures::from_path(Path::new("/nonexistent/oxbase/fixtures.toml")).unwrap_err();
         assert!(
@@ -470,6 +645,16 @@ path = "target/fixtures/t.sqlite"
             );
         }
         assert!(fx.tls.is_some(), "[tls]");
+        // The M2 engines all seed objects (m2-contracts §8).
+        for name in ["postgres", "mysql", "mariadb", "sqlite"] {
+            let e = engines.iter().find(|e| e.name == name).unwrap();
+            let (_, seed) = fx
+                .m2_seed(name, e.engine)
+                .unwrap_or_else(|| panic!("[m2.{name}]"));
+            assert!(seed.init_sql.is_some(), "[m2.{name}] init_sql");
+            assert!(seed.database.is_some(), "[m2.{name}] database");
+            assert!(!seed.objects.is_empty(), "[m2.{name}] objects");
+        }
         let dbg = format!("{ssh:?} {:?}", fx.engines["postgres"]);
         assert!(!dbg.contains(&ssh.password), "{dbg}");
         for e in &engines {
