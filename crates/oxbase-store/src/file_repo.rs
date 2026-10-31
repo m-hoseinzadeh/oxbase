@@ -77,8 +77,8 @@ pub fn app_config_dir() -> Result<PathBuf> {
     Ok(base.join(app_dir_name()))
 }
 
-/// The per-platform name of the app's directory under the user config directory.
-const fn app_dir_name() -> &'static str {
+/// The per-platform name of the app's directory under the user config (and data) directory.
+pub(crate) const fn app_dir_name() -> &'static str {
     if cfg!(target_os = "macos") {
         "dev.oxbase.app"
     } else {

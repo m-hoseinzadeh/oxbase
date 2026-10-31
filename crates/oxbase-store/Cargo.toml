@@ -23,6 +23,9 @@ uuid.workspace = true
 tokio.workspace = true
 # Platform config directory for the profile file (MIT OR Apache-2.0).
 dirs.workspace = true
+# M2: the app database (bundled SQLite, same crate as oxbase-sqlite) and history timestamps.
+rusqlite.workspace = true
+chrono.workspace = true
 
 [dev-dependencies]
 pretty_assertions.workspace = true

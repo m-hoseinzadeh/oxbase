@@ -188,3 +188,71 @@ host_key_fingerprint = "host_key.fingerprint"
 postgres = { host = "postgres", port = 5432 }
 mysql = { host = "mysql", port = 3306 }
 mariadb = { host = "mariadb", port = 3306 }
+
+# --- M2: seed objects for the object tree, fetchers and query runs -------------------------
+# Only the NAMES live here, so the dialect streams, the conformance harness and the live tests
+# agree. The objects themselves are created by each engine's init script (`init_sql`, owned by
+# that engine's dialect stream) and read back by `Fetcher::list` / `Fetcher::load`.
+# Unknown top-level tables are ignored by the M1 fixture readers.
+#
+# Shape on every engine (columns are a contract too, so `load` tests can assert them):
+#   m2_parent (id integer PK, code varchar(20) NOT NULL UNIQUE, note text NULL,
+#              CHECK named m2_parent_code_chk: char_length/length(code) > 0,
+#              table comment "M2 parent table" where the engine has comments)
+#   m2_child  (id integer PK, parent_id integer NOT NULL REFERENCES m2_parent(id)
+#              ON DELETE CASCADE as FK m2_child_parent_fk, qty integer NOT NULL DEFAULT 1,
+#              CHECK m2_child_qty_chk (qty >= 0), index m2_child_parent_idx (parent_id))
+#   m2_view   SELECT c.id, c.qty, p.code FROM m2_child c JOIN m2_parent p ON p.id = c.parent_id
+#   m2_trg    BEFORE INSERT ON m2_child, row level (sets qty to 0 when it is NULL / negative)
+#   m2_fn(n integer) RETURNS integer: returns n + 1
+#   m2_proc(n integer): a procedure that does nothing useful (SELECT/no-op)
+#   m2_seq    START 100 INCREMENT 5
+[m2]
+tables = ["m2_parent", "m2_child"]
+view = "m2_view"
+trigger = "m2_trg"
+trigger_table = "m2_child"
+function = "m2_fn"
+procedure = "m2_proc"
+sequence = "m2_seq"
+check_parent = "m2_parent_code_chk"
+check_child = "m2_child_qty_chk"
+foreign_key = "m2_child_parent_fk"
+index = "m2_child_parent_idx"
+table_comment = "M2 parent table"
+# Rows for the large-result live test: `SELECT g FROM generate_series(1, 1000000) g` (PG),
+# a recursive CTE elsewhere; nothing is stored.
+large_result_rows = 1000000
+
+[m2.postgres]
+init_sql = "tests/docker/init/postgres/04-m2.sql"
+database = "oxbase_test"
+schema = "m2"
+matview = "m2_mview"          # SELECT parent_id, count(*) FROM m2.m2_child GROUP BY parent_id
+trigger_function = "m2_trg_fn" # RETURNS trigger, used by m2_trg
+# A second database (owned by `oxbase`) with one table, to prove the tree opens a session per
+# PostgreSQL database: oxbase_m2_other.public.m2_other_t (id integer PK).
+other_database = "oxbase_m2_other"
+other_table = "m2_other_t"
+objects = ["m2_parent", "m2_child", "m2_view", "m2_mview", "m2_fn", "m2_proc", "m2_trg", "m2_seq"]
+
+[m2.mysql]
+init_sql = "tests/docker/init/mysql/04-m2.sql"
+# Database = schema level: the objects live directly in oxbase_test.
+database = "oxbase_test"
+objects = ["m2_parent", "m2_child", "m2_view", "m2_fn", "m2_proc", "m2_trg"]
+
+[m2.mariadb]
+init_sql = "tests/docker/init/mariadb/04-m2.sql"
+database = "oxbase_test"
+objects = ["m2_parent", "m2_child", "m2_view", "m2_fn", "m2_proc", "m2_trg", "m2_seq"]
+
+[m2.sqlite]
+# No container: tests apply this script to a fresh database file (tempfile), then ATTACH a
+# second file as `attached_as` holding `attached_table`, to prove main + attached listing.
+init_sql = "tests/docker/init/sqlite/01-m2.sql"
+database = "main"
+attached_as = "m2aux"
+attached_table = "m2_aux_t"
+# SQLite has no functions, procedures or sequences.
+objects = ["m2_parent", "m2_child", "m2_view", "m2_child_parent_idx", "m2_trg"]

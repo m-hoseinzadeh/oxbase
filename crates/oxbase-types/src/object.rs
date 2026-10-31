@@ -117,6 +117,32 @@ impl ObjectKind {
         }
     }
 
+    /// Plural label for a folder of this kind in the object tree ("Tables", "Foreign keys").
+    pub const fn plural_display_name(self) -> &'static str {
+        match self {
+            Self::Database => "Databases",
+            Self::Schema => "Schemas",
+            Self::Table => "Tables",
+            Self::Column => "Columns",
+            Self::Index => "Indexes",
+            Self::ForeignKey => "Foreign keys",
+            Self::Check => "Check constraints",
+            Self::View => "Views",
+            Self::MatView => "Materialized views",
+            Self::Function => "Functions",
+            Self::Procedure => "Procedures",
+            Self::Trigger => "Triggers",
+            Self::Sequence => "Sequences",
+            Self::User => "Users",
+            Self::Role => "Roles",
+            Self::Grant => "Grants",
+            Self::Event => "Events",
+            Self::Type => "Types",
+            Self::Extension => "Extensions",
+            Self::Key => "Keys",
+        }
+    }
+
     /// `true` for kinds that live inside a table (or a view / materialized view, for indexes and
     /// triggers) and are addressed through [`ObjectRef::parent`]: columns, indexes, foreign keys,
     /// checks and triggers.
@@ -164,6 +190,11 @@ impl FromStr for ObjectKind {
 ///   (a foreign key or check with no name, common in SQLite) as produced by
 ///   `ObjectDef::object_ref`. Such a reference cannot be looked up by name; address the
 ///   constraint through its table's definition instead.
+/// - `signature` (M2): for routines on engines with overloading (PostgreSQL), the identity
+///   argument types exactly as the server prints them (`integer, text`; PostgreSQL
+///   `pg_get_function_identity_arguments`), so two overloads of one name are two refs. `None`
+///   for every other object, and for routines on engines without overloading (MySQL, MariaDB).
+///   An empty string means "no arguments" and is different from `None`.
 ///
 /// Names are stored unquoted and exactly as the server reports them; quoting is a dialect job.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -178,6 +209,9 @@ pub struct ObjectRef {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_kind: Option<ObjectKind>,
     pub name: String,
+    /// Routine overload discriminator (M2); see the type docs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
 }
 
 impl ObjectRef {
@@ -190,6 +224,7 @@ impl ObjectRef {
             parent: None,
             parent_kind: None,
             name: name.into(),
+            signature: None,
         }
     }
 
@@ -208,6 +243,7 @@ impl ObjectRef {
             && self.schema.is_none()
             && self.parent.is_none()
             && self.parent_kind.is_none()
+            && self.signature.is_none()
     }
 
     /// A database / catalog.
@@ -239,6 +275,32 @@ impl ObjectRef {
     pub fn in_schema(mut self, schema: Option<&str>) -> Self {
         self.schema = schema.map(str::to_owned);
         self
+    }
+
+    /// Sets the routine signature (identity argument types; see the type docs).
+    #[must_use]
+    pub fn with_signature(mut self, signature: impl Into<String>) -> Self {
+        self.signature = Some(signature.into());
+        self
+    }
+
+    /// The name as shown to people: `name`, or `name(signature)` for a routine that has one.
+    pub fn display_name(&self) -> String {
+        match &self.signature {
+            Some(sig) => format!("{}({sig})", self.name),
+            None => self.name.clone(),
+        }
+    }
+
+    /// The database (catalog) this object lives in: `catalog`, or for a `Database` ref its own
+    /// name. `None` means "the session's current database".
+    pub fn database_name(&self) -> Option<&str> {
+        match self.kind {
+            ObjectKind::Database if self.catalog.is_none() && !self.name.is_empty() => {
+                Some(self.name.as_str())
+            }
+            _ => self.catalog.as_deref(),
+        }
     }
 
     /// A reference of `kind` named `name` that lives inside this object.
@@ -297,9 +359,14 @@ impl ObjectRef {
 }
 
 impl fmt::Display for ObjectRef {
-    /// `kind:catalog.schema.parent.name` for logs (unquoted; not SQL).
+    /// `kind:catalog.schema.parent.name` for logs (unquoted; not SQL), followed by
+    /// `(signature)` for routines that have one.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}:{}", self.kind, self.path().join("."))
+        write!(f, "{}:{}", self.kind, self.path().join("."))?;
+        if let Some(sig) = &self.signature {
+            write!(f, "({sig})")?;
+        }
+        Ok(())
     }
 }
 
@@ -348,6 +415,7 @@ mod tests {
             );
         }
         assert!("synonym".parse::<ObjectKind>().is_err());
+        assert_eq!(ObjectKind::ForeignKey.plural_display_name(), "Foreign keys");
         // ALL has no duplicates.
         let mut sorted = ObjectKind::ALL.to_vec();
         sorted.sort();
@@ -398,6 +466,46 @@ mod tests {
             serde_json::from_str(r#"{"kind":"index","schema":"s","parent":"t","name":"ix"}"#)
                 .unwrap();
         assert_eq!(legacy.owner(), Some(ObjectRef::table(None, Some("s"), "t")));
+    }
+
+    #[test]
+    fn signatures_tell_overloads_apart() {
+        let schema = ObjectRef::schema(Some("db"), "m2");
+        let a = schema
+            .child(ObjectKind::Function, "m2_fn")
+            .with_signature("integer");
+        let b = schema
+            .child(ObjectKind::Function, "m2_fn")
+            .with_signature("text, integer");
+        let none = schema
+            .child(ObjectKind::Function, "m2_fn")
+            .with_signature("");
+        assert_ne!(a, b);
+        assert_ne!(none, schema.child(ObjectKind::Function, "m2_fn"));
+        assert_eq!(a.display_name(), "m2_fn(integer)");
+        assert_eq!(none.display_name(), "m2_fn()");
+        assert_eq!(a.to_string(), "function:db.m2.m2_fn(integer)");
+        let json = serde_json::to_string(&a).unwrap();
+        assert_eq!(
+            json,
+            r#"{"kind":"function","catalog":"db","schema":"m2","name":"m2_fn","signature":"integer"}"#
+        );
+        assert_eq!(serde_json::from_str::<ObjectRef>(&json).unwrap(), a);
+        assert!(!ObjectRef::root().with_signature("").is_root());
+    }
+
+    #[test]
+    fn database_of_a_ref() {
+        assert_eq!(ObjectRef::database("shop").database_name(), Some("shop"));
+        assert_eq!(ObjectRef::root().database_name(), None);
+        assert_eq!(
+            ObjectRef::table(Some("shop"), Some("public"), "t").database_name(),
+            Some("shop")
+        );
+        assert_eq!(
+            ObjectRef::table(None, Some("public"), "t").database_name(),
+            None
+        );
     }
 
     #[test]

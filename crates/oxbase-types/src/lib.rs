@@ -9,7 +9,8 @@
 //! - [`value`] / [`data_type`]: the typed scalar [`Value`] and the logical [`DataType`].
 //! - [`object`]: [`ObjectKind`], the engine-agnostic [`ObjectRef`] path and [`ObjectSummary`].
 //! - [`props`]: [`PropId`] and the typed [`Extras`] map for database-specific properties.
-//! - [`def`]: the typed object model [`ObjectDef`] (tables, columns, indexes, ...).
+//! - [`def`]: the typed object model [`ObjectDef`] (databases and schemas, tables, columns,
+//!   indexes, views, routines, triggers, sequences, ...).
 //! - [`script`]: [`Script`], an ordered list of statements plus warnings.
 //! - [`diff`]: [`PropertyDiff`], one difference found by a comparator.
 //! - [`edit`]: [`RowEdit`] / [`RowKey`], grid edits for write-back.
@@ -25,6 +26,7 @@ pub mod diff;
 pub mod edit;
 pub mod engine;
 pub mod error;
+mod int_text;
 pub mod net;
 pub mod object;
 pub mod progress;
@@ -36,8 +38,10 @@ pub mod version;
 
 pub use data_type::DataType;
 pub use def::{
-    CheckDef, ColumnDef, FkAction, ForeignKeyDef, GeneratedColumn, GenericDef, IndexColumn,
-    IndexDef, ObjectDef, PrimaryKeyDef, TableDef, ViewDef,
+    ArgMode, CheckDef, ColumnDef, FkAction, ForeignKeyDef, GeneratedColumn, GenericDef,
+    IdentityDef, IndexColumn, IndexDef, ObjectDef, PrimaryKeyDef, RoutineArg, RoutineDef,
+    SchemaDef, SequenceDef, TableDef, TriggerDef, TriggerEvent, TriggerLevel, TriggerTiming,
+    ViewDef,
 };
 pub use diff::{DiffKind, PropertyDiff};
 pub use edit::{ColumnValue, KeyKind, RowEdit, RowKey};

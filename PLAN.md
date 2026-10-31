@@ -170,12 +170,20 @@ Every milestone ships as a working app on all three platforms through CI. The "D
   loosely. Details: `docs/m1-contracts.md` §11.
 - `mysql_async` trusts its bundled webpki roots (not the platform store) when no CA file is
   set.
-- Saving profiles with their keychain secrets is in `oxbase-services::profiles` (shared by the app
-  and the CLI). A stored database or SSH password stays with the destination it was saved for: an
+- Saving profiles with their keychain secrets is in `oxbase-services::profiles` (used by the app;
+  usable by the CLI, which has no connection commands yet). A stored database or SSH password stays with the destination it was saved for: an
   edit that changes the server, user, TLS or SSH route must retype it.
 - The OS keychain backend is proven by its own tests (`scripts/keychain-tests.sh`, CI job
   `keychain` on Linux, macOS and Windows; Linux uses a private gnome-keyring), not by the Docker
   conformance run, which uses an in-memory secret store.
+
+**M2 contracts (Design step, 2026-10-31).** `docs/m2-contracts.md` fixes the object tree
+(per-engine `TreeLayout` data and `DatabaseScope` in `oxbase-dialect`; PostgreSQL reads other
+databases through child sessions), the typed models for schemas, routines, triggers and
+sequences, the `oxbase-sql` splitter API, query runs with a spilling result store
+(`oxbase-services::query` / `results`), query history in a SQLite app DB (`oxbase-store`), and the
+Tauri commands and channel events. Each query editor runs on its own child session, so a long
+query never blocks the object tree.
 
 Order of work: M0–M3 prove the architecture. M4 and M7 are where the per-database matrix gets tested for real. M8 and M10 reuse the Comparator and DdlGenerator cells and get much cheaper if M3 is done right.
 

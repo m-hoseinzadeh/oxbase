@@ -14,6 +14,8 @@ workspace = true
 [dependencies]
 oxbase-types.workspace = true
 oxbase-driver.workspace = true
+# M2: Fetcher / TreeLayout cells registered by `dialect::register`.
+oxbase-dialect.workspace = true
 # rustls client configuration (ring) shared by every driver; also re-exports `rustls`.
 oxbase-net.workspace = true
 arrow-array.workspace = true

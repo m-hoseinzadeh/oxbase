@@ -106,6 +106,40 @@ pub const SECURITY: PropId = PropId::from_static("security");
 /// Identity seed / increment (SQL Server, PostgreSQL identity), as a JSON object.
 pub const IDENTITY: PropId = PropId::from_static("identity");
 
+// --- M2: routines, databases, views, listings ---
+
+/// Database or schema encoding (PostgreSQL `UTF8`).
+pub const ENCODING: PropId = PropId::from_static("encoding");
+/// Routine is deterministic (MySQL/MariaDB `DETERMINISTIC`).
+pub const DETERMINISTIC: PropId = PropId::from_static("deterministic");
+/// Routine volatility (PostgreSQL `immutable` / `stable` / `volatile`).
+pub const VOLATILITY: PropId = PropId::from_static("volatility");
+/// Routine strictness (PostgreSQL `STRICT` / `RETURNS NULL ON NULL INPUT`).
+pub const STRICT_INPUT: PropId = PropId::from_static("strict_input");
+/// Routine data access (MySQL `CONTAINS SQL`, `READS SQL DATA`, `MODIFIES SQL DATA`, `NO SQL`).
+pub const SQL_DATA_ACCESS: PropId = PropId::from_static("sql_data_access");
+/// Definer of a view, routine, trigger or event (MySQL/MariaDB `user@host`).
+pub const DEFINER: PropId = PropId::from_static("definer");
+/// View algorithm (MySQL/MariaDB `MERGE` / `TEMPTABLE` / `UNDEFINED`).
+pub const VIEW_ALGORITHM: PropId = PropId::from_static("view_algorithm");
+/// Materialized view holds data (PostgreSQL `ispopulated`).
+pub const POPULATED: PropId = PropId::from_static("populated");
+/// Temporary object (SQLite `temp` schema, PostgreSQL temporary tables).
+pub const TEMPORARY: PropId = PropId::from_static("temporary");
+/// Engine-specific kind of a table-like object (`partitioned`, `foreign`, `virtual`, ...).
+pub const TABLE_TYPE: PropId = PropId::from_static("table_type");
+/// File behind a database (SQLite `main` / attached database file path).
+pub const FILE: PropId = PropId::from_static("file");
+
+// --- M2: listing facts (`ObjectSummary::extras`) ---
+
+/// Column summary: the type as the engine spells it (text).
+pub const NATIVE_TYPE: PropId = PropId::from_static("native_type");
+/// Database summary: this is the session's current database (bool).
+pub const CURRENT: PropId = PropId::from_static("current");
+/// Total size on disk in bytes, when cheap to know (int).
+pub const SIZE_BYTES: PropId = PropId::from_static("size_bytes");
+
 /// Typed map of database-specific properties, ordered by id so output is deterministic.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(transparent)]

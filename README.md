@@ -18,13 +18,16 @@ crates/
   oxbase-designer, oxbase-diff, oxbase-transfer,  feature crates
   oxbase-io, oxbase-backup, oxbase-model,
   oxbase-bi, oxbase-ai, oxbase-jobs
-  oxbase-store                                    app DB, documents, keychain secrets
+  oxbase-store                                    app DB (history), documents, keychain secrets
   oxbase-services                                 orchestration shared by both front ends
   oxbase-cli                                      headless runner (binary: `oxbase`)
   oxbase-conformance                              cross-engine conformance harness
   app-tauri                                       Tauri 2 shell (no logic)
 ui/                                               React + TS + Vite front end
-tests/fixtures.toml                               test DB connection params (single source of truth)
+tests/fixtures.toml                               test DB connection params and M2 seed object names
+                                                  (single source of truth)
+docs/                                             frozen contracts per milestone (m1-contracts.md,
+                                                  m2-contracts.md)
 ```
 
 ## Prerequisites
@@ -104,6 +107,12 @@ TLS and SSH (M1):
   through a tunnel checks the certificate against the service name, not `127.0.0.1`.
 - `fixtures-up.sh` recreates the services that mount this material when it was regenerated.
 
+M2 seed objects: `[m2]` in `tests/fixtures.toml` names the objects every engine's init script
+creates (`m2_parent`, `m2_child`, `m2_view`, `m2_fn`, `m2_proc`, `m2_trg`, `m2_seq`, PostgreSQL
+`m2_mview` in schema `m2` and a second database `oxbase_m2_other`), so the fetcher and tree tests
+agree on names. SQLite has no container: its tests apply `tests/docker/init/sqlite/01-m2.sql`
+to a temporary file.
+
 The scripts only touch the `oxbase-fixtures` project. `OXBASE_FIXTURES_TIMEOUT` (default 300 s) sets
 how long `fixtures-up.sh` waits. CI uses `scripts/ci-fixtures.sh up|logs|down` on the same
 project.
@@ -180,6 +189,16 @@ run; `OXBASE_CONFORMANCE_ALLOW_MISSING=1` (or `--allow-missing` on the binary) r
 instead. A failed connection check always fails the run. Other knobs:
 `OXBASE_CONFORMANCE_PROBE_TIMEOUT_MS`, `OXBASE_CONFORMANCE_TCP_ONLY=1`,
 `OXBASE_CONFORMANCE_SKIP_CONNECT=1` (or `--skip-connect`: no connection checks).
+
+## App data
+
+Profiles live in `connections.json` in the config directory (`OXBASE_CONFIG_DIR` overrides it).
+From M2 the app database `oxbase.db` (query history and settings, SQLite with versioned
+migrations) lives in the local data directory: `~/.local/share/oxbase` on Linux,
+`~/Library/Application Support/dev.oxbase.app` on macOS, `%LOCALAPPDATA%\oxbase` on Windows
+(`OXBASE_DATA_DIR` overrides it). Query results that do not fit in memory spill to Arrow IPC
+files under `<temp>/oxbase-results/run-*`, deleted when the run or the app closes. History stores
+statements with password literals masked and can be turned off.
 
 ## Desktop app
 

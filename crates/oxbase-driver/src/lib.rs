@@ -100,6 +100,22 @@ pub trait Connection: Send + Sync {
         false
     }
 
+    /// The database (catalog) this session was opened on, when the driver knows it without a
+    /// round trip (M2). Used by `oxbase-services` to decide whether a tree node or a query in
+    /// database `X` can use this session or needs another one (see
+    /// `oxbase_dialect::DatabaseScope`).
+    ///
+    /// - PostgreSQL: the connected database (`ConnectParams::database`, or the user name, which
+    ///   is the server's default).
+    /// - MySQL / MariaDB: the default database given at connect time, if any (a later `USE`
+    ///   in the session is not tracked).
+    /// - SQLite: `main`.
+    ///
+    /// `None` means unknown; callers then assume the session is on no particular database.
+    fn current_database(&self) -> Option<String> {
+        None
+    }
+
     /// Runs `sql` (one or more statements, engine permitting) with positional `params`.
     ///
     /// The stream yields, per statement, either `Schema` followed by zero or more `Batch`es, or

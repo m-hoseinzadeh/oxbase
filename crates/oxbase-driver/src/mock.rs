@@ -9,7 +9,8 @@
 //! - anything else with `RowsAffected(0)`.
 //!
 //! [`MockConfig::batch_delay`] is slept before each batch, which makes cancellation observable.
-//! Connecting as user `denied` fails with an auth error. A mock refuses parameters for another
+//! Connecting as user `denied` fails with an auth error. `Connection::current_database` reports
+//! `ConnectParams::database`. A mock refuses parameters for another
 //! engine unless that engine was added with [`MockDriver::also_serves`] (the way the MySQL driver
 //! serves MariaDB); its connections report the engine they were opened for. Every executed
 //! statement (and
@@ -135,6 +136,7 @@ impl Driver for MockDriver {
         Ok(Box::new(MockConnection {
             inner: Arc::new(Inner {
                 engine: params.engine,
+                database: params.database.clone(),
                 version: self.version.clone(),
                 config: self.config.clone(),
                 log: self.log.clone(),
@@ -147,6 +149,7 @@ impl Driver for MockDriver {
 
 struct Inner {
     engine: Engine,
+    database: Option<String>,
     version: ServerVersion,
     config: MockConfig,
     log: Log,
@@ -273,6 +276,10 @@ impl Connection for MockConnection {
         &self.inner.version
     }
 
+    fn current_database(&self) -> Option<String> {
+        self.inner.database.clone()
+    }
+
     async fn execute(
         &self,
         sql: &str,
@@ -364,6 +371,16 @@ mod tests {
         d.connect(&ConnectParams::network(d.engine(), "mock"))
             .await
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn reports_the_database_it_was_opened_on() {
+        let d = MockDriver::new(Engine::Postgres);
+        assert_eq!(connect(&d).await.current_database(), None);
+        let mut p = ConnectParams::network(Engine::Postgres, "mock");
+        p.database = Some("other".into());
+        let c = d.connect(&p).await.unwrap();
+        assert_eq!(c.current_database().as_deref(), Some("other"));
     }
 
     #[tokio::test]

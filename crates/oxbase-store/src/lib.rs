@@ -13,6 +13,14 @@
 //!   tests; [`FileProfileRepository`] persists them as one JSON file in [`app_config_dir`]
 //!   (atomic writes, unknown fields preserved, never a secret value).
 //!
+//! M2 contracts (see `docs/m2-contracts.md`):
+//!
+//! - [`AppDb`]: the SQLite app database in [`app_data_dir`] with an append-only list of
+//!   [`MIGRATIONS`].
+//! - [`HistoryRepository`]: query history ([`HistoryEntry`], newest first, search, delete,
+//!   clear, prune) and its [`HistorySettings`]. [`MemoryHistoryRepository`] for tests;
+//!   [`SqliteHistoryRepository`] in the app database. Callers redact secrets before `append`.
+//!
 //! Turning a profile into driver parameters (resolving secrets, opening tunnels) is the
 //! connection manager's job in `oxbase-services`.
 
@@ -28,10 +36,20 @@ use uuid::Uuid;
 pub use oxbase_types::{Engine, KnownHostsPolicy, Secret, TlsMode};
 use oxbase_types::{Error, Result};
 
+mod app_db;
 mod file_repo;
+pub mod history;
 
+pub use app_db::{
+    AppDb, DATA_DIR_ENV, HISTORY_SETTINGS_KEY, MIGRATIONS, Migration, SqliteHistoryRepository,
+    app_data_dir,
+};
 pub use file_repo::{
     CONFIG_DIR_ENV, FileProfileRepository, PROFILES_FILE_SCHEMA_VERSION, app_config_dir,
+};
+pub use history::{
+    HistoryEntry, HistoryQuery, HistoryRepository, HistorySettings, HistoryStatus,
+    MemoryHistoryRepository,
 };
 
 /// Unknown JSON fields preserved across a load/save round trip.
