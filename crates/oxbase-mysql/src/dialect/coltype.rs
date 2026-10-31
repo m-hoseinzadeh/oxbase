@@ -110,19 +110,23 @@ pub(crate) fn quoted_list(column_type: &str) -> Vec<String> {
 
 /// The column default as an engine-native SQL expression.
 ///
-/// - MariaDB (10.2.7+) already reports an expression (`'new'`, `0`, `current_timestamp()`),
-///   and `NULL` for "default NULL"; that one is `None` like a column without a default.
-/// - MySQL reports literals unquoted (`new`) and marks expressions with `DEFAULT_GENERATED` in
-///   `EXTRA`: literals of non-numeric types are quoted here, expressions other than the
-///   `CURRENT_TIMESTAMP` family are wrapped in parentheses as in `CREATE TABLE`.
+/// - `expressions` is set for MariaDB 10.2.7+, which already reports an expression (`'new'`,
+///   `0`, `current_timestamp()`), and `NULL` for "default NULL"; that one is `None` like a
+///   column without a default.
+/// - MySQL (and MariaDB before 10.2.7) reports literals unquoted (`new`). MySQL 8.0.13+ marks
+///   expressions with `DEFAULT_GENERATED` in `EXTRA`: literals of non-numeric types are quoted
+///   here, expressions other than the `CURRENT_TIMESTAMP` family are wrapped in parentheses as in
+///   `CREATE TABLE`. Older servers have no marker, but their only expression default is
+///   `CURRENT_TIMESTAMP[(n)]` on a temporal column (a string literal of that text is not a valid
+///   temporal value), so that one is kept as an expression too.
 pub(crate) fn column_default(
-    mariadb: bool,
+    expressions: bool,
     raw: Option<&str>,
     extra: &str,
     ty: &DataType,
 ) -> Option<String> {
     let raw = raw?;
-    if mariadb {
+    if expressions {
         return (raw != "NULL").then(|| raw.to_owned());
     }
     if extra.to_ascii_uppercase().contains("DEFAULT_GENERATED") {
@@ -142,6 +146,9 @@ pub(crate) fn column_default(
             format!("({raw})")
         });
     }
+    if is_temporal(ty) && is_current_timestamp(raw) {
+        return Some(raw.to_owned());
+    }
     let bare = ty.is_numeric()
         || matches!(ty, DataType::Bool)
         || matches!(ty, DataType::Other { name } if name == "bit")
@@ -152,6 +159,27 @@ pub(crate) fn column_default(
     } else {
         BacktickQuoting.quote_str(raw)
     })
+}
+
+/// `DATETIME` / `TIMESTAMP` (the types that take a `CURRENT_TIMESTAMP` default).
+fn is_temporal(ty: &DataType) -> bool {
+    matches!(
+        ty,
+        DataType::Timestamp { .. } | DataType::TimestampTz { .. }
+    )
+}
+
+/// `CURRENT_TIMESTAMP`, `current_timestamp()` or `CURRENT_TIMESTAMP(n)`, any case.
+fn is_current_timestamp(raw: &str) -> bool {
+    let upper = raw.trim().to_ascii_uppercase();
+    let Some(rest) = upper.strip_prefix("CURRENT_TIMESTAMP") else {
+        return false;
+    };
+    rest.is_empty()
+        || rest
+            .strip_prefix('(')
+            .and_then(|r| r.strip_suffix(')'))
+            .is_some_and(|digits| digits.chars().all(|c| c.is_ascii_digit()))
 }
 
 /// `utf8mb4` from `utf8mb4_unicode_ci` (charset names contain no `_`; `binary` is itself).
@@ -250,6 +278,29 @@ mod tests {
         assert_eq!(
             column_default(false, Some("rand()"), "DEFAULT_GENERATED", &int).as_deref(),
             Some("(rand())")
+        );
+        // MySQL before 8.0.13 (no DEFAULT_GENERATED) and MariaDB before 10.2.7.
+        assert_eq!(
+            column_default(false, Some("CURRENT_TIMESTAMP"), "", &ts).as_deref(),
+            Some("CURRENT_TIMESTAMP")
+        );
+        assert_eq!(
+            column_default(
+                false,
+                Some("CURRENT_TIMESTAMP(3)"),
+                "on update CURRENT_TIMESTAMP(3)",
+                &ts
+            )
+            .as_deref(),
+            Some("CURRENT_TIMESTAMP(3)")
+        );
+        assert_eq!(
+            column_default(false, Some("CURRENT_TIMESTAMP"), "", &text).as_deref(),
+            Some("'CURRENT_TIMESTAMP'")
+        );
+        assert_eq!(
+            column_default(false, Some("CURRENT_TIMESTAMPX"), "", &ts).as_deref(),
+            Some("'CURRENT_TIMESTAMPX'")
         );
         // MariaDB
         assert_eq!(column_default(true, Some("NULL"), "", &int), None);

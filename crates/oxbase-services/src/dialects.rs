@@ -18,7 +18,7 @@ pub fn default_dialects() -> DialectRegistry {
 
     // oxbase_pg::dialect::register(&mut reg);
 
-    // oxbase_mysql::dialect::register(&mut reg);
+    oxbase_mysql::dialect::register(&mut reg);
 
     // oxbase_sqlite::dialect::register(&mut reg);
 

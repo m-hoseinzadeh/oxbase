@@ -18,8 +18,12 @@ use super::{
 /// The name MySQL and MariaDB give every primary key (index and constraint).
 pub(crate) const PRIMARY: &str = "PRIMARY";
 
-/// `TABLE_TYPE`s listed as tables (MariaDB adds system-versioned and, 11.2+, temporary ones).
-const TABLE_TYPES: &str = "('BASE TABLE', 'SYSTEM VERSIONED', 'TEMPORARY')";
+/// `TABLE_TYPE`s listed as tables (MariaDB adds system-versioned ones).
+///
+/// MariaDB 11.2+ also lists the reading session's own temporary tables as `TEMPORARY`. They are
+/// left out: the tree reads on a session that creates none, and a temporary table shadowing a
+/// base table of the same name would give two nodes with the same [`ObjectRef`].
+const TABLE_TYPES: &str = "('BASE TABLE', 'SYSTEM VERSIONED')";
 
 // ---- tables -----------------------------------------------------------------------------------
 
@@ -128,9 +132,6 @@ impl Fetcher for TableFetcher {
 fn table_type_extras(extras: &mut Extras, table_type: &str) {
     match table_type {
         "BASE TABLE" | "" => {}
-        "TEMPORARY" => {
-            extras.insert(props::TEMPORARY, true);
-        }
         other => {
             extras.insert(props::TABLE_TYPE, other.to_ascii_lowercase());
         }
@@ -156,6 +157,8 @@ async fn read_columns(
     cancel: &CancellationToken,
 ) -> Result<Vec<(ColumnDef, bool)>> {
     let mariadb = is_mariadb(c);
+    // MariaDB 10.2.7+ reports defaults as SQL expressions; older servers as bare literals.
+    let expr_defaults = mariadb && c.server_version().at_least_patch(10, 2, 7);
     let mut params = vec![text(db), text(table)];
     let sql = match only {
         Some(name) => {
@@ -167,11 +170,16 @@ async fn read_columns(
     let rows = query(c, &sql, &params, cancel).await?;
     Ok(rows
         .iter()
-        .map(|row| column_from_row(row, mariadb, checks))
+        .map(|row| column_from_row(row, mariadb, expr_defaults, checks))
         .collect())
 }
 
-fn column_from_row(row: &Row, mariadb: bool, checks: &[RawCheck]) -> (ColumnDef, bool) {
+fn column_from_row(
+    row: &Row,
+    mariadb: bool,
+    expr_defaults: bool,
+    checks: &[RawCheck],
+) -> (ColumnDef, bool) {
     let name = row.string(0);
     let facts = TypeFacts {
         data_type: row.string(4),
@@ -193,7 +201,12 @@ fn column_from_row(row: &Row, mariadb: bool, checks: &[RawCheck]) -> (ColumnDef,
     let mut col = ColumnDef::new(name, ty);
     col.native_type = facts.column_type;
     col.nullable = row.flag(3);
-    col.default = column_default(mariadb, row.text(2).as_deref(), &extra, &col.data_type);
+    col.default = column_default(
+        expr_defaults,
+        row.text(2).as_deref(),
+        &extra,
+        &col.data_type,
+    );
     col.auto_increment = extra_upper.contains("AUTO_INCREMENT");
     col.generated = row.non_empty(15).map(|expression| GeneratedColumn {
         expression,
@@ -230,6 +243,9 @@ impl Fetcher for ColumnFetcher {
         parent: &ObjectRef,
         cancel: CancellationToken,
     ) -> Result<Vec<ObjectSummary>> {
+        if !matches!(parent.kind, ObjectKind::Table | ObjectKind::View) {
+            return Ok(Vec::new());
+        }
         let db = database_of(c, parent, &cancel).await?;
         let parent = scoped(parent, &db);
         let checks = mariadb_checks(c, &db, &parent.name, &cancel).await?;
@@ -454,6 +470,7 @@ async fn read_foreign_keys(
            ON k.CONSTRAINT_SCHEMA = rc.CONSTRAINT_SCHEMA \
           AND k.CONSTRAINT_NAME = rc.CONSTRAINT_NAME \
           AND k.TABLE_NAME = rc.TABLE_NAME \
+          AND k.REFERENCED_TABLE_NAME IS NOT NULL \
          WHERE rc.CONSTRAINT_SCHEMA = ? AND rc.TABLE_NAME = ?{filter} \
          ORDER BY rc.CONSTRAINT_NAME, k.ORDINAL_POSITION"
     );

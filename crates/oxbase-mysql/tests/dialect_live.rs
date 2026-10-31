@@ -174,6 +174,11 @@ fn assert_sorted(list: &[ObjectSummary]) {
 
 async fn databases(key: &'static str) {
     let t = Ctx::new(key).await;
+    // The connect-time default database (`ConnectParams::database`).
+    assert_eq!(
+        t.c.current_database(),
+        Some(s(&t.f, &["engines", key, "database"]))
+    );
     let dbs = t.list(ObjectKind::Database, &ObjectRef::root()).await;
     assert_sorted(&dbs);
     let db = find(&dbs, &t.database().name);
@@ -294,6 +299,10 @@ async fn tables(key: &'static str) {
     assert_eq!(checks, [t.name("check_child").as_str()]);
 
     // Children of m2_child, one fetcher each.
+    assert_empty(
+        &t.list(ObjectKind::Column, &t.database()).await,
+        "columns under a database",
+    );
     let cols = t.list(ObjectKind::Column, &child).await;
     assert_eq!(names(&cols), ["id", "parent_id", "qty"]);
     assert_eq!(cols[0].obj, child.child(ObjectKind::Column, "id"));

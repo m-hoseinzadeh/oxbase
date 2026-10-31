@@ -104,6 +104,13 @@ fn applicability_and_versions() {
     assert!(caps.supports(K::View, props::VIEW_ALGORITHM, &mysql84));
     assert!(!caps.supports(K::Table, props::VIEW_ALGORITHM, &mysql84));
     assert!(!caps.supports(K::Sequence, props::COMMENT, &mysql84));
+    assert!(!caps.supports(K::Database, props::COMMENT, &mysql84));
+    assert!(caps.supports(K::Table, props::COMMENT, &mysql84));
+    assert!(!caps.supports(K::Table, props::TEMPORARY, &mysql84));
+    let maria_caps = MySqlCapabilities::new(Engine::MariaDb);
+    assert!(maria_caps.supports(K::Database, props::COMMENT, &maria));
+    assert!(!maria_caps.supports(K::Database, props::COMMENT, &maria102));
+    assert!(!maria_caps.supports(K::Table, props::TEMPORARY, &maria));
 }
 
 // ---- a connection that records statements ----------------------------------------------------
@@ -277,6 +284,64 @@ async fn old_servers_skip_what_they_lack() {
         .await
         .unwrap_err();
     assert!(matches!(err, Error::Unsupported { .. }), "{err}");
+}
+
+#[tokio::test]
+async fn columns_only_under_tables_and_views() {
+    let reg = registry();
+    for (engine, version) in [
+        (Engine::MySql, "8.4.13"),
+        (Engine::MariaDb, "11.8.9-MariaDB"),
+    ] {
+        let c = Recorder::new(engine, version);
+        let fetcher = reg.fetcher(engine, ObjectKind::Column).unwrap();
+        let listed = fetcher
+            .list(&c, &ObjectRef::database(DB), CancellationToken::new())
+            .await
+            .unwrap();
+        assert_empty(&listed, "columns under a database");
+        assert_empty(
+            &c.calls(),
+            &format!("{engine}: a column list under a database ran"),
+        );
+    }
+}
+
+#[tokio::test]
+async fn catalog_queries_shape() {
+    let reg = registry();
+    let db = ObjectRef::database(DB);
+    let table = db.child(ObjectKind::Table, TABLE);
+    // A UNIQUE key may share an FK's name: only referencing key columns join.
+    let c = Recorder::new(Engine::MySql, "8.4.13");
+    let fk = table.child(ObjectKind::ForeignKey, NAME);
+    let fetcher = reg.fetcher(Engine::MySql, ObjectKind::ForeignKey).unwrap();
+    let err = fetcher
+        .load(&c, &fk, CancellationToken::new())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::NotFound { .. }), "{err}");
+    assert!(
+        c.calls()
+            .iter()
+            .any(|(sql, _)| sql.contains("REFERENCED_TABLE_NAME IS NOT NULL")),
+        "{:?}",
+        c.calls()
+    );
+    // Session temporary tables (MariaDB 11.2+) are not tables of the tree.
+    let c = Recorder::new(Engine::MariaDb, "11.8.9-MariaDB");
+    let fetcher = reg.fetcher(Engine::MariaDb, ObjectKind::Table).unwrap();
+    let listed = fetcher
+        .list(&c, &db, CancellationToken::new())
+        .await
+        .unwrap();
+    assert_empty(&listed, "tables");
+    let calls = c.calls();
+    assert!(!calls.is_empty());
+    assert!(
+        calls.iter().all(|(sql, _)| !sql.contains("TEMPORARY")),
+        "{calls:?}"
+    );
 }
 
 /// Fails with the first element when `v` is not empty.

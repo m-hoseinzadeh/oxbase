@@ -212,8 +212,10 @@ impl MySqlCapabilities {
 }
 
 /// Extras no MySQL or MariaDB object has.
-const NEVER: [PropId; 15] = [
+const NEVER: [PropId; 16] = [
     props::UNLOGGED,
+    // Session temporary tables are not listed (see `table::TABLE_TYPES`).
+    props::TEMPORARY,
     props::WITHOUT_ROWID,
     props::STRICT,
     props::DEFERRABLE,
@@ -245,9 +247,9 @@ impl Capabilities for MySqlCapabilities {
         if prop == props::STORAGE_ENGINE || prop == props::ROW_FORMAT {
             return kind == K::Table;
         }
-        if prop == props::TEMPORARY {
-            // MariaDB 11.2+ lists session temporary tables in information_schema.
-            return kind == K::Table && self.mariadb && v.at_least(11, 2);
+        if prop == props::COMMENT && kind == K::Database {
+            // `SCHEMATA.SCHEMA_COMMENT`: MariaDB 10.5+ only; MySQL has no database comments.
+            return self.mariadb && v.at_least(10, 5);
         }
         if prop == INVISIBLE {
             return match kind {

@@ -45,6 +45,16 @@ fn events(text: &str) -> Vec<TriggerEvent> {
     out
 }
 
+/// The event clause of a `CREATE TRIGGER`: MariaDB reports a multi-event trigger as
+/// `INSERT,UPDATE`, which its DDL spells `INSERT OR UPDATE` (server order kept).
+fn event_clause(text: &str) -> String {
+    text.to_ascii_uppercase()
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|word| !word.is_empty() && *word != "OR")
+        .collect::<Vec<_>>()
+        .join(" OR ")
+}
+
 #[async_trait]
 impl Fetcher for TriggerFetcher {
     async fn list(
@@ -124,7 +134,7 @@ impl Fetcher for TriggerFetcher {
                 create_prefix(definer.as_deref()),
                 ident(&obj.name),
                 timing_text.to_ascii_uppercase(),
-                event_text.to_ascii_uppercase(),
+                event_clause(&event_text),
                 ident(&table),
             )
         });
@@ -169,5 +179,9 @@ mod tests {
             events("delete,insert"),
             [TriggerEvent::Insert, TriggerEvent::Delete]
         );
+        assert_eq!(event_clause("INSERT"), "INSERT");
+        assert_eq!(event_clause("INSERT,UPDATE"), "INSERT OR UPDATE");
+        assert_eq!(event_clause("update, delete"), "UPDATE OR DELETE");
+        assert_eq!(event_clause("INSERT OR UPDATE"), "INSERT OR UPDATE");
     }
 }

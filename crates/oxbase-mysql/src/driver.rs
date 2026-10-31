@@ -230,9 +230,10 @@ impl MySqlDriver {
         // Cancel side connections reuse the session's options; the database may be dropped
         // meanwhile and is not needed for KILL.
         let side_opts = Opts::from(OptsBuilder::from_opts(opts).db_name(None::<String>));
-        Ok(MySqlConnection::new(
-            conn, side_opts, options, flavor, version, tls_in_use, shown,
-        ))
+        Ok(
+            MySqlConnection::new(conn, side_opts, options, flavor, version, tls_in_use, shown)
+                .with_database(params.database.clone()),
+        )
     }
 }
 
