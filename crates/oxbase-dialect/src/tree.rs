@@ -158,7 +158,7 @@ mod tests {
             .with_children(K::View, &[]);
         assert_eq!(layout.root(), &[ChildGroup::direct(K::Database)]);
         assert_eq!(layout.children(K::Database).len(), 2);
-        assert!(layout.children(K::Column).is_empty());
+        assert_eq!(layout.children(K::Column), [] as [ChildGroup; 0]);
         assert!(layout.is_expandable(K::Table));
         assert!(!layout.is_expandable(K::View));
         assert_eq!(

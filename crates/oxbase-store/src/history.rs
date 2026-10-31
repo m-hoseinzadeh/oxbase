@@ -330,11 +330,9 @@ mod tests {
         assert_eq!(repo.clear(Some(b)).await.unwrap(), 1);
         assert_eq!(repo.list(&HistoryQuery::default()).await.unwrap(), vec![e2]);
         assert_eq!(repo.clear(None).await.unwrap(), 1);
-        assert!(
-            repo.list(&HistoryQuery::default())
-                .await
-                .unwrap()
-                .is_empty()
+        assert_eq!(
+            repo.list(&HistoryQuery::default()).await.unwrap(),
+            Vec::<HistoryEntry>::new()
         );
     }
 

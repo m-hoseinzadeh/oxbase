@@ -211,7 +211,7 @@ mod tests {
     fn migrations_are_ordered_from_one() {
         for (i, m) in MIGRATIONS.iter().enumerate() {
             assert_eq!(usize::try_from(m.version).unwrap(), i + 1, "{}", m.name);
-            assert!(!m.sql.trim().is_empty());
+            assert_ne!(m.sql.trim(), "");
         }
     }
 }

@@ -78,7 +78,10 @@ mod tests {
     #[test]
     fn builds_the_app_state() {
         let (connections, _workbench) = app_state(None);
-        assert!(connections.manager().list_open().is_empty());
+        assert_eq!(
+            connections.manager().list_open(),
+            Vec::<oxbase_services::SessionSummary>::new()
+        );
     }
 
     #[test]

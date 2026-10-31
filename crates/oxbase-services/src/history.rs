@@ -182,12 +182,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(stored, None);
-        assert!(
-            service
-                .list(&HistoryQuery::default())
-                .await
-                .unwrap()
-                .is_empty()
+        assert_eq!(
+            service.list(&HistoryQuery::default()).await.unwrap(),
+            Vec::<HistoryEntry>::new()
         );
         assert!(!service.settings().await.unwrap().enabled);
     }
