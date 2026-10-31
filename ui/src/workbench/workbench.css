@@ -651,6 +651,14 @@ input[type="search"] {
   z-index: 900;
 }
 
+.messages__dropped {
+  margin: 0;
+  padding: var(--space-1) var(--space-2);
+  border-bottom: 1px solid var(--color-border);
+  color: var(--color-fg-muted);
+  font-size: 12px;
+}
+
 .messages {
   flex: 1;
   margin: 0;

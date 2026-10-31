@@ -72,6 +72,8 @@ export function QueryEditorPanel({
   const cancelWanted = useRef(false);
   /** The base session the core opened this editor's session from, if any. */
   const editorSession = useRef<string | null>(null);
+  /** A `query_close_editor` still in flight: the next run waits for it (same `EditorId`). */
+  const pendingClose = useRef<Promise<void> | null>(null);
   const startedAt = useRef(0);
 
   // Without a choice, the editor uses the first open connection.
@@ -112,11 +114,21 @@ export function QueryEditorPanel({
   }, [sessionKey]);
 
   // A tab that switches connection gives up its session on the old one.
+  const closeEditorSession = useCallback((): Promise<void> => {
+    editorSession.current = null;
+    const closing = queryCloseEditor(editorId)
+      .catch(() => {})
+      .finally(() => {
+        if (pendingClose.current === closing) pendingClose.current = null;
+      });
+    pendingClose.current = closing;
+    return closing;
+  }, [editorId]);
+
   const releaseEditor = useCallback(() => {
     if (editorSession.current === null) return;
-    editorSession.current = null;
-    void queryCloseEditor(editorId).catch(() => {});
-  }, [editorId]);
+    void closeEditorSession();
+  }, [closeEditorSession]);
 
   useEffect(() => releaseEditor, [releaseEditor]);
 
@@ -145,9 +157,12 @@ export function QueryEditorPanel({
     // The editor's core session belongs to one connection: moving to another (the first open
     // connection closed, say) closes it first, and the tab stays on the new one.
     if (editorSession.current !== null && editorSession.current !== session.id) {
-      editorSession.current = null;
-      await queryCloseEditor(editorId).catch(() => {});
+      await closeEditorSession();
     }
+    // A close sent when the user switched connection must land before this run opens the
+    // editor's new session, or it could close that one.
+    while (pendingClose.current) await pendingClose.current;
+    if (seq !== runSeq.current) return;
     setChosenSession(session.id);
     editorSession.current = session.id;
     try {

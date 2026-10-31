@@ -1,4 +1,4 @@
-import { tableFromArrays } from "apache-arrow";
+import { Table, tableFromArrays, Utf8, vectorFromArray } from "apache-arrow";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ResultPager } from "./pager";
 
@@ -112,6 +112,53 @@ describe("ResultPager", () => {
     expect(most).toBeLessThanOrEqual(12);
     // Pages scrolled away from are gone.
     expect(pager.cell(0, 0)).toBeNull();
+  });
+
+  it("caps the cached bytes and shrinks requests when rows are wide", async () => {
+    const wide = "x".repeat(10_000); // about 10 kB a row
+    const calls: Array<{ offset: number; limit: number }> = [];
+    const fetch = vi.fn(async (offset: number, limit: number) => {
+      calls.push({ offset, limit });
+      const n = Math.max(0, Math.min(limit, MILLION - offset));
+      return new Table({
+        id: vectorFromArray(Float64Array.from({ length: n }, (_, i) => offset + i)),
+        text: vectorFromArray(
+          Array.from({ length: n }, () => wide),
+          new Utf8(),
+        ),
+      });
+    });
+    const maxBytes = 8_000_000;
+    const pager = new ResultPager(fetch, {
+      pageSize: 100,
+      maxPages: 1000,
+      prefetchPages: 1,
+      maxBytes,
+      maxRequestBytes: 2_500_000,
+    });
+    pager.setRowCount(MILLION);
+    pager.setVisible(0, 49);
+    await settle();
+    expect(idAt(pager, 49)).toBe(49);
+    for (let row = 1000; row < 100_000; row += 1000) {
+      pager.setVisible(row, row + 49);
+      await settle(20);
+      expect(idAt(pager, row + 49)).toBe(row + 49);
+      // The visible page plus at most what the budget allows.
+      expect(pager.cachedBytes).toBeLessThanOrEqual(maxBytes + 1_100_000);
+    }
+    // Once a 1 MB page is known, one request carries at most two pages (2.5 MB aimed for).
+    for (const call of calls.slice(1)) expect(call.limit).toBeLessThanOrEqual(200);
+    expect(pager.cachedPages).toBeLessThan(10);
+  });
+
+  it("reads rows for copying without touching the cache", async () => {
+    const { fetch } = backend(() => MILLION);
+    const pager = new ResultPager(fetch, { pageSize: 100 });
+    pager.setRowCount(MILLION);
+    const table = await pager.readRows(500_000, 3);
+    expect(table.numRows).toBe(3);
+    expect(pager.cachedPages).toBe(0);
   });
 
   it("follows a growing row count while the result streams", async () => {

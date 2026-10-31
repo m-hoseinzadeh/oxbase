@@ -42,7 +42,12 @@ export interface RunState {
   /** The statement running now. */
   current: number | null;
   results: ResultInfo[];
+  /** The latest messages, at most {@link MAX_MESSAGES} (older notices are dropped first). */
   messages: RunMessage[];
+  /** Messages dropped to keep the list bounded (a script can raise any number of notices). */
+  droppedMessages: number;
+  /** Error messages of the run, dropped ones included. */
+  errorCount: number;
   error: ErrorInfo | null;
   elapsedMs: number | null;
 }
@@ -63,9 +68,14 @@ export const IDLE_RUN: RunState = {
   current: null,
   results: [],
   messages: [],
+  droppedMessages: 0,
+  errorCount: 0,
   error: null,
   elapsedMs: null,
 };
+
+/** Most messages a run keeps; beyond it the oldest notices (then the oldest messages) go. */
+export const MAX_MESSAGES = 1000;
 
 export function isActive(status: RunStatus): boolean {
   return status === "starting" || status === "running";
@@ -75,8 +85,25 @@ function plural(n: number, one: string, many: string): string {
   return `${n.toLocaleString("en-US")} ${n === 1 ? one : many}`;
 }
 
-function addMessage(state: RunState, message: Omit<RunMessage, "id">): RunMessage[] {
-  return [...state.messages, { ...message, id: state.messages.length }];
+type MessageFields = Pick<RunState, "messages" | "droppedMessages" | "errorCount">;
+
+/** The message list with `message` appended, kept to {@link MAX_MESSAGES} entries. */
+function addMessage(state: RunState, message: Omit<RunMessage, "id">): MessageFields {
+  const id = state.messages.length + state.droppedMessages;
+  const errorCount = state.errorCount + (message.kind === "error" ? 1 : 0);
+  if (state.messages.length < MAX_MESSAGES) {
+    return {
+      messages: [...state.messages, { ...message, id }],
+      droppedMessages: state.droppedMessages,
+      errorCount,
+    };
+  }
+  // Drop the oldest notice so errors and statement results stay; else the oldest message.
+  const notice = state.messages.findIndex((m) => m.kind === "notice");
+  const drop = notice === -1 ? 0 : notice;
+  const messages = state.messages.filter((_, i) => i !== drop);
+  messages.push({ ...message, id });
+  return { messages, droppedMessages: state.droppedMessages + 1, errorCount };
 }
 
 function statementPreview(state: RunState, index: number): string | undefined {
@@ -139,7 +166,7 @@ function applyEvent(state: RunState, event: RunEvent): RunState {
     case "notice":
       return {
         ...state,
-        messages: addMessage(state, {
+        ...addMessage(state, {
           kind: "notice",
           level: event.level,
           ...(event.statementIndex === undefined ? {} : { statementIndex: event.statementIndex }),
@@ -161,7 +188,7 @@ function applyEvent(state: RunState, event: RunEvent): RunState {
       return {
         ...state,
         current: null,
-        messages: addMessage(state, {
+        ...addMessage(state, {
           kind: "ok",
           statementIndex: event.statementIndex,
           ...(preview ? { statement: preview } : {}),
@@ -175,7 +202,7 @@ function applyEvent(state: RunState, event: RunEvent): RunState {
       return {
         ...state,
         current: null,
-        messages: addMessage(state, {
+        ...addMessage(state, {
           kind: "error",
           statementIndex: event.statementIndex,
           ...(preview ? { statement: preview } : {}),
@@ -206,7 +233,7 @@ function applyEvent(state: RunState, event: RunEvent): RunState {
         error,
         results,
         elapsedMs: event.elapsedMs,
-        messages: addMessage(state, {
+        ...addMessage(state, {
           kind: status === "finished" ? "summary" : "error",
           text,
           elapsedMs: event.elapsedMs,
@@ -227,7 +254,7 @@ export function runReducer(state: RunState, action: RunAction): RunState {
         ...state,
         status: "failed",
         error: action.error,
-        messages: addMessage(state, { kind: "error", text: action.error.message }),
+        ...addMessage(state, { kind: "error", text: action.error.message }),
       };
     case "reset":
       return IDLE_RUN;

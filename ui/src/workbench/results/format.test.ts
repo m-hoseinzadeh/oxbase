@@ -8,12 +8,20 @@ import {
   makeVector,
   TimeMicrosecond,
   TimestampMicrosecond,
+  TimeUnit,
   tableFromArrays,
   Utf8,
   vectorFromArray,
 } from "apache-arrow";
 import { describe, expect, it } from "vitest";
-import { columnTypeLabel, decimalText, formatCell } from "./format";
+import {
+  civilFromDays,
+  columnTypeLabel,
+  dateFromDays,
+  decimalText,
+  formatCell,
+  timestampText,
+} from "./format";
 
 describe("formatCell", () => {
   it("reports NULL apart from text", () => {
@@ -61,6 +69,29 @@ describe("formatCell", () => {
       makeData({ type: new DateDay(), length: 1, data: Int32Array.from([20_027]) }),
     );
     expect(formatCell(date, 0).text).toBe("2024-10-31");
+  });
+
+  it("formats dates and timestamps past JS Date's range and BC", () => {
+    expect(civilFromDays(0)).toEqual({ year: 1970, month: 1, day: 1 });
+    expect(civilFromDays(-719_162)).toEqual({ year: 1, month: 1, day: 1 });
+    expect(dateFromDays(20_027)).toBe("2024-10-31");
+    expect(dateFromDays(-719_528)).toBe("0001-01-01 BC"); // year 0
+    expect(dateFromDays(-735_160)).toBe("0044-03-15 BC"); // year -43
+    expect(dateFromDays(2_145_042_905)).toBe("5874897-12-31");
+    // 290000-01-01 00:00:00.5 (microseconds), beyond Date's ±8.64e15 ms.
+    const micros = 105_200_797n * 86_400n * 1_000_000n + 500_000n;
+    expect(timestampText(micros, TimeUnit.MICROSECOND, null)).toBe("290000-01-01 00:00:00.5");
+    // One second before 0001-01-01 is 1 BC.
+    const beforeEra = (-719_162n * 86_400n - 1n) * 1_000_000n;
+    expect(timestampText(beforeEra, TimeUnit.MICROSECOND, "UTC")).toBe("0001-12-31 23:59:59Z BC");
+    const ts = makeVector(
+      makeData({
+        type: new TimestampMicrosecond(),
+        length: 1,
+        data: BigInt64Array.from([micros]),
+      }),
+    );
+    expect(() => formatCell(ts, 0)).not.toThrow();
   });
 
   it("formats decimals with their scale", () => {

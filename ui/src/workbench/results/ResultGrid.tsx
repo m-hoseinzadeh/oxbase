@@ -17,6 +17,7 @@ import {
 } from "@glideapps/glide-data-grid";
 import { type RefObject, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ColumnInfo } from "../../api";
+import { type CopyNotify, cellsForSelection, NULL_COPY_TEXT } from "./copy";
 import { cellDisplayText, columnTypeLabel, formatCell, initialColumnWidth } from "./format";
 import type { ResultPager } from "./pager";
 
@@ -103,9 +104,11 @@ export interface ResultGridProps {
   columns: ColumnInfo[];
   /** Rows stored so far; grows while the result streams. */
   rowCount: number;
+  /** Tells the user about a copy that was cut short or failed. */
+  onNotice?: CopyNotify;
 }
 
-export function ResultGrid({ pager, columns, rowCount }: ResultGridProps) {
+export function ResultGrid({ pager, columns, rowCount, onNotice }: ResultGridProps) {
   const gridRef = useRef<DataEditorRef>(null);
   const portalRef = useRef<HTMLDivElement>(null);
   const region = useRef<Rectangle>({ x: 0, y: 0, width: 0, height: 0 });
@@ -154,7 +157,7 @@ export function ResultGrid({ pager, columns, rowCount }: ResultGridProps) {
           kind: GridCellKind.Text,
           data: "",
           displayData: "NULL",
-          copyData: "",
+          copyData: NULL_COPY_TEXT,
           allowOverlay: false,
           style: "faded",
           contentAlign: value.numeric ? "right" : "left",
@@ -198,6 +201,17 @@ export function ResultGrid({ pager, columns, rowCount }: ResultGridProps) {
     [columns],
   );
 
+  // Copying reads the selection from the core (see ./copy), never "#LOADING" placeholders.
+  const noticeRef = useRef(onNotice);
+  noticeRef.current = onNotice;
+  const getCellsForSelection = useCallback(
+    (selection: Rectangle, signal: AbortSignal) =>
+      cellsForSelection(pager, columns, rowCount, selection, signal, (message) =>
+        noticeRef.current?.(message),
+      ),
+    [pager, columns, rowCount],
+  );
+
   const onVisibleRegionChanged = useCallback(
     (range: Rectangle) => {
       region.current = range;
@@ -225,7 +239,7 @@ export function ResultGrid({ pager, columns, rowCount }: ResultGridProps) {
         onColumnResize={(_column, newSize, index) =>
           setWidths((current) => ({ ...current, [index]: newSize }))
         }
-        getCellsForSelection
+        getCellsForSelection={getCellsForSelection}
         rowMarkers="number"
         smoothScrollX
         smoothScrollY

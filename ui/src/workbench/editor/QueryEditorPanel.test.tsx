@@ -222,6 +222,41 @@ describe("QueryEditorPanel", () => {
     expect(calls("query_close_editor")).toEqual([{ editorId: "editor-1" }]);
   });
 
+  it("waits for the old session's close before running on another connection", async () => {
+    const other: SessionSummary = { ...SESSION, id: "s-2", profile_name: "Other PG" };
+    let releaseClose: (() => void) | null = null;
+    const base = tauriCore.invoke.getMockImplementation();
+    tauriCore.invoke.mockImplementation(async (cmd, args) => {
+      if (cmd === "list_open_connections") return [SESSION, other];
+      if (cmd === "query_close_editor") {
+        return new Promise((resolve) => {
+          releaseClose = () => resolve(null);
+        });
+      }
+      return base?.(cmd, args);
+    });
+    await renderPanel();
+    fireEvent.click(screen.getByRole("button", { name: "Run" }));
+    await waitFor(() => expect(onEvent).not.toBeNull());
+    act(() => {
+      onEvent?.({ type: "started", runId: "run-1", statements: [] });
+      onEvent?.({ type: "finished", elapsedMs: 3 });
+    });
+    fireEvent.change(screen.getByRole("combobox", { name: "Connection" }), {
+      target: { value: "s-2" },
+    });
+    expect(calls("query_close_editor")).toEqual([{ editorId: "editor-1" }]);
+    fireEvent.click(screen.getByRole("button", { name: "Run" }));
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    });
+    // The second run waits for the close.
+    expect(calls("query_run")).toHaveLength(1);
+    act(() => releaseClose?.());
+    await waitFor(() => expect(calls("query_run")).toHaveLength(2));
+    expect(calls("query_run")[1]).toMatchObject({ sessionId: "s-2", editorId: "editor-1" });
+  });
+
   it("needs an open connection", () => {
     tauriCore.invoke.mockResolvedValue([]);
     render(<QueryEditorPanel editorId="editor-2" />);

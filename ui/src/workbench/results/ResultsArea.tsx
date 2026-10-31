@@ -19,7 +19,15 @@ const MESSAGE_ICON: Record<RunMessage["kind"], string> = {
   summary: "∑",
 };
 
-function Messages({ messages, status }: { messages: RunMessage[]; status: RunState["status"] }) {
+function Messages({
+  messages,
+  dropped,
+  status,
+}: {
+  messages: RunMessage[];
+  dropped: number;
+  status: RunState["status"];
+}) {
   if (messages.length === 0) {
     return (
       <p className="results__empty">
@@ -28,26 +36,48 @@ function Messages({ messages, status }: { messages: RunMessage[]; status: RunSta
     );
   }
   return (
-    <ol className="messages" aria-label="Messages">
-      {messages.map((m) => (
-        <li
-          key={m.id}
-          className={`messages__item messages__item--${m.kind}${m.level ? ` messages__item--${m.level}` : ""}`}
-        >
-          <span className="messages__icon" aria-hidden="true">
-            {MESSAGE_ICON[m.kind]}
-          </span>
-          <span className="messages__body">
-            {m.statement ? <code className="messages__statement">{m.statement}</code> : null}
-            <span className="messages__text">{m.text}</span>
-          </span>
-          {m.elapsedMs !== undefined ? (
-            <span className="messages__time">{formatMs(m.elapsedMs)}</span>
-          ) : null}
-        </li>
-      ))}
-    </ol>
+    <>
+      {dropped > 0 ? (
+        <p className="messages__dropped" data-testid="messages-dropped">
+          {dropped.toLocaleString("en-US")} earlier {dropped === 1 ? "message" : "messages"} not
+          shown
+        </p>
+      ) : null}
+      <ol className="messages" aria-label="Messages">
+        {messages.map((m) => (
+          <li
+            key={m.id}
+            className={`messages__item messages__item--${m.kind}${m.level ? ` messages__item--${m.level}` : ""}`}
+          >
+            <span className="messages__icon" aria-hidden="true">
+              {MESSAGE_ICON[m.kind]}
+            </span>
+            <span className="messages__body">
+              {m.statement ? <code className="messages__statement">{m.statement}</code> : null}
+              <span className="messages__text">{m.text}</span>
+            </span>
+            {m.elapsedMs !== undefined ? (
+              <span className="messages__time">{formatMs(m.elapsedMs)}</span>
+            ) : null}
+          </li>
+        ))}
+      </ol>
+    </>
   );
+}
+
+/** Re-renders when `pager` loads rows or a page request fails (the pager is not React state). */
+function usePagerUpdates(pager: ResultPager | null): void {
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    if (!pager) return;
+    let lastError = pager.error;
+    return pager.onLoad(() => {
+      if (pager.error === lastError) return;
+      lastError = pager.error;
+      setTick((t) => t + 1);
+    });
+  }, [pager]);
 }
 
 export interface ResultsAreaProps {
@@ -58,6 +88,8 @@ export function ResultsArea({ run }: ResultsAreaProps) {
   // The tab the user picked, for the run it was picked in (a new run starts on its first result).
   const [picked, setPicked] = useState<{ runId: string | null; tab: TabId } | null>(null);
   const pagers = useRef(new Map<number, ResultPager>());
+  /** The last copy notice, for the result tab it came from. */
+  const [notice, setNotice] = useState<{ key: string; text: string } | null>(null);
   const pagersRun = useRef<string | null>(null);
 
   // A new run (or none) starts with fresh pagers.
@@ -118,8 +150,11 @@ export function ResultsArea({ run }: ResultsAreaProps) {
 
   const activeResult =
     typeof shown === "number" ? run.results.find((r) => r.resultIndex === shown) : undefined;
-  const errors = run.messages.filter((m) => m.kind === "error").length;
+  const errors = run.errorCount;
   const pager = activeResult ? pagerFor(activeResult) : null;
+  usePagerUpdates(pager);
+  const gridKey = activeResult ? `${run.runId}:${activeResult.resultIndex}` : "";
+  const shownNotice = notice && notice.key === gridKey ? notice.text : null;
 
   return (
     <section className="results" aria-label="Results">
@@ -164,18 +199,20 @@ export function ResultsArea({ run }: ResultsAreaProps) {
               {rowCountLabel(activeResult)}
               {activeResult.columns.length === 0 ? " · no columns" : ""}
               {pager.error ? ` · page failed: ${pager.error}` : ""}
+              {shownNotice ? ` · ${shownNotice}` : ""}
             </div>
             <div className="results__grid">
               <ResultGrid
-                key={`${run.runId}:${activeResult.resultIndex}`}
+                key={gridKey}
                 pager={pager}
                 columns={activeResult.columns}
                 rowCount={activeResult.rowCount}
+                onNotice={(text) => setNotice({ key: gridKey, text })}
               />
             </div>
           </>
         ) : (
-          <Messages messages={run.messages} status={run.status} />
+          <Messages messages={run.messages} dropped={run.droppedMessages} status={run.status} />
         )}
       </div>
     </section>

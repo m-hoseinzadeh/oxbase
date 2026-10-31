@@ -60,23 +60,74 @@ function splitSeconds(raw: bigint, unit: number): { seconds: bigint; fraction: s
   return { seconds, fraction };
 }
 
-function dateFromDays(days: number): string {
-  return new Date(days * 86_400_000).toISOString().slice(0, 10);
+const DAY_SECONDS = 86_400n;
+
+/** Floor division (rounds toward minus infinity, unlike `Math.trunc`). */
+function floorDiv(a: number, b: number): number {
+  return Math.floor(a / b);
 }
 
-function timestampText(raw: bigint, unit: number, timezone: string | null | undefined): string {
+/**
+ * The proleptic Gregorian date `days` after 1970-01-01, by integer arithmetic (JS `Date` stops
+ * at ±275,760 years and has no BC formatting). Year 0 is 1 BC, as in Arrow.
+ */
+export function civilFromDays(days: number): { year: number; month: number; day: number } {
+  const z = days + 719_468;
+  const era = floorDiv(z, 146_097);
+  const doe = z - era * 146_097; // [0, 146096]
+  const yoe = floorDiv(
+    doe - floorDiv(doe, 1460) + floorDiv(doe, 36_524) - floorDiv(doe, 146_096),
+    365,
+  );
+  const doy = doe - (365 * yoe + floorDiv(yoe, 4) - floorDiv(yoe, 100)); // [0, 365]
+  const mp = floorDiv(5 * doy + 2, 153); // [0, 11], March first
+  const day = doy - floorDiv(153 * mp + 2, 5) + 1;
+  const month = mp < 10 ? mp + 3 : mp - 9;
+  const year = yoe + era * 400 + (month <= 2 ? 1 : 0);
+  return { year, month, day };
+}
+
+/** `YYYY-MM-DD` (more year digits when needed) and whether the date is BC. */
+function dateParts(days: number): { text: string; bc: boolean } {
+  const { year, month, day } = civilFromDays(days);
+  const bc = year <= 0;
+  const shown = bc ? 1 - year : year;
+  return { text: `${pad(shown, 4)}-${pad(month, 2)}-${pad(day, 2)}`, bc };
+}
+
+/** A date as the databases print it: `2024-10-31`, `0044-03-15 BC`. */
+export function dateFromDays(days: number): string {
+  if (!Number.isFinite(days)) return String(days);
+  const { text, bc } = dateParts(days);
+  return bc ? `${text} BC` : text;
+}
+
+function timeOfDay(seconds: number, fraction: string): string {
+  const hh = Math.floor(seconds / 3600);
+  const mm = Math.floor((seconds % 3600) / 60);
+  return `${pad(hh, 2)}:${pad(mm, 2)}:${pad(seconds % 60, 2)}${fraction ? `.${fraction}` : ""}`;
+}
+
+export function timestampText(
+  raw: bigint,
+  unit: number,
+  timezone: string | null | undefined,
+): string {
   const { seconds, fraction } = splitSeconds(raw, unit);
-  const iso = new Date(Number(seconds) * 1000).toISOString(); // YYYY-MM-DDTHH:MM:SS.000Z
-  const text = `${iso.slice(0, 10)} ${iso.slice(11, 19)}${fraction ? `.${fraction}` : ""}`;
-  return timezone ? `${text}Z` : text;
+  let days = seconds / DAY_SECONDS;
+  let rest = seconds % DAY_SECONDS;
+  if (rest < 0n) {
+    days -= 1n;
+    rest += DAY_SECONDS;
+  }
+  const date = dateParts(Number(days));
+  const text = `${date.text} ${timeOfDay(Number(rest), fraction)}${timezone ? "Z" : ""}`;
+  return date.bc ? `${text} BC` : text;
 }
 
 function timeText(raw: bigint, unit: number): string {
   const { seconds, fraction } = splitSeconds(raw, unit);
-  const s = Number(seconds);
-  const hh = Math.floor(s / 3600);
-  const mm = Math.floor((s % 3600) / 60);
-  return `${pad(hh, 2)}:${pad(mm, 2)}:${pad(s % 60, 2)}${fraction ? `.${fraction}` : ""}`;
+  return timeOfDay(Number(seconds), fraction);
 }
 
 /** A 128-bit (or 256-bit) little-endian two's complement integer from 32-bit words. */
@@ -164,8 +215,10 @@ export function formatCell(vector: Vector, index: number, column?: ColumnInfo): 
       if (t.unit === DateUnit.DAY && values instanceof Int32Array) {
         text = dateFromDays(values[i] ?? 0);
       } else {
-        const ms = vector.get(index) as number;
-        text = new Date(ms).toISOString().slice(0, 10);
+        // Date64: milliseconds (Arrow JS may hand back a number or a Date).
+        const value = vector.get(index) as unknown;
+        const ms = value instanceof Date ? value.getTime() : Number(value);
+        text = Number.isFinite(ms) ? dateFromDays(Math.floor(ms / 86_400_000)) : genericText(value);
       }
       break;
     }

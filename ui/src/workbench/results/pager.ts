@@ -8,8 +8,11 @@
  *   (`coalesceMs`) has passed. A burst of scroll events therefore costs a few requests, and
  *   pages scrolled past in between are never fetched.
  * - Contiguous missing pages go out as one request (up to `maxPagesPerRequest` pages).
- * - The cache keeps at most `maxPages` pages (least recently used are dropped, never the
- *   visible ones), so memory stays bounded however far the user scrolls.
+ * - The cache keeps at most `maxPages` pages and at most `maxBytes` of decoded Arrow data (least
+ *   recently used pages are dropped, never the visible ones), so memory stays bounded however
+ *   far the user scrolls and however wide the rows are.
+ * - Requests are sized by bytes too: once the rows turn out wide, fewer pages go per request
+ *   (down to one) and no pages are prefetched past `maxRequestBytes`.
  * - While the result is still streaming, the row count grows; a page that came back short is
  *   fetched again once more rows exist.
  */
@@ -28,6 +31,10 @@ export interface PagerOptions {
   prefetchPages?: number;
   /** Throttle window between requests, in ms. */
   coalesceMs?: number;
+  /** Most decoded bytes kept in memory (visible pages are kept even past it). */
+  maxBytes?: number;
+  /** Aimed-for size of one response, in decoded bytes. */
+  maxRequestBytes?: number;
 }
 
 /** One cached page. `rows` can be short of `pageSize` at the end or while streaming. */
@@ -36,6 +43,8 @@ interface Page {
   rows: number;
   /** The row count when the page was fetched: a short page is refetched only once it grew. */
   knownTotal: number;
+  /** Decoded size: the page's share of its response's Arrow buffers. */
+  bytes: number;
 }
 
 /** A cell of a loaded row: the Arrow column and the index inside it. */
@@ -53,7 +62,16 @@ const DEFAULTS: Required<PagerOptions> = {
   maxPagesPerRequest: 16,
   prefetchPages: 1,
   coalesceMs: 24,
+  maxBytes: 192 * 1024 * 1024,
+  maxRequestBytes: 24 * 1024 * 1024,
 };
+
+/** Bytes of the Arrow buffers behind `table`. */
+export function tableBytes(table: Table): number {
+  let bytes = 0;
+  for (const data of table.data) bytes += data.byteLength;
+  return bytes;
+}
 
 export class ResultPager {
   readonly pageSize: number;
@@ -61,8 +79,14 @@ export class ResultPager {
   private readonly maxPagesPerRequest: number;
   private readonly prefetchPages: number;
   private readonly coalesceMs: number;
+  private readonly maxBytes: number;
+  private readonly maxRequestBytes: number;
 
   private total = 0;
+  /** Bytes held by the cached pages. */
+  private bytes = 0;
+  /** Bytes per row seen in the last response (0 until one arrived). */
+  private rowBytes = 0;
   private readonly pages = new Map<number, Page>();
   private readonly loading = new Set<number>();
   private firstVisible = 0;
@@ -87,6 +111,8 @@ export class ResultPager {
     this.maxPagesPerRequest = Math.max(1, Math.floor(o.maxPagesPerRequest));
     this.maxPages = Math.max(Math.floor(o.maxPages), 2 * this.prefetchPages + 2);
     this.coalesceMs = Math.max(0, o.coalesceMs);
+    this.maxBytes = Math.max(1, o.maxBytes);
+    this.maxRequestBytes = Math.max(1, o.maxRequestBytes);
   }
 
   get rowCount(): number {
@@ -96,6 +122,11 @@ export class ResultPager {
   /** Pages currently held in memory. */
   get cachedPages(): number {
     return this.pages.size;
+  }
+
+  /** Decoded bytes currently held in memory. */
+  get cachedBytes(): number {
+    return this.bytes;
   }
 
   onLoad(listener: LoadListener): () => void {
@@ -139,9 +170,18 @@ export class ResultPager {
     return vector ? { vector, index } : null;
   }
 
+  /**
+   * Rows `[offset, offset + limit)` straight from the core, bypassing the cache (for copying a
+   * selection: it neither evicts the visible pages nor stays in memory).
+   */
+  readRows(offset: number, limit: number): Promise<Table> {
+    return this.fetchPage(offset, limit);
+  }
+
   /** Drops every cached page (e.g. while the result's tab is hidden). */
   release(): void {
     this.pages.clear();
+    this.bytes = 0;
     this.firstVisible = 0;
     this.lastVisible = -1;
   }
@@ -152,6 +192,7 @@ export class ResultPager {
     if (this.timer !== null) clearTimeout(this.timer);
     this.timer = null;
     this.pages.clear();
+    this.bytes = 0;
     this.listeners.clear();
   }
 
@@ -175,6 +216,13 @@ export class ResultPager {
     return page.rows < this.pageSize && end < this.total && this.total > page.knownTotal;
   }
 
+  /** Pages one request may carry: fewer once rows turn out wide, at least one. */
+  private pagesPerRequest(): number {
+    if (this.rowBytes === 0) return this.maxPagesPerRequest;
+    const pages = Math.floor(this.maxRequestBytes / (this.rowBytes * this.pageSize));
+    return Math.min(this.maxPagesPerRequest, Math.max(1, pages));
+  }
+
   /** Pages to fetch, visible ones first, then the prefetch margin (nearest first). */
   private neededPages(): number[] {
     if (this.lastVisible < this.firstVisible || this.total === 0) return [];
@@ -182,7 +230,9 @@ export class ResultPager {
     const last = this.pageOf(Math.min(this.lastVisible, this.total - 1));
     const out: number[] = [];
     for (let p = first; p <= last; p += 1) if (this.needsFetch(p)) out.push(p);
-    for (let d = 1; d <= this.prefetchPages; d += 1) {
+    // Pages too wide to fit a request are not prefetched.
+    const prefetch = this.rowBytes * this.pageSize > this.maxRequestBytes ? 0 : this.prefetchPages;
+    for (let d = 1; d <= prefetch; d += 1) {
       if (this.needsFetch(last + d)) out.push(last + d);
       if (first - d >= 0 && this.needsFetch(first - d)) out.push(first - d);
     }
@@ -198,8 +248,9 @@ export class ResultPager {
     const wanted = new Set(needed);
     let start = seed;
     let end = seed;
-    while (end - start + 1 < this.maxPagesPerRequest && wanted.has(end + 1)) end += 1;
-    while (end - start + 1 < this.maxPagesPerRequest && wanted.has(start - 1)) start -= 1;
+    const most = this.pagesPerRequest();
+    while (end - start + 1 < most && wanted.has(end + 1)) end += 1;
+    while (end - start + 1 < most && wanted.has(start - 1)) start -= 1;
     const offset = start * this.pageSize;
     const limit = Math.min((end - start + 1) * this.pageSize, this.total - offset);
     const knownTotal = this.total;
@@ -212,12 +263,16 @@ export class ResultPager {
       const table = await this.fetchPage(offset, limit);
       if (this.disposed) return;
       loadedRows = table.numRows;
+      const responseBytes = tableBytes(table);
+      if (loadedRows > 0) this.rowBytes = responseBytes / loadedRows;
       for (let p = start; p <= end; p += 1) {
         const from = (p - start) * this.pageSize;
         const to = Math.min(from + this.pageSize, table.numRows);
         const slice = table.slice(from, Math.max(from, to));
-        this.pages.delete(p);
-        this.pages.set(p, { table: slice, rows: slice.numRows, knownTotal });
+        const bytes = loadedRows > 0 ? (responseBytes * slice.numRows) / loadedRows : 0;
+        this.dropPage(p);
+        this.pages.set(p, { table: slice, rows: slice.numRows, knownTotal, bytes });
+        this.bytes += bytes;
       }
       this.error = null;
     } catch (error) {
@@ -234,15 +289,29 @@ export class ResultPager {
     if (!failed) this.schedule();
   }
 
-  /** Drops the least recently used pages beyond `maxPages`, never a visible one. */
+  private dropPage(p: number): void {
+    const page = this.pages.get(p);
+    if (!page) return;
+    this.pages.delete(p);
+    this.bytes -= page.bytes;
+  }
+
+  private overBudget(): boolean {
+    return this.pages.size > this.maxPages || this.bytes > this.maxBytes;
+  }
+
+  /**
+   * Drops the least recently used pages beyond `maxPages` or `maxBytes`, never a visible one.
+   */
   private evict(): void {
-    if (this.pages.size <= this.maxPages) return;
+    if (!this.overBudget()) return;
     const firstKeep = this.pageOf(this.firstVisible);
     const lastKeep = this.pageOf(Math.max(this.lastVisible, this.firstVisible));
-    for (const p of this.pages.keys()) {
-      if (this.pages.size <= this.maxPages) break;
+    for (const p of [...this.pages.keys()]) {
+      if (!this.overBudget()) break;
       if (p >= firstKeep && p <= lastKeep) continue;
-      this.pages.delete(p);
+      this.dropPage(p);
     }
+    if (this.pages.size === 0) this.bytes = 0;
   }
 }

@@ -5,7 +5,7 @@ import { refreshAll, resetConnectionsStore } from "../../connections/store";
 import type { ConnectionProfile, SessionSummary } from "../../connections/types";
 import { tauriCore } from "../../test/tauriMock";
 import { notifyHistoryChanged } from "../events";
-import { HISTORY_PAGE, HistoryPanel } from "./HistoryPanel";
+import { HISTORY_PAGE, HistoryPanel, nextPageBefore } from "./HistoryPanel";
 
 vi.mock("@tauri-apps/api/core", async () => (await import("../../test/tauriMock")).tauriCore);
 vi.mock("@tauri-apps/plugin-dialog", () => ({ open: vi.fn() }));
@@ -200,6 +200,33 @@ describe("HistoryPanel", () => {
     expect(screen.getByText(/Recording is off/)).toBeInTheDocument();
   });
 
+  it("does not skip entries that share the last entry's start time", async () => {
+    // Statements of one script started in the same millisecond, across the page boundary.
+    const same = new Date(Date.UTC(2026, 9, 31, 9, 0, 0)).toISOString();
+    entries = [
+      ...Array.from({ length: HISTORY_PAGE - 2 }, (_, i) => entry(i + 1)),
+      ...Array.from({ length: 6 }, (_, i) => entry(1000 + i, { startedAt: same })),
+      entry(5000),
+    ];
+    await renderPanel();
+    expect(shown()).toHaveLength(HISTORY_PAGE);
+    fireEvent.click(screen.getByRole("button", { name: "Load more" }));
+    await waitFor(() => expect(shown()).toHaveLength(HISTORY_PAGE + 5));
+    expect(screen.queryByRole("button", { name: "Load more" })).not.toBeInTheDocument();
+  });
+
+  it("steps past a whole page of entries with one start time", async () => {
+    const same = new Date(Date.UTC(2026, 9, 31, 9, 0, 0)).toISOString();
+    entries = [
+      ...Array.from({ length: HISTORY_PAGE + 3 }, (_, i) => entry(1000 + i, { startedAt: same })),
+      entry(5000),
+    ];
+    await renderPanel();
+    fireEvent.click(screen.getByRole("button", { name: "Load more" }));
+    // The rest of that millisecond cannot be reached through the contract; older ones can.
+    await waitFor(() => expect(shown()).toHaveLength(HISTORY_PAGE + 1));
+  });
+
   it("reloads when a run ends and pages with Load more", async () => {
     entries = Array.from({ length: HISTORY_PAGE + 5 }, (_, i) => entry(i + 1));
     await renderPanel();
@@ -207,7 +234,10 @@ describe("HistoryPanel", () => {
     fireEvent.click(screen.getByRole("button", { name: "Load more" }));
     await waitFor(() => expect(shown()).toHaveLength(HISTORY_PAGE + 5));
     const last = entries[HISTORY_PAGE - 1] as HistoryEntry;
-    expect(historyCalls().at(-1)).toEqual({ limit: HISTORY_PAGE, before: last.startedAt });
+    expect(historyCalls().at(-1)).toEqual({
+      limit: HISTORY_PAGE,
+      before: nextPageBefore(last.startedAt),
+    });
 
     entries = [entry(0, { sql: "SELECT now()" })];
     act(() => notifyHistoryChanged());

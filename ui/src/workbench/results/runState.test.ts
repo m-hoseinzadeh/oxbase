@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { RunEvent, StatementSpan } from "../../api";
-import { IDLE_RUN, type RunState, rowCountLabel, runReducer } from "./runState";
+import { IDLE_RUN, MAX_MESSAGES, type RunState, rowCountLabel, runReducer } from "./runState";
 
 const SCRIPT = "SELECT * FROM big;\nUPDATE t SET x = 1;";
 
@@ -122,5 +122,36 @@ describe("runReducer", () => {
     });
     expect(failed.status).toBe("failed");
     expect(failed.messages[0]?.text).toBe("a run is already active");
+  });
+
+  it("keeps a bounded message list under a flood of notices", () => {
+    let state = runReducer(IDLE_RUN, { type: "start", script: "DO $$ ... $$" });
+    state = runReducer(state, {
+      type: "event",
+      event: { type: "started", runId: "r", statements: [] },
+    });
+    state = runReducer(state, {
+      type: "event",
+      event: {
+        type: "statementFailed",
+        statementIndex: 0,
+        error: { category: "sql", message: "early failure" },
+        elapsedMs: 1,
+      },
+    });
+    const flood = 5_000;
+    for (let i = 0; i < flood; i += 1) {
+      state = runReducer(state, {
+        type: "event",
+        event: { type: "notice", level: "info", message: `x ${i}` },
+      });
+    }
+    expect(state.messages).toHaveLength(MAX_MESSAGES);
+    expect(state.droppedMessages).toBe(flood + 1 - MAX_MESSAGES);
+    // The error stays, the newest notices are kept, ids stay unique.
+    expect(state.messages[0]?.text).toBe("early failure");
+    expect(state.messages.at(-1)?.text).toBe(`x ${flood - 1}`);
+    expect(new Set(state.messages.map((m) => m.id)).size).toBe(MAX_MESSAGES);
+    expect(state.errorCount).toBe(1);
   });
 });

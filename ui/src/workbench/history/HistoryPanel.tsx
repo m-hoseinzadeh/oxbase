@@ -33,6 +33,16 @@ const STATUS_LABEL: Record<HistoryEntry["status"], string> = {
   cancelled: "Cancelled",
 };
 
+/**
+ * The `before` bound for the page after an entry that started at `startedAt`: the end of that
+ * millisecond, so entries sharing the start time are not skipped (the caller drops the ones
+ * already shown). Falls back to `startedAt` itself when it does not parse.
+ */
+export function nextPageBefore(startedAt: string): string {
+  const ms = Date.parse(startedAt);
+  return Number.isNaN(ms) ? startedAt : new Date(ms + 1).toISOString();
+}
+
 export function HistoryPanel() {
   const { profiles, sessions } = useConnections();
   const [search, setSearch] = useState("");
@@ -101,10 +111,25 @@ export function HistoryPanel() {
     if (!last) return;
     const seq = loadSeq.current;
     try {
-      const page = await historyList(buildQuery(last.startedAt));
+      // `before` is strict and statements of one script often share a start time, so ask from
+      // just after the last entry's millisecond and skip the entries already shown.
+      const shown = new Set(entries.map((e) => e.id));
+      const page = await historyList(buildQuery(nextPageBefore(last.startedAt)));
       if (seq !== loadSeq.current) return;
-      setEntries((current) => [...current, ...page]);
-      setHasMore(page.length === HISTORY_PAGE);
+      let fresh = page.filter((e) => !shown.has(e.id));
+      let more = page.length === HISTORY_PAGE;
+      if (fresh.length === 0 && more) {
+        // A whole page shares that millisecond: step past it rather than ask again forever.
+        const next = await historyList(buildQuery(last.startedAt));
+        if (seq !== loadSeq.current) return;
+        fresh = next.filter((e) => !shown.has(e.id));
+        more = next.length === HISTORY_PAGE;
+      }
+      setEntries((current) => {
+        const ids = new Set(current.map((e) => e.id));
+        return [...current, ...fresh.filter((e) => !ids.has(e.id))];
+      });
+      setHasMore(more && fresh.length > 0);
     } catch (e) {
       setError(toCommandError(e).message);
     }

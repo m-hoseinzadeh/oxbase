@@ -45,7 +45,15 @@ pub fn profile_repository(fallback_dir: Option<&Path>) -> Arc<dyn ProfileReposit
 pub fn history_repository() -> Arc<dyn HistoryRepository> {
     match tauri::async_runtime::block_on(AppDb::open_default()) {
         Ok(db) => Arc::new(SqliteHistoryRepository::new(db)),
-        Err(_) => Arc::new(MemoryHistoryRepository::new()),
+        Err(error) => {
+            // Only the error's category: the message could carry a path.
+            eprintln!(
+                "oxbase: warning: the app database could not be opened ({}); query history is \
+                 kept in memory for this run only",
+                error.category()
+            );
+            Arc::new(MemoryHistoryRepository::new())
+        }
     }
 }
 
