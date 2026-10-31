@@ -170,8 +170,8 @@ async fn run_step(
         return Ok(());
     }
     let got = match on {
-        On::Conn(c) => exec_on(*c, &step.sql, &[]).await?,
-        On::Tx(tx) => exec_tx(*tx, &step.sql, &[]).await?,
+        On::Conn(c) => exec_on(c, &step.sql, &[]).await?,
+        On::Tx(tx) => exec_tx(tx, &step.sql, &[]).await?,
     };
     let rows = rows_of(&got);
     if let Some(name) = &step.capture {
@@ -721,7 +721,7 @@ async fn live_round_trip_column() {
     let loaded = fetcher(ObjectKind::Column)
         .load(
             c,
-            &tref.child(ObjectKind::Column, &col.name),
+            &tref.child(ObjectKind::Column, col.name.as_str()),
             CancellationToken::new(),
         )
         .await
@@ -763,13 +763,13 @@ async fn live_round_trip_column() {
     assert!(script.is_destructive());
     apply(c, &script).await.unwrap();
     let mut expected = fetched.clone();
-    expected.columns[2] = wider.clone();
+    expected.columns[2].clone_from(&wider);
     let fetched = load_table(c, &name).await;
     assert_same(&expected, &fetched);
 
     let script = generator
         .drop_object(
-            &tref.child(ObjectKind::Column, &wider.name),
+            &tref.child(ObjectKind::Column, wider.name.as_str()),
             &DdlContext::new(&version).with_table(&fetched),
         )
         .unwrap();
@@ -812,7 +812,7 @@ async fn live_round_trip_index() {
     )
     .await
     .unwrap();
-    let iref = tref.child(ObjectKind::Index, &idx.name);
+    let iref = tref.child(ObjectKind::Index, idx.name.as_str());
     let loaded = fetcher(ObjectKind::Index)
         .load(c, &iref, CancellationToken::new())
         .await
@@ -1008,7 +1008,7 @@ async fn live_round_trip_check() {
     let loaded = fetcher(ObjectKind::Check)
         .load(
             c,
-            &tref.child(ObjectKind::Check, &format!("{name}_chk")),
+            &tref.child(ObjectKind::Check, format!("{name}_chk")),
             CancellationToken::new(),
         )
         .await
@@ -1051,7 +1051,7 @@ async fn live_round_trip_check() {
 
     let script = generator
         .drop_object(
-            &tref.child(ObjectKind::Check, &format!("{name}_chk")),
+            &tref.child(ObjectKind::Check, format!("{name}_chk")),
             &DdlContext::new(&version).with_table(&fetched),
         )
         .unwrap();

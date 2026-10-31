@@ -189,10 +189,7 @@ fn insert(values: &[ColumnValue], target: &DmlTarget<'_>) -> Result<DmlPlan> {
                     .filter(|v| !v.is_null())
             })
             .collect();
-        match given {
-            Some(key) => Some(select_by_key(target, &key)?),
-            None => None,
-        }
+        given.map(|key| select_by_key(target, &key)).transpose()?
     };
     Ok(DmlPlan {
         write: w.finish(),

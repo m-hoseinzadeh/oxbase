@@ -140,10 +140,10 @@ fn without_rowid(t: &TableDef) -> bool {
 }
 
 fn pk_columns(t: &TableDef) -> &[String] {
-    t.primary_key
-        .as_ref()
-        .map(|pk| pk.columns.as_slice())
-        .unwrap_or_default()
+    match &t.primary_key {
+        Some(pk) => &pk.columns,
+        None => &[],
+    }
 }
 
 fn same_name(a: &str, b: &str) -> bool {
@@ -906,7 +906,7 @@ struct Plan {
 }
 
 fn push_once(list: &mut Vec<String>, name: &str) {
-    if !list.iter().any(|n| n == name) {
+    if !list.iter().any(|n| n.as_str() == name) {
         list.push(name.to_owned());
     }
 }
@@ -1435,15 +1435,15 @@ fn push_triggers(script: &mut Script, r: &Rebuild<'_>) -> Result<()> {
             .trim_end_matches(';')
             .trim_end()
             .to_owned();
-        if table_rename.is_some() || !r.renames.columns.is_empty() {
-            if let Some(rewritten) =
+        let renamed_any = table_rename.is_some() || !r.renames.columns.is_empty();
+        if renamed_any
+            && let Some(rewritten) =
                 parse::rename_in_trigger(&sql, table_rename, &r.renames.columns, &ident)
-            {
-                sql = rewritten;
-                script.warn(format!(
-                    "trigger {name} is re-created with the renamed names replaced; review it"
-                ));
-            }
+        {
+            sql = rewritten;
+            script.warn(format!(
+                "trigger {name} is re-created with the renamed names replaced; review it"
+            ));
         }
         if attached && !flag(&trigger.extras, &props::TEMPORARY) {
             sql = parse::qualify_trigger_name(&sql, &ident(r.schema));
@@ -1579,7 +1579,7 @@ impl DdlGenerator for SqliteDdl {
                     .position(|c| c.name == a.name)
                     .ok_or_else(|| missing(ObjectKind::Column, &a.name, &cur.obj.name))?;
                 let mut next = cur.clone();
-                next.columns[pos] = b.clone();
+                next.columns[pos].clone_from(b);
                 alter_table(cur, &next, ctx)
             }
             (ObjectDef::Index { table, index: a }, ObjectDef::Index { index: b, .. }) => {
@@ -1591,7 +1591,7 @@ impl DdlGenerator for SqliteDdl {
                         .position(|i| i.name == a.name)
                         .ok_or_else(|| missing(ObjectKind::Index, &a.name, &cur.obj.name))?;
                     let mut next = cur.clone();
-                    next.indexes[pos] = b.clone();
+                    next.indexes[pos].clone_from(b);
                     return alter_table(cur, &next, ctx);
                 }
                 let mut script = Script::new();
@@ -1634,7 +1634,7 @@ impl DdlGenerator for SqliteDdl {
                         )
                     })?;
                 let mut next = cur.clone();
-                next.foreign_keys[pos] = b.clone();
+                next.foreign_keys[pos].clone_from(b);
                 alter_table(cur, &next, ctx)
             }
             (ObjectDef::Check { table, check: a }, ObjectDef::Check { check: b, .. }) => {
@@ -1654,7 +1654,7 @@ impl DdlGenerator for SqliteDdl {
                         )
                     })?;
                 let mut next = cur.clone();
-                next.checks[pos] = b.clone();
+                next.checks[pos].clone_from(b);
                 alter_table(cur, &next, ctx)
             }
             _ => Err(Error::invalid_input(format!(
@@ -2142,7 +2142,7 @@ mod tests {
             extras: Extras::new(),
         });
         let mut new_checked = new.clone();
-        new_checked.checks = checked.checks.clone();
+        new_checked.checks.clone_from(&checked.checks);
         new_checked.checks[0].expression = "1".into();
         let script = SqliteDdl
             .alter(
