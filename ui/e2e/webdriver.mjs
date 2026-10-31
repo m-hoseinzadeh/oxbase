@@ -24,9 +24,17 @@ export class WebDriverError extends Error {
   }
 }
 
+/** The id of a serialized web element (W3C key, or the legacy JSON Wire key), else null. */
+function elementIdOf(value) {
+  if (value === null || typeof value !== "object") return null;
+  if (typeof value[ELEMENT_KEY] === "string") return value[ELEMENT_KEY];
+  if (typeof value.ELEMENT === "string") return value.ELEMENT;
+  return null;
+}
+
 /** True when `value` is a serialized web element. */
 export function isElement(value) {
-  return value !== null && typeof value === "object" && ELEMENT_KEY in value;
+  return elementIdOf(value) !== null;
 }
 
 export class WebDriver {
@@ -127,6 +135,27 @@ export class WebDriver {
     return this.request("POST", this.session("/execute/async"), { script, args });
   }
 
+  /**
+   * Runs `script` (a function body returning a DOM element or null) and returns that element as
+   * a WebDriver reference, or null. The element is tagged with a `data-e2e-ref` attribute and
+   * looked up with a CSS selector, so this does not depend on how the driver serializes nodes
+   * returned by scripts.
+   */
+  async executeElement(script, ...args) {
+    const ref = await this.execute(
+      `const el = (function () {\n${script}\n}).apply(this, arguments);
+       if (!el || el.nodeType !== 1) return null;
+       if (!el.hasAttribute("data-e2e-ref")) {
+         window.__e2eRefs = (window.__e2eRefs || 0) + 1;
+         el.setAttribute("data-e2e-ref", String(window.__e2eRefs));
+       }
+       return el.getAttribute("data-e2e-ref");`,
+      ...args,
+    );
+    if (ref === null || ref === undefined) return null;
+    return this.find(`[data-e2e-ref="${ref}"]`);
+  }
+
   async findAll(css) {
     return this.request("POST", this.session("/elements"), {
       using: "css selector",
@@ -141,8 +170,11 @@ export class WebDriver {
   }
 
   elementId(element) {
-    if (!isElement(element)) throw new Error("not a web element");
-    return element[ELEMENT_KEY];
+    const id = elementIdOf(element);
+    if (id === null) {
+      throw new Error(`not a web element: ${JSON.stringify(element)?.slice(0, 200)}`);
+    }
+    return id;
   }
 
   click(element) {

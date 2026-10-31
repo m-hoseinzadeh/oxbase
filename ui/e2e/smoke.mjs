@@ -255,7 +255,7 @@ function hookText(name) {
 }
 
 function locate(name) {
-  return wd.execute(
+  return wd.executeElement(
     "const s = window.__e2e; return s ? s.locate(s.hooks[arguments[0]]) : null;",
     name,
   );
@@ -289,7 +289,7 @@ async function typeSql(sql) {
   const textarea = await waitFor(
     "the SQL editor (Monaco)",
     () =>
-      wd.execute(
+      wd.executeElement(
         "const e = window.__e2e.locate(window.__e2e.hooks.editor);" +
           "return e ? e.querySelector('textarea') : null;",
       ),
@@ -382,7 +382,7 @@ async function launch() {
 
 async function connect() {
   const option = await waitFor(`the saved connection "${config.profileName}"`, () =>
-    wd.execute(
+    wd.executeElement(
       "const list = window.__e2e.locate(window.__e2e.hooks.connectionList);" +
         "if (!list) return null;" +
         "for (const o of list.querySelectorAll('[role=option], [data-testid=connection-item]')) {" +
@@ -403,7 +403,7 @@ async function connect() {
     const el = await locate("passwordPrompt");
     if (!el) return null;
     // The hook may sit on the dialog rather than on its input.
-    return wd.execute(
+    return wd.executeElement(
       "const e = arguments[0]; return e.tagName === 'INPUT' ? e : e.querySelector('input[type=password]');",
       el,
     );
@@ -755,7 +755,7 @@ async function cancelRun() {
 /** Expands the object tree along `labels` (labels not shown are skipped) and returns the row. */
 async function treeRow(labels, target) {
   const find = (label) =>
-    wd.execute(
+    wd.executeElement(
       "for (const r of document.querySelectorAll('[role=tree] [role=treeitem]')) {" +
         "  const l = r.querySelector('.tree__label');" +
         "  if (l && l.textContent.trim().toLowerCase() === arguments[0].toLowerCase()) return r; }" +
@@ -829,7 +829,7 @@ async function editCell() {
   const cell = await waitFor(
     `the "code" cell of the test row`,
     () =>
-      wd.execute(
+      wd.executeElement(
         "const view = arguments[0];" +
           "const table = view.querySelector('table[role=grid]'); if (!table) return null;" +
           "let idx = null; for (const th of table.querySelectorAll('thead th'))" +
@@ -848,7 +848,7 @@ async function editCell() {
   const input = await waitFor(
     "the cell editor",
     () =>
-      wd.execute(
+      wd.executeElement(
         "return document.querySelector('.gdg-growing-entry textarea, #portal textarea, " +
           ".result-grid__portal textarea, [data-testid=cell-editor] textarea, [data-testid=cell-editor] input');",
       ),

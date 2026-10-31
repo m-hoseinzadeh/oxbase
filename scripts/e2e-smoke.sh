@@ -137,7 +137,7 @@ export LIBGL_ALWAYS_SOFTWARE=1
 export NO_AT_BRIDGE=1
 
 echo "e2e-smoke: app $app"
-echo "e2e-smoke: tauri-driver $(tauri-driver --help >/dev/null 2>&1 && echo found), WebKitWebDriver $(WebKitWebDriver --version 2>/dev/null || echo '?')"
+echo "e2e-smoke: tauri-driver $(command -v tauri-driver), WebKitWebDriver $(command -v WebKitWebDriver)"
 echo "e2e-smoke: output $out"
 
 tauri-driver --port 4444 --native-port 4445 >"$out/webdriver.log" 2>&1 &
