@@ -84,6 +84,10 @@ use std::ops::Range;
 
 use oxbase_types::Engine;
 
+mod lex;
+mod redact;
+mod splitter;
+
 /// The SQL dialect to split, chosen from the connection's engine with
 /// [`SqlDialect::for_engine`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -151,8 +155,7 @@ pub struct Statement {
 /// Never fails: unterminated strings, comments or bodies run to the end of the text and make
 /// one last statement.
 pub fn split(dialect: SqlDialect, text: &str) -> Vec<Statement> {
-    let _ = (dialect, text);
-    unimplemented!("m2: sql")
+    splitter::split(dialect, text)
 }
 
 /// The statement for "run current statement" at `byte_offset` (see [`pick_statement`]).
@@ -198,8 +201,7 @@ pub fn pick_statement(statements: &[Statement], byte_offset: usize) -> Option<&S
 /// searchable. This is a best-effort filter for the obvious cases, not a guarantee; the
 /// history can also be turned off (`docs/m2-contracts.md`).
 pub fn redact_secrets(dialect: SqlDialect, sql: &str) -> Cow<'_, str> {
-    let _ = (dialect, sql);
-    unimplemented!("m2: sql")
+    redact::redact(dialect, sql)
 }
 
 /// What [`redact_secrets`] puts in place of a secret string literal.
