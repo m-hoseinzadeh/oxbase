@@ -43,12 +43,14 @@ import { toCommandError } from "../../connections/api";
 import { openTableDesigner } from "../layout";
 import { ResultPager } from "../results/pager";
 import { timedQueryPage } from "../results/perf";
+import { type CellOverride, type GridEditing, ResultGrid } from "../results/ResultGrid";
 import {
-  type CellOverride,
-  type GridEditing,
   type GridRowSelection,
-  ResultGrid,
-} from "../results/ResultGrid";
+  NO_ROWS,
+  selectedRowCount,
+  selectedRows,
+  singleRow,
+} from "../results/rowSelection";
 import { IDLE_RUN, isActive, rowCountLabel, runReducer } from "../results/runState";
 import { CellEditor } from "./CellEditor";
 import {
@@ -138,11 +140,7 @@ export function TableDataPanel({ editorId, sessionId, table }: TableDataParams) 
   const [applying, setApplying] = useState(false);
   const [applyError, setApplyError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
-  const [selection, setSelection] = useState<GridRowSelection>({
-    current: null,
-    first: 0,
-    last: -1,
-  });
+  const [selection, setSelection] = useState<GridRowSelection>(NO_ROWS);
   const [view, setView] = useState<View>("grid");
   const [forms, setForms] = useState<ReadonlyMap<number, FormRow | { error: string }>>(new Map());
   const [confirm, setConfirm] = useState<{ text: string; action: () => void } | null>(null);
@@ -195,7 +193,7 @@ export function TableDataPanel({ editorId, sessionId, table }: TableDataParams) 
       setApplyError(null);
       setNotice(null);
       resetForms();
-      setSelection({ current: null, first: 0, last: -1 });
+      setSelection(NO_ROWS);
       // A close sent when the tab went away (or StrictMode's remount) lands first.
       while (pendingClose.current) await pendingClose.current;
       await Promise.resolve();
@@ -434,7 +432,7 @@ export function TableDataPanel({ editorId, sessionId, table }: TableDataParams) 
   function addRow() {
     const { changes: next } = insertRow(changes);
     setChanges(next);
-    setSelection({ current: totalRows, first: totalRows, last: totalRows });
+    setSelection(singleRow(totalRows));
   }
 
   async function duplicateRow() {
@@ -467,17 +465,17 @@ export function TableDataPanel({ editorId, sessionId, table }: TableDataParams) 
     }
     const cells = duplicateCells(editability.columns, base);
     setChanges((c) => insertRow(c, cells).changes);
-    setSelection({ current: totalRows, first: totalRows, last: totalRows });
+    setSelection(singleRow(totalRows));
   }
 
   function deleteSelected() {
-    const first = Math.max(0, Math.min(selection.first, selection.last));
-    const last = Math.min(totalRows - 1, Math.max(selection.first, selection.last));
-    if (last < first) return;
+    // Exactly the selected rows: a selection with gaps never widens to its first..last span.
+    const rows = selectedRows(selection, totalRows);
+    if (rows.length === 0) return;
     let next = changes;
     // New rows go by edit index: remove from the end so earlier indexes stay valid.
     const newEdits: number[] = [];
-    for (let index = first; index <= last; index += 1) {
+    for (const index of rows) {
       const row = gridRow(index, stored, applied, changes);
       if (!row) continue;
       if (row.type === "new") newEdits.push(row.edit);
@@ -538,17 +536,7 @@ export function TableDataPanel({ editorId, sessionId, table }: TableDataParams) 
   const wantedRows = useMemo(() => {
     if (view === "grid") return [];
     if (view === "form") return current === null ? [] : [current];
-    const first = Math.max(0, Math.min(selection.first, selection.last));
-    const last = Math.min(
-      totalRows - 1,
-      Math.max(selection.first, selection.last),
-      first + MAX_JSON_ROWS - 1,
-    );
-    const rows: number[] = [];
-    if (selection.last >= selection.first && last >= first) {
-      for (let r = first; r <= last; r += 1) rows.push(r);
-    } else if (current !== null) rows.push(current);
-    return rows;
+    return selectedRows(selection, totalRows, MAX_JSON_ROWS);
   }, [view, current, selection, totalRows]);
 
   useEffect(() => {
@@ -646,12 +634,7 @@ export function TableDataPanel({ editorId, sessionId, table }: TableDataParams) 
     (editability && !editability.editable ? (editability.readOnlyReason ?? "read-only") : null);
   const pendingCount = changes.edits.length;
   const conditionCount = countConditions(draft) + (query.sort.length > 0 ? 1 : 0);
-  const selectedCount =
-    selection.last >= selection.first
-      ? selection.last - selection.first + 1
-      : current !== null
-        ? 1
-        : 0;
+  const selectedCount = selectedRowCount(selection, totalRows);
 
   let status = "";
   if (run.status === "starting" || run.status === "running") status = "Loading…";
@@ -836,6 +819,7 @@ export function TableDataPanel({ editorId, sessionId, table }: TableDataParams) 
               rowCount={stored}
               edit={editing}
               onSelectRows={setSelection}
+              selectedRows={selection}
             />
           </div>
         ) : view === "form" ? (
@@ -854,16 +838,14 @@ export function TableDataPanel({ editorId, sessionId, table }: TableDataParams) 
             onChange={(column, input) => currentRow && commit(currentRow, column, input)}
             onPrev={
               current !== null && current > 0
-                ? () =>
-                    setSelection({ current: current - 1, first: current - 1, last: current - 1 })
+                ? () => setSelection(singleRow(current - 1))
                 : undefined
             }
             onNext={
               current !== null && current < totalRows - 1
-                ? () =>
-                    setSelection({ current: current + 1, first: current + 1, last: current + 1 })
+                ? () => setSelection(singleRow(current + 1))
                 : current === null && totalRows > 0
-                  ? () => setSelection({ current: 0, first: 0, last: 0 })
+                  ? () => setSelection(singleRow(0))
                   : undefined
             }
           />

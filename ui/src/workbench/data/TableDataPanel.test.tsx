@@ -21,17 +21,33 @@ vi.mock("@tauri-apps/api/core", async () => (await import("../../test/tauriMock"
 vi.mock("../results/ResultGrid", async () => {
   const { useState } = await import("react");
   return {
-    ResultGrid: ({ rowCount, columns, edit, onSelectRows }: ResultGridProps) => {
+    ResultGrid: ({ rowCount, columns, edit, onSelectRows, selectedRows }: ResultGridProps) => {
       const [open, setOpen] = useState<[number, number] | null>(null);
       const rows = rowCount + (edit?.extraRows ?? 0);
+      const isSelected = (r: number) =>
+        selectedRows?.current === r || !!selectedRows?.ranges.some(([a, b]) => r >= a && r < b);
       return (
         <div data-testid="grid">
+          <button
+            type="button"
+            onClick={() =>
+              onSelectRows?.({
+                current: null,
+                ranges: [
+                  [0, 1],
+                  [2, 3],
+                ],
+              })
+            }
+          >
+            select rows 0 and 2
+          </button>
           {Array.from({ length: rows }, (_, r) => (
             // biome-ignore lint/suspicious/noArrayIndexKey: rows are positions.
-            <div key={r} data-testid={`row-${r}`}>
+            <div key={r} data-testid={`row-${r}`} data-selected={isSelected(r) ? "yes" : "no"}>
               <button
                 type="button"
-                onClick={() => onSelectRows?.({ current: r, first: r, last: r })}
+                onClick={() => onSelectRows?.({ current: r, ranges: [[r, r + 1]] })}
               >
                 select {r}
               </button>
@@ -343,6 +359,37 @@ describe("TableDataPanel", () => {
     expect(screen.getByTestId("cell-3-id")).toHaveTextContent("4");
     expect(screen.getByTestId("cell-2-name")).toHaveAttribute("data-highlight", "deleted");
     expect(screen.getByRole("button", { name: "Apply" })).toBeDisabled();
+  });
+
+  it("deletes exactly the selected rows when the selection has a gap", async () => {
+    await renderPanel();
+    await waitFor(() => expect(screen.getByRole("button", { name: "Add row" })).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: "select rows 0 and 2" }));
+    fireEvent.click(screen.getByRole("button", { name: "Delete 2 rows" }));
+    expect(screen.getByTestId("cell-0-name")).toHaveAttribute("data-highlight", "deleted");
+    expect(screen.getByTestId("cell-1-name")).toHaveAttribute("data-highlight", "");
+    expect(screen.getByTestId("cell-2-name")).toHaveAttribute("data-highlight", "deleted");
+    fireEvent.click(screen.getByRole("button", { name: "Apply (2)" }));
+    await screen.findByText("Saved 2 changes.");
+    expect(calls("edit_apply")[0]?.changes).toEqual({
+      edits: [
+        { op: "delete", row: 0 },
+        { op: "delete", row: 2 },
+      ],
+    });
+  });
+
+  it("selects a new row in the grid, so Delete acts on the highlighted row", async () => {
+    await renderPanel();
+    await waitFor(() => expect(screen.getByRole("button", { name: "Add row" })).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: "select 1" }));
+    expect(screen.getByTestId("row-1")).toHaveAttribute("data-selected", "yes");
+    fireEvent.click(screen.getByRole("button", { name: "Add row" }));
+    expect(screen.getByTestId("row-1")).toHaveAttribute("data-selected", "no");
+    expect(screen.getByTestId("row-3")).toHaveAttribute("data-selected", "yes");
+    fireEvent.click(screen.getByRole("button", { name: "Delete row" }));
+    expect(screen.queryByTestId("row-3")).not.toBeInTheDocument();
+    expect(screen.getByTestId("cell-1-name")).toHaveAttribute("data-highlight", "");
   });
 
   it("keeps the buffer and shows each edit's error when an apply rolls back", async () => {

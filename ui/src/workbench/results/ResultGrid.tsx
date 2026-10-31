@@ -38,6 +38,7 @@ import type { ColumnInfo } from "../../api";
 import { type CopyNotify, cellsForSelection, NULL_COPY_TEXT } from "./copy";
 import { cellDisplayText, columnTypeLabel, formatCell, initialColumnWidth } from "./format";
 import type { ResultPager } from "./pager";
+import { fromGridSelection, type GridRowSelection, toGridSelection } from "./rowSelection";
 
 /** Rows assumed visible before the grid reports its real viewport. */
 const MIN_VIEWPORT_ROWS = 60;
@@ -131,12 +132,7 @@ export interface CellOverride {
   placeholder?: string | undefined;
 }
 
-/** The selected cell's row and the selected row range (grid rows). */
-export interface GridRowSelection {
-  current: number | null;
-  first: number;
-  last: number;
-}
+export type { GridRowSelection } from "./rowSelection";
 
 export interface GridEditing {
   /** Rows shown after the stored ones (new rows). */
@@ -203,8 +199,14 @@ export interface ResultGridProps {
   onNotice?: CopyNotify | undefined;
   /** Editing (table data); absent = read-only result. */
   edit?: GridEditing | undefined;
-  /** The selected row(s) changed. */
+  /** The selected row(s) changed (the exact rows, gaps included). */
   onSelectRows?: ((selection: GridRowSelection) => void) | undefined;
+  /**
+   * The row selection the caller holds. When it changes to something the grid did not report
+   * itself (a new row, Prev / Next in the form view, a remount), the grid shows it and scrolls
+   * the current row into view.
+   */
+  selectedRows?: GridRowSelection | undefined;
 }
 
 const NO_SELECTION: GridSelection = {
@@ -219,13 +221,16 @@ export function ResultGrid({
   onNotice,
   edit,
   onSelectRows,
+  selectedRows,
 }: ResultGridProps) {
   const gridRef = useRef<DataEditorRef>(null);
   const portalRef = useRef<HTMLDivElement>(null);
   const region = useRef<Rectangle>({ x: 0, y: 0, width: 0, height: 0 });
   const theme = useGridTheme();
   const [widths, setWidths] = useState<Record<number, number>>({});
-  const [selection, setSelection] = useState<GridSelection>(NO_SELECTION);
+  const [selection, setSelection] = useState<GridSelection>(() =>
+    selectedRows ? toGridSelection(selectedRows) : NO_SELECTION,
+  );
   const colours = useMemo(readEditColours, []);
   const editRef = useRef(edit);
   editRef.current = edit;
@@ -337,21 +342,29 @@ export function ResultGrid({
 
   const selectRef = useRef(onSelectRows);
   selectRef.current = onSelectRows;
+  /** The selection last reported to (or received from) the caller; unset so a remount scrolls. */
+  const reported = useRef<GridRowSelection | undefined>(undefined);
   const onGridSelectionChange = useCallback((next: GridSelection) => {
     setSelection(next);
     const notify = selectRef.current;
     if (!notify) return;
-    const current = next.current;
-    if (current) {
-      const { y, height } = current.range;
-      notify({ current: current.cell[1], first: y, last: y + Math.max(height, 1) - 1 });
-      return;
-    }
-    const first = next.rows.first();
-    const last = next.rows.last();
-    if (first !== undefined && last !== undefined) notify({ current: first, first, last });
-    else notify({ current: null, first: 0, last: -1 });
+    const rows = fromGridSelection(next);
+    reported.current = rows;
+    notify(rows);
   }, []);
+
+  // A selection made by the caller: show it and bring its current row into view.
+  useEffect(() => {
+    if (!selectedRows || selectedRows === reported.current) return;
+    reported.current = selectedRows;
+    setSelection((prev) => {
+      const col = prev.current?.cell[0] ?? 0;
+      return toGridSelection(selectedRows, col);
+    });
+    if (selectedRows.current !== null) {
+      gridRef.current?.scrollTo(0, selectedRows.current, "vertical");
+    }
+  }, [selectedRows]);
 
   // The column's type, right-aligned in its header when there is room for it.
   const drawHeader = useCallback<DrawHeaderCallback>(

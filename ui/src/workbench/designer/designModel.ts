@@ -185,9 +185,19 @@ function renameIn(list: readonly string[], from: string, to: string): string[] {
   return list.map((c) => (c === from ? to : c));
 }
 
+/** Whether a foreign key points at the designed table itself (by its loaded or new name). */
+export function isSelfReference(design: TableDesign, fk: ForeignKeyDef): boolean {
+  const ref = fk.ref_table;
+  const schema = ref.schema ?? design.table.schema;
+  if ((schema ?? "") !== (design.table.schema ?? "")) return false;
+  return ref.name === design.table.name || ref.name === design.original?.ref.name;
+}
+
 /**
- * Renames column `from` to `to` in the primary key, the indexes and the foreign keys (the
- * column itself keeps its origin, so the core generates a rename).
+ * Renames column `from` to `to` in the primary key, the indexes and the foreign keys
+ * (including the referenced columns of a foreign key to this same table). The column itself
+ * keeps its origin, so the core generates a rename. Call it once per committed rename, never
+ * per keystroke: partial names would capture references of other columns.
  */
 export function renameColumnRefs(design: TableDesign, from: string, to: string): TableDesign {
   if (from === to || from === "") return design;
@@ -212,29 +222,91 @@ export function renameColumnRefs(design: TableDesign, from: string, to: string):
     })),
     foreignKeys: design.foreignKeys.map((item) => ({
       ...item,
-      def: { ...item.def, columns: renameIn(item.def.columns, from, to) },
+      def: {
+        ...item.def,
+        columns: renameIn(item.def.columns, from, to),
+        ...(isSelfReference(design, item.def)
+          ? { ref_columns: renameIn(item.def.ref_columns, from, to) }
+          : {}),
+      },
     })),
   };
 }
 
-/** Drops column `name` from the primary key, indexes and foreign keys (column removed). */
+/** Why column `index` cannot be renamed to `to`, or `null` when it can. */
+export function columnNameProblem(design: TableDesign, index: number, to: string): string | null {
+  const col = design.columns[index];
+  if (!col) return null;
+  if (to === "" && col.column.name !== "") return "A column needs a name";
+  if (to !== "" && design.columns.some((c, i) => i !== index && c.column.name === to)) {
+    return `Another column is already named ${to}`;
+  }
+  return null;
+}
+
+/**
+ * Column `index` renamed to `to`, with its primary key, index and foreign key references
+ * following it; an error when the name is empty or taken (nothing changes then).
+ */
+export function renameColumn(
+  design: TableDesign,
+  index: number,
+  to: string,
+): { design: TableDesign } | { error: string } {
+  const col = design.columns[index];
+  if (!col || col.column.name === to) return { design };
+  const problem = columnNameProblem(design, index, to);
+  if (problem) return { error: problem };
+  const renamed: TableDesign = {
+    ...design,
+    columns: design.columns.map((c, i) =>
+      i === index ? { ...c, column: { ...c.column, name: to } } : c,
+    ),
+  };
+  return { design: renameColumnRefs(renamed, col.column.name, to) };
+}
+
+/**
+ * The design without the references to removed column `name`. Like PostgreSQL's DROP COLUMN,
+ * every primary key, index and foreign key that uses the column goes as a whole (a composite
+ * key is never silently narrowed to its other columns, which would change its meaning); a
+ * foreign key from this table to itself that references the column goes too. Check
+ * expressions are not parsed: the preview shows what the database says about them.
+ */
 export function dropColumnRefs(design: TableDesign, name: string): TableDesign {
-  const pk = design.primaryKey
-    ? { ...design.primaryKey, columns: design.primaryKey.columns.filter((c) => c !== name) }
-    : undefined;
   const next: TableDesign = {
     ...design,
-    indexes: design.indexes.map((item) => ({
-      ...item,
-      def: {
-        ...item.def,
-        columns: item.def.columns.filter((c) => c.is_expression || c.name !== name),
-      },
-    })),
+    indexes: design.indexes.filter(
+      (item) => !item.def.columns.some((c) => !c.is_expression && c.name === name),
+    ),
+    foreignKeys: design.foreignKeys.filter(
+      (item) =>
+        !item.def.columns.includes(name) &&
+        !(isSelfReference(design, item.def) && item.def.ref_columns.includes(name)),
+    ),
   };
-  if (pk && pk.columns.length > 0) next.primaryKey = pk;
-  else delete next.primaryKey;
+  if (design.primaryKey?.columns.includes(name)) delete next.primaryKey;
   return next;
+}
+
+/** What removing column `name` also removes (see `dropColumnRefs`), for the user. */
+export function dependentsOfColumn(design: TableDesign, name: string): string[] {
+  const out: string[] = [];
+  if (design.primaryKey?.columns.includes(name)) {
+    out.push(`the primary key (${design.primaryKey.columns.join(", ")})`);
+  }
+  for (const item of design.indexes) {
+    if (item.def.columns.some((c) => !c.is_expression && c.name === name)) {
+      out.push(`${item.def.unique ? "unique index" : "index"} ${item.def.name || "(unnamed)"}`);
+    }
+  }
+  for (const item of design.foreignKeys) {
+    const self = isSelfReference(design, item.def) && item.def.ref_columns.includes(name);
+    if (item.def.columns.includes(name) || self) {
+      out.push(`foreign key ${item.def.name || `(${item.def.columns.join(", ")})`}`);
+    }
+  }
+  return out;
 }
 
 /** Whether an operation is offered (native or by a rebuild). */

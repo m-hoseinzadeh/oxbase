@@ -31,7 +31,7 @@ import { Modal } from "../../components/Modal";
 import { cancelRequest, newRequestId, toCommandError } from "../../connections/api";
 import { languageFor } from "../editor/language";
 import { SqlEditor, type SqlEditorHandle } from "../editor/SqlEditor";
-import { openTableData } from "../layout";
+import { openTableData, sameObject } from "../layout";
 import {
   ChecksEditor,
   ColumnsEditor,
@@ -49,6 +49,11 @@ export interface TableDesignerProps {
   isNew?: boolean | undefined;
   /** Debounce of the preview request after a change, in ms. */
   previewDelayMs?: number | undefined;
+  /**
+   * The designed table is now `table` (a new table was created, or the table was renamed):
+   * the tab updates its params and title so it is found (and reloaded) under the new name.
+   */
+  onTableChanged?: ((table: ObjectRef) => void) | undefined;
 }
 
 type Tab = "columns" | "indexes" | "foreignKeys" | "checks" | "options";
@@ -107,6 +112,7 @@ export function TableDesignerPanel({
   table,
   isNew = false,
   previewDelayMs = 300,
+  onTableChanged,
 }: TableDesignerProps) {
   const [caps, setCaps] = useState<EngineCapabilities | null>(null);
   const [capsError, setCapsError] = useState<string | null>(null);
@@ -140,28 +146,49 @@ export function TableDesignerPanel({
     };
   }, [sessionId]);
 
-  const load = useCallback(async () => {
-    setLoadError(null);
-    try {
-      const d = await designerLoad(sessionId, table);
-      setLoaded(d);
-      setDesign(d);
-      setReport(null);
-      setApplyError(null);
-    } catch (error) {
-      setLoadError(toCommandError(error).message);
-    }
-  }, [sessionId, table]);
+  const load = useCallback(
+    async (target: ObjectRef) => {
+      setLoadError(null);
+      try {
+        const d = await designerLoad(sessionId, target);
+        setLoaded(d);
+        setDesign(d);
+        setReport(null);
+        setApplyError(null);
+      } catch (error) {
+        setLoadError(toCommandError(error).message);
+      }
+    },
+    [sessionId],
+  );
 
+  // The design shown, for the effect below (which must not re-run when it changes).
+  const loadedRef = useRef(loaded);
+  loadedRef.current = loaded;
+
+  // Load the table the tab was opened with, unless that table is already shown (the params
+  // were updated to the table an apply created or renamed).
   useEffect(() => {
-    if (!isNew) void load();
-  }, [isNew, load]);
+    if (isNew) return;
+    const shown = loadedRef.current;
+    if (shown && sameObject(shown.table, table)) return;
+    void load(table);
+  }, [isNew, table, load]);
+
+  /** The table as it is now: the last loaded or applied design's, else the one opened. */
+  const currentTable = !creating && loaded ? loaded.table : table;
+  const reload = () => void load(currentTable);
 
   const dirty = design !== null && design !== loaded;
 
   // A new preview after every change (debounced); the request before it is cancelled.
   useEffect(() => {
     if (!design || !dirty) {
+      // A preview still in flight is for changes that are gone (discarded or applied).
+      previewSeq.current += 1;
+      const old = previewRequest.current;
+      previewRequest.current = null;
+      if (old) void cancelRequest(old).catch(() => {});
       setPreview({ status: "idle" });
       return;
     }
@@ -238,9 +265,13 @@ export function TableDesignerPanel({
       );
       setReport(result);
       if (result.design) {
+        const before = creating ? null : (loaded?.table ?? table);
         setLoaded(result.design);
         setDesign(result.design);
         setCreating(false);
+        if (!before || !sameObject(before, result.design.table)) {
+          onTableChanged?.(result.design.table);
+        }
       }
       const outcome = result.outcome;
       if (
@@ -312,12 +343,7 @@ export function TableDesignerPanel({
         </button>
         {!creating ? (
           <>
-            <button
-              type="button"
-              className="button"
-              disabled={applying}
-              onClick={() => void load()}
-            >
+            <button type="button" className="button" disabled={applying} onClick={reload}>
               Reload
             </button>
             <button
@@ -378,7 +404,7 @@ export function TableDesignerPanel({
             </ol>
           ) : null}
           {/changed since it was loaded/i.test(applyError) ? (
-            <button type="button" className="button button--small" onClick={() => void load()}>
+            <button type="button" className="button button--small" onClick={reload}>
               Reload the table
             </button>
           ) : null}

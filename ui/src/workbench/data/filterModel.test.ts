@@ -111,6 +111,24 @@ describe("filter model", () => {
     expect(problems[1]?.message).toMatch(/is NULL/);
   });
 
+  it("treats an empty text as an empty string on text columns", () => {
+    const equalsEmpty = newCondition("name");
+    const notEmpty = { ...withOp(newCondition("name"), "ne"), values: [""] };
+    expect(draftToFilter(draft(equalsEmpty, notEmpty), COLUMNS)).toEqual({
+      filter: {
+        type: "and",
+        items: [
+          { type: "condition", column: "name", op: "eq", values: [{ type: "text", value: "" }] },
+          { type: "condition", column: "name", op: "ne", values: [{ type: "text", value: "" }] },
+        ],
+      },
+      problems: [],
+    });
+    // A number or a boolean still needs a value.
+    const { problems } = draftToFilter(draft(newCondition("active")), COLUMNS);
+    expect(problems).toHaveLength(1);
+  });
+
   it("sends the raw WHERE as one rawSql filter", () => {
     const d: FilterDraft = { ...emptyDraft(), mode: "raw", raw: " a = 'x;y' " };
     expect(draftToFilter(d, COLUMNS).filter).toEqual({ type: "rawSql", sql: "a = 'x;y'" });

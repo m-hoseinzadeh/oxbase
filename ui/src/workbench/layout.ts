@@ -82,7 +82,8 @@ export interface DesignerPanelParams {
   isNew?: boolean;
 }
 
-function sameObject(a: ObjectRef, b: ObjectRef): boolean {
+/** Whether two refs name the same object (kind, catalog, schema, name). */
+export function sameObject(a: ObjectRef, b: ObjectRef): boolean {
   return (
     a.kind === b.kind &&
     a.name === b.name &&
@@ -134,6 +135,11 @@ export function openTableData(init: { sessionId: string; table: ObjectRef }): st
   return editorId;
 }
 
+/** The title of a table designer tab. */
+export function designerTitle(params: DesignerPanelParams): string {
+  return params.isNew ? "New table" : `Design ${params.table.name}`;
+}
+
 /** Opens the table designer for a table, or for a new table when `isNew`. */
 export function openTableDesigner(init: DesignerPanelParams): void {
   const api = dockview;
@@ -159,7 +165,7 @@ export function openTableDesigner(init: DesignerPanelParams): void {
   api.addPanel({
     id: `designer-${Date.now().toString(36)}-${counter}`,
     component: "designer",
-    title: init.isNew ? "New table" : `Design ${init.table.name}`,
+    title: designerTitle(init),
     params: init,
     ...(neighbour ? { position: { referencePanel: neighbour, direction: "within" } } : {}),
   });

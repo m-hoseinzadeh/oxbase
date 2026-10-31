@@ -22,6 +22,7 @@ import {
   allowed,
   type DefaultMode,
   defaultMode,
+  dependentsOfColumn,
   dropColumnRefs,
   guessDataType,
   issuesAt,
@@ -29,7 +30,7 @@ import {
   newColumn,
   newForeignKey,
   newIndex,
-  renameColumnRefs,
+  renameColumn,
   splitNames,
   supportHint,
   TYPE_SUGGESTIONS,
@@ -90,22 +91,24 @@ export function ColumnsEditor({
 }: EditorProps) {
   const listId = useId();
   const [details, setDetails] = useState<number | null>(null);
+  const [removedNote, setRemovedNote] = useState<string | null>(null);
   const pk = new Set(design.primaryKey?.columns ?? []);
   const max = caps.maxIdentifierLength ?? undefined;
   const canAdd = isNew ? caps.createTable : allowed(caps.addColumn);
   const canReorder = isNew || allowed(caps.reorderColumns);
   const canPk = isNew || allowed(caps.changePrimaryKey);
 
+  /** Replaces column `index` (its name is changed only through `commitName`). */
   function setColumn(index: number, next: DesignColumn) {
-    const prev = design.columns[index];
-    let d: TableDesign = {
-      ...design,
-      columns: design.columns.map((c, i) => (i === index ? next : c)),
-    };
-    if (prev && prev.column.name !== next.column.name) {
-      d = renameColumnRefs(d, prev.column.name, next.column.name);
-    }
-    onChange(d);
+    onChange({ ...design, columns: design.columns.map((c, i) => (i === index ? next : c)) });
+  }
+
+  /** A committed rename (blur or Enter): references follow it once, from the old name. */
+  function commitName(index: number, name: string): string | null {
+    const result = renameColumn(design, index, name);
+    if ("error" in result) return result.error;
+    if (result.design !== design) onChange(result.design);
+    return null;
   }
 
   function setColumnDef(index: number, patch: Partial<DesignColumn["column"]>) {
@@ -131,6 +134,12 @@ export function ColumnsEditor({
   function remove(index: number) {
     const col = design.columns[index];
     if (!col) return;
+    const dependents = col.column.name ? dependentsOfColumn(design, col.column.name) : [];
+    setRemovedNote(
+      dependents.length > 0
+        ? `Removing ${col.column.name} also removed ${dependents.join(", ")}.`
+        : null,
+    );
     const d = dropColumnRefs(
       { ...design, columns: design.columns.filter((_, i) => i !== index) },
       col.column.name,
@@ -220,15 +229,13 @@ export function ColumnsEditor({
                     </button>
                   </td>
                   <td>
-                    <input
-                      type="text"
-                      aria-label={`Column ${index + 1} name`}
+                    <ColumnNameInput
+                      label={`Column ${index + 1} name`}
                       value={col.column.name}
                       maxLength={max}
                       disabled={disabled || !can(caps.renameColumn)}
                       title={nameHint}
-                      spellCheck={false}
-                      onChange={(e) => setColumnDef(index, { name: e.target.value })}
+                      onCommit={(name) => commitName(index, name)}
                     />
                   </td>
                   <td>
@@ -377,6 +384,11 @@ export function ColumnsEditor({
           })}
         </tbody>
       </table>
+      {removedNote ? (
+        <p className="designer__note" role="status" data-testid="column-removed-note">
+          {removedNote}
+        </p>
+      ) : null}
       <div className="designer__add">
         <button
           type="button"
@@ -389,6 +401,75 @@ export function ColumnsEditor({
         </button>
       </div>
     </div>
+  );
+}
+
+/**
+ * A column name edited as a draft and committed on blur or Enter (Escape drops the draft), so
+ * references are renamed once from the committed name and never from a half-typed one. A name
+ * that is empty or taken stays as an invalid draft with the reason.
+ */
+function ColumnNameInput({
+  label,
+  value,
+  maxLength,
+  disabled,
+  title,
+  onCommit,
+}: {
+  label: string;
+  value: string;
+  maxLength: number | undefined;
+  disabled: boolean;
+  title: string | undefined;
+  /** Commits the name; returns why it was refused, or `null`. */
+  onCommit: (name: string) => string | null;
+}) {
+  const [draft, setDraft] = useState<string | null>(null);
+  const [problem, setProblem] = useState<string | null>(null);
+  const errorId = useId();
+  function commit() {
+    if (draft === null) return;
+    if (draft === value) {
+      setDraft(null);
+      setProblem(null);
+      return;
+    }
+    const refused = onCommit(draft);
+    setProblem(refused);
+    if (!refused) setDraft(null);
+  }
+  return (
+    <>
+      <input
+        type="text"
+        aria-label={label}
+        value={draft ?? value}
+        maxLength={maxLength}
+        disabled={disabled}
+        title={problem ?? title}
+        aria-invalid={problem ? true : undefined}
+        aria-describedby={problem ? errorId : undefined}
+        spellCheck={false}
+        onChange={(e) => {
+          setDraft(e.target.value);
+          setProblem(null);
+        }}
+        onBlur={commit}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") commit();
+          else if (e.key === "Escape") {
+            setDraft(null);
+            setProblem(null);
+          }
+        }}
+      />
+      {problem ? (
+        <span id={errorId} className="designer__issue designer__issue--error" role="alert">
+          {problem}
+        </span>
+      ) : null}
+    </>
   );
 }
 
@@ -412,26 +493,41 @@ function ColumnDetails({
     onChange({ ...col, column: { ...def, ...patch } });
   const identity = def.identity ? (def.identity.always ? "always" : "default") : "none";
   const canGenerated = caps.generatedStored || caps.generatedVirtual;
+  // Auto increment and identity need the engine's support; on a stored column they are a
+  // change of the column's definition, so the engine must also be able to alter it.
+  const autoHint = !caps.autoIncrement
+    ? "Auto increment is not supported by this database"
+    : existing
+      ? supportHint(caps.alterColumnType, "Changing auto increment")
+      : undefined;
+  const canAuto = caps.autoIncrement && (!existing || allowed(caps.alterColumnType));
+  const identityHint = !caps.identity
+    ? "Identity columns are not supported by this database"
+    : existing
+      ? supportHint(caps.alterColumnType, "Changing identity")
+      : undefined;
+  const canIdentity = caps.identity && (!existing || allowed(caps.alterColumnType));
   return (
     <div className="designer__details">
-      {caps.autoIncrement ? (
-        <label className="checkbox">
+      {caps.autoIncrement || def.auto_increment ? (
+        <label className="checkbox" title={autoHint}>
           <input
             type="checkbox"
+            aria-label={`Column ${index + 1} auto increment`}
             checked={def.auto_increment}
-            disabled={disabled || (existing && !allowed(caps.alterColumnType))}
+            disabled={disabled || !canAuto}
             onChange={(e) => set({ auto_increment: e.target.checked })}
           />
           Auto increment
         </label>
       ) : null}
-      {caps.identity ? (
-        <label className="designer__inline">
+      {caps.identity || def.identity ? (
+        <label className="designer__inline" title={identityHint}>
           Identity
           <select
             aria-label={`Column ${index + 1} identity`}
             value={identity}
-            disabled={disabled}
+            disabled={disabled || !canIdentity}
             onChange={(e) => {
               const v = e.target.value;
               const { identity: _i, ...rest } = def;

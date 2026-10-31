@@ -15,6 +15,7 @@ import { QueryEditorPanel } from "./workbench/editor/QueryEditorPanel";
 import { HistoryPanel } from "./workbench/history/HistoryPanel";
 import {
   type DesignerPanelParams,
+  designerTitle,
   newEditorId,
   openQueryEditor,
   type QueryEditorParams,
@@ -38,12 +39,23 @@ function TableDataTab({ params }: IDockviewPanelProps<TableDataPanelParams>) {
   return <TableDataPanel editorId={editorId} sessionId={params.sessionId} table={params.table} />;
 }
 
-function DesignerTab({ params }: IDockviewPanelProps<DesignerPanelParams>) {
+function DesignerTab({ params, api }: IDockviewPanelProps<DesignerPanelParams>) {
   if (!params.sessionId || !params.table) {
     return <p className="results__empty">This tab lost its table. Open it again from the tree.</p>;
   }
   return (
-    <TableDesignerPanel sessionId={params.sessionId} table={params.table} isNew={params.isNew} />
+    <TableDesignerPanel
+      sessionId={params.sessionId}
+      table={params.table}
+      isNew={params.isNew}
+      onTableChanged={(table) => {
+        // The tab now designs the created or renamed table: found (and reloaded) by that name.
+        // dockview merges params: `isNew` is set explicitly, not left out.
+        const next: DesignerPanelParams = { sessionId: params.sessionId, table, isNew: false };
+        api.updateParameters(next);
+        api.setTitle(designerTitle(next));
+      }}
+    />
   );
 }
 

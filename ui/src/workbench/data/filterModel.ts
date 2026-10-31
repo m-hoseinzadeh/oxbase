@@ -175,9 +175,13 @@ function conditionToFilter(
   const arity = filterOpArity(node.op);
   if (arity === "none") return { type: "condition", column: node.column, op: node.op };
   let values = node.values;
+  // Empty slots of a value list are slots not filled in yet.
   if (arity === "many") values = values.filter((v) => v !== "");
-  const isPattern = PATTERN_OPS.has(node.op);
-  if (values.length === 0 || (!isPattern && values.some((v) => v === ""))) {
+  // An empty text is a real empty string (contract §5): `name = ''` is a valid condition on a
+  // text column (and on any column with a pattern operator). Other inputs need a value.
+  const input = columns.find((c) => c.name === node.column)?.input.type ?? "text";
+  const emptyAllowed = PATTERN_OPS.has(node.op) || input === "text" || input === "other";
+  if (values.length === 0 || (!emptyAllowed && values.some((v) => v === ""))) {
     problems.push({
       id: node.id,
       message:

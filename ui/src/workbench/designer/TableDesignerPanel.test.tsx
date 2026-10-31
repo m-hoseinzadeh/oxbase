@@ -118,6 +118,54 @@ const LOADED: TableDesign = {
   extras: {},
 };
 
+/** `items` with a foreign key to itself and a two-column unique index. */
+const WIDE: TableDef = {
+  ...ORIGINAL,
+  columns: [
+    ...ORIGINAL.columns,
+    {
+      name: "parent_id",
+      data_type: { type: "int", bits: 64, unsigned: false },
+      native_type: "bigint",
+      nullable: true,
+      auto_increment: false,
+      extras: {},
+    },
+  ],
+  indexes: [
+    ...ORIGINAL.indexes,
+    {
+      name: "items_qty_parent_key",
+      columns: [
+        { name: "qty", is_expression: false, descending: false },
+        { name: "parent_id", is_expression: false, descending: false },
+      ],
+      unique: true,
+      is_constraint: true,
+      extras: {},
+    },
+  ],
+  foreign_keys: [
+    {
+      name: "items_parent_fk",
+      columns: ["parent_id"],
+      ref_table: TABLE,
+      ref_columns: ["id"],
+      on_delete: "cascade",
+      on_update: "no_action",
+      extras: {},
+    },
+  ],
+};
+
+const WIDE_LOADED: TableDesign = {
+  ...LOADED,
+  original: WIDE,
+  columns: WIDE.columns.map((column, origin) => ({ origin, column })),
+  indexes: WIDE.indexes.map((def, origin) => ({ origin, def })),
+  foreignKeys: WIDE.foreign_keys.map((def, origin) => ({ origin, def })),
+};
+
 function preview(patch: Partial<DesignPreview> = {}): DesignPreview {
   return {
     diffs: [
@@ -153,6 +201,8 @@ function preview(patch: Partial<DesignPreview> = {}): DesignPreview {
 let capabilities: EngineCapabilities;
 let nextPreview: () => DesignPreview;
 let applyResult: () => DesignApplyReport;
+let loadDesign: (table: ObjectRef) => TableDesign;
+let previewGate: Promise<void> | null;
 
 function calls(cmd: string): Array<Record<string, unknown>> {
   return tauriCore.invoke.mock.calls
@@ -174,13 +224,20 @@ beforeEach(() => {
     },
     design: LOADED,
   });
-  tauriCore.invoke.mockImplementation(async (cmd) => {
+  loadDesign = (table) => {
+    if (table.name !== TABLE.name) throw { category: "not_found", message: `${table.name}?` };
+    return LOADED;
+  };
+  previewGate = null;
+  tauriCore.invoke.mockImplementation(async (cmd, args) => {
+    const a = (args ?? {}) as Record<string, unknown>;
     switch (cmd) {
       case "capabilities_get":
         return capabilities;
       case "designer_load":
-        return LOADED;
+        return loadDesign(a.table as ObjectRef);
       case "designer_preview":
+        if (previewGate) await previewGate;
         return nextPreview();
       case "designer_apply":
         return applyResult();
@@ -192,13 +249,26 @@ beforeEach(() => {
   });
 });
 
-async function renderDesigner(props: { isNew?: boolean; table?: ObjectRef } = {}) {
+/** Types a column name one keystroke at a time, then leaves the field (which commits it). */
+function renameColumnInput(column: number, name: string, commit: "blur" | "enter" = "blur") {
+  const input = screen.getByRole("textbox", { name: `Column ${column} name` });
+  for (let i = 1; i <= name.length; i += 1) {
+    fireEvent.change(input, { target: { value: name.slice(0, i) } });
+  }
+  if (commit === "blur") fireEvent.blur(input);
+  else fireEvent.keyDown(input, { key: "Enter" });
+}
+
+async function renderDesigner(
+  props: { isNew?: boolean; table?: ObjectRef; onTableChanged?: (table: ObjectRef) => void } = {},
+) {
   render(
     <TableDesignerPanel
       sessionId="s-1"
       table={props.table ?? TABLE}
       isNew={props.isNew}
       previewDelayMs={0}
+      onTableChanged={props.onTableChanged}
     />,
   );
   if (!props.isNew) await screen.findByRole("table", { name: "Columns" });
@@ -214,9 +284,7 @@ describe("TableDesignerPanel", () => {
     expect(calls("designer_load")).toEqual([{ sessionId: "s-1", table: TABLE, requestId: null }]);
     expect(calls("designer_preview")).toHaveLength(0);
 
-    fireEvent.change(screen.getByRole("textbox", { name: "Column 1 name" }), {
-      target: { value: "item_id" },
-    });
+    renameColumnInput(1, "item_id");
     await waitFor(() => expect(calls("designer_preview")).toHaveLength(1));
     const sent = calls("designer_preview")[0] as { sessionId: string; design: TableDesign };
     expect(sent.sessionId).toBe("s-1");
@@ -274,8 +342,8 @@ describe("TableDesignerPanel", () => {
     await waitFor(() => expect(calls("designer_preview")).toHaveLength(1));
     const sent = calls("designer_preview")[0] as { design: TableDesign };
     expect(sent.design.columns.map((c) => c.origin)).toEqual([0]);
-    // The dropped column also leaves its index.
-    expect(sent.design.indexes[0]?.def.columns).toEqual([]);
+    // The dropped column takes its index with it.
+    expect(sent.design.indexes).toEqual([]);
 
     expect(await screen.findByTestId("destructive-warning")).toHaveTextContent("drop column qty");
     fireEvent.click(screen.getByRole("button", { name: "Apply" }));
@@ -385,9 +453,7 @@ describe("TableDesignerPanel", () => {
     });
     fireEvent.click(screen.getByRole("tab", { name: /Columns/ }));
     fireEvent.click(screen.getByRole("button", { name: "+ Column" }));
-    fireEvent.change(screen.getByRole("textbox", { name: "Column 1 name" }), {
-      target: { value: "id" },
-    });
+    renameColumnInput(1, "id");
     fireEvent.change(screen.getByRole("combobox", { name: "Column 1 type" }), {
       target: { value: "bigint" },
     });
@@ -442,9 +508,7 @@ describe("TableDesignerPanel", () => {
       },
     });
     await renderDesigner();
-    fireEvent.change(screen.getByRole("textbox", { name: "Column 1 name" }), {
-      target: { value: "item_id" },
-    });
+    renameColumnInput(1, "item_id");
     await waitFor(() => expect(screen.getByRole("button", { name: "Apply" })).toBeEnabled());
     fireEvent.click(screen.getByRole("button", { name: "Apply" }));
     fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Apply" }));
@@ -455,5 +519,142 @@ describe("TableDesignerPanel", () => {
     );
     // The edited design stays for another try.
     expect(screen.getByRole("textbox", { name: "Column 1 name" })).toHaveValue("item_id");
+  });
+
+  it("renames references once, from the committed name, never from a half-typed one", async () => {
+    await renderDesigner();
+    // Typing "id2" over qty passes through "i" and "id" (the PK column's name).
+    renameColumnInput(2, "id2");
+    await waitFor(() => expect(calls("designer_preview")).toHaveLength(1));
+    const sent = calls("designer_preview")[0] as { design: TableDesign };
+    expect(sent.design.columns.map((c) => [c.origin, c.column.name])).toEqual([
+      [0, "id"],
+      [1, "id2"],
+    ]);
+    // The primary key stays on id; the index follows qty.
+    expect(sent.design.primaryKey?.columns).toEqual(["id"]);
+    expect(sent.design.indexes[0]?.def.columns.map((c) => c.name)).toEqual(["id2"]);
+
+    // A taken name is refused with the reason; nothing changes.
+    renameColumnInput(2, "id", "enter");
+    const name = screen.getByRole("textbox", { name: "Column 2 name" });
+    expect(name).toHaveAttribute("aria-invalid", "true");
+    expect(screen.getByRole("alert")).toHaveTextContent("Another column is already named id");
+    // An empty name is refused too (references would point at nothing).
+    fireEvent.change(name, { target: { value: "" } });
+    fireEvent.blur(name);
+    expect(screen.getByRole("alert")).toHaveTextContent("A column needs a name");
+    // Escape drops the draft.
+    fireEvent.keyDown(name, { key: "Escape" });
+    expect(name).toHaveValue("id2");
+    expect(name).not.toHaveAttribute("aria-invalid");
+    expect(calls("designer_preview")).toHaveLength(1);
+  });
+
+  it("renames the referenced columns of a foreign key to the same table", async () => {
+    loadDesign = () => WIDE_LOADED;
+    await renderDesigner();
+    renameColumnInput(1, "item_id");
+    await waitFor(() => expect(calls("designer_preview")).toHaveLength(1));
+    const sent = calls("designer_preview")[0] as { design: TableDesign };
+    expect(sent.design.primaryKey?.columns).toEqual(["item_id"]);
+    expect(sent.design.foreignKeys[0]?.def).toMatchObject({
+      columns: ["parent_id"],
+      ref_columns: ["item_id"],
+    });
+  });
+
+  it("removes a composite index or foreign key with its column instead of narrowing it", async () => {
+    loadDesign = () => WIDE_LOADED;
+    await renderDesigner();
+    fireEvent.click(screen.getByRole("button", { name: "Remove column 3" }));
+    await waitFor(() => expect(calls("designer_preview")).toHaveLength(1));
+    const sent = calls("designer_preview")[0] as { design: TableDesign };
+    expect(sent.design.columns.map((c) => c.column.name)).toEqual(["id", "qty"]);
+    // UNIQUE (qty, parent_id) goes whole; the single-column index on qty stays.
+    expect(sent.design.indexes.map((i) => i.def.name)).toEqual(["items_qty_idx"]);
+    expect(sent.design.foreignKeys).toEqual([]);
+    expect(sent.design.primaryKey?.columns).toEqual(["id"]);
+    expect(screen.getByTestId("column-removed-note")).toHaveTextContent(
+      "Removing parent_id also removed unique index items_qty_parent_key, foreign key items_parent_fk.",
+    );
+
+    // Removing the referenced column drops the self-referencing foreign key too.
+    fireEvent.click(screen.getByRole("button", { name: "Discard" }));
+    fireEvent.click(screen.getByRole("button", { name: "Remove column 1" }));
+    await waitFor(() => expect(calls("designer_preview")).toHaveLength(2));
+    const second = calls("designer_preview")[1] as { design: TableDesign };
+    expect(second.design.primaryKey).toBeUndefined();
+    expect(second.design.foreignKeys).toEqual([]);
+  });
+
+  it("drops a preview that lands after the changes were discarded", async () => {
+    let release: () => void = () => {};
+    previewGate = new Promise((resolve) => {
+      release = resolve;
+    });
+    await renderDesigner();
+    renameColumnInput(1, "item_id");
+    await waitFor(() => expect(calls("designer_preview")).toHaveLength(1));
+    const requestId = calls("designer_preview")[0]?.requestId;
+    fireEvent.click(screen.getByRole("button", { name: "Discard" }));
+    expect(calls("cancel_request")).toContainEqual({ requestId });
+    release();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(screen.getByTestId("ddl-preview")).toHaveTextContent("-- No changes");
+    expect(screen.queryByTestId("non-atomic-warning")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Apply" })).toBeDisabled();
+  });
+
+  it("reloads the renamed table and moves the tab to its new name", async () => {
+    const renamed: ObjectRef = { ...TABLE, name: "goods" };
+    const renamedDesign: TableDesign = {
+      ...LOADED,
+      original: { ...ORIGINAL, ref: renamed },
+      table: renamed,
+    };
+    applyResult = () => ({
+      outcome: {
+        committed: true,
+        atomic: true,
+        steps: [{ index: 0, status: "done", elapsedMs: 3 }],
+        warnings: [],
+      },
+      design: renamedDesign,
+    });
+    loadDesign = (table) => (table.name === "goods" ? renamedDesign : LOADED);
+    const onTableChanged = vi.fn();
+    await renderDesigner({ onTableChanged });
+    fireEvent.click(screen.getByRole("tab", { name: "Options" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "Table name" }), {
+      target: { value: "goods" },
+    });
+    await waitFor(() => expect(screen.getByRole("button", { name: "Apply" })).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: "Apply" }));
+    fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Apply" }));
+    await screen.findByText("Applied 1 statement.");
+    expect(onTableChanged).toHaveBeenCalledWith(renamed);
+
+    fireEvent.click(screen.getByRole("button", { name: "Reload" }));
+    await waitFor(() => expect(calls("designer_load")).toHaveLength(2));
+    expect(calls("designer_load")[1]?.table).toEqual(renamed);
+    expect(screen.queryByText(/Could not load the table/)).not.toBeInTheDocument();
+  });
+
+  it("gates identity and auto increment of a stored column on altering it", async () => {
+    capabilities = caps({ ...PG_DESIGNER, alterColumnType: "unsupported", autoIncrement: true });
+    await renderDesigner();
+    fireEvent.click(screen.getByRole("button", { name: "More options of column 1" }));
+    const identity = screen.getByRole("combobox", { name: "Column 1 identity" });
+    expect(identity).toBeDisabled();
+    expect(identity.closest("label")).toHaveAttribute(
+      "title",
+      "Changing identity is not supported by this database",
+    );
+    expect(screen.getByRole("checkbox", { name: "Column 1 auto increment" })).toBeDisabled();
+    // A new column may use them.
+    fireEvent.click(screen.getByRole("button", { name: "+ Column" }));
+    fireEvent.click(screen.getByRole("button", { name: "More options of column 3" }));
+    expect(screen.getByRole("combobox", { name: "Column 3 identity" })).toBeEnabled();
   });
 });
