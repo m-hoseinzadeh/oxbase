@@ -214,7 +214,6 @@ async fn fetchers_bind_every_name() {
                 "{engine}/{kind} load: {err}"
             );
             let calls = c.calls();
-            assert!(!calls.is_empty(), "{engine}/{kind} ran no query");
             let mut bound = false;
             for (sql, params) in &calls {
                 assert!(

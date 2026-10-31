@@ -682,7 +682,7 @@ async fn cancel_and_bound_names(key: &'static str) {
 
     // The session stays usable.
     let tables = t.list(ObjectKind::Table, &t.database()).await;
-    assert!(!tables.is_empty());
+    assert!(names(&tables).contains(&"m2_parent"));
     t.c.close().await.unwrap();
 }
 
