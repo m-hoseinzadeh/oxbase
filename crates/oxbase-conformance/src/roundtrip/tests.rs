@@ -690,14 +690,18 @@ fn toy_caps() -> DesignerCapabilities {
 /// `oxbase_services::default_dialects` with the toy generator, the default comparator rules
 /// and `designer` for SQLite.
 fn toy_registry(ddl: ToyDdl, designer: DesignerCapabilities) -> DialectRegistry {
-    toy_registry_with(ddl, designer, Arc::new(RulesComparator(DefaultRules)))
+    toy_registry_with(
+        ddl,
+        designer,
+        &(Arc::new(RulesComparator(DefaultRules)) as Arc<dyn Comparator>),
+    )
 }
 
 /// [`toy_registry`] with `cmp` as the comparator of every designer kind.
 fn toy_registry_with(
     ddl: ToyDdl,
     designer: DesignerCapabilities,
-    cmp: Arc<dyn Comparator>,
+    cmp: &Arc<dyn Comparator>,
 ) -> DialectRegistry {
     let mut reg = adapter::registry();
     let inner = reg.capabilities(Engine::Sqlite).unwrap();
@@ -836,7 +840,7 @@ fn a_comparator_blind_to_a_property_fails_the_round_trip() {
     let reg = toy_registry_with(
         ToyDdl::default(),
         toy_caps(),
-        Arc::new(RulesComparator(BlindRules)),
+        &(Arc::new(RulesComparator(BlindRules)) as Arc<dyn Comparator>),
     );
     let out = run_all(&fx, &engines, &[true], &reg);
     for kind in DESIGNER_KINDS {
@@ -854,7 +858,7 @@ fn a_comparator_blind_to_a_property_fails_the_round_trip() {
     let reg = toy_registry_with(
         ToyDdl::default(),
         toy_caps(),
-        Arc::new(RulesComparator(AnyTargetRules)),
+        &(Arc::new(RulesComparator(AnyTargetRules)) as Arc<dyn Comparator>),
     );
     let out = run_all(&fx, &engines, &[true], &reg);
     let fk = find(&out, ObjectKind::ForeignKey, Check::Roundtrip);
