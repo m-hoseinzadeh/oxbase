@@ -211,25 +211,21 @@ impl Comparator for MySqlComparator {
 
 /// [`normalize_pair`] for any pair of definitions (tables, or one child of each).
 fn normalize_defs(a: &ObjectDef, b: &ObjectDef) -> (ObjectDef, ObjectDef) {
-    match (a, b) {
-        (ObjectDef::Table(x), ObjectDef::Table(y)) => {
-            let (x, y) = normalize_pair(x, y);
-            (ObjectDef::Table(x), ObjectDef::Table(y))
-        }
-        _ => {
-            let mut a = a.clone();
-            let mut b = b.clone();
-            for def in [&mut a, &mut b] {
-                match def {
-                    ObjectDef::Column { column, .. } => normalize_column(column),
-                    ObjectDef::Index { index, .. } => normalize_index(index),
-                    ObjectDef::ForeignKey { foreign_key, .. } => normalize_fk(foreign_key),
-                    _ => {}
-                }
-            }
-            (a, b)
+    if let (ObjectDef::Table(x), ObjectDef::Table(y)) = (a, b) {
+        let (x, y) = normalize_pair(x, y);
+        return (ObjectDef::Table(x), ObjectDef::Table(y));
+    }
+    let mut a = a.clone();
+    let mut b = b.clone();
+    for def in [&mut a, &mut b] {
+        match def {
+            ObjectDef::Column { column, .. } => normalize_column(column),
+            ObjectDef::Index { index, .. } => normalize_index(index),
+            ObjectDef::ForeignKey { foreign_key, .. } => normalize_fk(foreign_key),
+            _ => {}
         }
     }
+    (a, b)
 }
 
 /// Both tables without the differences this engine does not store (see the module docs).

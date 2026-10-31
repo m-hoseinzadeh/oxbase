@@ -176,7 +176,8 @@ mod tests {
         assert!(!old.checks_enforced);
         assert_eq!(old.drop_check, Support::Unsupported);
         assert!(old.notes.iter().any(|n| n.contains("CHECK")));
-        assert!(!old.expression_indexes);
+        assert!(old.expression_indexes);
+        assert!(!designer(false, &v("5.7.44")).expression_indexes);
 
         let maria = designer(true, &v("11.8.9-MariaDB"));
         assert!(maria.checks_enforced && maria.descending_indexes);

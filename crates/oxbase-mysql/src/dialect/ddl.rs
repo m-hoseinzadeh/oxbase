@@ -45,6 +45,8 @@
 //! before MySQL 8.0 / MariaDB 10.8, invisible columns and indexes on servers without them,
 //! `NOT ENFORCED` checks on MariaDB, and changing system versioning.
 
+use std::fmt::Write as _;
+
 use oxbase_dialect::compare::{CompareRules, diff_columns, diff_foreign_keys, diff_indexes};
 use oxbase_dialect::{BacktickQuoting, DdlContext, DdlGenerator, Quoting};
 use oxbase_types::{
@@ -540,7 +542,7 @@ impl Gen {
                         idx.name
                     )));
                 }
-                p.push_str(&format!("({len})"));
+                let _ = write!(p, "({len})");
             }
             if part.descending {
                 if !self.f.descending_indexes {
@@ -645,14 +647,15 @@ impl Gen {
             s.push_str(&self.ident(name));
             s.push(' ');
         }
-        s.push_str(&format!(
+        let _ = write!(
+            s,
             "FOREIGN KEY ({}) REFERENCES {} ({}) ON DELETE {} ON UPDATE {}",
             self.idents(&fk.columns),
             self.qualified(&target),
             self.idents(&fk.ref_columns),
             fk_action(fk, fk.on_delete)?,
             fk_action(fk, fk.on_update)?
-        ));
+        );
         Ok(s)
     }
 
@@ -865,17 +868,17 @@ impl Gen {
                     });
                     effective.push(r.clone());
                 }
-                ObjectKind::Index if self.f.rename_index => {
-                    if old.indexes.iter().any(|i| i.name == r.old)
-                        && new.indexes.iter().any(|i| i.name == r.new)
-                    {
-                        rename_clauses.push(format!(
-                            "RENAME INDEX {} TO {}",
-                            self.ident(&r.old),
-                            self.ident(&r.new)
-                        ));
-                        effective.push(r.clone());
-                    }
+                ObjectKind::Index
+                    if self.f.rename_index
+                        && old.indexes.iter().any(|i| i.name == r.old)
+                        && new.indexes.iter().any(|i| i.name == r.new) =>
+                {
+                    rename_clauses.push(format!(
+                        "RENAME INDEX {} TO {}",
+                        self.ident(&r.old),
+                        self.ident(&r.new)
+                    ));
+                    effective.push(r.clone());
                 }
                 _ => {}
             }

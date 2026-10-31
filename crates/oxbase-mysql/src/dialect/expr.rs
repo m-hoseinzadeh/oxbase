@@ -200,28 +200,25 @@ fn read_string(chars: &[char], start: usize) -> (String, usize) {
             return (s, i + 1);
         }
         if c == '\\' {
-            match chars.get(i + 1) {
-                Some(&next) => {
-                    match next {
-                        'n' => s.push('\n'),
-                        'r' => s.push('\r'),
-                        't' => s.push('\t'),
-                        '0' => s.push('\0'),
-                        'b' => s.push('\u{8}'),
-                        'Z' => s.push('\u{1a}'),
-                        // `\%` and `\_` keep their backslash (LIKE patterns).
-                        '%' | '_' => {
-                            s.push('\\');
-                            s.push(next);
-                        }
-                        other => s.push(other),
+            if let Some(&next) = chars.get(i + 1) {
+                match next {
+                    'n' => s.push('\n'),
+                    'r' => s.push('\r'),
+                    't' => s.push('\t'),
+                    '0' => s.push('\0'),
+                    'b' => s.push('\u{8}'),
+                    'Z' => s.push('\u{1a}'),
+                    // `\%` and `\_` keep their backslash (LIKE patterns).
+                    '%' | '_' => {
+                        s.push('\\');
+                        s.push(next);
                     }
-                    i += 2;
+                    other => s.push(other),
                 }
-                None => {
-                    s.push('\\');
-                    i += 1;
-                }
+                i += 2;
+            } else {
+                s.push('\\');
+                i += 1;
             }
             continue;
         }

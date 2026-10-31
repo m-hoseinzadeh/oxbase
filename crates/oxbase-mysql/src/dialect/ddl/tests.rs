@@ -385,7 +385,7 @@ fn alter_keeps_attributes_and_moves_columns() {
              AFTER `parent`"
         ]
     );
-    assert!(script.warnings.is_empty());
+    assert_eq!(script.warnings, Vec::<String>::new());
     assert!(!script.steps[0].destructive);
 
     // A column moved first; a widening type change is not destructive.

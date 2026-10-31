@@ -67,7 +67,7 @@ impl DmlWriter for MySqlDmlWriter {
                         read_back: None,
                     });
                 }
-                let read_back = inserted_row(target, values)?;
+                let read_back = inserted_row(target, values);
                 Ok(DmlPlan {
                     write: w.finish(),
                     returning: false,
@@ -152,9 +152,9 @@ fn check_writable(table: &TableDef, values: &[ColumnValue]) -> Result<()> {
 /// The read-back of an inserted row: `SELECT ... WHERE key`, each key value from the edit or,
 /// for an `AUTO_INCREMENT` key column the edit left out (or set to NULL), `LAST_INSERT_ID()`.
 /// `None` when nothing is read back or a key value is unknown.
-fn inserted_row(target: &DmlTarget<'_>, values: &[ColumnValue]) -> Result<Option<BoundStatement>> {
+fn inserted_row(target: &DmlTarget<'_>, values: &[ColumnValue]) -> Option<BoundStatement> {
     if target.read_back.is_empty() {
-        return Ok(None);
+        return None;
     }
     let q = BacktickQuoting;
     let mut w = SqlWriter::new(&q);
@@ -183,10 +183,10 @@ fn inserted_row(target: &DmlTarget<'_>, values: &[ColumnValue]) -> Result<Option
             None if auto => {
                 w.ident(column).push(" = LAST_INSERT_ID()");
             }
-            None => return Ok(None),
+            None => return None,
         }
     }
-    Ok(Some(w.finish()))
+    Some(w.finish())
 }
 
 /// `SELECT <read_back> FROM t WHERE <key> = <values>`.
@@ -305,7 +305,7 @@ mod tests {
             rb.sql,
             "SELECT `id`, `co``de`, `amount`, `total` FROM `db`.`order` WHERE `id` = LAST_INSERT_ID()"
         );
-        assert!(rb.params.is_empty());
+        assert_eq!(rb.params, Vec::<Value>::new());
 
         // MariaDB 10.5+: RETURNING.
         let p = plan(true, "11.8.9-MariaDB", &pk(), &edit, &all()).unwrap();
