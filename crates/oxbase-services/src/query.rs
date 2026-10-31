@@ -1017,7 +1017,7 @@ async fn execute(context: RunContext) {
         .enumerate()
         .map(|(i, s)| StatementSpan::new(i, s))
         .collect();
-    *lock(&context.run.statements) = spans.clone();
+    (*lock(&context.run.statements)).clone_from(&spans);
     context
         .emit(RunEvent::Started {
             run_id: context.run.id,
@@ -1519,7 +1519,7 @@ mod tests {
 
     #[test]
     fn column_info_from_arrow_fields() {
-        let mut meta = std::collections::HashMap::new();
+        let mut meta = HashMap::new();
         meta.insert("oxbase.pg.type".to_owned(), "int8".to_owned());
         let schema = Schema::new(vec![
             Field::new("id", DataType::Int64, false).with_metadata(meta),

@@ -585,9 +585,9 @@ async fn max_rows_truncates_and_the_run_goes_on() {
     let (run, events) = h
         .run("a", "rows 1000 100; rows 120 100; update 4", options)
         .await;
-    let shape = shape(&events);
+    let seen = shape(&events);
     assert_eq!(
-        shape,
+        seen,
         [
             "started 3",
             "stmt 0",
@@ -687,21 +687,19 @@ async fn the_disk_cap_truncates_and_the_run_goes_on() {
     })
     .await;
     let (run, events) = h.run("a", "rows 5000 100; update 1", no_history()).await;
-    let shape = shape(&events);
+    let seen = shape(&events);
     assert!(
-        shape
-            .iter()
+        seen.iter()
             .any(|s| s.starts_with("notice Warning: result 1 stopped after")
                 && s.contains("disk space")),
-        "{shape:?}"
+        "{seen:?}"
     );
     assert!(
-        shape
-            .iter()
+        seen.iter()
             .any(|s| s.starts_with("done 0:") && s.ends_with("truncated"))
     );
     assert_eq!(
-        &shape[shape.len() - 3..],
+        &seen[seen.len() - 3..],
         ["stmt 1", "ok 1 Some(1)", "finished"]
     );
     let info = h.service.info(run).unwrap();
@@ -735,14 +733,10 @@ async fn cancel_ends_the_run_quickly_and_keeps_the_rows() {
         "{:?}",
         clock.elapsed()
     );
-    let shape = shape(&rest);
-    assert_eq!(
-        &shape[shape.len() - 2..],
-        ["failed 0 Cancelled", "cancelled"]
-    );
+    let seen = shape(&rest);
+    assert_eq!(&seen[seen.len() - 2..], ["failed 0 Cancelled", "cancelled"]);
     assert!(
-        shape
-            .iter()
+        seen.iter()
             .any(|s| s.starts_with("done 0:") && s.ends_with("truncated"))
     );
     let info = h.service.info(run).unwrap();
