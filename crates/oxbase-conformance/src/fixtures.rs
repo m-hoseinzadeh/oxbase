@@ -80,6 +80,9 @@ pub struct Fixtures {
     /// M1: the SSH bastion (`[ssh]`).
     #[serde(default)]
     pub ssh: Option<SshFixture>,
+    /// M2: the seed objects the fetchers must find (`[m2]` and `[m2.<engine>]`).
+    #[serde(default)]
+    pub m2: Option<M2Fixture>,
     /// Where the file came from, for error messages. Not part of the TOML.
     #[serde(skip)]
     pub origin: String,
@@ -195,6 +198,87 @@ impl std::fmt::Debug for SshFixture {
 pub struct SshTarget {
     pub host: String,
     pub port: u16,
+}
+
+/// The `[m2]` table: names of the objects every engine's M2 seed script creates (the shape is
+/// documented next to the table in `tests/fixtures.toml`). Every field is optional so a partial
+/// table never breaks the M0/M1 checks.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct M2Fixture {
+    /// `[parent table, child table]`: the child references the parent.
+    pub tables: Vec<String>,
+    pub view: Option<String>,
+    pub trigger: Option<String>,
+    /// The table `trigger` fires on.
+    pub trigger_table: Option<String>,
+    pub function: Option<String>,
+    pub procedure: Option<String>,
+    pub sequence: Option<String>,
+    /// Check constraint on the parent table.
+    pub check_parent: Option<String>,
+    /// Check constraint on the child table.
+    pub check_child: Option<String>,
+    /// Foreign key of the child table.
+    pub foreign_key: Option<String>,
+    /// Index on the child table.
+    pub index: Option<String>,
+    pub table_comment: Option<String>,
+    pub large_result_rows: Option<u64>,
+    /// `[m2.<engine>]` tables, by fixture name (other unknown keys are kept as values).
+    #[serde(flatten)]
+    pub engines: BTreeMap<String, M2Entry>,
+}
+
+/// One unknown key of `[m2]`: an engine table, or anything else.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum M2Entry {
+    Engine(M2EngineSeed),
+    Other(toml::Value),
+}
+
+/// One `[m2.<engine>]` table.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct M2EngineSeed {
+    /// The engine's seed script, relative to the workspace root. Applied by the Docker init for
+    /// server engines; the harness applies it itself for SQLite.
+    pub init_sql: Option<String>,
+    /// The database the seed objects live in (`main` on SQLite).
+    pub database: Option<String>,
+    /// PostgreSQL: the schema the seed objects live in.
+    pub schema: Option<String>,
+    pub matview: Option<String>,
+    pub trigger_function: Option<String>,
+    /// PostgreSQL: a second database the database listing must show.
+    pub other_database: Option<String>,
+    pub other_table: Option<String>,
+    /// SQLite: the name a second file is attached under.
+    pub attached_as: Option<String>,
+    pub attached_table: Option<String>,
+    /// The seed objects that exist on this engine (tables, views, routines, triggers, ...).
+    pub objects: Vec<String>,
+}
+
+impl M2Fixture {
+    /// The `[m2.<name>]` table, if there is one.
+    pub fn engine(&self, name: &str) -> Option<&M2EngineSeed> {
+        match self.engines.get(name)? {
+            M2Entry::Engine(e) => Some(e),
+            M2Entry::Other(_) => None,
+        }
+    }
+}
+
+impl Fixtures {
+    /// The M2 seed of the fixture `name` (falling back to the engine kind's name), with the
+    /// shared `[m2]` table.
+    pub fn m2_seed(&self, name: &str, engine: Engine) -> Option<(&M2Fixture, &M2EngineSeed)> {
+        let m2 = self.m2.as_ref()?;
+        let seed = m2.engine(name).or_else(|| m2.engine(engine.as_str()))?;
+        Some((m2, seed))
+    }
 }
 
 // Hand-written so the password never ends up in a panic message or log line.

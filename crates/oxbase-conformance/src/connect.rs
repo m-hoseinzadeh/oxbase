@@ -262,9 +262,10 @@ fn failed_all(e: &ResolvedEngine, why: &str) -> Vec<ConnCell> {
         .collect()
 }
 
-/// Shared state of one run: the manager and the fixture definitions.
-struct Ctx {
-    mgr: ConnectionManager,
+/// Shared state of one run: the manager and the fixture definitions. The M2 fetch checks
+/// ([`crate::fetch`]) open their sessions through it too.
+pub(crate) struct Ctx {
+    pub(crate) mgr: ConnectionManager,
     secrets: Arc<MemorySecretStore>,
     fixtures: Fixtures,
 }
@@ -272,7 +273,7 @@ struct Ctx {
 type CheckResult = Result<String, String>;
 
 impl Ctx {
-    fn new(fixtures: &Fixtures) -> Self {
+    pub(crate) fn new(fixtures: &Fixtures) -> Self {
         let secrets = Arc::new(MemorySecretStore::new());
         let mgr = ConnectionManager::new(
             default_drivers(),
@@ -335,7 +336,7 @@ impl Ctx {
     }
 
     /// A direct profile as the fixture user (`tls_user = false`) or the TLS-only user.
-    async fn profile(
+    pub(crate) async fn profile(
         &self,
         e: &ResolvedEngine,
         tls_user: bool,
@@ -793,7 +794,7 @@ const fn rows_statement(engine: Engine) -> &'static str {
     }
 }
 
-fn millis(d: Duration) -> u64 {
+pub(crate) fn millis(d: Duration) -> u64 {
     u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
 }
 

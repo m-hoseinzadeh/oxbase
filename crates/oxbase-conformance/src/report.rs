@@ -12,7 +12,8 @@ use crate::matrix::{Cell, CellStatus, Check};
 use crate::probe::{ProbeOutcome, Target};
 
 /// Bumped when the JSON layout changes incompatibly.
-/// Version 2 (M1) adds `connection_checks`, `connections` and `connection_summary`.
+/// Version 2 (M1) adds `connection_checks`, `connections` and `connection_summary`. M2 only adds
+/// the optional `elapsed_ms` of a cell (compatible, so still version 2).
 pub const REPORT_SCHEMA_VERSION: u32 = 2;
 
 /// `<CARGO_TARGET_DIR or <workspace>/target>/conformance/report.json`.
@@ -134,8 +135,26 @@ impl Report {
                 names.join(", ")
             ));
         }
-        if self.summary.fail > 0 {
-            problems.push(format!("{} matrix cell(s) failed", self.summary.fail));
+        let failed_cells: Vec<_> = self
+            .cells
+            .iter()
+            .filter(|c| c.status == CellStatus::Fail)
+            .map(|c| {
+                format!(
+                    "  - {} {} {}: {}",
+                    c.engine,
+                    c.object_kind,
+                    c.check,
+                    c.detail.as_deref().unwrap_or("failed")
+                )
+            })
+            .collect();
+        if !failed_cells.is_empty() {
+            problems.push(format!(
+                "{} matrix cell(s) failed:\n{}",
+                failed_cells.len(),
+                failed_cells.join("\n")
+            ));
         }
         let failed: Vec<_> = self
             .connections
@@ -308,15 +327,43 @@ impl Report {
         if s.pending > 0 && s.pass == 0 && s.fail == 0 {
             let _ = writeln!(
                 out,
-                "All applicable cells are pending: object-kind cells start in M2 (M4 for mssql, \
-                 M7 for mongodb and redis)."
+                "No object-kind cell ran: fetch_list cells run once an engine registers its \
+                 fetchers in oxbase_services::default_dialects (M2), roundtrip needs M3 (M4 for \
+                 mssql, M7 for mongodb and redis)."
             );
         }
+        self.render_fetch_details(&mut out);
         if !self.connections.is_empty() {
             out.push('\n');
             self.render_connections(&mut out);
         }
         out
+    }
+
+    /// One line per `fetch_list` cell that ran (pass or fail), with what it listed and loaded.
+    fn render_fetch_details(&self, out: &mut String) {
+        let ran: Vec<_> = self
+            .cells
+            .iter()
+            .filter(|c| {
+                c.check == Check::FetchList
+                    && matches!(c.status, CellStatus::Pass | CellStatus::Fail)
+            })
+            .collect();
+        if ran.is_empty() {
+            return;
+        }
+        let _ = writeln!(out, "fetch_list (M2):");
+        for c in ran {
+            let _ = writeln!(
+                out,
+                "  {} {} {}: {}",
+                c.engine,
+                c.object_kind,
+                c.status.label(),
+                c.detail.as_deref().unwrap_or("")
+            );
+        }
     }
 
     /// The second table: engine x connection check (M1).
@@ -399,7 +446,8 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use super::*;
-    use crate::matrix::plan_engine;
+    use crate::adapter::provisional_registry;
+    use crate::matrix::plan_engine_in;
     use crate::probe::Handshake;
 
     fn probe(reachable: bool) -> ProbeOutcome {
@@ -441,8 +489,9 @@ mod tests {
                 probe: probe(redis_up),
             },
         ];
-        let mut cells = plan_engine("postgres", Engine::Postgres);
-        cells.extend(plan_engine("redis", Engine::Redis));
+        let reg = provisional_registry();
+        let mut cells = plan_engine_in(&reg, "postgres", Engine::Postgres);
+        cells.extend(plan_engine_in(&reg, "redis", Engine::Redis));
         let summary = Summary::from_cells(&cells);
         Report {
             report_schema_version: REPORT_SCHEMA_VERSION,
@@ -506,7 +555,8 @@ mod tests {
             "Summary: {} cells: 0 pass, 0 fail, {} pending, 0 skipped, {} n/a",
             s.total, s.pending, s.not_applicable
         )));
-        assert!(text.contains("object-kind cells start in M2"));
+        assert!(text.contains("No object-kind cell ran"));
+        assert!(!text.contains("fetch_list (M2):"));
     }
 
     #[test]
@@ -570,6 +620,51 @@ mod tests {
     }
 
     #[test]
+    fn renders_fetch_list_details_and_gates_on_failed_cells() {
+        let mut report = sample(true, false);
+        let idx = |kind| {
+            report
+                .cells
+                .iter()
+                .position(|c| {
+                    c.engine == "postgres" && c.object_kind == kind && c.check == Check::FetchList
+                })
+                .unwrap()
+        };
+        let (table, view) = (idx(ObjectKind::Table), idx(ObjectKind::View));
+        report.cells[table].status = CellStatus::Pass;
+        report.cells[table].detail = Some("m2_parent under schema:oxbase_test.m2".to_owned());
+        report.cells[table].elapsed_ms = Some(12);
+        report.summary = Summary::from_cells(&report.cells);
+        let text = report.render();
+        assert_eq!(line_starting(&text, "table "), "table        p+p       ---");
+        assert!(
+            text.contains("fetch_list (M2):\n  postgres table pass: m2_parent under"),
+            "{text}"
+        );
+        assert!(!text.contains("No object-kind cell ran"), "{text}");
+        assert!(report.gate().is_ok());
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["cells"][table]["elapsed_ms"], 12);
+
+        report.cells[view].status = CellStatus::Fail;
+        report.cells[view].detail = Some("m2_view not listed".to_owned());
+        report.summary = Summary::from_cells(&report.cells);
+        let err = report.gate().unwrap_err();
+        assert!(
+            err.contains(
+                "1 matrix cell(s) failed:\n  - postgres view fetch_list: m2_view not listed"
+            ),
+            "{err}"
+        );
+        assert!(
+            report
+                .render()
+                .contains("  postgres view fail: m2_view not listed")
+        );
+    }
+
+    #[test]
     fn table_columns_align() {
         let mut out = String::new();
         write_table(
@@ -620,7 +715,11 @@ mod tests {
         assert_eq!(cell["object_kind"], "database");
         assert_eq!(cell["check"], "roundtrip");
         assert_eq!(cell["status"], "pending");
-        assert_eq!(cell["detail"], "pending (M2: no dialect cells yet)");
+        assert_eq!(
+            cell["detail"],
+            "pending (M3: needs DdlGenerator and Comparator cells)"
+        );
+        assert!(cell.get("elapsed_ms").is_none());
         let back: Report = serde_json::from_value(json).unwrap();
         assert_eq!(back.summary, report.summary);
         assert_eq!(back.cells, report.cells);

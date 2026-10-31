@@ -17,7 +17,8 @@ name = "oxbase-conformance"
 path = "src/main.rs"
 
 [dependencies]
-# Engine/ObjectKind come from oxbase-types; cell applicability from oxbase-dialect (src/adapter.rs).
+# Engine/ObjectKind come from oxbase-types; cell applicability and fetchers from oxbase-dialect
+# through oxbase_services::default_dialects (src/adapter.rs, src/fetch.rs).
 oxbase-types.workspace = true
 oxbase-dialect.workspace = true
 # M1 connection checks (src/connect.rs) run through the real drivers and connection manager.
@@ -34,3 +35,6 @@ thiserror.workspace = true
 
 [dev-dependencies]
 pretty_assertions.workspace = true
+# Fake fetchers in the fetch_list unit tests, over a mock connection.
+async-trait.workspace = true
+oxbase-driver = { workspace = true, features = ["mock"] }

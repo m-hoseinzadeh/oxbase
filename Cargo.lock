@@ -3713,6 +3713,7 @@ dependencies = [
 name = "oxbase-conformance"
 version = "0.0.1"
 dependencies = [
+ "async-trait",
  "futures",
  "oxbase-dialect",
  "oxbase-driver",

@@ -13,13 +13,15 @@
 //! An unreachable fixture fails the test with the engine name and port. Set
 //! `OXBASE_CONFORMANCE_ALLOW_MISSING=1` to report it as skipped instead.
 
-use oxbase_conformance::adapter::Engine;
-use oxbase_conformance::matrix::CellStatus;
-use oxbase_conformance::{fixtures, report, runner};
+use oxbase_conformance::adapter::{self, Engine};
+use oxbase_conformance::fixtures::Fixtures;
+use oxbase_conformance::matrix::{CellStatus, Check};
+use oxbase_conformance::{fetch, fixtures, report, runner};
 
-/// M0 exit criterion (the harness runs against all engines) plus the M1 connection checks:
-/// every applicable check of the M1 engines passes, and the engines without an M1 driver report
-/// pending.
+/// M0 exit criterion (the harness runs against all engines), the M1 connection checks (every
+/// applicable check of the M1 engines passes, engines without a driver report pending) and the
+/// M2 `fetch_list` cells: every cell with a registered Fetcher and a seed object passes, the
+/// rest stay pending (or n/a when the server version lacks the kind).
 #[test]
 #[ignore = "needs the Docker fixtures (scripts/fixtures-up.sh); run with --include-ignored"]
 fn harness_runs_against_all_engines_and_m1_connection_checks_pass() {
@@ -40,14 +42,48 @@ fn harness_runs_against_all_engines_and_m1_connection_checks_pass() {
     if let Err(msg) = report.gate() {
         panic!("{msg}");
     }
-    // Object-kind cells need dialect cells (M2+), so none may have run.
-    assert_eq!(
-        report.summary.pass + report.summary.fail,
-        0,
-        "{:?}",
-        report.summary
-    );
-    assert!(report.summary.pending + report.summary.skipped > 0);
+    assert_eq!(report.summary.fail, 0, "{:?}", report.summary);
+
+    let fx = Fixtures::from_path(&path).unwrap();
+    let resolved = fx.resolve().unwrap();
+    let registry = adapter::registry();
+    let skipped_ok = opts.allow_missing || opts.skip_fetch;
+    for c in &report.cells {
+        if c.check != Check::FetchList {
+            // roundtrip and capabilities have no runner before M3.
+            assert!(
+                !matches!(c.status, CellStatus::Pass | CellStatus::Fail),
+                "{} {} {}: {:?} {:?}",
+                c.engine,
+                c.object_kind,
+                c.check,
+                c.status,
+                c.detail
+            );
+            continue;
+        }
+        let e = resolved.iter().find(|e| e.name == c.engine).unwrap();
+        let must_run = fetch::runnable_kinds(&registry, e.engine).contains(&c.object_kind)
+            && !fetch::groups_for(&fx, e, c.object_kind).is_empty();
+        let ok = match c.status {
+            CellStatus::Pass => must_run,
+            CellStatus::Pending => !must_run,
+            CellStatus::NotApplicable => true,
+            CellStatus::Skipped => skipped_ok,
+            CellStatus::Fail => false,
+        };
+        assert!(
+            ok,
+            "{} {} fetch_list: {:?} {:?} (registered fetcher and seed: {must_run})",
+            c.engine, c.object_kind, c.status, c.detail
+        );
+    }
+    let passed = report
+        .cells
+        .iter()
+        .filter(|c| c.check == Check::FetchList && c.status == CellStatus::Pass)
+        .count();
+    println!("fetch_list cells passed: {passed}");
 
     for c in &report.connections {
         let m1 = matches!(
