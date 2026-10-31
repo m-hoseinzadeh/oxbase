@@ -33,6 +33,24 @@ fn every_layout_kind_has_a_fetcher() {
 }
 
 #[test]
+fn every_designer_role_is_registered() {
+    let reg = registry();
+    let mysql = ServerVersion::parse("8.4.6").unwrap();
+    let maria = ServerVersion::parse("11.8.9-MariaDB").unwrap();
+    for (engine, v) in [(Engine::MySql, &mysql), (Engine::MariaDb, &maria)] {
+        assert_eq!(
+            reg.missing_designer_roles(engine),
+            Vec::<String>::new(),
+            "{engine}"
+        );
+        assert!(reg.dml_writer(engine).is_ok());
+        let caps = reg.capabilities(engine).unwrap().designer(v);
+        assert!(caps.create_table && !caps.transactional_ddl, "{engine}");
+        assert_eq!(caps.max_identifier_length, Some(64));
+    }
+}
+
+#[test]
 fn layouts_follow_the_contract() {
     use ObjectKind as K;
     let reg = registry();

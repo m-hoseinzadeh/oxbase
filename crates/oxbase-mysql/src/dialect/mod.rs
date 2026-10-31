@@ -1,6 +1,16 @@
-//! MySQL and MariaDB dialect cells (M2): object-tree fetchers, the tree layout, capabilities and
-//! quoting, for [`Engine::MySql`] and [`Engine::MariaDb`] alike. [`register`] adds them to a
-//! [`DialectRegistry`].
+//! MySQL and MariaDB dialect cells: object-tree fetchers, the tree layout, capabilities and
+//! quoting (M2), and the designer and grid-editing roles (M3), for [`Engine::MySql`] and
+//! [`Engine::MariaDb`] alike. [`register`] adds them to a [`DialectRegistry`].
+//!
+//! # M3 roles
+//!
+//! For `Table`, `Column`, `Index`, `ForeignKey` and `Check`: a DDL generator (module `ddl`: one
+//! `CREATE TABLE` / `ALTER TABLE` with many clauses, every step non-transactional because each
+//! DDL statement commits on its own) and a comparator (module `compare`: the shared walk of
+//! `oxbase_dialect::compare` with MySQL's spelling rules, after removing what these servers do
+//! not store, such as primary key names). Per engine: the DML writer (module `dml`: bound `?`
+//! parameters, `LAST_INSERT_ID()` / MariaDB `RETURNING` read-back) and
+//! `Capabilities::designer` (module `caps`), all version-aware through `ServerVersion`.
 //!
 //! # Catalog
 //!
@@ -38,10 +48,16 @@
 //! System databases (`information_schema`, `mysql`, `performance_schema`, `sys`) and everything
 //! in them are listed with `system = true`.
 
+mod caps;
 mod coltype;
+mod compare;
 mod database;
+mod ddl;
 mod ddl_text;
+mod dml;
 mod event;
+mod expr;
+mod native;
 mod routine;
 mod rows;
 mod sequence;
@@ -52,7 +68,8 @@ mod view;
 use std::sync::Arc;
 
 use oxbase_dialect::{
-    BacktickQuoting, Capabilities, ChildGroup, DatabaseScope, DialectRegistry, TreeLayout,
+    BacktickQuoting, Capabilities, ChildGroup, DESIGNER_KINDS, DatabaseScope, DesignerCapabilities,
+    DialectRegistry, TreeLayout,
 };
 use oxbase_driver::{CancellationToken, Connection};
 use oxbase_types::{
@@ -78,9 +95,22 @@ pub const STATUS: PropId = PropId::from_static("status");
 const SYSTEM_DATABASES: [&str; 4] = ["information_schema", "mysql", "performance_schema", "sys"];
 
 /// Registers the MySQL and MariaDB cells: a fetcher for every kind of the tree layout (plus
-/// events), the layout itself, capabilities, quoting and the not-applicable kinds.
+/// events), the layout itself, capabilities, quoting and the not-applicable kinds (M2); a DDL
+/// generator and a comparator for every designer kind, and the DML writer (M3).
 pub fn register(reg: &mut DialectRegistry) {
     for engine in [Engine::MySql, Engine::MariaDb] {
+        let mariadb = engine == Engine::MariaDb;
+        for kind in DESIGNER_KINDS {
+            reg.register_ddl(engine, kind, Arc::new(ddl::MySqlDdl { mariadb }));
+            reg.register_comparator(
+                engine,
+                kind,
+                Arc::new(compare::MySqlComparator {
+                    rules: compare::MySqlRules { mariadb },
+                }),
+            );
+        }
+        reg.register_dml_writer(engine, Arc::new(dml::MySqlDmlWriter { mariadb }));
         reg.register_fetcher(
             engine,
             ObjectKind::Database,
@@ -274,6 +304,10 @@ impl Capabilities for MySqlCapabilities {
             return kind == K::Check && !self.mariadb;
         }
         true
+    }
+
+    fn designer(&self, v: &ServerVersion) -> DesignerCapabilities {
+        caps::designer(self.mariadb, v)
     }
 
     fn supports_kind(&self, kind: ObjectKind, v: &ServerVersion) -> bool {

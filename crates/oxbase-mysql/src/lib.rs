@@ -6,8 +6,8 @@
 //! [`DriverRegistry`](oxbase_driver::DriverRegistry) for both. A connection reports the flavour
 //! its server announces in `VERSION()` ([`Flavor`]).
 //!
-//! The dialect cells (object-tree fetchers, tree layout, capabilities, quoting) are in
-//! [`dialect`]; [`dialect::register`] adds them to a
+//! The dialect cells (object-tree fetchers, tree layout, capabilities, quoting; M3: DDL
+//! generators, comparators, the DML writer and designer capabilities) are in [`dialect`]; [`dialect::register`] adds them to a
 //! [`DialectRegistry`](oxbase_dialect::DialectRegistry) for both engines.
 //!
 //! # Results
@@ -19,6 +19,9 @@
 //! - Each statement yields `Schema` + `Batch`es, or `RowsAffected`. A statement that generated an
 //!   `AUTO_INCREMENT` id also yields an info notice with code [`LAST_INSERT_ID_CODE`]
 //!   (`ResultItem` has no slot for it), and [`MySqlConnection::last_insert_id`] returns it.
+//! - `UPDATE` / `INSERT ... ON DUPLICATE KEY UPDATE` counts are *matched* rows: every session sets
+//!   `CLIENT_FOUND_ROWS`, so an update that writes the values a row already has reports 1 (the
+//!   grid editor treats anything but 1 as a conflict).
 //! - Warnings: when the last statement reports warnings, `SHOW WARNINGS` runs after it and each
 //!   row becomes a [`Notice`](oxbase_driver::Notice) (code = MySQL error number). Earlier
 //!   statements of a script only get a count, since the server keeps details for the last one.
