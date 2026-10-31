@@ -681,12 +681,14 @@ async fn non_atomic_scripts_stop_at_the_first_failure() {
     assert_eq!(outcome.warnings.len(), 1);
     assert!(outcome.warnings[0].contains("a clean-up step failed"));
 
-    // A failing prepare step runs no main step.
+    // A failing prepare step stops the prepare phase there and runs no main step.
     let mut script = Script::new();
     script
         .push_step(ScriptStep::new("FAIL early").in_phase(StepPhase::Prepare))
+        .push_step(ScriptStep::new("SET fk off").in_phase(StepPhase::Prepare))
         .push_step(ScriptStep::new("MAIN"))
         .push_step(ScriptStep::new("CLEANUP").in_phase(StepPhase::Finally));
+    let mark = h.mark();
     let outcome = execute_script(&h.base(), &script, true, CancellationToken::new())
         .await
         .unwrap();
@@ -695,10 +697,12 @@ async fn non_atomic_scripts_stop_at_the_first_failure() {
         [
             (0, StepStatus::Failed),
             (1, StepStatus::NotRun),
-            (2, StepStatus::Done),
+            (2, StepStatus::NotRun),
+            (3, StepStatus::Done),
         ]
     );
     assert!(!outcome.committed);
+    assert_eq!(h.log_since(mark), ["db1: FAIL early", "db1: CLEANUP"]);
 }
 
 #[tokio::test]

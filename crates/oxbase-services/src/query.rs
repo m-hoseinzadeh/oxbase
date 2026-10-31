@@ -688,6 +688,17 @@ impl QueryService {
                 "the session of query run {run} was closed; run the query again"
             )));
         }
+        // A stopped statement that did not wind down may still be draining on this session,
+        // or the driver may be about to close it (see `RunContext::stop`).
+        let unclean = lock(&self.registry.editors)
+            .get(&found.editor)
+            .is_some_and(|e| e.unclean && e.child.as_ref().is_some_and(|c| c.id() == session.id()));
+        if unclean {
+            return Err(Error::invalid_input(format!(
+                "the cancelled query run {run} may still be stopping on its connection; run the \
+                 query again"
+            )));
+        }
         Ok(session)
     }
 

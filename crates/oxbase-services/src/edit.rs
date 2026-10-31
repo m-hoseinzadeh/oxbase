@@ -958,8 +958,8 @@ impl EditService {
             if let Some(stored) = overlay.rows.get(&row) {
                 if !stored.known {
                     return Err(Error::invalid_input(format!(
-                        "row {row} was added but could not be read back; reload the table data \
-                         to edit it"
+                        "new row {row} was saved but could not be read back, so its key is \
+                         unknown; reload the table data to edit it"
                     )));
                 }
                 return Ok(stored.clone());
@@ -1241,7 +1241,12 @@ fn record_applied(
     prepared: Prepared,
     done: Executed,
 ) -> EditOutcome {
-    let read = done.row.map(|batch| row_of(&batch, def, names));
+    // An update whose read-back could not convert every cell keeps the row as it was plus
+    // the written values (still identifiable by its key) rather than an unknown row.
+    let read = done
+        .row
+        .map(|batch| row_of(&batch, def, names))
+        .filter(|read| read.known || prepared.before.is_none());
     let mut report = outcome(EditStatus::Applied, None, prepared.row);
     match prepared.kind {
         EditKind::Delete => {

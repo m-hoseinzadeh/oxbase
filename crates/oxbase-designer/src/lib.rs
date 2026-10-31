@@ -597,6 +597,26 @@ fn is_integer(t: &DataType) -> bool {
     matches!(t, DataType::Int { .. })
 }
 
+/// One name of a namespace the validator checks for duplicates.
+struct Named<'n> {
+    /// Where the name is in the design (`indexes[2].name`).
+    path: String,
+    name: &'n str,
+    /// The design gives this name: a new item, or one renamed from its origin's name.
+    fresh: bool,
+}
+
+impl<'n> Named<'n> {
+    /// `before`: the origin's name (`None` for a new item).
+    fn new(path: String, name: &'n str, before: Option<&str>) -> Self {
+        Self {
+            path,
+            name,
+            fresh: before != Some(name),
+        }
+    }
+}
+
 /// The validator's state: issues in design order.
 struct Validator<'a> {
     design: &'a TableDesign,
@@ -726,14 +746,22 @@ impl<'a> Validator<'a> {
         for (pos, (item, column)) in design.columns.iter().zip(&new_def.columns).enumerate() {
             let path = format!("columns[{pos}]");
             self.name(&format!("{path}.name"), "a column", &column.name);
-            self.duplicate(
-                &format!("{path}.name"),
-                "column",
-                &column.name,
-                new_def.columns[..pos].iter().map(|c| c.name.as_str()),
-            );
             self.column(&path, item, column);
         }
+        let original = self.original();
+        let names: Vec<Named<'_>> = design
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(pos, item)| {
+                let before = item
+                    .origin
+                    .and_then(|o| original?.columns.get(o))
+                    .map(|c| c.name.as_str());
+                Named::new(format!("columns[{pos}].name"), &item.column.name, before)
+            })
+            .collect();
+        self.duplicates("a column", &names);
         if let Some(original) = self.original() {
             if Self::removed(&origins, original.columns.len()) > 0 {
                 self.need(self.caps.drop_column, "columns", "dropping a column");
@@ -882,33 +910,32 @@ impl<'a> Validator<'a> {
         }
     }
 
-    /// An error when `name` equals one of `earlier`; a warning when it differs only in case.
-    fn duplicate<'n>(
-        &mut self,
-        path: &str,
-        what: &str,
-        name: &str,
-        earlier: impl Iterator<Item = &'n str>,
-    ) {
-        let mut case_only = false;
-        for other in earlier {
-            if other == name {
-                self.error(
-                    path.to_owned(),
-                    format!("there is already a {what} named '{name}'"),
-                );
-                return;
+    /// Duplicate names in one namespace. Only names this design gives (new or renamed items)
+    /// are checked: what the server reported is how the table is. A name that differs from
+    /// another only in case is an error too: MySQL, MariaDB, SQLite and SQL Server fold case in
+    /// these names, and on PostgreSQL such pairs are legal but a trap.
+    fn duplicates(&mut self, what: &str, names: &[Named<'_>]) {
+        for (pos, item) in names.iter().enumerate() {
+            if !item.fresh || item.name.trim().is_empty() {
+                continue;
             }
-            case_only |= other.eq_ignore_ascii_case(name);
-        }
-        if case_only && !name.is_empty() {
-            self.warning(
-                path.to_owned(),
+            // Two new names that clash are reported once, on the later one.
+            let clash = names.iter().enumerate().find(|(other_pos, other)| {
+                *other_pos != pos
+                    && (*other_pos < pos || !other.fresh)
+                    && other.name.eq_ignore_ascii_case(item.name)
+            });
+            let Some((_, other)) = clash else { continue };
+            let message = if other.name == item.name {
+                format!("there is already {what} named '{}'", item.name)
+            } else {
                 format!(
-                    "another {what} name differs from '{name}' only in case; some databases \
-                     treat them as the same name"
-                ),
-            );
+                    "'{}' and '{}' differ only in case; most databases treat them as the same \
+                     name",
+                    item.name, other.name
+                )
+            };
+            self.error(item.path.clone(), message);
         }
     }
 
@@ -976,15 +1003,73 @@ impl<'a> Validator<'a> {
             .is_none_or(|old| old.nullable != column.column.nullable)
     }
 
-    /// Names of every constraint and index so far (they share one namespace on most engines).
-    fn constraint_names(&self) -> Vec<String> {
+    /// The primary key's name, when it has one, as an entry of a namespace.
+    fn primary_key_name(&self) -> Option<Named<'a>> {
         let design = self.design;
-        design
-            .primary_key
-            .as_ref()
-            .and_then(|pk| pk.name.clone())
-            .into_iter()
-            .collect()
+        let name = design.primary_key.as_ref()?.name.as_deref()?;
+        let before = self
+            .original()
+            .and_then(|o| o.primary_key.as_ref())
+            .and_then(|pk| pk.name.as_deref());
+        Some(Named::new("primaryKey.name".to_owned(), name, before))
+    }
+
+    /// Index names (with the primary key's, which names its index): one namespace on every
+    /// engine.
+    fn index_namespace(&mut self) {
+        let design = self.design;
+        let original = self.original();
+        let mut names: Vec<Named<'_>> = self.primary_key_name().into_iter().collect();
+        names.extend(design.indexes.iter().enumerate().map(|(pos, item)| {
+            let before = item
+                .origin
+                .and_then(|o| original?.indexes.get(o))
+                .map(|i| i.name.as_str());
+            Named::new(format!("indexes[{pos}].name"), &item.def.name, before)
+        }));
+        self.duplicates("an index", &names);
+    }
+
+    /// Constraint names: the primary key, unique constraints, foreign keys and checks. Plain
+    /// indexes are not in it: MySQL and MariaDB name the index InnoDB adds for a foreign key
+    /// after the constraint, so an index and a foreign key sharing a name is normal there.
+    fn constraint_namespace(&mut self) {
+        let design = self.design;
+        let original = self.original();
+        let mut names: Vec<Named<'_>> = self.primary_key_name().into_iter().collect();
+        for (pos, item) in design.indexes.iter().enumerate() {
+            if item.def.is_constraint {
+                let before = item
+                    .origin
+                    .and_then(|o| original?.indexes.get(o))
+                    .filter(|i| i.is_constraint)
+                    .map(|i| i.name.as_str());
+                names.push(Named::new(
+                    format!("indexes[{pos}].name"),
+                    &item.def.name,
+                    before,
+                ));
+            }
+        }
+        for (pos, item) in design.foreign_keys.iter().enumerate() {
+            if let Some(name) = &item.def.name {
+                let before = item
+                    .origin
+                    .and_then(|o| original?.foreign_keys.get(o))
+                    .and_then(|f| f.name.as_deref());
+                names.push(Named::new(format!("foreignKeys[{pos}].name"), name, before));
+            }
+        }
+        for (pos, item) in design.checks.iter().enumerate() {
+            if let Some(name) = &item.def.name {
+                let before = item
+                    .origin
+                    .and_then(|o| original?.checks.get(o))
+                    .and_then(|c| c.name.as_deref());
+                names.push(Named::new(format!("checks[{pos}].name"), name, before));
+            }
+        }
+        self.duplicates("a constraint", &names);
     }
 
     fn indexes(&mut self) {
@@ -997,18 +1082,11 @@ impl<'a> Validator<'a> {
             self.original().map(|o| o.indexes.len()),
         );
         let columns = self.column_names();
-        let mut names = self.constraint_names();
+        self.index_namespace();
         for (pos, item) in design.indexes.iter().enumerate() {
             let path = format!("indexes[{pos}]");
             let index = &item.def;
             self.name(&format!("{path}.name"), "an index", &index.name);
-            self.duplicate(
-                &format!("{path}.name"),
-                "index or constraint",
-                &index.name,
-                names.iter().map(String::as_str),
-            );
-            names.push(index.name.clone());
             if index.columns.is_empty() {
                 self.error(format!("{path}.columns"), "the index has no columns");
             }
@@ -1100,20 +1178,11 @@ impl<'a> Validator<'a> {
             &origins,
             self.original().map(|o| o.foreign_keys.len()),
         );
-        let mut names = self.constraint_names();
-        names.extend(design.indexes.iter().map(|i| i.def.name.clone()));
         for (pos, item) in design.foreign_keys.iter().enumerate() {
             let path = format!("foreignKeys[{pos}]");
             let fk = &item.def;
             if let Some(name) = &fk.name {
                 self.name(&format!("{path}.name"), "a foreign key", name);
-                self.duplicate(
-                    &format!("{path}.name"),
-                    "index or constraint",
-                    name,
-                    names.iter().map(String::as_str),
-                );
-                names.push(name.clone());
             }
             if fk.columns.is_empty() {
                 self.error(format!("{path}.columns"), "the foreign key has no columns");
@@ -1212,26 +1281,12 @@ impl<'a> Validator<'a> {
         let caps = self.caps;
         let origins: Vec<Option<usize>> = design.checks.iter().map(|i| i.origin).collect();
         self.origins("checks", &origins, self.original().map(|o| o.checks.len()));
-        let mut names = self.constraint_names();
-        names.extend(design.indexes.iter().map(|i| i.def.name.clone()));
-        names.extend(
-            design
-                .foreign_keys
-                .iter()
-                .filter_map(|f| f.def.name.clone()),
-        );
+        self.constraint_namespace();
         for (pos, item) in design.checks.iter().enumerate() {
             let path = format!("checks[{pos}]");
             let check = &item.def;
             if let Some(name) = &check.name {
                 self.name(&format!("{path}.name"), "a check", name);
-                self.duplicate(
-                    &format!("{path}.name"),
-                    "index or constraint",
-                    name,
-                    names.iter().map(String::as_str),
-                );
-                names.push(name.clone());
             }
             if !caps.checks_enforced {
                 self.warning(
@@ -1700,7 +1755,7 @@ mod tests {
         let found = issues(&d, &engine);
         for (severity, path, text) in [
             (E, "table.name", "longer than 63 bytes"),
-            (W, "columns[2].name", "only in case"),
+            (E, "columns[2].name", "differ only in case"),
             (E, "columns[3].name", "already a column named 'customer'"),
             (E, "columns[4]", "not an integer column"),
             (E, "columns[4]", "identity columns are not supported"),
@@ -1714,7 +1769,7 @@ mod tests {
             (W, "columns[1].dataType", "may fail or truncate"),
             (E, "primaryKey.columns[1]", "no column 'nope'"),
             (E, "primaryKey.columns[2]", "must be NOT NULL"),
-            (E, "indexes[1].name", "already a index or constraint named"),
+            (E, "indexes[1].name", "already an index named"),
             (
                 E,
                 "indexes[1].columns[0]",
@@ -1744,7 +1799,7 @@ mod tests {
             (E, "foreignKeys[1].onDelete", "not supported"),
             (E, "foreignKeys[2].refColumns[0]", "cannot reference 'id'"),
             (E, "checks[0]", "out of range"),
-            (E, "checks[1].name", "already a index or constraint named"),
+            (E, "checks[1].name", "already a constraint named"),
             (E, "checks[1].expression", "has no expression"),
         ] {
             assert!(
@@ -1758,6 +1813,115 @@ mod tests {
             .position(|(_, p, _)| p.starts_with("primaryKey"));
         let last_column = found.iter().rposition(|(_, p, _)| p.starts_with("columns"));
         assert!(last_column < first_pk);
+    }
+
+    /// MySQL and MariaDB: `CONSTRAINT fk_p FOREIGN KEY (pid)` without an index on `pid` makes
+    /// InnoDB add `KEY fk_p (pid)`, so the loaded table has an index and a foreign key that
+    /// share a name.
+    fn mysql_shaped() -> TableDef {
+        let mut table = TableDef::new(ObjectRef::table(Some("db"), None, "c"));
+        table.columns.push(ColumnDef::new("pid", DataType::INT32));
+        table.columns.push(ColumnDef::new("Name", DataType::Text));
+        table.columns.push(ColumnDef::new("name", DataType::Text));
+        table.indexes.push(IndexDef {
+            name: "fk_p".into(),
+            columns: vec![IndexColumn::column("pid")],
+            unique: false,
+            is_constraint: false,
+            predicate: None,
+            extras: Extras::new(),
+        });
+        table.foreign_keys.push(ForeignKeyDef {
+            name: Some("fk_p".into()),
+            columns: vec!["pid".into()],
+            ref_table: ObjectRef::table(Some("db"), None, "p"),
+            ref_columns: vec!["id".into()],
+            on_delete: FkAction::NoAction,
+            on_update: FkAction::NoAction,
+            extras: Extras::new(),
+        });
+        table
+    }
+
+    #[test]
+    fn names_are_checked_per_namespace_and_only_when_the_design_gives_them() {
+        use IssueSeverity::Error as E;
+        let engine = Engine::new(true);
+        // An index and a foreign key may share a name; what the server reported (here two
+        // column names that differ only in case) is not the user's to fix.
+        let design = TableDesign::from_def(mysql_shaped());
+        assert_eq!(issues(&design, &engine), []);
+        let mut changed = design.clone();
+        changed.columns.push(new_column("extra", DataType::INT32));
+        assert_eq!(
+            issues(&changed, &engine)
+                .into_iter()
+                .filter(|(s, _, _)| *s == E)
+                .collect::<Vec<_>>(),
+            []
+        );
+
+        // A new item placed before an existing one with its name still clashes.
+        let mut d = design.clone();
+        d.indexes.insert(
+            0,
+            DesignItem::new(IndexDef {
+                name: "FK_P".into(),
+                columns: vec![IndexColumn::column("pid")],
+                unique: false,
+                is_constraint: false,
+                predicate: None,
+                extras: Extras::new(),
+            }),
+        );
+        d.checks.push(DesignItem::new(CheckDef {
+            name: Some("fk_p".into()),
+            expression: "pid > 0".into(),
+            extras: Extras::new(),
+        }));
+        // A renamed column clashes with another only in case.
+        d.columns[1].column.name = "NAME".into();
+        let found = issues(&d, &engine);
+        for (path, text) in [
+            ("columns[1].name", "differ only in case"),
+            ("indexes[0].name", "differ only in case"),
+            ("checks[0].name", "already a constraint named 'fk_p'"),
+        ] {
+            assert!(
+                has(&found, E, path, text),
+                "missing {path}: {text}\nin {found:#?}"
+            );
+        }
+        // Each clash is reported once.
+        assert_eq!(
+            found
+                .iter()
+                .filter(|(s, p, _)| *s == E && p.ends_with(".name"))
+                .count(),
+            3,
+            "{found:#?}"
+        );
+
+        // Two new names that clash: reported on the later one.
+        let mut d = design;
+        for name in ["ix_a", "ix_a"] {
+            d.indexes.push(DesignItem::new(IndexDef {
+                name: name.into(),
+                columns: vec![IndexColumn::column("pid")],
+                unique: false,
+                is_constraint: false,
+                predicate: None,
+                extras: Extras::new(),
+            }));
+        }
+        let found = issues(&d, &engine);
+        assert!(has(
+            &found,
+            E,
+            "indexes[2].name",
+            "already an index named 'ix_a'"
+        ));
+        assert!(!found.iter().any(|(_, p, _)| p == "indexes[1].name"));
     }
 
     #[test]

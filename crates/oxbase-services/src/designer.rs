@@ -586,10 +586,14 @@ pub async fn execute_script(
             .collect()
     };
 
-    // 1. Prepare, outside any transaction.
+    // 1. Prepare, outside any transaction; a failure stops at that step.
     for index in by_phase(StepPhase::Prepare) {
-        run.step(Runner::Connection(connection), script, index, &cancel)
-            .await;
+        if run.failed {
+            run.not_run(&[index]);
+        } else {
+            run.step(Runner::Connection(connection), script, index, &cancel)
+                .await;
+        }
     }
 
     // 2. Main.

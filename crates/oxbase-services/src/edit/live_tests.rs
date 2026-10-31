@@ -42,6 +42,19 @@ use crate::history::HistoryService;
 use crate::query::{EditorId, QueryConfig, RunEvent};
 use crate::{ConnectionManager, ProvidedSecrets, SessionId, default_dialects, default_drivers};
 
+/// `true` when `OXBASE_SERVICES_REQUIRE_M3_CELLS=1`: an engine whose M3 cells (`DmlWriter`,
+/// `DdlGenerator`, `Comparator`) or `[m3]` seed tables are still missing fails the live tests
+/// instead of reporting them as pending.
+pub(crate) fn require_m3_cells() -> bool {
+    std::env::var("OXBASE_SERVICES_REQUIRE_M3_CELLS").is_ok_and(|v| v == "1")
+}
+
+/// Reports `what` as pending (not tested), or fails when [`require_m3_cells`].
+fn pending(key: &str, what: &str) {
+    report(&format!("{key}: {what} PENDING (not tested)"));
+    assert!(!require_m3_cells(), "{key}: {what} missing");
+}
+
 /// Writes a line to stderr, bypassing the test harness's output capture.
 pub(crate) fn report(line: &str) {
     let _ = writeln!(std::io::stderr().lock(), "[m3 services] {line}");
@@ -223,9 +236,10 @@ impl Live {
                 && registry.dml_writer(engine).is_err()
                 && let Ok(quoting) = registry.quoting(engine)
             {
-                report(&format!(
-                    "{key}: no DmlWriter registered yet; using the generic test writer"
-                ));
+                pending(
+                    key,
+                    "the engine's DmlWriter (using the generic test writer)",
+                );
                 registry.register_dml_writer(engine, Arc::new(GenericWriter { quoting }));
             }
         })
@@ -656,10 +670,7 @@ async fn seed_tables(key: &'static str, engine: Engine) {
     if engine == Engine::Sqlite {
         let init = root().join(string(engine_m3, "init_sql"));
         let Ok(script) = std::fs::read_to_string(&init) else {
-            report(&format!(
-                "{key}: seed tables pending ({} missing)",
-                init.display()
-            ));
+            pending(key, &format!("seed tables ({} missing)", init.display()));
             return;
         };
         live.sql(&script).await;
@@ -675,10 +686,16 @@ async fn seed_tables(key: &'static str, engine: Engine) {
     };
     let pk = seed(&string(m3, "edit_pk_table"), ObjectKind::Table);
     if !live.exists(&pk).await {
-        report(&format!("{key}: seed tables pending (no {})", pk.name));
+        pending(key, &format!("seed tables (no {})", pk.name));
         return;
     }
     let has_writer = live.dialects.dml_writer(engine).is_ok();
+    if !has_writer {
+        pending(
+            key,
+            "the engine's DmlWriter (seed tables checked read-only)",
+        );
+    }
     let begin = |table: ObjectRef, editor: &'static str| {
         let live = &live;
         async move {

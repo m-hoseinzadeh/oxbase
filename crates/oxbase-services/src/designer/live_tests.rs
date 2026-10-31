@@ -22,12 +22,7 @@ use oxbase_types::{
 };
 
 use super::*;
-use crate::edit::live_tests::{ENGINES, Live, report};
-
-/// `true` when a pending engine must fail the test.
-pub(crate) fn require_m3_cells() -> bool {
-    std::env::var("OXBASE_SERVICES_REQUIRE_M3_CELLS").is_ok_and(|v| v == "1")
-}
+use crate::edit::live_tests::{ENGINES, Live, report, require_m3_cells};
 
 fn column(name: &str, data_type: DataType, nullable: bool) -> DesignColumn {
     let mut column = ColumnDef::new(name, data_type);
@@ -114,7 +109,10 @@ async fn designer_cycle(key: &'static str, engine: Engine) {
     let live = Live::connect(key, engine, false).await;
     let missing = live.dialects.missing_designer_roles(engine);
     if !missing.is_empty() {
-        report(&format!("{key}: designer pending: {}", missing.join(", ")));
+        report(&format!(
+            "{key}: designer round trip PENDING (not tested): {}",
+            missing.join(", ")
+        ));
         assert!(
             !require_m3_cells(),
             "{key}: designer cells missing: {missing:?}"
