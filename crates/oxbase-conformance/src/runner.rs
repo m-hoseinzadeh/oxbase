@@ -4,6 +4,8 @@ use std::path::Path;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use oxbase_dialect::DialectRegistry;
+
 use crate::adapter::{self, Engine};
 use crate::connect::{self, ConnCell, ConnCheck};
 use crate::fetch::{self, FetchOutcome};
@@ -13,9 +15,10 @@ use crate::probe::{self, ProbeOptions};
 use crate::report::{
     CheckInfo, ConnCheckInfo, EngineStatus, REPORT_SCHEMA_VERSION, Report, Summary,
 };
+use crate::roundtrip;
 
 /// The milestone this harness build implements.
-pub const MILESTONE: &str = "M2";
+pub const MILESTONE: &str = "M3";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RunOptions {
@@ -26,12 +29,15 @@ pub struct RunOptions {
     pub skip_connect: bool,
     /// Skip the M2 `fetch_list` cells (cells with a fetcher are reported as skipped).
     pub skip_fetch: bool,
+    /// Skip the M3 `roundtrip` and `capabilities` cells (cells that would run are reported as
+    /// skipped).
+    pub skip_roundtrip: bool,
 }
 
 impl RunOptions {
     /// Reads `OXBASE_CONFORMANCE_ALLOW_MISSING`, `OXBASE_CONFORMANCE_PROBE_TIMEOUT_MS`,
-    /// `OXBASE_CONFORMANCE_TCP_ONLY`, `OXBASE_CONFORMANCE_SKIP_CONNECT` and
-    /// `OXBASE_CONFORMANCE_SKIP_FETCH`.
+    /// `OXBASE_CONFORMANCE_TCP_ONLY`, `OXBASE_CONFORMANCE_SKIP_CONNECT`,
+    /// `OXBASE_CONFORMANCE_SKIP_FETCH` and `OXBASE_CONFORMANCE_SKIP_ROUNDTRIP`.
     pub fn from_env() -> Self {
         let var = |name: &str| std::env::var(name).ok();
         let mut opts = Self::from_vars(
@@ -41,6 +47,7 @@ impl RunOptions {
         );
         opts.skip_connect = is_truthy(var("OXBASE_CONFORMANCE_SKIP_CONNECT").as_deref());
         opts.skip_fetch = is_truthy(var("OXBASE_CONFORMANCE_SKIP_FETCH").as_deref());
+        opts.skip_roundtrip = is_truthy(var("OXBASE_CONFORMANCE_SKIP_ROUNDTRIP").as_deref());
         opts
     }
 
@@ -62,11 +69,12 @@ impl RunOptions {
             allow_missing: is_truthy(allow_missing),
             skip_connect: false,
             skip_fetch: false,
+            skip_roundtrip: false,
         }
     }
 }
 
-fn is_truthy(v: Option<&str>) -> bool {
+pub(crate) fn is_truthy(v: Option<&str>) -> bool {
     v.is_some_and(|v| {
         matches!(
             v.trim().to_ascii_lowercase().as_str(),
@@ -82,8 +90,8 @@ pub fn run_path(path: &Path, opts: &RunOptions) -> Result<Report, FixturesError>
     Ok(run(path, &fixtures, &engines, opts))
 }
 
-/// Probes every engine concurrently, runs the connection checks and the `fetch_list` cells, and
-/// builds the report.
+/// Probes every engine concurrently, runs the connection checks, the `fetch_list` cells and the
+/// `roundtrip` / `capabilities` cells, and builds the report.
 pub fn run(
     fixtures_path: &Path,
     fixtures: &Fixtures,
@@ -118,12 +126,21 @@ pub fn run(
     } else {
         fetch::run_all(fixtures, engines, &reachable, &registry)
     };
+    let round_trips = if opts.skip_roundtrip {
+        Vec::new()
+    } else {
+        roundtrip::run_all(fixtures, engines, &reachable, &registry)
+    };
     let mut statuses = Vec::with_capacity(engines.len());
     let mut cells = Vec::new();
     for (e, probe) in engines.iter().zip(probes) {
         let mut planned = plan_engine_in(&registry, &e.name, e.engine);
         if probe.reachable {
             apply_fetch(&mut planned, &fetched, opts.skip_fetch);
+            roundtrip::apply(&mut planned, &round_trips);
+            if opts.skip_roundtrip {
+                skip_roundtrip(&mut planned, &registry, e.engine);
+            }
         } else {
             for cell in &mut planned {
                 if cell.status == CellStatus::Pending {
@@ -199,6 +216,20 @@ fn apply_fetch(cells: &mut [Cell], fetched: &[FetchOutcome], skip_fetch: bool) {
     }
 }
 
+/// With `skip_roundtrip`, the `roundtrip` / `capabilities` cells that would have run are
+/// reported as skipped.
+fn skip_roundtrip(cells: &mut [Cell], registry: &DialectRegistry, engine: Engine) {
+    let runnable = roundtrip::runnable_kinds(registry, engine);
+    for cell in cells.iter_mut().filter(|c| {
+        matches!(c.check, Check::Roundtrip | Check::Capabilities)
+            && c.status == CellStatus::Pending
+            && runnable.contains(&c.object_kind)
+    }) {
+        cell.status = CellStatus::Skipped;
+        cell.detail = Some("round-trip checks disabled".to_owned());
+    }
+}
+
 /// Connection cells when the checks are switched off: pending/n-a cells stay as they are, the
 /// rest are skipped.
 fn skipped_connections(engines: &[ResolvedEngine]) -> Vec<ConnCell> {
@@ -238,10 +269,12 @@ pub fn check_engine(
             fixtures_path.display()
         ));
     }
-    // Reachability only: the connection checks and fetch cells belong to the full run.
+    // Reachability only: the connection checks, fetch and round-trip cells belong to the full
+    // run.
     let opts = RunOptions {
         skip_connect: true,
         skip_fetch: true,
+        skip_roundtrip: true,
         ..*opts
     };
     let report = run(fixtures_path, &fixtures, &engines, &opts);
