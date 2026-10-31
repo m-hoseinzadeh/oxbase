@@ -12,5 +12,24 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
+oxbase-types.workspace = true
+async-trait.workspace = true
+# rustls with the ring provider only (see the workspace manifest).
+rustls.workspace = true
+rustls-native-certs.workspace = true
+# SSH tunnels (src/ssh.rs and src/ssh/).
+russh.workspace = true
+# HMAC-SHA1 for hashed known_hosts entries (`|1|salt|hash`) and HMAC-SHA256 credential scopes.
+ring.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
+futures.workspace = true
+serde.workspace = true
+toml.workspace = true
+rcgen.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true

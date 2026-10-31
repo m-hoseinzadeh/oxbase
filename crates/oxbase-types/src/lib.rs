@@ -14,6 +14,9 @@
 //! - [`diff`]: [`PropertyDiff`], one difference found by a comparator.
 //! - [`edit`]: [`RowEdit`] / [`RowKey`], grid edits for write-back.
 //! - [`progress`]: [`Progress`], one progress event of a long-running operation.
+//! - [`secret`]: [`Secret`], a string that never leaks into `Debug`, logs or documents.
+//! - [`net`]: [`Endpoint`], [`TlsOptions`] / [`TlsMode`] and [`SshOptions`] (connection addressing,
+//!   TLS and SSH settings shared by drivers, `oxbase-net`, `oxbase-store` and services).
 //! - [`error`]: the single [`Error`] type and [`Result`] alias.
 
 pub mod data_type;
@@ -22,10 +25,12 @@ pub mod diff;
 pub mod edit;
 pub mod engine;
 pub mod error;
+pub mod net;
 pub mod object;
 pub mod progress;
 pub mod props;
 pub mod script;
+pub mod secret;
 pub mod value;
 pub mod version;
 
@@ -38,9 +43,13 @@ pub use diff::{DiffKind, PropertyDiff};
 pub use edit::{ColumnValue, KeyKind, RowEdit, RowKey};
 pub use engine::Engine;
 pub use error::{Error, ErrorCategory, Result};
+pub use net::{
+    Endpoint, KeySource, KnownHostsPolicy, PemSource, SshAuth, SshOptions, TlsMode, TlsOptions,
+};
 pub use object::{ObjectKind, ObjectRef, ObjectSummary};
 pub use progress::{Progress, ProgressUnit};
 pub use props::{Extras, PropId};
 pub use script::{Script, Statement};
+pub use secret::Secret;
 pub use value::Value;
 pub use version::ServerVersion;

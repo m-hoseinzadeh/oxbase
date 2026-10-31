@@ -12,5 +12,25 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
+oxbase-types.workspace = true
+oxbase-driver.workspace = true
+# rustls client configuration (ring) shared by every driver; also re-exports `rustls`.
+oxbase-net.workspace = true
+arrow-array.workspace = true
+arrow-schema.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+chrono.workspace = true
+futures.workspace = true
+tokio.workspace = true
+tokio-postgres.workspace = true
+# MakeTlsConnect over rustls (ring only, no bundled roots); wrapped in src/tls.rs.
+tokio-postgres-rustls.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
+serde_json.workspace = true
+toml.workspace = true
+tokio.workspace = true

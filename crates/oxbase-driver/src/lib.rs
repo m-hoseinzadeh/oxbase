@@ -14,6 +14,20 @@
 //! - A token that is already cancelled makes `execute` return `Err(Error::Cancelled)` without
 //!   sending anything to the server.
 //!
+//! Out-of-band cancel requests (PostgreSQL `CancelRequest`, the MySQL `KILL QUERY` side
+//! connection) dial [`ConnectParams::dial_endpoint`], the same address as the session itself, so
+//! cancel works through an SSH tunnel. A cancel that reaches the server after the statement
+//! finished is harmless; drivers must make sure it cannot hit a *later* statement (MySQL: kill
+//! by the connection id only while the statement it targets is still running).
+//!
+//! # Addressing, TLS and SSH
+//!
+//! See [`ConnectParams`]: drivers dial [`ConnectParams::dial_endpoint`], verify TLS against
+//! [`ConnectParams::tls_server_name`], build their rustls configuration with
+//! `oxbase_net::tls::client_config` (or, when the client library builds its own, map
+//! [`TlsOptions`] onto it with the same semantics and load PEM material through `oxbase_net::tls`),
+//! and never open SSH tunnels themselves.
+//!
 //! # Progress
 //!
 //! Long-running operations above the driver (catalog loads, import, transfer, backup) take a
@@ -36,10 +50,12 @@ pub mod mock;
 use async_trait::async_trait;
 use oxbase_types::{Engine, Result, ServerVersion, Value};
 
-pub use oxbase_types::{Progress, ProgressUnit};
-pub use params::{
-    ConnectParams, Secret, SshAuth, SshOptions, TlsMode, TlsOptions, is_sensitive_option,
+pub use oxbase_types::{
+    Endpoint, KeySource, KnownHostsPolicy, PemSource, Secret, SshAuth, SshOptions, TlsMode,
+    TlsOptions,
 };
+pub use oxbase_types::{Progress, ProgressUnit};
+pub use params::{ConnectParams, is_sensitive_option};
 pub use progress::ProgressSink;
 pub use registry::DriverRegistry;
 pub use result::{
@@ -60,7 +76,8 @@ pub trait Driver: Send + Sync {
     /// (the MySQL driver serves MariaDB) with [`DriverRegistry::register_as`].
     fn engine(&self) -> Engine;
 
-    /// Opens a connection. Tunnelling (SSH) and TLS are driven by `params`.
+    /// Opens a connection described by `params` (see [`ConnectParams`] for the addressing and
+    /// TLS rules). Any SSH tunnel is already open: dial [`ConnectParams::dial_endpoint`].
     async fn connect(&self, params: &ConnectParams) -> Result<Box<dyn Connection>>;
 }
 
@@ -75,6 +92,13 @@ pub trait Connection: Send + Sync {
 
     /// Version reported by the server at connect time.
     fn server_version(&self) -> &ServerVersion;
+
+    /// `true` when the session's transport is encrypted with TLS (with `TlsMode::Prefer` this
+    /// says whether the server accepted TLS). Drivers that can negotiate TLS must override it;
+    /// the default suits embedded engines.
+    fn tls_in_use(&self) -> bool {
+        false
+    }
 
     /// Runs `sql` (one or more statements, engine permitting) with positional `params`.
     ///

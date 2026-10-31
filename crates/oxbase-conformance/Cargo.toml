@@ -20,6 +20,13 @@ path = "src/main.rs"
 # Engine/ObjectKind come from oxbase-types; cell applicability from oxbase-dialect (src/adapter.rs).
 oxbase-types.workspace = true
 oxbase-dialect.workspace = true
+# M1 connection checks (src/connect.rs) run through the real drivers and connection manager.
+oxbase-driver.workspace = true
+oxbase-net.workspace = true
+oxbase-store.workspace = true
+oxbase-services.workspace = true
+futures.workspace = true
+tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true

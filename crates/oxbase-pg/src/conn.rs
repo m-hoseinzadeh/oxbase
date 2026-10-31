@@ -1,0 +1,957 @@
+//! Connections, statement execution, cancellation and transactions.
+//!
+//! # How a statement runs
+//!
+//! Every `execute` spawns a task that waits for the connection's statement lock, runs the
+//! statement and feeds a bounded channel (the returned stream), so at most a couple of batches
+//! are buffered and nothing is ever collected in memory.
+//!
+//! - **No parameters, one statement**: the statement is prepared (Parse/Describe, which gives
+//!   the column types) and then run with the simple query protocol, whose text values are
+//!   decoded into typed Arrow columns. Text output means any type, including ones this driver
+//!   does not know, arrives exactly as the server prints it.
+//! - **No parameters, several statements** (a script): the simple query protocol, one result
+//!   per statement. Column types are not available on this path, so every column is `Utf8`
+//!   (the server's text form, no `oxbase.pg.*` metadata). Run statements one at a time to get
+//!   typed columns.
+//! - **With parameters**: the extended protocol. The statement is prepared, the server infers
+//!   the parameter types and [`crate::encode`] converts each [`Value`] to that type in binary.
+//!   Results arrive in binary and are decoded by [`crate::decode`].
+//!
+//! Server notices (`RAISE NOTICE`, warnings) are captured from the connection and interleaved
+//! with the results as `ResultItem::Notice`, in arrival order.
+//!
+//! # Cancellation
+//!
+//! A statement is interrupted when its token fires, when `cancel_running` is called (which
+//! interrupts every statement submitted before the call, the running one and any still queued
+//! behind it), or when its stream is dropped. Then the task:
+//!
+//! 1. stops forwarding results, yields `Err(Cancelled)` (unless the stream was dropped) and
+//!    drops its senders, so the stream ends right after that error;
+//! 2. sends no further protocol message for this statement (a statement interrupted while its
+//!    `Parse` or a pending `ROLLBACK` was in flight is never sent at all);
+//! 3. sends a PostgreSQL `CancelRequest` through `tokio-postgres`' `CancelToken` and repeats it
+//!    with backoff until the statement has ended, so a request that reached the backend just
+//!    before the statement did is not lost. It dials the same IP and port as the session (the
+//!    SSH tunnel's local end when tunnelled) with the session's TLS settings;
+//! 4. keeps the statement lock until the statement has ended and the last cancel request has
+//!    been written, so a cancel cannot target a later statement of this driver. What remains is
+//!    the protocol's inherent race: `tokio-postgres` does not wait for the server to act on a
+//!    cancel request, so one that the server processes late can still reach the next statement.
+//!
+//! A server-side `query_canceled` error this driver did not cause (`statement_timeout`,
+//! `pg_cancel_backend()` from another session) is reported as an SQL error with code `57014`
+//! and the server's message, not as `Cancelled`.
+
+use std::future::{Future, poll_fn};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, MutexGuard, PoisonError};
+use std::time::Duration;
+
+use async_trait::async_trait;
+use futures::StreamExt;
+use oxbase_driver::{
+    CancellationToken, ConnectParams, Connection, Notice, ResultItem, ResultStream, TlsMode, Tx,
+    collect,
+};
+use oxbase_types::{Endpoint, Engine, Error, Result, ServerVersion, Value};
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+use tokio_postgres::config::{ChannelBinding, SslNegotiation, TargetSessionAttrs};
+use tokio_postgres::error::SqlState;
+use tokio_postgres::types::{FromSql, ToSql, Type};
+use tokio_postgres::{AsyncMessage, CancelToken, Client, Config, SimpleQueryMessage};
+
+use crate::decode::BatchBuilder;
+use crate::encode::PgParam;
+use crate::error::{from_pg, notice_from_db};
+use crate::split::count_statements;
+use crate::tls::{PgTls, ssl_mode, ssl_negotiation};
+use crate::types::ColSpec;
+
+/// Notices queued beyond this are dropped (and counted) instead of growing without bound.
+const NOTICE_BACKLOG: usize = 10_000;
+/// How long a cancelled statement may take to end before the lock is released anyway.
+const DRAIN_LIMIT: Duration = Duration::from_secs(30);
+/// Deadline for delivering a cancel request.
+const CANCEL_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// Delay before the first repeated cancel request; it doubles up to [`CANCEL_RESEND_MAX`].
+const CANCEL_RESEND_FIRST: Duration = Duration::from_millis(250);
+const CANCEL_RESEND_MAX: Duration = Duration::from_secs(2);
+/// Whole-connect deadline when `ConnectParams::connect_timeout` is not set.
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long `close` waits for the session to say goodbye.
+const CLOSE_WAIT: Duration = Duration::from_secs(2);
+
+fn lock<T>(m: &StdMutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Notices
+
+struct NoticeTx {
+    tx: mpsc::UnboundedSender<Notice>,
+    queued: Arc<AtomicUsize>,
+    dropped: Arc<AtomicUsize>,
+}
+
+impl NoticeTx {
+    fn push(&self, notice: Notice) {
+        if self.queued.load(Ordering::Acquire) >= NOTICE_BACKLOG {
+            self.dropped.fetch_add(1, Ordering::AcqRel);
+            return;
+        }
+        self.queued.fetch_add(1, Ordering::AcqRel);
+        if self.tx.send(notice).is_err() {
+            self.queued.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
+
+/// The receiving end of the connection's notices; owned by whoever holds the statement lock.
+pub(crate) struct NoticeRx {
+    rx: mpsc::UnboundedReceiver<Notice>,
+    queued: Arc<AtomicUsize>,
+    dropped: Arc<AtomicUsize>,
+}
+
+impl NoticeRx {
+    fn dropped_notice(&self) -> Option<Notice> {
+        let n = self.dropped.swap(0, Ordering::AcqRel);
+        (n > 0).then(|| {
+            Notice::warning(format!(
+                "{n} server notices were discarded because they arrived faster than they were read"
+            ))
+        })
+    }
+
+    async fn recv(&mut self) -> Option<Notice> {
+        if let Some(n) = self.dropped_notice() {
+            return Some(n);
+        }
+        let n = self.rx.recv().await?;
+        self.queued.fetch_sub(1, Ordering::AcqRel);
+        Some(n)
+    }
+
+    fn try_recv(&mut self) -> Option<Notice> {
+        if let Some(n) = self.dropped_notice() {
+            return Some(n);
+        }
+        let n = self.rx.try_recv().ok()?;
+        self.queued.fetch_sub(1, Ordering::AcqRel);
+        Some(n)
+    }
+}
+
+fn notice_channel() -> (NoticeTx, NoticeRx) {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let queued = Arc::new(AtomicUsize::new(0));
+    let dropped = Arc::new(AtomicUsize::new(0));
+    (
+        NoticeTx {
+            tx,
+            queued: queued.clone(),
+            dropped: dropped.clone(),
+        },
+        NoticeRx {
+            rx,
+            queued,
+            dropped,
+        },
+    )
+}
+
+// ---------------------------------------------------------------------------------------------
+// Shared connection state
+
+/// How `execute` sends SQL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// Pick the protocol from the parameters and statement count (see the module docs).
+    Auto,
+    /// Internal commands (`BEGIN`, `COMMIT`, ...): simple protocol, no prepare.
+    Script,
+}
+
+struct Shared {
+    /// `None` after `close`.
+    client: StdMutex<Option<Arc<Client>>>,
+    cancel_token: CancelToken,
+    /// The session's TLS settings, for cancel requests.
+    cancel_tls: PgTls,
+    /// The statement lock; it owns the notice receiver.
+    exec: Arc<tokio::sync::Mutex<NoticeRx>>,
+    /// Parent of the stop token of every statement submitted since the last `cancel_running`
+    /// (or `close`). Each statement takes a child token in `execute`, before its task is
+    /// spawned, so cancelling this one reaches running and queued statements alike.
+    stop_all: StdMutex<CancellationToken>,
+    /// Set when a `Tx` was dropped without commit / rollback.
+    rollback_pending: AtomicBool,
+    tx_open: AtomicBool,
+    conn_task: StdMutex<Option<JoinHandle<()>>>,
+}
+
+impl Shared {
+    fn client(&self) -> Result<Arc<Client>> {
+        let client = lock(&self.client)
+            .clone()
+            .ok_or_else(|| Error::connection("the connection is closed"))?;
+        if client.is_closed() {
+            return Err(Error::connection("the connection to the server is closed"));
+        }
+        Ok(client)
+    }
+
+    fn execute(
+        self: &Arc<Self>,
+        sql: &str,
+        params: &[Value],
+        cancel: CancellationToken,
+        mode: Mode,
+    ) -> Result<ResultStream> {
+        if cancel.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        let client = self.client()?;
+        let (tx, rx) = mpsc::channel(2);
+        let job = Job {
+            shared: self.clone(),
+            client,
+            sql: sql.to_owned(),
+            params: params.to_vec(),
+            cancel,
+            stop: lock(&self.stop_all).child_token(),
+            mode,
+        };
+        tokio::spawn(job.run(tx));
+        Ok(futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|item| (item, rx))
+        })
+        .boxed())
+    }
+
+    /// Runs an internal command and waits for it to finish.
+    async fn run_to_end(self: &Arc<Self>, sql: &str) -> Result<()> {
+        let stream = self.execute(sql, &[], CancellationToken::new(), Mode::Script)?;
+        collect(stream).await.map(|_| ())
+    }
+
+    /// Interrupts every statement submitted so far (running or queued).
+    fn stop_all(&self) {
+        let old = std::mem::replace(&mut *lock(&self.stop_all), CancellationToken::new());
+        old.cancel();
+    }
+
+    async fn send_cancel_request(&self) {
+        match tokio::time::timeout(
+            CANCEL_REQUEST_TIMEOUT,
+            self.cancel_token.cancel_query(self.cancel_tls.clone()),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::warn!(error = %from_pg(&e), "PostgreSQL cancel request failed");
+            }
+            Err(_) => tracing::warn!("PostgreSQL cancel request timed out"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Statement jobs
+
+/// Where a job sends its items. Once `halt` fires nothing more is sent, and no new protocol
+/// message may be started for the statement ([`Sink::check`]).
+struct Sink {
+    out: StdMutex<Option<mpsc::Sender<Result<ResultItem>>>>,
+    halt: CancellationToken,
+}
+
+impl Sink {
+    async fn send(&self, item: Result<ResultItem>) {
+        if self.halt.is_cancelled() {
+            return;
+        }
+        // The clone lives only for this send, so taking `out` ends the stream promptly.
+        let Some(tx) = lock(&self.out).clone() else {
+            return;
+        };
+        tokio::select! {
+            biased;
+            () = self.halt.cancelled() => {}
+            // A closed channel is noticed by the job's select.
+            _ = tx.send(item) => {}
+        }
+    }
+
+    async fn item(&self, item: ResultItem) {
+        self.send(Ok(item)).await;
+    }
+
+    /// `Err(Cancelled)` once the statement was interrupted: called before every request that
+    /// would start new work on the server.
+    fn check(&self) -> Result<()> {
+        if self.halt.is_cancelled() {
+            Err(Error::Cancelled)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+struct Job {
+    shared: Arc<Shared>,
+    client: Arc<Client>,
+    sql: String,
+    params: Vec<Value>,
+    /// The caller's token.
+    cancel: CancellationToken,
+    /// Child of `Shared::stop_all`.
+    stop: CancellationToken,
+    mode: Mode,
+}
+
+impl Job {
+    async fn run(self, out: mpsc::Sender<Result<ResultItem>>) {
+        let Job {
+            shared,
+            client,
+            sql,
+            params,
+            cancel,
+            stop,
+            mode,
+        } = self;
+        // Wait for the previous statement on this connection to end. Nothing has been sent for
+        // this one yet, so an interruption here needs no cancel request.
+        let mut notices = tokio::select! {
+            biased;
+            () = cancel.cancelled() => {
+                let _ = out.send(Err(Error::Cancelled)).await;
+                return;
+            }
+            () = stop.cancelled() => {
+                let _ = out.send(Err(Error::Cancelled)).await;
+                return;
+            }
+            () = out.closed() => return,
+            guard = shared.exec.clone().lock_owned() => guard,
+        };
+        let sink = Sink {
+            out: StdMutex::new(Some(out.clone())),
+            halt: CancellationToken::new(),
+        };
+        let work = async {
+            if shared.rollback_pending.swap(false, Ordering::AcqRel) {
+                if let Err(e) = sink.check() {
+                    // Not sent: the next statement rolls back instead.
+                    shared.rollback_pending.store(true, Ordering::Release);
+                    return Err(e);
+                }
+                if let Err(e) = client.batch_execute("ROLLBACK").await {
+                    tracing::debug!(error = %from_pg(&e), "rollback of a dropped transaction failed");
+                }
+            }
+            let result = run_statement(&client, &sql, &params, mode, &mut notices, &sink).await;
+            drain_notices(&mut notices, &sink).await;
+            result
+        };
+        tokio::pin!(work);
+        let interrupted = tokio::select! {
+            biased;
+            result = &mut work => {
+                if let Err(e) = result {
+                    sink.send(Err(e)).await;
+                }
+                None
+            }
+            () = cancel.cancelled() => Some(true),
+            () = stop.cancelled() => Some(true),
+            () = out.closed() => Some(false),
+        };
+        if let Some(report) = interrupted {
+            sink.halt.cancel();
+            // Drop every sender (the job's, the sink's, and on its next poll the one inside an
+            // in-flight `Sink::send`) so the stream ends right after `Err(Cancelled)`.
+            drop(lock(&sink.out).take());
+            if report {
+                tokio::spawn(async move {
+                    let _ = out.send(Err(Error::Cancelled)).await;
+                });
+            } else {
+                drop(out);
+            }
+            if tokio::time::timeout(DRAIN_LIMIT, cancel_until_done(&shared, work))
+                .await
+                .is_err()
+            {
+                tracing::warn!(
+                    "a cancelled PostgreSQL statement did not end within {DRAIN_LIMIT:?}"
+                );
+            }
+        }
+        // `work` and then `notices` (the statement lock) are dropped here.
+    }
+}
+
+/// Sends cancel requests (with backoff) while driving the interrupted statement `work` to its
+/// end. A request already on its way when `work` ends is completed before returning, so it
+/// cannot reach a later statement while this one's lock is released.
+async fn cancel_until_done<F: Future>(shared: &Shared, mut work: Pin<&mut F>) {
+    let mut delay = CANCEL_RESEND_FIRST;
+    loop {
+        let started = AtomicBool::new(false);
+        let send = async {
+            started.store(true, Ordering::Relaxed);
+            shared.send_cancel_request().await;
+        };
+        tokio::pin!(send);
+        let finished = tokio::select! {
+            biased;
+            _ = work.as_mut() => true,
+            () = send.as_mut() => false,
+        };
+        if finished {
+            if started.load(Ordering::Relaxed) {
+                send.await;
+            }
+            return;
+        }
+        tokio::select! {
+            biased;
+            _ = work.as_mut() => return,
+            () = tokio::time::sleep(delay) => {}
+        }
+        delay = (delay * 2).min(CANCEL_RESEND_MAX);
+    }
+}
+
+async fn drain_notices(notices: &mut NoticeRx, sink: &Sink) {
+    while let Some(n) = notices.try_recv() {
+        sink.item(ResultItem::Notice(n)).await;
+    }
+}
+
+async fn flush(builder: &mut BatchBuilder, sink: &Sink) -> Result<()> {
+    if let Some(batch) = builder.finish()? {
+        sink.item(ResultItem::Batch(batch)).await;
+    }
+    for n in builder.take_warnings() {
+        sink.item(ResultItem::Notice(n)).await;
+    }
+    Ok(())
+}
+
+async fn run_statement(
+    client: &Client,
+    sql: &str,
+    params: &[Value],
+    mode: Mode,
+    notices: &mut NoticeRx,
+    sink: &Sink,
+) -> Result<()> {
+    drain_notices(notices, sink).await;
+    if !params.is_empty() {
+        return run_extended(client, sql, params, notices, sink).await;
+    }
+    let typed = match mode {
+        Mode::Script => None,
+        Mode::Auto => match count_statements(sql) {
+            0 => return Ok(()),
+            1 => match sink.check().map(|()| client.prepare(sql))?.await {
+                Ok(stmt) => Some(
+                    stmt.columns()
+                        .iter()
+                        .map(|c| ColSpec::typed(c.name(), c.type_(), c.type_modifier()))
+                        .collect::<Vec<_>>(),
+                ),
+                // A syntax error, which includes "cannot insert multiple commands into a
+                // prepared statement" (the lexer saw one statement where the server sees
+                // several): run it as a script. The SQLSTATE is checked, not the message, so
+                // this works with any `lc_messages`. A real syntax error is reported again by
+                // the simple protocol, which parses the whole string before running any of it.
+                Err(e) if e.code() == Some(&SqlState::SYNTAX_ERROR) => None,
+                Err(e) => return Err(from_pg(&e)),
+            },
+            _ => None,
+        },
+    };
+    run_simple(client, sql, typed, notices, sink).await
+}
+
+async fn run_simple(
+    client: &Client,
+    sql: &str,
+    mut typed: Option<Vec<ColSpec>>,
+    notices: &mut NoticeRx,
+    sink: &Sink,
+) -> Result<()> {
+    sink.check()?;
+    let stream = client
+        .simple_query_raw(sql)
+        .await
+        .map_err(|e| from_pg(&e))?;
+    tokio::pin!(stream);
+    let mut current: Option<BatchBuilder> = None;
+    loop {
+        let msg = tokio::select! {
+            biased;
+            Some(n) = notices.recv() => {
+                sink.item(ResultItem::Notice(n)).await;
+                continue;
+            }
+            msg = stream.next() => msg,
+        };
+        match msg {
+            None => break,
+            Some(Err(e)) => {
+                if let Some(b) = current.as_mut() {
+                    flush(b, sink).await?;
+                }
+                return Err(from_pg(&e));
+            }
+            Some(Ok(SimpleQueryMessage::RowDescription(cols))) => {
+                let specs = match typed.take() {
+                    Some(specs) if specs.len() == cols.len() => specs,
+                    _ => cols.iter().map(|c| ColSpec::untyped(c.name())).collect(),
+                };
+                let builder = BatchBuilder::new(specs)?;
+                sink.item(ResultItem::Schema(builder.schema())).await;
+                current = Some(builder);
+            }
+            Some(Ok(SimpleQueryMessage::Row(row))) => {
+                let b = current
+                    .as_mut()
+                    .ok_or_else(|| Error::internal("PostgreSQL sent a row before its columns"))?;
+                for i in 0..b.num_columns() {
+                    let value = row.try_get(i).map_err(|e| from_pg(&e))?;
+                    b.append_text(i, value);
+                }
+                b.end_row();
+                if b.is_full() {
+                    flush(b, sink).await?;
+                }
+            }
+            Some(Ok(SimpleQueryMessage::CommandComplete(n))) => match current.take() {
+                Some(mut b) => flush(&mut b, sink).await?,
+                None => sink.item(ResultItem::RowsAffected(n)).await,
+            },
+            Some(Ok(_)) => {}
+        }
+    }
+    Ok(())
+}
+
+/// Any column value as raw bytes (binary format).
+struct RawValue<'a>(&'a [u8]);
+
+impl<'a> FromSql<'a> for RawValue<'a> {
+    fn from_sql(
+        _ty: &Type,
+        raw: &'a [u8],
+    ) -> std::result::Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        Ok(Self(raw))
+    }
+
+    fn accepts(_ty: &Type) -> bool {
+        true
+    }
+}
+
+async fn run_extended(
+    client: &Client,
+    sql: &str,
+    params: &[Value],
+    notices: &mut NoticeRx,
+    sink: &Sink,
+) -> Result<()> {
+    sink.check()?;
+    let stmt = client.prepare(sql).await.map_err(|e| from_pg(&e))?;
+    if stmt.params().len() != params.len() {
+        return Err(Error::invalid_input(format!(
+            "the statement has {} parameter(s) but {} value(s) were given",
+            stmt.params().len(),
+            params.len()
+        )));
+    }
+    let bound: Vec<PgParam<'_>> = params.iter().map(PgParam).collect();
+    sink.check()?;
+    let rows = client
+        .query_raw(&stmt, bound.iter().map(|p| p as &(dyn ToSql + Sync)))
+        .await
+        .map_err(|e| from_pg(&e))?;
+    tokio::pin!(rows);
+    let specs: Vec<ColSpec> = stmt
+        .columns()
+        .iter()
+        .map(|c| ColSpec::typed(c.name(), c.type_(), c.type_modifier()))
+        .collect();
+    let mut builder = if specs.is_empty() {
+        None
+    } else {
+        let b = BatchBuilder::new(specs)?;
+        sink.item(ResultItem::Schema(b.schema())).await;
+        Some(b)
+    };
+    loop {
+        let next = tokio::select! {
+            biased;
+            Some(n) = notices.recv() => {
+                sink.item(ResultItem::Notice(n)).await;
+                continue;
+            }
+            next = rows.next() => next,
+        };
+        match next {
+            None => break,
+            Some(Err(e)) => {
+                if let Some(b) = builder.as_mut() {
+                    flush(b, sink).await?;
+                }
+                return Err(from_pg(&e));
+            }
+            Some(Ok(row)) => {
+                if let Some(b) = builder.as_mut() {
+                    for i in 0..b.num_columns() {
+                        let raw: Option<RawValue<'_>> = row.try_get(i).map_err(|e| from_pg(&e))?;
+                        b.append_binary(i, raw.map(|r| r.0));
+                    }
+                    b.end_row();
+                    if b.is_full() {
+                        flush(b, sink).await?;
+                    }
+                }
+            }
+        }
+    }
+    match builder.as_mut() {
+        Some(b) => flush(b, sink).await?,
+        None => {
+            sink.item(ResultItem::RowsAffected(rows.rows_affected().unwrap_or(0)))
+                .await;
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------
+// Connecting
+
+/// An open PostgreSQL session.
+pub struct PgConnection {
+    shared: Arc<Shared>,
+    version: ServerVersion,
+    tls_in_use: bool,
+    server: Endpoint,
+}
+
+impl std::fmt::Debug for PgConnection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PgConnection")
+            .field("server", &self.server)
+            .field("version", &self.version.raw())
+            .field("tls_in_use", &self.tls_in_use)
+            .finish_non_exhaustive()
+    }
+}
+
+fn option_value<'a>(params: &'a ConnectParams, key: &str) -> Option<&'a str> {
+    params.options.get(key).map(String::as_str)
+}
+
+fn apply_options(cfg: &mut Config, params: &ConnectParams) -> Result<()> {
+    // Output formats the text decoder expects (users may still change them in the session).
+    let mut startup = String::from("-c DateStyle=ISO -c bytea_output=hex");
+    if let Some(extra) = option_value(params, "options").filter(|o| !o.trim().is_empty()) {
+        startup.push(' ');
+        startup.push_str(extra);
+    }
+    cfg.options(startup);
+    for (key, value) in &params.options {
+        match key.as_str() {
+            "options" | "sslnegotiation" => {}
+            "channel_binding" => {
+                cfg.channel_binding(match value.trim() {
+                    "disable" => ChannelBinding::Disable,
+                    "prefer" => ChannelBinding::Prefer,
+                    "require" => ChannelBinding::Require,
+                    other => {
+                        return Err(Error::invalid_input(format!(
+                            "unknown channel_binding '{other}' (expected disable, prefer or require)"
+                        )));
+                    }
+                });
+            }
+            "target_session_attrs" => {
+                cfg.target_session_attrs(match value.trim() {
+                    "any" => TargetSessionAttrs::Any,
+                    "read-write" => TargetSessionAttrs::ReadWrite,
+                    "read-only" => TargetSessionAttrs::ReadOnly,
+                    other => {
+                        return Err(Error::invalid_input(format!(
+                            "unknown target_session_attrs '{other}' (expected any, read-write or \
+                             read-only)"
+                        )));
+                    }
+                });
+            }
+            other => tracing::debug!(option = other, "ignoring unknown PostgreSQL option"),
+        }
+    }
+    Ok(())
+}
+
+fn connect_error(err: &tokio_postgres::Error, server: &Endpoint, dial: &Endpoint) -> Error {
+    let via = if dial == server {
+        String::new()
+    } else {
+        format!(" via {dial}")
+    };
+    match from_pg(err) {
+        Error::Connection { message } => {
+            Error::connection(format!("PostgreSQL at {server}{via}: {message}"))
+        }
+        Error::Timeout { message } => {
+            Error::timeout(format!("PostgreSQL at {server}{via}: {message}"))
+        }
+        other => other,
+    }
+}
+
+impl PgConnection {
+    /// Opens a session (see the crate docs for addressing, TLS and options).
+    pub async fn connect(params: &ConnectParams) -> Result<Self> {
+        params.validate()?;
+        if params.engine != Engine::Postgres {
+            return Err(Error::invalid_input(format!(
+                "the PostgreSQL driver cannot open {} connections",
+                params.engine.display_name()
+            )));
+        }
+        oxbase_net::tls::install_default_crypto_provider();
+        let server = params
+            .server_endpoint()
+            .ok_or_else(|| Error::invalid_input("PostgreSQL needs a host"))?;
+        let dial = params
+            .dial_endpoint()
+            .ok_or_else(|| Error::invalid_input("PostgreSQL needs a host"))?;
+        let user = params
+            .user
+            .as_deref()
+            .map(str::trim)
+            .filter(|u| !u.is_empty())
+            .ok_or_else(|| Error::invalid_input("PostgreSQL needs a user name"))?;
+
+        let server_host = server.host.trim_start_matches('[').trim_end_matches(']');
+        let unix_socket = server_host.starts_with('/') && params.dial_addr.is_none();
+        let mut cfg = Config::new();
+        match dial.ip() {
+            // tokio-postgres dials `hostaddr`; `host` only names the server.
+            Some(ip) => {
+                if server_host.starts_with('/') {
+                    cfg.host(ip.to_string());
+                } else {
+                    cfg.host(server_host);
+                }
+                cfg.hostaddr(ip);
+            }
+            None => {
+                cfg.host(&dial.host);
+            }
+        }
+        cfg.port(dial.port);
+        cfg.user(user);
+        if let Some(password) = &params.password {
+            cfg.password(password.expose());
+        }
+        if let Some(db) = params.database.as_deref().filter(|d| !d.trim().is_empty()) {
+            cfg.dbname(db);
+        }
+        cfg.application_name(params.application_name.as_deref().unwrap_or("oxbase"));
+        if let Some(t) = params.connect_timeout {
+            cfg.connect_timeout(t);
+        }
+
+        // PostgreSQL has no TLS over Unix sockets: Prefer means plaintext there.
+        let mut effective = params.clone();
+        if unix_socket && effective.tls.mode == TlsMode::Prefer {
+            effective.tls.mode = TlsMode::Disable;
+        }
+        let mode = effective.tls.mode;
+        let negotiation = ssl_negotiation(option_value(params, "sslnegotiation"), mode)?;
+        cfg.ssl_mode(ssl_mode(mode));
+        cfg.ssl_negotiation(negotiation);
+        apply_options(&mut cfg, params)?;
+
+        let tls = PgTls::new(&effective, negotiation == SslNegotiation::Direct)?;
+        let (session_tls, tls_used) = tls.tracked();
+        let limit = params.connect_timeout.unwrap_or(DEFAULT_CONNECT_TIMEOUT);
+        let (client, mut connection) =
+            match tokio::time::timeout(limit, cfg.connect(session_tls)).await {
+                Err(_) => {
+                    return Err(Error::timeout(format!(
+                        "connecting to PostgreSQL at {server} took longer than {limit:?}"
+                    )));
+                }
+                Ok(Err(e)) => return Err(connect_error(&e, &server, &dial)),
+                Ok(Ok(pair)) => pair,
+            };
+
+        let version = connection
+            .parameter("server_version")
+            .and_then(|v| ServerVersion::parse(v).ok())
+            .unwrap_or_else(|| {
+                tracing::warn!("PostgreSQL did not report a parsable server_version");
+                ServerVersion::new(0, 0, 0)
+            });
+
+        let (notice_tx, notice_rx) = notice_channel();
+        let conn_task = tokio::spawn(async move {
+            loop {
+                match poll_fn(|cx| connection.poll_message(cx)).await {
+                    Some(Ok(AsyncMessage::Notice(db))) => notice_tx.push(notice_from_db(&db)),
+                    // LISTEN/NOTIFY is not surfaced at M1.
+                    Some(Ok(_)) => {}
+                    Some(Err(e)) => {
+                        tracing::debug!(error = %from_pg(&e), "PostgreSQL session ended");
+                        break;
+                    }
+                    None => break,
+                }
+            }
+        });
+
+        let shared = Arc::new(Shared {
+            cancel_token: client.cancel_token(),
+            client: StdMutex::new(Some(Arc::new(client))),
+            cancel_tls: tls,
+            exec: Arc::new(tokio::sync::Mutex::new(notice_rx)),
+            stop_all: StdMutex::new(CancellationToken::new()),
+            rollback_pending: AtomicBool::new(false),
+            tx_open: AtomicBool::new(false),
+            conn_task: StdMutex::new(Some(conn_task)),
+        });
+        Ok(Self {
+            shared,
+            version,
+            tls_in_use: tls_used.load(Ordering::Acquire),
+            server,
+        })
+    }
+}
+
+#[async_trait]
+impl Connection for PgConnection {
+    fn engine(&self) -> Engine {
+        Engine::Postgres
+    }
+
+    fn server_version(&self) -> &ServerVersion {
+        &self.version
+    }
+
+    fn tls_in_use(&self) -> bool {
+        self.tls_in_use
+    }
+
+    async fn execute(
+        &self,
+        sql: &str,
+        params: &[Value],
+        cancel: CancellationToken,
+    ) -> Result<ResultStream> {
+        self.shared.execute(sql, params, cancel, Mode::Auto)
+    }
+
+    /// Interrupts the running statement and any submitted after it that are still queued (see
+    /// the module docs). A statement submitted after this call is not affected.
+    async fn cancel_running(&self) -> Result<()> {
+        self.shared.stop_all();
+        Ok(())
+    }
+
+    async fn begin(&self) -> Result<Box<dyn Tx>> {
+        if self.shared.tx_open.swap(true, Ordering::AcqRel) {
+            return Err(Error::invalid_input(
+                "a transaction is already open on this connection; commit or roll it back first",
+            ));
+        }
+        match self.shared.run_to_end("BEGIN").await {
+            Ok(()) => Ok(Box::new(PgTx {
+                shared: self.shared.clone(),
+                done: AtomicBool::new(false),
+            })),
+            Err(e) => {
+                self.shared.tx_open.store(false, Ordering::Release);
+                Err(e)
+            }
+        }
+    }
+
+    async fn close(&self) -> Result<()> {
+        let client = lock(&self.shared.client).take();
+        if client.is_none() {
+            return Ok(());
+        }
+        self.shared.stop_all();
+        // Dropping the last client handle makes the session send Terminate and end.
+        drop(client);
+        let handle = lock(&self.shared.conn_task).take();
+        if let Some(mut handle) = handle
+            && tokio::time::timeout(CLOSE_WAIT, &mut handle).await.is_err()
+        {
+            handle.abort();
+        }
+        Ok(())
+    }
+}
+
+/// An open transaction. Statements run on the same session as the connection's.
+struct PgTx {
+    shared: Arc<Shared>,
+    done: AtomicBool,
+}
+
+impl PgTx {
+    async fn finish(&self, sql: &str) -> Result<()> {
+        self.done.store(true, Ordering::Release);
+        let result = self.shared.run_to_end(sql).await;
+        self.shared.tx_open.store(false, Ordering::Release);
+        result
+    }
+}
+
+#[async_trait]
+impl Tx for PgTx {
+    async fn execute(
+        &self,
+        sql: &str,
+        params: &[Value],
+        cancel: CancellationToken,
+    ) -> Result<ResultStream> {
+        self.shared.execute(sql, params, cancel, Mode::Auto)
+    }
+
+    async fn commit(self: Box<Self>) -> Result<()> {
+        self.finish("COMMIT").await
+    }
+
+    async fn rollback(self: Box<Self>) -> Result<()> {
+        self.finish("ROLLBACK").await
+    }
+}
+
+impl Drop for PgTx {
+    fn drop(&mut self) {
+        if !self.done.load(Ordering::Acquire) {
+            // Rolled back before the next statement on this connection.
+            self.shared.rollback_pending.store(true, Ordering::Release);
+            self.shared.tx_open.store(false, Ordering::Release);
+        }
+    }
+}

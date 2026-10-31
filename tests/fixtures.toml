@@ -36,6 +36,14 @@ database = "oxbase_test"
 version_query = "SELECT version()"
 version_prefix = "PostgreSQL 18.6"
 
+
+# M1: a user that may only connect over TLS. pg_hba.conf: `hostssl all oxbase_tls all
+# scram-sha-256` before `hostnossl all oxbase_tls all reject`. The server runs with ssl=on and
+# the [tls] server certificate/key (key file mode 0600, owned by the postgres user).
+[engines.postgres.tls_user]
+user = "oxbase_tls"
+password = "Oxbase_Fixture_Pw_2026"
+database = "oxbase_test"
 [engines.mysql]
 kind = "mysql"
 image = "mysql:8.4.13"            # 8.4 LTS
@@ -49,6 +57,13 @@ database = "oxbase_test"
 version_query = "SELECT VERSION()"
 version_prefix = "8.4.13"
 
+
+# M1: `CREATE USER 'oxbase_tls'@'%' ... REQUIRE SSL`, with the same grants as `oxbase` on
+# oxbase_test. The server uses the [tls] CA/server certificate (--ssl-ca/--ssl-cert/--ssl-key).
+[engines.mysql.tls_user]
+user = "oxbase_tls"
+password = "Oxbase_Fixture_Pw_2026"
+database = "oxbase_test"
 [engines.mariadb]
 kind = "mariadb"
 image = "mariadb:11.8.9"          # 11.8 LTS
@@ -62,6 +77,13 @@ database = "oxbase_test"
 version_query = "SELECT VERSION()"
 version_prefix = "11.8.9-MariaDB"
 
+
+# M1: `CREATE USER 'oxbase_tls'@'%' ... REQUIRE SSL`, same grants as `oxbase` on oxbase_test.
+# MariaDB 11.8 also needs --ssl-ca/--ssl-cert/--ssl-key pointing at the [tls] files.
+[engines.mariadb.tls_user]
+user = "oxbase_tls"
+password = "Oxbase_Fixture_Pw_2026"
+database = "oxbase_test"
 [engines.mssql]
 kind = "mssql"
 image = "mcr.microsoft.com/mssql/server:2025-CU10-ubuntu-24.04"
@@ -79,7 +101,10 @@ version_prefix = "Microsoft SQL Server 2025"
 
 [engines.mongodb]
 kind = "mongodb"
-image = "mongo:8.0.34"
+# MongoDB 8.x refuses to start on Linux kernel 6.19+ (SERVER-121912), which GitHub's
+# ubuntu-24.04 runners now use. 7.0 uses the older allocator and is unaffected. Move to 8.x
+# once an image starts on the CI kernel.
+image = "mongo:7.0.45"
 host = "127.0.0.1"
 port = 15417
 container_port = 27017
@@ -89,7 +114,7 @@ database = "oxbase_test"
 auth_source = "admin"
 # Admin command document (JSON); read `version` from the reply.
 version_query = '{"buildInfo": 1}'
-version_prefix = "8.0.34"
+version_prefix = "7.0.45"
 
 [engines.redis]
 kind = "redis"
@@ -110,3 +135,56 @@ kind = "sqlite"
 # No container: a file created by the harness under the target dir (gitignored).
 path = "target/fixtures/oxbase_test.sqlite"
 version_query = "SELECT sqlite_version()"
+
+# --- M1: TLS -------------------------------------------------------------------------------
+# Test PKI, generated before the containers start (by the fixtures scripts, into the gitignored
+# target dir) and mounted read-only into postgres, mysql and mariadb. One private CA signs one
+# server certificate valid for every name a test may verify: direct (localhost / 127.0.0.1)
+# and through the SSH bastion (the compose service names). Paths are relative to `dir`, which
+# is relative to the workspace root.
+[tls]
+dir = "target/fixtures/tls"
+ca_cert = "ca.pem"
+ca_key = "ca-key.pem"
+server_cert = "server.pem"
+server_key = "server-key.pem"
+server_sans = ["localhost", "127.0.0.1", "postgres", "mysql", "mariadb"]
+# Client certificate for mutual-TLS tests, signed by the same CA (CN = the TLS user).
+client_cert = "client.pem"
+client_key = "client-key.pem"
+client_cn = "oxbase_tls"
+valid_days = 825
+
+# --- M1: SSH bastion -----------------------------------------------------------------------
+# One OpenSSH server inside the compose network; tests tunnel through it to the engines by
+# their compose service names (`targets`). Port 15422 verified free with `ss -ltn` on
+# 2026-10-31. Image tag verified with `docker manifest inspect` on 2026-10-31 (amd64 + arm64).
+# The image ships `AllowTcpForwarding no`: the fixture must set it to `yes` (custom-cont-init
+# script) or every tunnel fails with "administratively prohibited".
+[ssh]
+service = "ssh"
+image = "lscr.io/linuxserver/openssh-server:10.3_p1-r1-ls240"
+host = "127.0.0.1"
+port = 15422
+container_port = 2222
+user = "oxbase"
+password = "Oxbase_Fixture_Pw_2026"
+# Generated before `up` into the gitignored target dir:
+#  - client key pairs: `client_key` (no passphrase) and `client_key_encrypted` (passphrase
+#    `client_key_passphrase`), both public keys installed as the user's authorized_keys;
+#  - a fixed ed25519 host key mounted into the container, so tests can pin it;
+#  - `known_hosts` with the line for "[127.0.0.1]:15422" (Strict policy tests) and
+#    `host_key_fingerprint` with its SHA256:<base64> fingerprint (Fingerprint policy tests).
+key_dir = "target/fixtures/ssh"
+client_key = "id_ed25519"
+client_key_encrypted = "id_ed25519_enc"
+client_key_passphrase = "Oxbase_Fixture_Pw_2026"
+host_key = "ssh_host_ed25519_key"
+known_hosts = "known_hosts"
+host_key_fingerprint = "host_key.fingerprint"
+
+# How the bastion reaches each engine inside the compose network (SSH tunnel targets).
+[ssh.targets]
+postgres = { host = "postgres", port = 5432 }
+mysql = { host = "mysql", port = 3306 }
+mariadb = { host = "mariadb", port = 3306 }

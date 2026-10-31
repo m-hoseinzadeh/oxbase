@@ -6,12 +6,14 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::adapter::{Engine, ObjectKind};
+use crate::connect::{ConnCell, ConnCheck};
 use crate::fixtures::in_workspace;
 use crate::matrix::{Cell, CellStatus, Check};
 use crate::probe::{ProbeOutcome, Target};
 
 /// Bumped when the JSON layout changes incompatibly.
-pub const REPORT_SCHEMA_VERSION: u32 = 1;
+/// Version 2 (M1) adds `connection_checks`, `connections` and `connection_summary`.
+pub const REPORT_SCHEMA_VERSION: u32 = 2;
 
 /// `<CARGO_TARGET_DIR or <workspace>/target>/conformance/report.json`.
 pub fn default_report_path() -> PathBuf {
@@ -52,6 +54,12 @@ pub struct CheckInfo {
     pub description: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConnCheckInfo {
+    pub id: ConnCheck,
+    pub description: String,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Summary {
     pub total: usize,
@@ -64,12 +72,14 @@ pub struct Summary {
 
 impl Summary {
     pub fn from_cells(cells: &[Cell]) -> Self {
-        let mut s = Self {
-            total: cells.len(),
-            ..Self::default()
-        };
-        for c in cells {
-            *match c.status {
+        Self::from_statuses(cells.iter().map(|c| c.status))
+    }
+
+    pub fn from_statuses(statuses: impl IntoIterator<Item = CellStatus>) -> Self {
+        let mut s = Self::default();
+        for status in statuses {
+            s.total += 1;
+            *match status {
                 CellStatus::Pass => &mut s.pass,
                 CellStatus::Fail => &mut s.fail,
                 CellStatus::Pending => &mut s.pending,
@@ -96,6 +106,14 @@ pub struct Report {
     pub checks: Vec<CheckInfo>,
     pub cells: Vec<Cell>,
     pub summary: Summary,
+    /// M1: the connection checks (columns of the second table).
+    #[serde(default)]
+    pub connection_checks: Vec<ConnCheckInfo>,
+    /// M1: one entry per (engine, connection check).
+    #[serde(default)]
+    pub connections: Vec<ConnCell>,
+    #[serde(default)]
+    pub connection_summary: Summary,
 }
 
 impl Report {
@@ -118,6 +136,26 @@ impl Report {
         }
         if self.summary.fail > 0 {
             problems.push(format!("{} matrix cell(s) failed", self.summary.fail));
+        }
+        let failed: Vec<_> = self
+            .connections
+            .iter()
+            .filter(|c| c.status == CellStatus::Fail)
+            .map(|c| {
+                format!(
+                    "  - {} {}: {}",
+                    c.engine,
+                    c.check,
+                    c.detail.as_deref().unwrap_or("failed")
+                )
+            })
+            .collect();
+        if !failed.is_empty() {
+            problems.push(format!(
+                "{} connection check(s) failed:\n{}",
+                failed.len(),
+                failed.join("\n")
+            ));
         }
         if !self.allow_missing {
             let down: Vec<_> = self
@@ -270,10 +308,60 @@ impl Report {
         if s.pending > 0 && s.pass == 0 && s.fail == 0 {
             let _ = writeln!(
                 out,
-                "All applicable cells are pending: no engine has a driver yet."
+                "All applicable cells are pending: object-kind cells start in M2 (M4 for mssql, \
+                 M7 for mongodb and redis)."
             );
         }
+        if !self.connections.is_empty() {
+            out.push('\n');
+            self.render_connections(&mut out);
+        }
         out
+    }
+
+    /// The second table: engine x connection check (M1).
+    fn render_connections(&self, out: &mut String) {
+        let _ = writeln!(out, "Connection checks (M1):");
+        let mut header = vec!["ENGINE"];
+        header.extend(self.connection_checks.iter().map(|c| c.id.as_str()));
+        let mut rows = Vec::new();
+        for e in &self.engines {
+            let mut row = vec![e.name.clone()];
+            for check in &self.connection_checks {
+                row.push(
+                    self.connections
+                        .iter()
+                        .find(|c| c.engine == e.name && c.check == check.id)
+                        .map_or_else(|| "?".to_owned(), ConnCell::label),
+                );
+            }
+            rows.push(row);
+        }
+        write_table(out, &header, &rows);
+        let details: Vec<_> = self
+            .connections
+            .iter()
+            .filter(|c| matches!(c.status, CellStatus::Pass | CellStatus::Fail))
+            .collect();
+        if !details.is_empty() {
+            let _ = writeln!(out, "Details:");
+            for c in details {
+                let _ = writeln!(
+                    out,
+                    "  {} {} {}: {}",
+                    c.engine,
+                    c.check,
+                    c.status.label(),
+                    c.detail.as_deref().unwrap_or("")
+                );
+            }
+        }
+        let s = &self.connection_summary;
+        let _ = writeln!(
+            out,
+            "Connection summary: {} checks: {} pass, {} fail, {} pending, {} skipped, {} n/a",
+            s.total, s.pass, s.fail, s.pending, s.skipped, s.not_applicable
+        );
     }
 }
 
@@ -374,6 +462,9 @@ mod tests {
                 .collect(),
             cells,
             summary,
+            connection_checks: Vec::new(),
+            connections: Vec::new(),
+            connection_summary: Summary::default(),
         }
     }
 
@@ -415,7 +506,67 @@ mod tests {
             "Summary: {} cells: 0 pass, 0 fail, {} pending, 0 skipped, {} n/a",
             s.total, s.pending, s.not_applicable
         )));
-        assert!(text.contains("no engine has a driver yet"));
+        assert!(text.contains("object-kind cells start in M2"));
+    }
+
+    #[test]
+    fn renders_connection_table_and_gates_on_failures() {
+        use crate::connect::ConnCheck;
+        let mut report = sample(true, false);
+        report.connection_checks = ConnCheck::ALL
+            .iter()
+            .map(|&c| ConnCheckInfo {
+                id: c,
+                description: c.description().to_owned(),
+            })
+            .collect();
+        let cell = |engine: &str, kind, check, status, detail: Option<&str>| ConnCell {
+            engine: engine.to_owned(),
+            engine_kind: kind,
+            check,
+            status,
+            detail: detail.map(str::to_owned),
+            elapsed_ms: None,
+        };
+        for check in ConnCheck::ALL {
+            report.connections.push(cell(
+                "postgres",
+                Engine::Postgres,
+                check,
+                CellStatus::Pass,
+                Some("ok"),
+            ));
+            report.connections.push(cell(
+                "redis",
+                Engine::Redis,
+                check,
+                CellStatus::Pending,
+                None,
+            ));
+        }
+        report.connection_summary =
+            Summary::from_statuses(report.connections.iter().map(|c| c.status));
+        let text = report.render();
+        assert_eq!(
+            line_starting(&text, "ENGINE    connect"),
+            "ENGINE    connect       tls           ssh           tls_over_ssh  cancel        \
+             stream_200k"
+        );
+        assert!(
+            text.lines()
+                .any(|l| l.starts_with("redis ") && l.contains("pending (M7)")),
+            "{text}"
+        );
+        assert!(text.contains("  postgres cancel pass: ok"), "{text}");
+        assert!(report.gate().is_ok());
+
+        report.connections[0].status = CellStatus::Fail;
+        report.connections[0].detail = Some("boom".to_owned());
+        let err = report.gate().unwrap_err();
+        assert!(err.contains("postgres connect: boom"), "{err}");
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["connections"][0]["check"], "connect");
+        assert_eq!(json["connection_checks"][5]["id"], "stream_200k");
     }
 
     #[test]
@@ -469,7 +620,7 @@ mod tests {
         assert_eq!(cell["object_kind"], "database");
         assert_eq!(cell["check"], "roundtrip");
         assert_eq!(cell["status"], "pending");
-        assert_eq!(cell["detail"], "no driver yet");
+        assert_eq!(cell["detail"], "pending (M2: no dialect cells yet)");
         let back: Report = serde_json::from_value(json).unwrap();
         assert_eq!(back.summary, report.summary);
         assert_eq!(back.cells, report.cells);

@@ -5,31 +5,38 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::adapter::{self, Engine};
+use crate::connect::{self, ConnCell, ConnCheck};
 use crate::fixtures::{Fixtures, FixturesError, ResolvedEngine};
 use crate::matrix::{CellStatus, Check, plan_engine_in};
 use crate::probe::{self, ProbeOptions};
-use crate::report::{CheckInfo, EngineStatus, REPORT_SCHEMA_VERSION, Report, Summary};
+use crate::report::{
+    CheckInfo, ConnCheckInfo, EngineStatus, REPORT_SCHEMA_VERSION, Report, Summary,
+};
 
 /// The milestone this harness build implements.
-pub const MILESTONE: &str = "M0";
+pub const MILESTONE: &str = "M1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RunOptions {
     pub probe: ProbeOptions,
     /// Report unreachable fixtures as skipped instead of failing.
     pub allow_missing: bool,
+    /// Skip the M1 connection checks (they are reported as skipped).
+    pub skip_connect: bool,
 }
 
 impl RunOptions {
-    /// Reads `OXBASE_CONFORMANCE_ALLOW_MISSING`, `OXBASE_CONFORMANCE_PROBE_TIMEOUT_MS` and
-    /// `OXBASE_CONFORMANCE_TCP_ONLY`.
+    /// Reads `OXBASE_CONFORMANCE_ALLOW_MISSING`, `OXBASE_CONFORMANCE_PROBE_TIMEOUT_MS`,
+    /// `OXBASE_CONFORMANCE_TCP_ONLY` and `OXBASE_CONFORMANCE_SKIP_CONNECT`.
     pub fn from_env() -> Self {
         let var = |name: &str| std::env::var(name).ok();
-        Self::from_vars(
+        let mut opts = Self::from_vars(
             var("OXBASE_CONFORMANCE_ALLOW_MISSING").as_deref(),
             var("OXBASE_CONFORMANCE_PROBE_TIMEOUT_MS").as_deref(),
             var("OXBASE_CONFORMANCE_TCP_ONLY").as_deref(),
-        )
+        );
+        opts.skip_connect = is_truthy(var("OXBASE_CONFORMANCE_SKIP_CONNECT").as_deref());
+        opts
     }
 
     /// [`RunOptions::from_env`] with the values passed in.
@@ -48,6 +55,7 @@ impl RunOptions {
                 handshake: !is_truthy(tcp_only),
             },
             allow_missing: is_truthy(allow_missing),
+            skip_connect: false,
         }
     }
 }
@@ -89,6 +97,13 @@ pub fn run(
             .map(|h| h.join().expect("probe thread panicked"))
             .collect()
     });
+
+    let reachable: Vec<bool> = probes.iter().map(|p| p.reachable).collect();
+    let connections = if opts.skip_connect {
+        skipped_connections(engines)
+    } else {
+        connect::run_all(fixtures, engines, &reachable)
+    };
 
     let registry = adapter::registry();
     let mut statuses = Vec::with_capacity(engines.len());
@@ -137,7 +152,35 @@ pub fn run(
             .collect(),
         summary: Summary::from_cells(&cells),
         cells,
+        connection_checks: ConnCheck::ALL
+            .iter()
+            .map(|&c| ConnCheckInfo {
+                id: c,
+                description: c.description().to_owned(),
+            })
+            .collect(),
+        connection_summary: Summary::from_statuses(connections.iter().map(|c| c.status)),
+        connections,
     }
+}
+
+/// Connection cells when the checks are switched off: pending/n-a cells stay as they are, the
+/// rest are skipped.
+fn skipped_connections(engines: &[ResolvedEngine]) -> Vec<ConnCell> {
+    engines
+        .iter()
+        .flat_map(|e| {
+            connect::static_cells(e, false)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|mut c| {
+                    if c.status == CellStatus::Skipped {
+                        c.detail = Some("connection checks disabled".to_owned());
+                    }
+                    c
+                })
+        })
+        .collect()
 }
 
 /// Probes every fixture of one engine kind. `Ok` carries a one-line summary; `Err` names the
@@ -160,7 +203,12 @@ pub fn check_engine(
             fixtures_path.display()
         ));
     }
-    let report = run(fixtures_path, &fixtures, &engines, opts);
+    // Reachability only: the connection checks belong to the full run.
+    let opts = RunOptions {
+        skip_connect: true,
+        ..*opts
+    };
+    let report = run(fixtures_path, &fixtures, &engines, &opts);
     let lines: Vec<_> = report
         .engines
         .iter()
@@ -237,6 +285,8 @@ mod tests {
         let report = run(Path::new("t"), &fixtures, &engines, &opts);
 
         assert!(!report.engines[0].probe.reachable);
+        // Redis has no driver before M7: its connection checks are pending, never run.
+        assert_eq!(report.connection_summary.pending, ConnCheck::ALL.len());
         assert_eq!(report.summary.pending, 0);
         assert_eq!(report.summary.skipped, redis_kinds() * Check::ALL.len());
         assert_eq!(report.missing_engines.len(), Engine::ALL.len() - 1);

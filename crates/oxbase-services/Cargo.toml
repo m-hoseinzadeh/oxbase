@@ -12,5 +12,24 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
+oxbase-types.workspace = true
+oxbase-driver.workspace = true
+oxbase-net.workspace = true
+oxbase-store.workspace = true
+# Engine drivers registered by `default_drivers`.
+oxbase-pg.workspace = true
+oxbase-mysql.workspace = true
+oxbase-sqlite.workspace = true
+chrono.workspace = true
+serde.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
+async-trait.workspace = true
+oxbase-driver = { workspace = true, features = ["mock"] }
+serde_json.workspace = true
+tokio.workspace = true
+# Live end-to-end tests read tests/fixtures.toml.
+toml.workspace = true

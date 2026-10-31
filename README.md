@@ -42,17 +42,22 @@ tests/fixtures.toml                               test DB connection params (sin
 ## Checks
 
 These are the commands CI runs (`.github/workflows/ci.yml`). All of them were run and passed on
-Linux x86_64 (Ubuntu, WebKitGTK 4.1 installed) on 2026-10-31.
+Linux x86_64 (Ubuntu, WebKitGTK 4.1 installed) on 2026-10-31, last for the M1 integration
+(`cargo deny` 0.20.2).
 
 ```sh
 # Rust
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
+RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps --locked
 cargo build -p app-tauri --locked          # proves the Tauri shell links
                                            # (verified via `pnpm --dir ../../ui tauri build --debug --no-bundle`
                                            #  from crates/app-tauri, which runs the UI build first)
 cargo run -p oxbase-cli -- --version          # prints "oxbase 0.0.1"
+cargo deny check                              # licenses, advisories, bans, sources
+cargo tree -i openssl-sys; cargo tree -i aws-lc-sys   # both must find nothing (rustls + ring only)
+scripts/keychain-tests.sh                     # real OS keychain tests (see Conformance harness)
 
 # UI (from ui/)
 pnpm install --frozen-lockfile
@@ -78,10 +83,26 @@ live in `tests/fixtures.toml`, the single source of truth: host ports 15400-1549
 
 ```sh
 scripts/fixtures-up.sh            # start all engines, wait until healthy and seeded
-scripts/fixtures-up.sh redis      # or only some services
+scripts/fixtures-up.sh postgres mysql mariadb ssh   # or only some services (the M1 set)
 scripts/fixtures-status.sh        # state and health of each service
 scripts/fixtures-down.sh          # remove the project's containers, network and volumes
+scripts/fixtures-certs.sh [--force]   # (re)generate the test PKI and SSH keys; fixtures-up runs it
 ```
+
+TLS and SSH (M1):
+
+- **Test PKI** (`[tls]`): `scripts/fixtures-certs.sh` (OpenSSL 1.1.1+/3.x and ssh-keygen) writes a
+  CA, a server certificate for `localhost`, `127.0.0.1`, `postgres`, `mysql` and `mariadb`, and a
+  client certificate (CN `oxbase_tls`) to `target/fixtures/tls`. PostgreSQL, MySQL and MariaDB
+  run with TLS on. Each has a user `oxbase_tls` that the server accepts **only** over TLS
+  (`[engines.<name>.tls_user]`); the normal `oxbase` user works with and without TLS.
+- **SSH bastion** (`[ssh]`): the `ssh` service, an OpenSSH server on `127.0.0.1:15422` with user
+  `oxbase` (password, plain key `id_ed25519` and passphrase key `id_ed25519_enc`, all in
+  `target/fixtures/ssh`). Its host key is fixed, so `known_hosts` (Strict) and
+  `host_key.fingerprint` (pinning) work. Tunnels reach the engines by their compose service
+  names (`[ssh.targets]`: `postgres:5432`, `mysql:3306`, `mariadb:3306`), so `VerifyFull`
+  through a tunnel checks the certificate against the service name, not `127.0.0.1`.
+- `fixtures-up.sh` recreates the services that mount this material when it was regenerated.
 
 The scripts only touch the `oxbase-fixtures` project. `OXBASE_FIXTURES_TIMEOUT` (default 300 s) sets
 how long `fixtures-up.sh` waits. CI uses `scripts/ci-fixtures.sh up|logs|down` on the same
@@ -89,27 +110,76 @@ project.
 
 ## Conformance harness
 
-`crates/oxbase-conformance` runs the engine x object kind x check matrix (PLAN.md §3) against the
-fixtures. Rows and columns are `oxbase_types::ObjectKind` and `oxbase_types::Engine`; a cell is n/a
-when the `oxbase_dialect::DialectRegistry` marks it not applicable. At M0 there are no drivers, so
-it only proves each fixture answers its protocol handshake and reports every applicable cell
-as pending.
+`crates/oxbase-conformance` prints two tables and writes both to
+`target/conformance/report.json` (report schema 2):
+
+1. **Object-kind matrix** (engine x object kind x check, PLAN.md §3). Rows and columns are
+   `oxbase_types::ObjectKind` and `oxbase_types::Engine`; a cell is n/a when the
+   `oxbase_dialect::DialectRegistry` marks it not applicable. Its cells need dialect cells
+   (Fetcher, DdlGenerator, ...), so every applicable cell stays pending until M2 (M4 for mssql,
+   M7 for mongodb and redis). The harness still proves each fixture answers its handshake.
+2. **Connection checks** (M1), through the real drivers, `ConnectionManager` and russh provider:
+   `connect` (plain, server version equals `version_prefix`), `tls` (`VerifyFull` with the
+   fixture CA as `oxbase_tls`, `tls_in_use`; plaintext and a wrong server name refused), `ssh`
+   (bastion, password auth, Strict known_hosts), `tls_over_ssh` (encrypted-key auth plus
+   `VerifyFull` against the service name; a wrong name refused), `cancel` (`pg_sleep(30)` /
+   `SLEEP(30)` / an endless recursive CTE ends with `Cancelled` and the session answers
+   `SELECT 1` within 2 s, via the token and via `cancel_running`) and `stream_200k` (200 000
+   generated rows arrive in more than one batch). SQLite has no TLS/SSH columns; mssql, mongodb
+   and redis show `pending (M4)` / `pending (M7)`.
 
 ```sh
 scripts/fixtures-up.sh
-cargo test -p oxbase-conformance --locked -- --include-ignored --nocapture   # live tests, prints the matrix
-cargo run -p oxbase-conformance                                     # same matrix, writes target/conformance/report.json
+cargo test -p oxbase-conformance --locked -- --include-ignored --nocapture --test-threads 1   # prints both tables
+cargo run -p oxbase-conformance                  # same tables, writes target/conformance/report.json
 scripts/fixtures-down.sh
 ```
 
-Last verified 2026-10-31 on Linux x86_64: all 7 fixtures reachable (PostgreSQL 18.6, MySQL
-8.4.13, MariaDB 11.8.9, SQL Server 2025, MongoDB 8.0.34, Redis 8.10, SQLite file); matrix of
-420 cells = 237 pending, 183 n/a, 0 fail. Fixtures need roughly 1-2 GB of free disk for their
-volumes (MongoDB refuses to start below 500 MB); `cargo clean` frees the shared `target/`.
+The other M1 live tests (driver, tunnel and connection-manager scenarios) also need the
+fixtures:
+
+```sh
+cargo test -p oxbase-net -p oxbase-pg -p oxbase-mysql -p oxbase-sqlite -p oxbase-services \
+    --locked -- --include-ignored --test-threads 1
+```
+
+The OS keychain tests (`keychain_smoke` and `keychain_long_values` in `oxbase-store`,
+`keychain_backed_profile_round_trip` in `oxbase-services`, which saves and opens a profile through
+`ConnectionManager` on top of `KeyringSecretStore`) are `#[ignore]`d and also need
+`OXBASE_KEYCHAIN_TESTS=1`. Run them with:
+
+```sh
+scripts/keychain-tests.sh     # cargo test -p oxbase-store -p oxbase-services -- --ignored keychain
+```
+
+macOS and Windows use the login keychain / Credential Manager. On Linux the script starts a
+private D-Bus session with its own gnome-keyring (throwaway keyring in a temp dir; needs
+`dbus-run-session` and `gnome-keyring-daemon`), so it works without a desktop session and never
+touches your keyrings; `OXBASE_KEYCHAIN_USE_SESSION=1` uses your current session instead. Any
+command can follow the script name, e.g.
+`scripts/keychain-tests.sh cargo test -p oxbase-services -- --include-ignored --test-threads 1`
+runs the services live tests with the keychain test included. CI runs the script on Linux, macOS
+and Windows (`keychain` job).
+
+Last verified 2026-10-31 on Linux x86_64 (M1 integration) with all 7 fixtures up
+(`scripts/fixtures-up.sh`): every fixture reachable (PostgreSQL 18.6, MySQL 8.4.13, MariaDB
+11.8.9, SQL Server 2025, MongoDB 8.0.34 (the fixture is now 7.0.45, see tests/fixtures.toml), Redis 8.10, SQLite file); object-kind matrix of 420
+cells = 237 pending, 183 n/a, 0 fail; connection checks 42 = 21 pass (postgres, mysql, mariadb,
+sqlite 3.54.1), 18 pending (mssql M4, mongodb/redis M7), 3 n/a (SQLite TLS/SSH), 0 fail. The
+other M1 live tests and the keychain tests (Linux, private gnome-keyring) passed in the same run.
+
+Disk: the full stack needs about 4-5 GB on top of the images already present (the SQL Server,
+MongoDB and Redis images alone are about 4 GB, and SQL Server keeps writing while it runs).
+With less free space, start only the M1 set (`scripts/fixtures-up.sh postgres mysql mariadb
+ssh`) and run the harness with `OXBASE_CONFORMANCE_ALLOW_MISSING=1`; MongoDB refuses to start
+below 500 MB free. `cargo clean` frees the shared `target/` (a full debug build of the
+workspace, tests and app is about 6-7 GB).
 
 Plain `cargo test` skips the live tests (they are `#[ignore]`). An unreachable fixture fails the
 run; `OXBASE_CONFORMANCE_ALLOW_MISSING=1` (or `--allow-missing` on the binary) reports it as skipped
-instead. Other knobs: `OXBASE_CONFORMANCE_PROBE_TIMEOUT_MS`, `OXBASE_CONFORMANCE_TCP_ONLY=1`.
+instead. A failed connection check always fails the run. Other knobs:
+`OXBASE_CONFORMANCE_PROBE_TIMEOUT_MS`, `OXBASE_CONFORMANCE_TCP_ONLY=1`,
+`OXBASE_CONFORMANCE_SKIP_CONNECT=1` (or `--skip-connect`: no connection checks).
 
 ## Desktop app
 
@@ -125,8 +195,11 @@ pnpm tauri build                          # release bundles for the current OS
 
 ## CI
 
-- `.github/workflows/ci.yml` (push to main, pull requests, weekly): fmt + clippy on Linux;
-  `cargo test --workspace` on Linux, macOS and Windows; UI lint, typecheck, test and build;
+- `.github/workflows/ci.yml` has two lanes. **Fast lane**, on pushes to `wip/**` branches:
+  Linux only (lint, tests, keychain, UI, Docker conformance, cargo-deny), about 10-15 minutes.
+  **Full lane**, on pull requests, pushes to main, weekly and manual runs: fmt + clippy on Linux;
+  `cargo test --workspace` on Linux, macOS and Windows; the OS keychain tests
+  (`scripts/keychain-tests.sh`) on Linux, macOS and Windows; UI lint, typecheck, test and build;
   the conformance harness against the Docker fixtures; `cargo deny` (advisories, bans,
   licenses, sources).
 - `.github/workflows/bundle.yml` (push to main, manual): Tauri dev bundles for Linux x86_64,
@@ -135,14 +208,29 @@ pnpm tauri build                          # release bundles for the current OS
   `spctl -a -t exec` and `xcrun stapler validate` on the macOS `.app`, and
   `Get-AuthenticodeSignature` (must be `Valid`, timestamped) on the Windows `.msi`, NSIS `.exe`
   and app `.exe`. Linux has no OS code signing; its bundles are listed with SHA-256.
-  Signing is **enforced by default** (M0 exit check): the job fails before the build if this
-  OS's secrets are missing and after it if a bundle is unsigned, ad-hoc signed or unnotarized.
-  Opt out with the repository variable `OXBASE_REQUIRE_SIGNING=false` (push) or by unticking
-  `require_signing` (manual run). Secrets: `APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`,
-  `APPLE_ID`, `APPLE_PASSWORD`, `APPLE_TEAM_ID`, `WINDOWS_CERTIFICATE`,
+  Signing is **opt-in** until the project has Apple and Windows certificates. Turn it on with
+  the repository variable `OXBASE_REQUIRE_SIGNING=true` (push) or by ticking `require_signing`
+  (manual run); the job then fails before the build if this OS's secrets are missing and after
+  it if a bundle is unsigned, ad-hoc signed or unnotarized. Secrets: `APPLE_CERTIFICATE`,
+  `APPLE_CERTIFICATE_PASSWORD`, `APPLE_ID`, `APPLE_PASSWORD`, `APPLE_TEAM_ID`, `WINDOWS_CERTIFICATE`,
   `WINDOWS_CERTIFICATE_PASSWORD` (optional: `APPLE_SIGNING_IDENTITY`,
   `TAURI_SIGNING_PRIVATE_KEY`, `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`); see the header of the
   workflow file.
+
+### Verifying changes in CI
+
+Maintainers build and test in GitHub Actions rather than locally. Work in progress goes to a
+`wip/<milestone>-<stream>` branch; each milestone lands on main as one squash-merged pull
+request from a `milestone/<id>` branch, which runs the full lane. To push and wait for the result:
+
+```bash
+node scripts/ci-wait.mjs --push            # push HEAD to the current wip/* branch, wait for CI
+node scripts/ci-wait.mjs --sha <commit>    # just wait for (or report) the run on a commit
+```
+
+It prints one line per job and, for failed jobs, only the error lines of the log (compiler
+errors, failed tests, panics, `##[error]`). Exit code 0 means all green. It uses `GITHUB_TOKEN`
+or the github.com credential that `git push` uses, and never pushes to main.
 
 ## License
 

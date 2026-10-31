@@ -156,14 +156,55 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 # --- cli ---
 clap = { version = "4.6.7", features = ["derive"] }
 
+# --- database drivers (M1) ---
+# TLS everywhere is rustls with the *ring* provider (no OpenSSL, no aws-lc-rs: ring builds on
+# Linux/macOS/Windows with only a C compiler, aws-lc-sys needs cmake/NASM on some hosts).
+# Never enable a crate's `aws-lc-rs`/`aws_lc_rs`/`native-tls` features; `cargo tree -i openssl-sys`
+# and `cargo tree -i aws-lc-sys` must stay empty.
+tokio-postgres = "0.7.18"
+# MakeTlsConnect for tokio-postgres over rustls (MIT). `ring` only, no bundled roots.
+tokio-postgres-rustls = { version = "0.14.0", default-features = false, features = ["ring"] }
+# `default-rustls-ring` = rustls-tls + tls12 + derive + pure-Rust flate2 + ring. Note: its
+# rustls-tls feature always links webpki-roots (CDLA-Permissive-2.0); we turn the built-in roots
+# off per connection, but deny.toml must allow that license.
+mysql_async = { version = "0.37.1", default-features = false, features = ["default-rustls-ring"] }
+rusqlite = { version = "0.41.1", features = ["bundled"] }
+
+# --- network: TLS (rustls + ring) and SSH (russh + ring) ---
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+# PEM parsing lives in rustls-pki-types (`pem::PemObject`); rustls-pemfile is superseded by it.
+rustls-pki-types = { version = "1.15.1", features = ["std"] }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12", "logging"] }
+# Platform trust store (system roots for VerifyCa/VerifyFull without a CA file).
+rustls-native-certs = "0.8.5"
+# SSH client (keys via `russh::keys`, which re-exports ssh-key; russh-keys is retired).
+russh = { version = "0.65.0", default-features = false, features = ["ring", "flate2", "rsa"] }
+# HMAC for hashed known_hosts entries and credential scoping in oxbase-net. Already in the graph
+# through rustls and russh (Apache-2.0 AND ISC).
+ring = "0.17.14"
+
+# --- platform ---
+# Platform config directory for the profile file (oxbase-store; MIT OR Apache-2.0).
+dirs = "7.0.0"
+
+# --- secrets ---
+# keyring 4 `v1` (default): macOS Keychain, Windows Credential Manager, Secret Service over zbus
+# with pure-Rust crypto on Linux/BSD (no libdbus, no OpenSSL). API: keyring::Entry.
+keyring = "4.2.0"
+
 # --- app shell (Tauri 2; 3.x is alpha, do not bump) ---
 tauri = "2.12.5"
 tauri-build = "2.7.4"
+# Native file pickers; keep on the same major.minor as @tauri-apps/plugin-dialog in ui/.
+tauri-plugin-dialog = "2.8.4"
 
 # --- dev / test ---
 tokio-test = "0.4.6"
 pretty_assertions = "1.4.1"
 rstest = "0.28.0"
+# Test certificates (ring backend, matches the workspace provider).
+rcgen = "0.14.10"
+tempfile = "3.27.0"
 
 [profile.dev]
 # Keep the shared target dir small: line tables only, no full debuginfo.

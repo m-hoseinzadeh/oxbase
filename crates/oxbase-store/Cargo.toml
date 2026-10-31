@@ -12,5 +12,19 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
+oxbase-types.workspace = true
+async-trait.workspace = true
+# OS keychain behind KeyringSecretStore.
+keyring.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+# Blocking keychain and file I/O run on `spawn_blocking`.
+tokio.workspace = true
+# Platform config directory for the profile file (MIT OR Apache-2.0).
+dirs.workspace = true
 
 [dev-dependencies]
+pretty_assertions.workspace = true
+tempfile.workspace = true
+tokio.workspace = true

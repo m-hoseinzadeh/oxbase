@@ -21,6 +21,20 @@
   --color-accent-fg: #ffffff;
   --color-status-bg: #2563eb;
   --color-status-fg: #ffffff;
+  --color-success: #15803d;
+  --color-success-bg: #ecfdf3;
+  --color-danger: #b42318;
+  --color-danger-bg: #fef3f2;
+  --color-focus: #2563eb;
+  --color-overlay: rgb(15 18 25 / 45%);
+  --color-input-bg: #ffffff;
+
+  --engine-postgres: #336791;
+  --engine-mysql: #00758f;
+  --engine-mariadb: #8a5a2b;
+  --engine-sqlite: #4b5563;
+  --engine-other: #6b7280;
+  --engine-fg: #ffffff;
 
   --space-1: 4px;
   --space-2: 8px;
@@ -43,6 +57,20 @@
     --color-accent-fg: #0d1117;
     --color-status-bg: #2b2f36;
     --color-status-fg: #c9cdd4;
+    --color-success: #4ade80;
+    --color-success-bg: #12261a;
+    --color-danger: #f97066;
+    --color-danger-bg: #2d1514;
+    --color-focus: #7aa2f7;
+    --color-overlay: rgb(0 0 0 / 60%);
+    --color-input-bg: #15171b;
+
+    --engine-postgres: #5b8fc4;
+    --engine-mysql: #2e9bb3;
+    --engine-mariadb: #b58553;
+    --engine-sqlite: #8b95a5;
+    --engine-other: #8b95a5;
+    --engine-fg: #0d1117;
   }
 }
 
@@ -157,4 +185,400 @@ body {
   color: var(--color-status-fg);
   font-size: 12px;
   flex-shrink: 0;
+}
+
+/* --- shared controls ------------------------------------------------------------------- */
+
+.button {
+  font: inherit;
+  padding: var(--space-1) var(--space-3);
+  border: 1px solid var(--color-border);
+  border-radius: 4px;
+  background: var(--color-bg);
+  color: var(--color-fg);
+  cursor: pointer;
+}
+
+.button:hover:not(:disabled) {
+  background: var(--color-bg-muted);
+}
+
+.button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.button--primary {
+  background: var(--color-accent);
+  border-color: var(--color-accent);
+  color: var(--color-accent-fg);
+}
+
+.button--primary:hover:not(:disabled) {
+  background: var(--color-accent);
+  filter: brightness(1.08);
+}
+
+.button--danger {
+  background: var(--color-danger);
+  border-color: var(--color-danger);
+  color: var(--color-bg);
+}
+
+.button--danger:hover:not(:disabled) {
+  background: var(--color-danger);
+  filter: brightness(1.08);
+}
+
+:focus-visible {
+  outline: 2px solid var(--color-focus);
+  outline-offset: 1px;
+}
+
+input[type="text"],
+input[type="password"],
+select {
+  font: inherit;
+  width: 100%;
+  padding: var(--space-1) var(--space-2);
+  border: 1px solid var(--color-border);
+  border-radius: 4px;
+  background: var(--color-input-bg);
+  color: var(--color-fg);
+}
+
+input:disabled,
+select:disabled {
+  opacity: 0.6;
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+/* --- connections panel ----------------------------------------------------------------- */
+
+.panel--connections {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+}
+
+.connection-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  border-radius: 4px;
+}
+
+.connection-list__item {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2);
+  border-radius: 4px;
+  cursor: default;
+}
+
+.connection-list__item:hover {
+  background: var(--color-bg-muted);
+}
+
+.connection-list__item[aria-selected="true"] {
+  background: var(--color-accent);
+  color: var(--color-accent-fg);
+}
+
+.connection-list__text {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  flex: 1;
+}
+
+.connection-list__name {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.connection-list__meta {
+  color: var(--color-fg-muted);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.connection-list__status {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  color: var(--color-success);
+  font-size: 12px;
+}
+
+.connection-list__item[aria-selected="true"] .connection-list__meta,
+.connection-list__item[aria-selected="true"] .connection-list__status {
+  color: inherit;
+}
+
+.status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--color-success);
+}
+
+.engine-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 26px;
+  height: 26px;
+  border-radius: 5px;
+  background: var(--engine-other);
+  color: var(--engine-fg);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.engine-badge--postgres {
+  background: var(--engine-postgres);
+}
+
+.engine-badge--mysql {
+  background: var(--engine-mysql);
+}
+
+.engine-badge--mariadb {
+  background: var(--engine-mariadb);
+}
+
+.engine-badge--sqlite {
+  background: var(--engine-sqlite);
+}
+
+/* --- modal dialogs --------------------------------------------------------------------- */
+
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--color-overlay);
+}
+
+.modal {
+  display: flex;
+  flex-direction: column;
+  width: min(420px, calc(100vw - 32px));
+  max-height: calc(100vh - 32px);
+  background: var(--color-bg);
+  color: var(--color-fg);
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  box-shadow: 0 12px 32px rgb(0 0 0 / 25%);
+}
+
+.modal--wide {
+  width: min(560px, calc(100vw - 32px));
+}
+
+.modal__title {
+  margin: 0;
+  padding: var(--space-3) var(--space-4);
+  font-size: 15px;
+  font-weight: 600;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.modal__body {
+  padding: var(--space-4);
+  overflow: auto;
+}
+
+.modal__body > p {
+  margin: 0;
+}
+
+.modal__footer {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  justify-content: flex-end;
+  padding: var(--space-3) var(--space-4);
+  border-top: 1px solid var(--color-border);
+}
+
+.modal__footer-start {
+  margin-right: auto;
+}
+
+/* --- tabs and form fields -------------------------------------------------------------- */
+
+.tabs {
+  display: flex;
+  gap: var(--space-1);
+  margin-bottom: var(--space-3);
+  border-bottom: 1px solid var(--color-border);
+}
+
+.tabs__tab {
+  font: inherit;
+  padding: var(--space-2) var(--space-3);
+  border: none;
+  border-bottom: 2px solid transparent;
+  background: none;
+  color: var(--color-fg-muted);
+  cursor: pointer;
+}
+
+.tabs__tab[aria-selected="true"] {
+  border-bottom-color: var(--color-accent);
+  color: var(--color-fg);
+  font-weight: 600;
+}
+
+.tabs__tab:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.tabs__panel {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.tabs__panel[hidden] {
+  display: none;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  flex: 1;
+  min-width: 0;
+}
+
+.field label {
+  font-weight: 500;
+}
+
+.field__hint {
+  margin: 0;
+  color: var(--color-fg-muted);
+  font-size: 12px;
+}
+
+.field__error {
+  margin: 0;
+  color: var(--color-danger);
+  font-size: 12px;
+}
+
+.field--invalid input,
+.field--invalid select {
+  border-color: var(--color-danger);
+}
+
+.field-row {
+  display: flex;
+  gap: var(--space-3);
+}
+
+.input--port {
+  width: 90px;
+}
+
+.field-row .field:has(.input--port) {
+  flex: 0 0 90px;
+}
+
+.file-input {
+  display: flex;
+  gap: var(--space-1);
+}
+
+.checkbox {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.fieldset {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  margin: 0;
+  padding: 0;
+  border: none;
+  min-width: 0;
+}
+
+.dialog-status:empty {
+  display: none;
+}
+
+.test-result {
+  margin-top: var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  border-radius: 4px;
+  border: 1px solid var(--color-border);
+  background: var(--color-bg-subtle);
+}
+
+.test-result p {
+  margin: 0;
+}
+
+.test-result--ok {
+  border-color: var(--color-success);
+  background: var(--color-success-bg);
+}
+
+.test-result--error {
+  border-color: var(--color-danger);
+  background: var(--color-danger-bg);
+}
+
+.test-result__title {
+  font-weight: 600;
+}
+
+.test-result__message {
+  margin-top: var(--space-1);
+  overflow-wrap: anywhere;
+}
+
+.test-result__details {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 2px var(--space-3);
+  margin: var(--space-2) 0 0;
+}
+
+.test-result__details dt {
+  color: var(--color-fg-muted);
+}
+
+.test-result__details dd {
+  margin: 0;
 }
