@@ -856,7 +856,7 @@ fn apply_renames(old: &TableDef, r: &Renames) -> TableDef {
     let mut out = old.clone();
     let column = |name: &mut String| {
         if let Some(new) = renamed(&r.columns, name) {
-            *name = new.to_owned();
+            new.clone_into(name);
         }
     };
     if let Some((_, new)) = &r.table {
@@ -870,7 +870,7 @@ fn apply_renames(old: &TableDef, r: &Renames) -> TableDef {
     }
     for idx in &mut out.indexes {
         if let Some(new) = renamed(&r.indexes, &idx.name) {
-            idx.name = new.to_owned();
+            new.clone_into(&mut idx.name);
         }
         for part in idx.columns.iter_mut().filter(|p| !p.is_expression) {
             column(&mut part.name);
@@ -1750,7 +1750,7 @@ mod tests {
 
     fn col(name: &str, native: &str) -> ColumnDef {
         let mut c = ColumnDef::new(name, super::super::types::data_type(native));
-        c.native_type = native.to_owned();
+        native.clone_into(&mut c.native_type);
         c
     }
 

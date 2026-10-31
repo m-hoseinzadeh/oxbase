@@ -149,7 +149,7 @@ mod tests {
 
     fn col(name: &str, native: &str) -> ColumnDef {
         let mut c = ColumnDef::new(name, super::super::types::data_type(native));
-        c.native_type = native.to_owned();
+        native.clone_into(&mut c.native_type);
         c
     }
 

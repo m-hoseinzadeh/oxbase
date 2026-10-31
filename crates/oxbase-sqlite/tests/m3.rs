@@ -296,7 +296,7 @@ fn assert_same(expected: &TableDef, fetched: &TableDef) {
 
 fn column(name: &str, native: &str, data_type: DataType) -> ColumnDef {
     let mut c = ColumnDef::new(name, data_type);
-    c.native_type = native.to_owned();
+    native.clone_into(&mut c.native_type);
     c
 }
 
@@ -306,11 +306,11 @@ fn id_column() -> ColumnDef {
     id
 }
 
-fn pk(columns: &[&str]) -> Option<PrimaryKeyDef> {
-    Some(PrimaryKeyDef {
+fn pk(columns: &[&str]) -> PrimaryKeyDef {
+    PrimaryKeyDef {
         name: None,
         columns: columns.iter().map(|c| (*c).to_owned()).collect(),
-    })
+    }
 }
 
 fn index(name: &str, columns: &[&str]) -> IndexDef {
@@ -631,7 +631,7 @@ async fn live_round_trip_table() {
     t.columns.push(quoted);
     t.columns.push(column("名前", "REAL", DataType::FLOAT64));
     t.columns.push(column("parent", "INTEGER", DataType::INT64));
-    t.primary_key = pk(&["id"]);
+    t.primary_key = Some(pk(&["id"]));
     let mut by_name = index(&format!("{name}_idx"), &["名前"]);
     by_name.columns[0].descending = true;
     t.indexes.push(by_name);
