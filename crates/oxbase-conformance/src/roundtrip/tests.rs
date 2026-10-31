@@ -88,15 +88,24 @@ fn missing_roles_name_what_a_cell_needs() {
             "Capabilities"
         ]
     );
-    assert!(runnable_kinds(&reg, Engine::Sqlite).is_empty());
+    assert_eq!(
+        runnable_kinds(&reg, Engine::Sqlite),
+        Vec::<ObjectKind>::new()
+    );
     let toy = toy_registry(ToyDdl::default(), toy_caps());
-    assert!(missing_roles(&toy, Engine::Sqlite, ObjectKind::Check).is_empty());
+    assert_eq!(
+        missing_roles(&toy, Engine::Sqlite, ObjectKind::Check),
+        Vec::<String>::new()
+    );
     assert_eq!(
         runnable_kinds(&toy, Engine::Sqlite),
         DESIGNER_KINDS.to_vec()
     );
     // No driver yet: nothing runs, whatever is registered.
-    assert!(runnable_kinds(&toy, Engine::MsSql).is_empty());
+    assert_eq!(
+        runnable_kinds(&toy, Engine::MsSql),
+        Vec::<ObjectKind>::new()
+    );
     assert_eq!(
         pending_detail(&toy, Engine::Sqlite, ObjectKind::Check, Check::Roundtrip),
         "pending (roles registered; not run)"
