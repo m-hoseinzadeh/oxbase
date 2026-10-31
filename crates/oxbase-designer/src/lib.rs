@@ -1896,7 +1896,7 @@ mod tests {
         assert_eq!(
             found
                 .iter()
-                .filter(|(s, p, _)| *s == E && p.ends_with(".name"))
+                .filter(|(s, p, _)| *s == E && p.split('.').next_back() == Some("name"))
                 .count(),
             3,
             "{found:#?}"
