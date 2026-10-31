@@ -98,6 +98,10 @@ export interface SessionSummary {
   engine: Engine;
   info: ConnectionInfo;
   opened_at: string;
+  /** M2: the database the session was opened on, when one was asked for. */
+  database?: string;
+  /** M2: the base session of a child session (children are not listed by the core). */
+  parent?: string;
 }
 
 export type ErrorCategory =

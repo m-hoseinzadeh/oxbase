@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { render, screen, within } from "@testing-library/react";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { App } from "./App";
 import { tauriCore } from "./test/tauriMock";
@@ -20,12 +20,17 @@ describe("App layout", () => {
     tauriCore.isTauri.mockReset().mockReturnValue(false);
   });
 
-  it("renders the Connections panel, the Welcome tab and the status bar", async () => {
+  it("renders the Connections and Objects panels, the Welcome tab and the status bar", async () => {
     render(<App />);
     expect(await screen.findByText("No connections yet")).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "Welcome to oxbase" })).toBeInTheDocument();
     expect(screen.getByText("Connections")).toBeInTheDocument();
     expect(screen.getByText("Welcome")).toBeInTheDocument();
     expect(await screen.findByTestId("core-version")).toHaveTextContent("Core unavailable");
+    // M2 workbench panels: the object tree and the query history.
+    expect(screen.getByText("Objects")).toBeInTheDocument();
+    expect(screen.getByText("No open connections")).toBeInTheDocument();
+    const toolbar = screen.getByRole("toolbar", { name: "Workbench" });
+    expect(within(toolbar).getByRole("button", { name: "New query" })).toBeEnabled();
   });
 });

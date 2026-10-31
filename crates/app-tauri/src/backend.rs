@@ -11,8 +11,8 @@ use oxbase_services::query::{QueryConfig, QueryService};
 use oxbase_services::tree::TreeService;
 use oxbase_services::{ConnectionManager, DriverRegistry};
 use oxbase_store::{
-    FileProfileRepository, HistoryRepository, KeyringSecretStore, MemoryHistoryRepository,
-    MemoryProfileRepository, ProfileRepository,
+    AppDb, FileProfileRepository, HistoryRepository, KeyringSecretStore, MemoryHistoryRepository,
+    MemoryProfileRepository, ProfileRepository, SqliteHistoryRepository,
 };
 
 use crate::connections::ConnectionsState;
@@ -36,24 +36,46 @@ pub fn profile_repository(fallback_dir: Option<&Path>) -> Arc<dyn ProfileReposit
     }
 }
 
-/// Where query history lives.
+/// Where query history lives: the app database (`oxbase.db` in `oxbase_store::app_data_dir`,
+/// which `OXBASE_DATA_DIR` overrides), the same file `oxbase-cli` uses. When it cannot be opened
+/// (read-only disk, a file locked or damaged) history is kept in memory for this run, so the app
+/// still starts.
 ///
-/// m2 (app stream): switch to `SqliteHistoryRepository` on `AppDb::open_default()` (falling
-/// back to memory when it fails) once the store stream has implemented the app database.
+/// Call it outside an async runtime (it blocks on opening the database), as Tauri's `setup` is.
 pub fn history_repository() -> Arc<dyn HistoryRepository> {
-    Arc::new(MemoryHistoryRepository::new())
+    match tauri::async_runtime::block_on(AppDb::open_default()) {
+        Ok(db) => Arc::new(SqliteHistoryRepository::new(db)),
+        Err(error) => {
+            // Only the error's category: the message could carry a path.
+            eprintln!(
+                "oxbase: warning: the app database could not be opened ({}); query history is \
+                 kept in memory for this run only",
+                error.category()
+            );
+            Arc::new(MemoryHistoryRepository::new())
+        }
+    }
 }
 
-/// Builds the state behind the connection commands and the M2 workbench commands. Both share
-/// one `ConnectionManager`.
+/// Builds the state behind the connection commands and the M2 workbench commands, with history
+/// in the app database ([`history_repository`]).
 pub fn app_state(fallback_dir: Option<&Path>) -> (ConnectionsState, WorkbenchState) {
+    app_state_with(fallback_dir, history_repository())
+}
+
+/// [`app_state`] with the given history repository. Both states share one
+/// `ConnectionManager`.
+pub fn app_state_with(
+    fallback_dir: Option<&Path>,
+    history: Arc<dyn HistoryRepository>,
+) -> (ConnectionsState, WorkbenchState) {
     let manager = Arc::new(ConnectionManager::new(
         driver_registry(),
         Arc::new(KeyringSecretStore::new()),
         Arc::new(RusshTunnelProvider::new()),
     ));
     let dialects = Arc::new(oxbase_services::default_dialects());
-    let history = Arc::new(HistoryService::new(history_repository()));
+    let history = Arc::new(HistoryService::new(history));
     let tree = Arc::new(TreeService::new(
         Arc::clone(&manager),
         Arc::clone(&dialects),
@@ -77,7 +99,9 @@ mod tests {
 
     #[test]
     fn builds_the_app_state() {
-        let (connections, _workbench) = app_state(None);
+        // In memory: tests never touch the user's app database.
+        let (connections, _workbench) =
+            app_state_with(None, Arc::new(MemoryHistoryRepository::new()));
         assert_eq!(
             connections.manager().list_open(),
             Vec::<oxbase_services::SessionSummary>::new()

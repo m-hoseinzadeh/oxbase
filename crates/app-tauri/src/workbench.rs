@@ -47,6 +47,11 @@ impl WorkbenchState {
             history,
         }
     }
+
+    /// The object tree service (the connection commands forget its sessions on close).
+    pub(crate) fn tree(&self) -> &Arc<TreeService> {
+        &self.tree
+    }
 }
 
 /// Children of a tree node of the open (base) session `session_id`.
@@ -262,6 +267,99 @@ mod tests {
                 .await
                 .unwrap(),
             vec![]
+        );
+    }
+
+    /// The argument JSON the UI wrappers (`ui/src/api/workbench.ts`) send, mapped to the
+    /// command parameter types.
+    #[test]
+    fn ui_arguments_map_to_the_command_types() {
+        use oxbase_types::ObjectKind;
+        use serde_json::{from_value, json};
+
+        let node: TreeNodeRef = from_value(json!({
+            "type": "folder",
+            "parent": { "kind": "schema", "catalog": "app", "name": "public" },
+            "kind": "table"
+        }))
+        .unwrap();
+        let mut schema = ObjectRef::new(ObjectKind::Schema, "public");
+        schema.catalog = Some("app".into());
+        assert_eq!(
+            node,
+            TreeNodeRef::Folder {
+                parent: schema,
+                kind: ObjectKind::Table
+            }
+        );
+        assert_eq!(
+            from_value::<TreeNodeRef>(json!({ "type": "connection" })).unwrap(),
+            TreeNodeRef::Connection
+        );
+        let routine: TreeNodeRef = from_value(json!({
+            "type": "object",
+            "object": { "kind": "function", "catalog": "app", "schema": "public",
+                        "name": "f", "signature": "" }
+        }))
+        .unwrap();
+        let TreeNodeRef::Object { object } = routine else {
+            panic!("not an object node");
+        };
+        assert_eq!(object.signature.as_deref(), Some(""));
+
+        let show: TreeOptions = from_value(json!({ "showSystem": true })).unwrap();
+        assert!(show.show_system);
+
+        // Absent run options keep their defaults (stop on error, record history).
+        let options: RunOptions = from_value(json!({ "maxRows": 10, "database": "db2" })).unwrap();
+        assert_eq!(options.max_rows, Some(10));
+        assert_eq!(options.database.as_deref(), Some("db2"));
+        assert!(options.stop_on_error && options.record_history && !options.keep_previous);
+
+        let editor: EditorId = from_value(json!("tab-1")).unwrap();
+        assert_eq!(editor.as_str(), "tab-1");
+        let run: RunId = from_value(json!("0192e2a0-0000-7000-8000-000000000001")).unwrap();
+        assert_eq!(run.to_string(), "0192e2a0-0000-7000-8000-000000000001");
+        let session: SessionId = from_value(json!("0192e2a0-0000-7000-8000-000000000002")).unwrap();
+        assert_eq!(
+            session.0.to_string(),
+            "0192e2a0-0000-7000-8000-000000000002"
+        );
+
+        let query: HistoryQuery = from_value(json!({
+            "profileId": "0192e2a0-0000-7000-8000-000000000003",
+            "search": "select",
+            "limit": 50
+        }))
+        .unwrap();
+        assert_eq!(query.search.as_deref(), Some("select"));
+        assert_eq!(query.limit, 50);
+        assert!(query.profile_id.is_some());
+        let settings: HistorySettings =
+            from_value(json!({ "enabled": false, "maxEntries": 0 })).unwrap();
+        assert_eq!(
+            settings,
+            HistorySettings {
+                enabled: false,
+                max_entries: 0
+            }
+        );
+        let ids: Vec<Uuid> = from_value(json!(["0192e2a0-0000-7000-8000-000000000004"])).unwrap();
+        assert_eq!(ids.len(), 1);
+    }
+
+    /// Run events reach the UI as `{ "type": ..., camelCase fields }` (`RunEvent` in
+    /// `ui/src/api/types.ts`).
+    #[test]
+    fn run_events_serialise_as_the_ui_expects() {
+        let event = serde_json::to_value(RunEvent::Rows {
+            result_index: 2,
+            total_so_far: 1_000,
+        })
+        .unwrap();
+        assert_eq!(
+            event,
+            serde_json::json!({ "type": "rows", "resultIndex": 2, "totalSoFar": 1000 })
         );
     }
 
