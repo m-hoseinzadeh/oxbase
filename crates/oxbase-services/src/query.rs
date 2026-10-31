@@ -16,11 +16,20 @@
 //! The run is registered before its editor session is opened: closing the run or the editor,
 //! or dropping the service, stops a connect that hangs, and the connect gives up after
 //! `EDITOR_CONNECT_DEADLINE` (60 s) when the profile sets no connect timeout. A session lost
-//! during a run (a `Connection` error) is replaced on the editor's next run. When a stopped
-//! statement's stream does not wind down within `STOP_GRACE`, the driver may still close the
-//! session over it (MySQL/MariaDB do when `KILL QUERY` does not take effect in time); the
-//! editor's next statement that finds the session closed *before it started* then gets a new
-//! session (on the same database) and a warning notice, once.
+//! during a run (a `Connection` error) is replaced on the editor's next run.
+//!
+//! When a stopped statement's stream does not wind down within `STOP_GRACE`, the driver is
+//! still busy with it (MySQL/MariaDB keep killing and draining it for several seconds, and may
+//! close the session over it in the end). The editor is then marked *unclean*:
+//!
+//! - its **next run** does not queue behind that work: it opens a new session (on the same
+//!   database) right away, closes the old one in the background and emits a warning notice
+//!   (temporary tables, session settings and an open transaction of the old session are gone;
+//!   closing it rolls such a transaction back);
+//! - a **later statement of the same run** (after a result hit `max_rows` or the disk cap)
+//!   keeps the session, so the script's temporary tables and transaction survive; if it finds
+//!   the session closed *before it started*, it gets a new session (on the same database) and
+//!   a warning notice, once.
 //!
 //! Exception: a base session on a private in-memory database (SQLite `:memory:`) cannot have
 //! useful children (each would be a separate, empty database), so its editors run on the base
@@ -119,6 +128,11 @@ const STOP_GRACE: Duration = Duration::from_millis(1000);
 const EDITOR_CONNECT_DEADLINE: Duration = Duration::from_secs(60);
 /// How long `close` waits for a cancelled run to end before forgetting it anyway.
 const CLOSE_WAIT: Duration = Duration::from_secs(3);
+/// Warning sent when a run starts on a new session because the editor's last cancelled
+/// statement had not finished stopping on the old one.
+const REPLACED_UNCLEAN_NOTICE: &str = "the last cancelled statement was still stopping on the \
+    editor's session, so a new session was opened for this run (the old session's temporary \
+    tables and settings are gone, and a transaction left open on it is rolled back)";
 /// Spill directories older than this are left over from a crash and removed on start.
 const STALE_RUN_DIR_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
@@ -555,6 +569,16 @@ struct Editor {
     runs: Vec<RunId>,
 }
 
+/// The session a run gets from `QueryService::editor_session`.
+struct EditorSession {
+    session: SessionHandle,
+    /// The database it was opened on (`None`: the base's).
+    database: Option<String>,
+    /// The editor's previous session would have been kept, but the last run left a statement
+    /// the driver was still stopping on it, so this is a new one.
+    replaced: bool,
+}
+
 /// One run.
 struct Run {
     id: RunId,
@@ -641,7 +665,7 @@ impl QueryService {
         let run_id = RunId::new();
 
         // Reserve the editor.
-        let (previous, earlier) = {
+        let (previous, earlier, unclean) = {
             let mut editors = lock(&self.registry.editors);
             let editor = editors
                 .entry(target.editor.clone())
@@ -664,8 +688,17 @@ impl QueryService {
             } else {
                 std::mem::take(&mut editor.runs)
             };
-            let previous = (editor.base, editor.child.clone(), editor.database.clone());
-            (previous, earlier)
+            // The last run left a statement the driver is still stopping: the editor gives up
+            // that session now (`editor_session` closes it in the background), so a failed
+            // open below never leaves the editor pointing at it.
+            let unclean = std::mem::take(&mut editor.unclean);
+            let child = if unclean {
+                editor.child.take()
+            } else {
+                editor.child.clone()
+            };
+            let previous = (editor.base, child, editor.database.clone());
+            (previous, earlier, unclean)
         };
         for id in earlier {
             if let Err(e) = self.close(id).await {
@@ -697,19 +730,23 @@ impl QueryService {
         }
 
         let opened = match self
-            .editor_session(&target, engine, previous, &options, &run.token)
+            .editor_session(&target, engine, previous, unclean, &options, &run.token)
             .await
         {
             // Closed (or cancelled) while the session was opening.
-            Ok((session, _)) if run.token.is_cancelled() => {
-                if session.summary().parent.is_some() {
-                    close_session(&self.manager, session.id()).await;
+            Ok(ready) if run.token.is_cancelled() => {
+                if ready.session.summary().parent.is_some() {
+                    close_session(&self.manager, ready.session.id()).await;
                 }
                 Err(Error::Cancelled)
             }
             other => other,
         };
-        let (session, database) = match opened {
+        let EditorSession {
+            session,
+            database,
+            replaced,
+        } = match opened {
             Ok(ready) => ready,
             Err(e) => {
                 run.state.send_replace(RunState::Failed);
@@ -722,7 +759,7 @@ impl QueryService {
                 return Err(e);
             }
         };
-        let unclean = {
+        {
             let mut editors = lock(&self.registry.editors);
             let editor = editors
                 .entry(target.editor.clone())
@@ -737,8 +774,7 @@ impl QueryService {
             editor.base = target.session;
             editor.child = Some(session.clone());
             editor.database.clone_from(&database);
-            std::mem::take(&mut editor.unclean)
-        };
+        }
 
         let (tx, rx) = mpsc::channel(self.config.event_capacity.max(1));
         let context = RunContext {
@@ -748,7 +784,8 @@ impl QueryService {
             base: target.session,
             database: session.current_database().or_else(|| database.clone()),
             opened_on: database,
-            reopen_if_closed: AtomicBool::new(unclean),
+            reopen_if_closed: AtomicBool::new(false),
+            replaced_unclean: replaced,
             profile_id: base.summary().profile_id,
             session: Mutex::new(session),
             dialect,
@@ -769,8 +806,10 @@ impl QueryService {
     }
 
     /// The editor's session for this run, reopened when it is gone, belongs to another base,
-    /// or sits on another database than the one asked for. Returns it with the database it
-    /// was opened on. Stops when `cancel` fires and after [`EDITOR_CONNECT_DEADLINE`].
+    /// sits on another database than the one asked for, or when `unclean` (the last run left a
+    /// statement the driver is still stopping on it: the old session is then closed in the
+    /// background instead of waited for). Returns it with the database it was opened on.
+    /// Stops when `cancel` fires and after [`EDITOR_CONNECT_DEADLINE`].
     ///
     /// When a child would not see the base's data (a private in-memory database, see
     /// `ConnectionManager::children_share_data`), the editor runs on the **base session**
@@ -781,9 +820,10 @@ impl QueryService {
         target: &RunTarget,
         engine: Engine,
         (old_base, old_child, old_database): (SessionId, Option<SessionHandle>, Option<String>),
+        unclean: bool,
         options: &RunOptions,
         cancel: &CancellationToken,
-    ) -> Result<(SessionHandle, Option<String>)> {
+    ) -> Result<EditorSession> {
         let same_base = old_base == target.session;
         let use_base = !self.manager.children_share_data(target.session);
         // On `Attached` engines every database is visible from one session.
@@ -796,6 +836,8 @@ impl QueryService {
         } else {
             options.database.clone()
         };
+        // Set when the old session would have been kept but is replaced because it is unclean.
+        let mut replaced = false;
         // A base session used as the editor's session is never closed here.
         if let Some(child) = &old_child
             && child.summary().parent.is_some()
@@ -804,17 +846,35 @@ impl QueryService {
             let on_wanted = wanted.as_deref().is_none_or(|w| {
                 old_database.as_deref() == Some(w) || child.current_database().as_deref() == Some(w)
             });
-            if alive && on_wanted && !use_base {
-                return Ok((child.clone(), old_database));
+            let reusable = alive && on_wanted && !use_base;
+            if reusable && !unclean {
+                return Ok(EditorSession {
+                    session: child.clone(),
+                    database: old_database,
+                    replaced: false,
+                });
             }
-            close_session(&self.manager, child.id()).await;
+            if unclean {
+                // Closing waits for the driver to finish stopping the old statement: do not
+                // make this run wait for it.
+                replaced = reusable;
+                let manager = Arc::clone(&self.manager);
+                let id = child.id();
+                tokio::spawn(async move { close_session(&manager, id).await });
+            } else {
+                close_session(&self.manager, child.id()).await;
+            }
         }
         if use_base {
             let base = self
                 .manager
                 .get(target.session)
                 .ok_or_else(|| Error::not_found(format!("no open session {}", target.session)))?;
-            return Ok((base, None));
+            return Ok(EditorSession {
+                session: base,
+                database: None,
+                replaced: false,
+            });
         }
         let database = wanted.or(if same_base { old_database } else { None });
         let open = self
@@ -828,7 +888,11 @@ impl QueryService {
                     EDITOR_CONNECT_DEADLINE.as_secs()
                 )))
             })?;
-        Ok((child, database))
+        Ok(EditorSession {
+            session: child,
+            database,
+            replaced,
+        })
     }
 
     /// Cancels a running run. `false` when it is unknown or already ended.
@@ -1019,6 +1083,9 @@ struct RunContext {
     /// A statement of this editor was dropped without winding down (see `RunContext::stop`):
     /// the next statement that finds the session closed may replace it.
     reopen_if_closed: AtomicBool,
+    /// The run got a new session because the editor's last run left a statement the driver
+    /// was still stopping (see `QueryService::editor_session`): announced with a notice.
+    replaced_unclean: bool,
     /// The database the statements run in, for history.
     database: Option<String>,
     profile_id: Uuid,
@@ -1103,6 +1170,16 @@ async fn execute(context: RunContext) {
             statements: spans.clone(),
         })
         .await;
+    if context.replaced_unclean {
+        context
+            .emit(RunEvent::Notice {
+                statement_index: None,
+                level: NoticeLevel::Warning,
+                message: REPLACED_UNCLEAN_NOTICE.to_owned(),
+                code: None,
+            })
+            .await;
+    }
 
     let mut terminal = Terminal::Finished;
     for (index, (statement, span)) in statements.iter().zip(&spans).enumerate() {
@@ -1192,9 +1269,10 @@ impl RunContext {
     }
 
     /// Stops a statement (see the free function `stop`). When its stream did not wind down in
-    /// time, the driver may still be stopping it, or may close the session over it: the
-    /// editor's next statement may then replace a session it finds closed (see
-    /// `run_statement`).
+    /// time, the driver may still be stopping it, or may close the session over it: a later
+    /// statement of this run may then replace a session it finds closed (see
+    /// `run_statement`), and the editor is marked unclean, so its next run starts on a new
+    /// session (see `QueryService::editor_session`).
     async fn stop(&self, session: &SessionHandle, stream: ResultStream, token: &CancellationToken) {
         if !stop(stream, token).await && session.summary().parent.is_some() {
             tracing::debug!("a stopped statement did not wind down in time");
@@ -1213,6 +1291,22 @@ impl RunContext {
     /// Whether a statement that found `session` closed may replace it (once).
     fn may_reopen(&self, session: &SessionHandle) -> bool {
         session.summary().parent.is_some() && self.reopen_if_closed.swap(false, Ordering::SeqCst)
+    }
+
+    /// A statement started on `session` after an earlier one of this run did not wind down
+    /// in time: the session is idle again, so the editor is no longer unclean.
+    fn mark_clean(&self, session: &SessionHandle) {
+        if !self.reopen_if_closed.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        if let Some(editor) = lock(&self.registry.editors).get_mut(&self.run.editor)
+            && editor
+                .child
+                .as_ref()
+                .is_some_and(|c| c.id() == session.id())
+        {
+            editor.unclean = false;
+        }
     }
 
     /// Opens a new editor session in place of `old` (on the same database), makes it the
@@ -1322,7 +1416,11 @@ impl RunContext {
             }
         };
         let mut stream = match executed {
-            Ok(stream) => stream,
+            Ok(stream) => {
+                // The driver took a new statement: whatever it was still stopping is over.
+                self.mark_clean(&session);
+                stream
+            }
             Err(e) if token.is_cancelled() && e.is_cancelled() => {
                 return Outcome::Cancelled {
                     rows_returned: None,

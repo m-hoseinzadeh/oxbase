@@ -22,7 +22,10 @@ On PostgreSQL, MySQL, MariaDB and SQLite (M1 connections: plain, TLS, SSH, keych
   that spills to Arrow IPC files past 64 MiB; the grid fetches only the visible pages as Arrow
   IPC bytes, never JSON. Several result sets per run each get a tab, with a messages tab for
   notices, rows affected and errors. Stop cancels the server-side statement and keeps the rows
-  already received.
+  already received. The next run starts right away: if the server is still stopping the
+  cancelled statement (MySQL and MariaDB can take several seconds to finish a killed streaming
+  query), it runs on a new session and a warning says that the old session's temporary
+  tables, settings and open transaction are gone.
 - **History**: every statement is recorded in the app database with its status, duration and
   row count. Password and key literals are masked first. You can search, reopen, delete, clear,
   or turn history off.

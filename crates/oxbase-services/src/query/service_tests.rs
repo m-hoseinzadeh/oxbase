@@ -37,6 +37,9 @@ type Log = Arc<Mutex<Vec<String>>>;
 /// - `lose`: a connection error; `hang`: nothing until cancelled;
 /// - `stuck`: a result set, then nothing; a cancel closes the connection and the stream never
 ///   ends (a driver that gives up on a statement it cannot stop);
+/// - `slowstop`: a result set, then nothing; after a cancel the stream never ends and the
+///   connection's next `execute` waits [`SLOW_STOP`] (a driver still killing and draining the
+///   statement, like MySQL); `slowrows`: the same after 100 rows;
 /// - `select <any of the above>`: the same (the splitter calls it a query);
 /// - anything else: `RowsAffected(0)`.
 ///
@@ -67,6 +70,7 @@ impl Driver for ScriptDriver {
             version: ServerVersion::new(16, 0, 0),
             log: self.log.clone(),
             closed: Arc::new(AtomicBool::new(false)),
+            busy_until: Arc::new(Mutex::new(None)),
         }))
     }
 }
@@ -76,7 +80,12 @@ struct ScriptConnection {
     version: ServerVersion,
     log: Log,
     closed: Arc<AtomicBool>,
+    /// Set by `slowstop`: `execute` waits until then.
+    busy_until: Arc<Mutex<Option<Instant>>>,
 }
+
+/// How long a `slowstop` statement keeps its connection busy after a cancel.
+const SLOW_STOP: Duration = Duration::from_secs(2);
 
 fn schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
@@ -106,6 +115,7 @@ enum Step {
     Fail(Error),
     Hang,
     Stuck,
+    SlowStop,
 }
 
 fn arg(words: &[&str], i: usize, default: u64) -> u64 {
@@ -137,6 +147,10 @@ impl Connection for ScriptConnection {
         }
         if cancel.is_cancelled() {
             return Err(Error::Cancelled);
+        }
+        let busy_until = *self.busy_until.lock().unwrap();
+        if let Some(until) = busy_until {
+            tokio::time::sleep(until.saturating_duration_since(Instant::now())).await;
         }
         self.log.lock().unwrap().push(format!(
             "{}: {sql}",
@@ -189,14 +203,25 @@ impl Connection for ScriptConnection {
                 steps.push_back(Step::Item(ResultItem::Schema(schema())));
                 steps.push_back(Step::Stuck);
             }
+            "slowstop" => {
+                steps.push_back(Step::Item(ResultItem::Schema(schema())));
+                steps.push_back(Step::SlowStop);
+            }
+            "slowrows" => {
+                steps.push_back(Step::Item(ResultItem::Schema(schema())));
+                steps.push_back(Step::Rows { start: 0, n: 100 });
+                steps.push_back(Step::SlowStop);
+            }
             _ => steps.push_back(Step::Item(ResultItem::RowsAffected(0))),
         }
         let log = self.log.clone();
         let closed = Arc::clone(&self.closed);
+        let busy_until = Arc::clone(&self.busy_until);
         Ok(
             stream::unfold((steps, cancel, false), move |(mut steps, cancel, done)| {
                 let log = log.clone();
                 let closed = Arc::clone(&closed);
+                let busy_until = Arc::clone(&busy_until);
                 async move {
                     if done {
                         return None;
@@ -208,7 +233,7 @@ impl Connection for ScriptConnection {
                             () = tokio::time::sleep(delay) => {}
                         }
                     }
-                    if cancel.is_cancelled() {
+                    if cancel.is_cancelled() && !matches!(step, Step::SlowStop) {
                         log.lock().unwrap().push("cancelled".into());
                         return Some((Err(Error::Cancelled), (steps, cancel, true)));
                     }
@@ -223,6 +248,12 @@ impl Connection for ScriptConnection {
                         Step::Stuck => {
                             cancel.cancelled().await;
                             closed.store(true, Ordering::SeqCst);
+                            std::future::pending::<()>().await;
+                            Err(Error::Cancelled)
+                        }
+                        Step::SlowStop => {
+                            cancel.cancelled().await;
+                            *busy_until.lock().unwrap() = Some(Instant::now() + SLOW_STOP);
                             std::future::pending::<()>().await;
                             Err(Error::Cancelled)
                         }
@@ -1177,7 +1208,7 @@ async fn editors_of_a_private_in_memory_database_run_on_the_base_session() {
 }
 
 #[tokio::test]
-async fn a_session_closed_by_an_unfinished_cancel_is_replaced_on_the_next_statement() {
+async fn a_session_closed_by_an_unfinished_cancel_is_replaced_on_the_next_run() {
     let h = Harness::new(|_| {}).await;
     let handle = h.start("a", "stuck", no_history()).await;
     let mut events = handle.events;
@@ -1196,15 +1227,10 @@ async fn a_session_closed_by_an_unfinished_cancel_is_replaced_on_the_next_statem
     );
     assert_eq!(shape(&rest).last().unwrap(), "cancelled");
 
-    // The driver closed the session over the statement it could not stop: the next statement
-    // finds it closed before starting, gets a new session and runs.
+    // The statement did not wind down: the next run starts on a new session.
     let (_, events) = h.run("a", "update 1", no_history()).await;
     let seen = shape(&events);
-    assert!(
-        seen.iter()
-            .any(|s| s.starts_with("notice Warning: the editor's session was closed")),
-        "{seen:?}"
-    );
+    assert!(seen.contains(&replaced_notice()), "{seen:?}");
     assert_eq!(seen.last().unwrap(), "finished");
     assert_eq!(
         connects(&h),
@@ -1217,4 +1243,92 @@ async fn a_session_closed_by_an_unfinished_cancel_is_replaced_on_the_next_statem
     let (_, events) = h.run("a", "lose", no_history()).await;
     assert_eq!(shape(&events).last().unwrap(), "run failed Connection");
     assert_eq!(connects(&h), 3);
+}
+
+fn replaced_notice() -> String {
+    format!("notice Warning: {REPLACED_UNCLEAN_NOTICE}")
+}
+
+/// Starts `script` on editor `a`, cancels it once its first result set arrived and checks that
+/// the run ends `cancelled` within 2 s.
+async fn cancel_after_first_result(h: &Harness, script: &str) {
+    let handle = h.start("a", script, no_history()).await;
+    let mut events = handle.events;
+    loop {
+        if matches!(events.recv().await.unwrap(), RunEvent::ResultSet { .. }) {
+            break;
+        }
+    }
+    let clock = Instant::now();
+    assert!(h.service.cancel(handle.id));
+    let rest = drain(events).await;
+    assert!(
+        clock.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        clock.elapsed()
+    );
+    assert_eq!(shape(&rest).last().unwrap(), "cancelled");
+}
+
+#[tokio::test]
+async fn the_run_after_an_unfinished_stop_does_not_wait_for_the_driver() {
+    let h = Harness::new(|_| {}).await;
+    h.run("a", "update 1", no_history()).await;
+    assert_eq!(connects(&h), 2, "base + the editor's session");
+    // The driver keeps the session busy for `SLOW_STOP` after the cancel and never closes it.
+    cancel_after_first_result(&h, "select slowstop").await;
+
+    let clock = Instant::now();
+    let (_, events) = h.run("a", "update 2", no_history()).await;
+    let took = clock.elapsed();
+    let seen = shape(&events);
+    assert_eq!(
+        seen,
+        [
+            "started 1".to_owned(),
+            replaced_notice(),
+            "stmt 0".to_owned(),
+            "ok 0 Some(2)".to_owned(),
+            "finished".to_owned()
+        ]
+    );
+    assert!(
+        took < SLOW_STOP / 2,
+        "{took:?}: the run waited for the old session"
+    );
+    assert_eq!(connects(&h), 3, "a new session, on the same database");
+    assert_eq!(h.statements_run().last().unwrap(), "db1: update 2");
+
+    // The editor is clean again: the next run keeps that session, without a notice.
+    let (_, events) = h.run("a", "update 3", no_history()).await;
+    assert_eq!(
+        shape(&events),
+        ["started 1", "stmt 0", "ok 0 Some(3)", "finished"]
+    );
+    assert_eq!(connects(&h), 3);
+}
+
+#[tokio::test]
+async fn a_later_statement_of_the_run_keeps_the_session_after_an_unfinished_stop() {
+    let h = Harness::new(|_| {}).await;
+    let options = RunOptions {
+        max_rows: Some(50),
+        ..no_history()
+    };
+    // The row limit stops the query, which does not wind down; the next statement of the
+    // script waits for the driver on the same session (its temporary tables and transaction
+    // survive) and then the editor is clean again.
+    let (_, events) = h.run("a", "select slowrows; update 1", options).await;
+    let seen = shape(&events);
+    assert_eq!(seen.last().unwrap(), "finished", "{seen:?}");
+    assert!(!seen.contains(&replaced_notice()), "{seen:?}");
+    assert_eq!(connects(&h), 2);
+    assert_eq!(h.statements_run().last().unwrap(), "db1: update 1");
+
+    let (_, events) = h.run("a", "update 2", no_history()).await;
+    assert_eq!(
+        shape(&events),
+        ["started 1", "stmt 0", "ok 0 Some(2)", "finished"]
+    );
+    assert_eq!(connects(&h), 2, "the session is kept");
 }

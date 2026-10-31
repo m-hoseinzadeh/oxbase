@@ -6,7 +6,8 @@
 //!   random pages of 200 rows have a p95 latency under 50 ms, every row arrives exactly once
 //!   and the run's batch memory stays within its budget;
 //! - (b) cancelling after at least 200,000 rows ends the run within 2 s, the rows stay
-//!   pageable and the editor's session answers `SELECT 1` afterwards;
+//!   pageable and the editor answers `SELECT 1` within 2 s afterwards (on a new session when
+//!   the driver was still stopping the cancelled statement);
 //! - (c) a multi-statement script yields several result sets and rows-affected counts, all on
 //!   one session;
 //! - (d) history records each statement of a run, redacted, in the app database.
@@ -477,20 +478,26 @@ async fn cancel_mid_stream(key: &str, engine: Engine) {
             break;
         }
     }
+    let next = clock_next.elapsed();
     let one = live.service.page(handle.id, 0, 0, 10).await.unwrap();
     assert_eq!(one.num_rows(), 1, "{engine}");
     report(&format!(
         "{engine} cancel: cancelled after {received} rows ({kept} kept), run ended {:.0} ms \
          after cancel, next SELECT 1 took {:.0} ms{}",
         ms(stopped),
-        ms(clock_next.elapsed()),
+        ms(next),
         if replaced {
-            " (the driver had closed the editor's session after the cancel; it was replaced)"
+            " on a new session (the driver was still stopping the cancelled statement)"
         } else {
             " on the same session"
         }
     ));
     assert!(stopped < Duration::from_secs(2), "{engine}: {stopped:?}");
+    // Pressing Stop and running the next query must not queue behind the cancelled one.
+    assert!(
+        next < Duration::from_secs(2),
+        "{engine}: next SELECT 1 took {next:?}"
+    );
 }
 
 /// (c) a multi-statement script.

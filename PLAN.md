@@ -206,10 +206,13 @@ received stayed pageable. All 42 `fetch_list` cells pass. Where the build differ
   extras outside the contract: `NOT_ENFORCED`, `EXCLUSION` and `NULLS_FIRST`.
 - MySQL/MariaDB: session temporary tables are not listed. Events have a fetcher but no tree
   folder. MariaDB sequences can be listed on 10.3+ but loaded only on 11.5+. Trigger
-  definitions leave out `FOLLOWS`/`PRECEDES`. After a mid-stream cancel the editor session
-  stays usable, but the next statement waited 5-9 s in CI while the driver finished the
-  killed stream. On MariaDB the driver closed that session and the query service opened a new
-  one.
+  definitions leave out `FOLLOWS`/`PRECEDES`. After a mid-stream cancel the driver needs
+  several seconds to finish the killed stream (an earlier CI run measured 8-9 s before the
+  editor's next `SELECT 1` could start on that session). The query service no longer waits for
+  it: when the stopped stream has not wound down within 1 s, the editor's next run opens a new
+  session at once, closes the old one in the background and warns that its temporary tables,
+  settings and open transaction are gone. The live test requires that next `SELECT 1` within
+  2 s on every engine.
 - The query service's unit tests no longer carry a stand-in splitter or redactor. They use
   `oxbase_sql::split` and `redact_secrets`.
 - The Glide Data Grid is pinned to `6.0.4-alpha24`, the first line that declares React 19

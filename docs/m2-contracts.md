@@ -221,7 +221,12 @@ Full rules in the module docs; the invariants every implementation and test must
    goes on.
 6. **Cancel.** `query_cancel` ends the run with `cancelled` within **2 s**, the server-side
    statement is cancelled (driver contract, M1 §7), rows received so far stay pageable and their
-   results are marked truncated; the editor's session stays usable.
+   results are marked truncated. The editor's next run does not wait for the driver: when the
+   stopped stream did not wind down within the 1 s stop grace (MySQL/MariaDB keep killing and
+   draining a large streaming result for several seconds), that run opens a new session on the
+   same database right away, closes the old one in the background and emits a warning `notice`
+   (temporary tables, settings and an open transaction of the old session are gone); otherwise
+   it reuses the session. Later statements of the *same* run keep the session.
 7. **Cleanup.** `query_close` / `query_close_editor` / dropping the service delete the run
    directories; startup removes `run-*` directories older than 24 h. Nothing is written outside
    `QueryConfig::spill_dir` (default `<temp>/oxbase-results`).
