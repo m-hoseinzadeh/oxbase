@@ -5,7 +5,6 @@
  */
 import { useCallback, useEffect, useReducer, useRef, useState } from "react";
 import {
-  type Engine,
   isTerminalEvent,
   queryCancel,
   queryCloseEditor,
@@ -22,15 +21,9 @@ import type { QueryEditorParams } from "../layout";
 import { spanOffsets } from "../positions";
 import { ResultsArea } from "../results/ResultsArea";
 import { IDLE_RUN, isActive, runReducer } from "../results/runState";
+import { languageFor, type SqlLanguage } from "./language";
 import { Splitter } from "./Splitter";
-import { type EditorCommand, SqlEditor, type SqlEditorHandle, type SqlLanguage } from "./SqlEditor";
-
-/** The Monaco grammar for an engine's SQL. */
-const LANGUAGE: Partial<Record<Engine, SqlLanguage>> = {
-  postgres: "pgsql",
-  mysql: "mysql",
-  mariadb: "mysql",
-};
+import { type EditorCommand, SqlEditor, type SqlEditorHandle } from "./SqlEditor";
 
 interface DatabaseList {
   status: "idle" | "loading" | "ok" | "error";
@@ -231,7 +224,7 @@ export function QueryEditorPanel({
   }
 
   const engine = session?.engine;
-  const language: SqlLanguage = (engine && LANGUAGE[engine]) ?? "sql";
+  const language: SqlLanguage = languageFor(engine);
   const selectedDatabase = database ?? databases.current ?? "";
   const elapsed = active ? now - startedAt.current : run.elapsedMs;
   const disabled = !session || active;
@@ -295,6 +288,7 @@ export function QueryEditorPanel({
         <button
           type="button"
           className="button button--primary"
+          data-testid="run-button"
           disabled={disabled}
           onClick={runAll}
           title="Run all (Ctrl+Shift+Enter)"
@@ -313,10 +307,21 @@ export function QueryEditorPanel({
         >
           Run current
         </button>
-        <button type="button" className="button" disabled={!active} onClick={cancel}>
+        <button
+          type="button"
+          className="button"
+          data-testid="cancel-button"
+          disabled={!active}
+          onClick={cancel}
+        >
           Stop
         </button>
-        <span className="query-editor__status" role="status" aria-live="polite">
+        <span
+          className="query-editor__status"
+          role="status"
+          aria-live="polite"
+          data-testid="run-status"
+        >
           {hint ?? status}
           {elapsed !== null && run.status !== "idle" ? ` · ${formatMs(elapsed)}` : ""}
         </span>

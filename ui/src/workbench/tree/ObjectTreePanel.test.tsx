@@ -4,6 +4,7 @@ import type { ObjectRef, TreeNode, TreeNodeRef } from "../../api";
 import { refreshSessions, resetConnectionsStore } from "../../connections/store";
 import type { SessionSummary } from "../../connections/types";
 import { tauriCore } from "../../test/tauriMock";
+import { setDockviewApi } from "../layout";
 import { ObjectTreePanel } from "./ObjectTreePanel";
 
 vi.mock("@tauri-apps/api/core", async () => (await import("../../test/tauriMock")).tauriCore);
@@ -227,5 +228,58 @@ describe("ObjectTreePanel", () => {
     tauriCore.invoke.mockResolvedValue([]);
     render(<ObjectTreePanel />);
     expect(screen.getByText("No open connections")).toBeInTheDocument();
+  });
+  it("opens a table's data on double-click and its designer from the toolbar", async () => {
+    const added: Array<{ id: string; component: string; params: unknown }> = [];
+    const api = {
+      panels: [] as unknown[],
+      addPanel: (options: { id: string; component: string; params: unknown }) => {
+        added.push(options);
+      },
+      getPanel: () => undefined,
+    };
+    setDockviewApi(api as never);
+    try {
+      const tree = await renderTree();
+      fireEvent.click(item(/Local PG/));
+      fireEvent.keyDown(tree, { key: "ArrowRight" });
+      fireEvent.doubleClick(await screen.findByRole("treeitem", { name: /app/ }));
+      fireEvent.doubleClick(await screen.findByRole("treeitem", { name: "Tables" }));
+      const users = await screen.findByRole("treeitem", { name: /users/ });
+
+      // A table double-click opens its rows instead of expanding it.
+      fireEvent.doubleClick(users);
+      expect(users).toHaveAttribute("aria-expanded", "false");
+      expect(added).toHaveLength(1);
+      expect(added[0]).toMatchObject({
+        component: "tableData",
+        params: { sessionId: "s-1", table: USERS },
+      });
+      expect(added[0]?.id).toMatch(/^data-editor-/);
+
+      fireEvent.click(users);
+      fireEvent.click(screen.getByRole("button", { name: "Design" }));
+      expect(added[1]).toMatchObject({
+        component: "designer",
+        params: { sessionId: "s-1", table: USERS },
+      });
+
+      // New table goes into the selected table's database.
+      fireEvent.click(screen.getByRole("button", { name: "New table" }));
+      expect(added[2]).toMatchObject({
+        component: "designer",
+        params: {
+          sessionId: "s-1",
+          table: { kind: "table", catalog: "app", name: "" },
+          isNew: true,
+        },
+      });
+
+      // Columns and folders have no data to open.
+      fireEvent.click(item("Tables"));
+      expect(screen.getByRole("button", { name: "Open" })).toBeDisabled();
+    } finally {
+      setDockviewApi(null);
+    }
   });
 });

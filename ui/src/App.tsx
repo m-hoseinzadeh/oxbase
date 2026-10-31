@@ -9,14 +9,18 @@ import { type FunctionComponent, useEffect, useState } from "react";
 import { ConnectionsPanel } from "./panels/ConnectionsPanel";
 import { WelcomePanel } from "./panels/WelcomePanel";
 import { StatusBar } from "./StatusBar";
+import { TableDataPanel } from "./workbench/data/TableDataPanel";
+import { TableDesignerPanel } from "./workbench/designer/TableDesignerPanel";
 import { QueryEditorPanel } from "./workbench/editor/QueryEditorPanel";
 import { HistoryPanel } from "./workbench/history/HistoryPanel";
 import {
+  type DesignerPanelParams,
   newEditorId,
   openQueryEditor,
   type QueryEditorParams,
   setDockviewApi,
   showHistory,
+  type TableDataPanelParams,
 } from "./workbench/layout";
 import { ObjectTreePanel } from "./workbench/tree/ObjectTreePanel";
 
@@ -26,12 +30,31 @@ function QueryPanel({ params }: IDockviewPanelProps<QueryEditorParams>) {
   return <QueryEditorPanel {...params} editorId={editorId} />;
 }
 
+function TableDataTab({ params }: IDockviewPanelProps<TableDataPanelParams>) {
+  const [editorId] = useState(() => params.editorId || newEditorId());
+  if (!params.sessionId || !params.table) {
+    return <p className="results__empty">This tab lost its table. Open it again from the tree.</p>;
+  }
+  return <TableDataPanel editorId={editorId} sessionId={params.sessionId} table={params.table} />;
+}
+
+function DesignerTab({ params }: IDockviewPanelProps<DesignerPanelParams>) {
+  if (!params.sessionId || !params.table) {
+    return <p className="results__empty">This tab lost its table. Open it again from the tree.</p>;
+  }
+  return (
+    <TableDesignerPanel sessionId={params.sessionId} table={params.table} isNew={params.isNew} />
+  );
+}
+
 const components: Record<string, FunctionComponent<IDockviewPanelProps>> = {
   connections: () => <ConnectionsPanel />,
   objects: () => <ObjectTreePanel />,
   welcome: () => <WelcomePanel />,
   history: () => <HistoryPanel />,
   query: QueryPanel,
+  tableData: TableDataTab,
+  designer: DesignerTab,
 };
 
 // Structural variables come from dockview's light theme; colours are overridden in

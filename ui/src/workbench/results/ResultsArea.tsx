@@ -4,9 +4,9 @@
  * through its own {@link ResultPager}; hidden tabs drop their cached pages.
  */
 import { type KeyboardEvent, useEffect, useRef, useState } from "react";
-import { queryPage } from "../../api";
 import { formatMs } from "../format";
 import { ResultPager } from "./pager";
+import { timedQueryPage } from "./perf";
 import { ResultGrid } from "./ResultGrid";
 import { type ResultInfo, type RunMessage, type RunState, rowCountLabel } from "./runState";
 
@@ -122,7 +122,7 @@ export function ResultsArea({ run }: ResultsAreaProps) {
     let pager = pagers.current.get(result.resultIndex);
     if (!pager) {
       pager = new ResultPager((offset, limit) =>
-        queryPage(runId, result.resultIndex, offset, limit),
+        timedQueryPage(runId, result.resultIndex, offset, limit),
       );
       pagers.current.set(result.resultIndex, pager);
     }
@@ -196,7 +196,7 @@ export function ResultsArea({ run }: ResultsAreaProps) {
         {activeResult && pager ? (
           <>
             <div className="results__status" aria-live="polite" data-testid="result-status">
-              {rowCountLabel(activeResult)}
+              <span data-testid="row-counter">{rowCountLabel(activeResult)}</span>
               {activeResult.columns.length === 0 ? " · no columns" : ""}
               {pager.error ? ` · page failed: ${pager.error}` : ""}
               {shownNotice ? ` · ${shownNotice}` : ""}
