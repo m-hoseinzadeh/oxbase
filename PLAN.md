@@ -187,10 +187,10 @@ query never blocks the object tree.
 
 **M2 as built (notes, 2026-10-31).** The exit check passed in the CI conformance job (Linux,
 Docker fixtures; numbers in the README, *Conformance harness*). On each of PostgreSQL, MySQL,
-MariaDB and SQLite, a 1 000 000-row query streamed in under 2 s into a result store with an
-8 MiB budget, spilling to disk. Random 200-row pages took under 0.3 ms at p95. A cancel after
-about 250 000 rows ended the run within about 1 s, and the rows already received stayed
-pageable. All 42 `fetch_list` cells pass. Where the build differs from the text above or from
+MariaDB and SQLite, a 1 000 000-row query streamed in 0.9-2.3 s (two CI runs) into a result
+store with an 8 MiB budget, spilling to disk. Random 200-row pages took under 0.3 ms at p95.
+A cancel after about 250 000 rows ended the run within about 1 s, and the rows already
+received stayed pageable. All 42 `fetch_list` cells pass. Where the build differs from the text above or from
 `docs/m2-contracts.md`:
 
 - "Scroll smoothly" is proven by page latency in the core and by UI tests that check the grid

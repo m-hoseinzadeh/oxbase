@@ -213,7 +213,9 @@ SQL Server 2025, MongoDB 7.0.45, Redis, SQLite 3.54.1 file).
   SQLite 8 (database, table, column, index, foreign key, check, view, trigger).
 - Connection checks, 42: 21 pass (postgres, mysql, mariadb, sqlite), 18 pending (mssql M4,
   mongodb/redis M7), 3 n/a (SQLite TLS/SSH), 0 fail.
-- Query runs (`oxbase-services` live tests, 8 MiB memory budget so the result spills):
+- Query runs (`oxbase-services` live tests, 8 MiB memory budget so the result spills; CI run
+  41229578451. In a second run, 41230261610, the 1M-row stream took 1645 / 1778 / 2247 / 877 ms
+  (same engine order) and every other figure stayed in the same range):
 
   | Engine | 1M rows streamed | first page | random 200-row page p95 | spill | peak batch memory | cancel after ~230-250k rows: run ended |
   |---|---|---|---|---|---|---|
