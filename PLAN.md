@@ -193,6 +193,15 @@ A cancel after about 250 000 rows ended the run within about 1 s, and the rows a
 received stayed pageable. All 42 `fetch_list` cells pass. Where the build differs from the text above or from
 `docs/m2-contracts.md`:
 
+- Platforms: the full CI lane (Rust tests and OS keychain tests on Linux, macOS and Windows)
+  and the Bundle workflow (Tauri builds for Linux x86_64, macOS x86_64 and aarch64, Windows
+  x86_64) passed on `milestone/m2` at a0ee957 (manual runs 41232475071 and 41232477171). An
+  earlier full-lane run found one Windows-only test failure (a test opened a directory with
+  `File::open` to set its time), fixed before that run. The bundles are built but not
+  launched: the Monaco worker, the canvas grid and the binary `query_page` responses in WebKit
+  and WebView2 have no automated smoke test yet, and the page latency through Tauri IPC plus
+  Arrow decoding in the webview is not measured (the 1M-row test times `QueryService::page`
+  in-process).
 - "Scroll smoothly" is proven by page latency in the core and by UI tests that check the grid
   asks only for the visible row ranges. There is no automated in-webview scrolling benchmark
   yet. That belongs with the webview smoke tests of §7.
