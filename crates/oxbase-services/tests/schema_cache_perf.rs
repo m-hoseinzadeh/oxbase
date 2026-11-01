@@ -17,7 +17,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use arrow_array::Array as _;
 use oxbase_driver::collect;
 use oxbase_net::ssh::RusshTunnelProvider;
 use oxbase_schema_cache::{MEMORY_BUDGET_BYTES, MatchMode, NameKind, NameQuery, SchemaCache};

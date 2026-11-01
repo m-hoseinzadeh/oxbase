@@ -128,7 +128,10 @@ async fn reads_every_database_of_the_session() {
     assert_eq!(summary.kind, RelationKind::View);
     let view_cols: Vec<&str> = summary.columns.iter().map(|c| c.name.as_str()).collect();
     assert_eq!(view_cols, ["region", "n"]);
-    assert!(main.routines.is_empty() && main.sequences.is_empty() && main.types.is_empty());
+    assert_eq!(
+        (main.routines.len(), main.sequences.len(), main.types.len()),
+        (0, 0, 0)
+    );
 
     let aux = &snap.schemas[0];
     assert_eq!(aux.relations.len(), 1);

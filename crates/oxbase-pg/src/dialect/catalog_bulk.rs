@@ -104,6 +104,8 @@ const COLUMNS: &str = concat!(
     " ORDER BY c.oid, a.attnum LIMIT $4::int8"
 );
 
+/// Multi-argument `unnest` is grammar (`ROWS FROM`), not a function: it cannot be
+/// schema-qualified.
 const FOREIGN_KEYS: &str = concat!(
     "SELECT n.nspname::text AS schema_name, c.relname::text AS rel, con.oid::int8 AS id, \
             rn.nspname::text AS ref_schema, rc.relname::text AS ref_table, \
@@ -113,7 +115,7 @@ const FOREIGN_KEYS: &str = concat!(
      JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
      JOIN pg_catalog.pg_class rc ON rc.oid = con.confrelid \
      JOIN pg_catalog.pg_namespace rn ON rn.oid = rc.relnamespace \
-     CROSS JOIN LATERAL pg_catalog.unnest(con.conkey, con.confkey) WITH ORDINALITY AS k(attnum, refnum, ord) \
+     CROSS JOIN LATERAL unnest(con.conkey, con.confkey) WITH ORDINALITY AS k(attnum, refnum, ord) \
      JOIN pg_catalog.pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = k.attnum \
      JOIN pg_catalog.pg_attribute ra ON ra.attrelid = con.confrelid AND ra.attnum = k.refnum \
      WHERE con.contype = 'f' AND ",

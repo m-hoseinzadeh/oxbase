@@ -174,7 +174,7 @@ async fn checks(live: &Live) {
     assert_eq!(snap.engine, live.engine);
     assert_eq!(snap.database, live.database);
     assert_eq!(snap.default_schema.as_deref(), Some(live.database.as_str()));
-    assert_eq!(snap.search_path, [live.database.clone()]);
+    assert_eq!(snap.search_path, std::slice::from_ref(&live.database));
     assert!(snap.databases.contains(&live.database));
     // The Linux fixtures run with lower_case_table_names = 0.
     assert_eq!(snap.case_rules.relations, IdentCase::Sensitive, "{key}");
@@ -271,7 +271,7 @@ async fn checks(live: &Live) {
         .map(|r| r.name.as_str())
         .collect();
     assert_eq!(names, [format!("{p}order"), format!("{p}summary")], "{key}");
-    assert!(part.schemas[0].routines.is_empty());
+    assert_eq!(part.schemas[0].routines.len(), 0);
     assert_eq!(part.schemas[0].relations[0].foreign_keys.len(), 1);
 
     // A scope on another database reads nothing of this one.
@@ -281,7 +281,7 @@ async fn checks(live: &Live) {
             ..CatalogScope::full()
         })
         .await;
-    assert!(other.schemas.is_empty());
+    assert_eq!(other.schemas.len(), 0);
 
     // The column limit.
     let limited = live
