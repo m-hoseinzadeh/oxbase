@@ -617,7 +617,15 @@ async fn cancel_during_a_large_call_rolls_back() {
             println!("sqlite INSERT cancel latency: {latency:?}");
             assert!(latency < Duration::from_secs(2), "cancel took {latency:?}");
 
-            tx.rollback().await.expect("rollback");
+            // An interrupted write can make SQLite roll the transaction back by itself (the
+            // driver then reports it as no longer active); either way nothing may be left.
+            match tx.rollback().await {
+                Ok(()) => {}
+                Err(Error::InvalidInput { message }) if message.contains("no longer active") => {
+                    println!("sqlite rolled the interrupted transaction back itself");
+                }
+                Err(e) => panic!("rollback: {e:?}"),
+            }
             assert_eq!(
                 count_rows(c.as_ref(), &name).await,
                 vec![vec![Value::Int(0)]]

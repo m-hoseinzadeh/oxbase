@@ -194,7 +194,8 @@ with `;`, the file is UTF-8 with `\n` line ends and starts with a comment naming
 Text that starts with `=`, `+`, `-`, `@`, tab or CR is a formula to a spreadsheet. With
 `formulaGuard` (default on): CSV writes it with a leading `'` (`guard_text`); XLSX writes it as a
 string cell with the quote-prefix format (`needs_guard`). Data is never written with
-`write_formula`. Numbers are never guarded. The guard is an option because the CSV change is
+`write_formula`. Numbers are never guarded, and neither is text that is a plain number
+(`-12.50`, `+1`, `-1.5e3`; *as built*, §13 integration). The guard is an option because the CSV change is
 visible to non-spreadsheet consumers.
 
 ## 4. Bulk loading (`oxbase_dialect::bulk`, load stream)
@@ -680,3 +681,34 @@ Streams record deviations from this file here, with the reason.
   offset if written). `OXBASE_E2E_REQUIRE_M5=1` makes it mandatory; it has not run yet (the
   webview smoke job skips `wip/*-perf`), so run it on `wip/*-app` or `wip/*-integrate` with the
   hook before setting that.
+
+### integration (2026-11-01)
+
+- **read**: `CsvReadOptions::trim` also trims quoted fields (the `csv` parser does not report
+  quoting); the option's doc says so.
+- **Formula guard** (§3.8): text that is a plain number (optional sign, digits with at most one
+  `.`, optional exponent) is not guarded. SQL Server `decimal` and PostgreSQL `numeric` without
+  a precision reach the writers as text, and the first export round trip on SQL Server wrote
+  `'-4920.81`. A plain number is never run as a formula.
+- **Import progress**: besides the events after each batch and each commit, the import sends a
+  heartbeat `progress` every `progress_interval` while it waits on a load call, a commit or the
+  reader (unchanged counters, growing `elapsedMs`). The first 1 GB run on PostgreSQL had gaps of
+  1.7-2.3 s during commits; with the heartbeat the largest gap was 493 ms.
+- **XLSX times** are cut to the millisecond, not rounded (`rust_xlsxwriter` converts with whole
+  milliseconds); the services round-trip test compares that way.
+- **SQL dump under another name** (`SqlDumpOptions::table` differing from the source table):
+  the source table name inside key, index and constraint names becomes the new name; a
+  constraint name without it is dropped (the target names it) and an index name without it
+  gets the new table name as a prefix, with a note. Without this a PostgreSQL dump could not
+  load next to its source (constraint names are unique per schema).
+- **Webview e2e hook**: `crates/app-tauri/src/files.rs` has the debug-only `--e2e-file-dir`
+  argument of `ui/e2e/README.md` (`#[cfg(debug_assertions)]`; release builds have neither the
+  code nor the text). CI sets `OXBASE_E2E_REQUIRE_M5=1`.
+- **CI gates**: the conformance job runs the M5 live tests of `oxbase-io` (SQL dump on each
+  engine), the five loaders and the services with `OXBASE_SERVICES_REQUIRE_M5_IO=1`;
+  `import-perf` sets `OXBASE_REQUIRE_M5_PERF=1` on every lane. A unit test of
+  `oxbase-services` requires a registered native bulk loader for all five SQL engines.
+- **Still open**: SQLite `decimal` columns of tables the import creates get `NUMERIC` affinity,
+  which keeps about 15 significant digits (load stream note above). Mapping them to `TEXT` is a
+  SQLite DDL decision that was not made in M5. The SQL Server loader stays on parameterized
+  multi-row inserts (about 3 900 rows/s), which still needs Design's sign-off.

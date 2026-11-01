@@ -355,6 +355,43 @@ take. The exit check is a CI job `import-perf` that generates a 1 GB CSV on the 
 imports it into PostgreSQL and MySQL with checksum, progress, memory and cancel assertions. Six
 streams (read, write, load, services, app, perf) fill the skeletons.
 
+**M5 as built (notes, 2026-11-01).** The exit check passed in the CI job `import-perf` (Linux,
+`--profile perf`, PostgreSQL and MySQL fixtures, `OXBASE_REQUIRE_M5_PERF=1`; full-lane run
+41328475066 on `milestone/m5` at 2434d20): a generated 1 238 093 427-byte CSV of 10 000 000 rows
+was imported into PostgreSQL 18.6 with `COPY` in 60.7 s (164 742 rows/s, 20.4 MB/s, 22 MiB peak
+RSS growth) and into MySQL 8.4.13 with multi-row inserts in 91.9 s (108 845 rows/s, 13.5 MB/s,
+87 MiB), the checksum matched on both, progress events were at most 498 ms apart, and a cancel
+at about 25% ended the import 1 ms / 152 ms after the call with exactly the committed rows (2.6
+/ 2.5 million) left, as the report said. "Export of any result or table": the services live
+tests export a filtered and sorted table, a query and a 300 000-row spilled result, and round-trip
+a table through CSV, JSON, XLSX and Parquet on all five SQL engines (SQL dumps run back on
+PostgreSQL and SQLite, and each engine's own dump on PostgreSQL, MySQL, MariaDB and SQL Server
+in `oxbase-io`'s live test); the webview smoke test imports a CSV and exports a result grid's
+query through the app (debug-only `--e2e-file-dir` hook, required with
+`OXBASE_E2E_REQUIRE_M5=1`). All five SQL engines register a native `BulkLoader` (unit-tested).
+The full CI lane (Rust tests: 949 passed on Linux and macOS, 948 on Windows; OS keychain tests on
+all three; webview smoke; import-perf) and the Bundle workflow (Linux x86_64, macOS aarch64 and
+x86_64, Windows x86_64, run 41328476718) passed; that conformance run failed once on a SQLite
+cancel test that expected its own rollback to succeed after SQLite had already rolled the
+interrupted transaction back (test fixed). Where the build differs from the text above or from
+`docs/m5-contracts.md` (its §13 lists every deviation):
+
+- SQL Server loads with typed, parameterized multi-row `INSERT`s (2 098 parameters, 1 000 rows
+  per statement; about 7 000 rows/s for 100 000 rows of every type in a debug build), not TDS
+  bulk load: tiberius needs exact per-column wire types and a half-sent bulk stream cannot be
+  cancelled in-band. SQLite also uses multi-row inserts (32 766 parameters).
+- SQLite `decimal` columns of tables the import creates get `NUMERIC` affinity, which keeps
+  about 15 significant digits; mapping them to `TEXT` is still open.
+- The import sends a heartbeat `progress` event during a slow load call, commit or read (the
+  first PostgreSQL run had 2 s gaps during commits). Text that is a plain number (SQL Server
+  decimals and unconstrained PostgreSQL `numeric` arrive as text) never gets the formula guard.
+  XLSX keeps times to the millisecond by cutting, not rounding. A SQL dump written under another
+  table name renames the source's key, index and constraint names.
+- CSV `trim` also trims quoted fields (the parser does not report quoting). With line ending
+  `cr`, comment lines still end only at LF.
+- The 1 GB check runs on PostgreSQL and MySQL only; at the SQL Server rates measured in CI
+  (3 900 to 7 000 rows/s) the same file would take about 25 to 45 minutes.
+
 Order of work: M0–M3 prove the architecture. M4 and M7 are where the per-database matrix gets tested for real. M8 and M10 reuse the Comparator and DdlGenerator cells and get much cheaper if M3 is done right.
 
 ## 7. Main risks
