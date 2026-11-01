@@ -613,6 +613,7 @@ fn incomplete_statements_give_partial_outlines() {
     let dialect = Dialect::builtin(Engine::Postgres).unwrap();
     let e = outline(&dialect, "SELECT é", 8..100);
     assert_eq!(e.class, StatementClass::Empty);
+    #[allow(clippy::reversed_empty_ranges)] // a reversed range on purpose
     let e = outline(&dialect, "SELECT 1", 5..2);
     assert_eq!(e.class, StatementClass::Empty);
 }
