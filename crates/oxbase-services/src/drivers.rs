@@ -14,6 +14,9 @@ pub fn default_drivers() -> DriverRegistry {
     drivers.register_as(Engine::MySql, mysql.clone());
     drivers.register_as(Engine::MariaDb, mysql);
     drivers.register(Arc::new(oxbase_sqlite::SqliteDriver));
+    // M4: the driver stream uncomments this line (and only this line) when the SQL Server
+    // driver is complete; until then SQL Server has no driver and stays "pending (M4)".
+    // oxbase_mssql::register(&mut drivers);
     drivers
 }
 

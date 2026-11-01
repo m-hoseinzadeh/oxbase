@@ -17,6 +17,10 @@ pub struct LexRules {
     pub e_strings: bool,
     /// `#` starts a comment (MySQL/MariaDB).
     pub hash_comments: bool,
+    /// `[...]` is a quoted identifier, with `]]` standing for one `]` (SQL Server; SQLite also
+    /// accepts it). Without this rule a `'` inside brackets would look like the start of a
+    /// string and hide what follows it (M4).
+    pub bracket_identifiers: bool,
 }
 
 /// Quotes identifiers and renders literals for one engine, plus the small lexical facts that
@@ -26,7 +30,7 @@ pub struct LexRules {
 /// The provided methods follow standard SQL; engines override what differs. M3 added
 /// [`Quoting::placeholder`], [`Quoting::text_cast`], [`Quoting::nulls_ordering`],
 /// [`Quoting::like_specials`], [`Quoting::limit_clause`] and [`Quoting::lex_rules`], all with
-/// defaults.
+/// defaults. M4 added [`Quoting::top_clause`] (SQL Server `SELECT TOP (n)`).
 pub trait Quoting: Send + Sync {
     /// Quotes an identifier unconditionally, escaping embedded quote characters.
     fn quote_ident(&self, ident: &str) -> String;
@@ -56,27 +60,7 @@ pub trait Quoting: Send + Sync {
     ///
     /// Engines whose syntax differs override this.
     fn qualify(&self, obj: &ObjectRef) -> String {
-        let parts: [Option<&str>; 4] = match obj.kind {
-            ObjectKind::ForeignKey | ObjectKind::Check => return self.quote_ident(&obj.name),
-            ObjectKind::Column => [
-                obj.catalog.as_deref(),
-                obj.schema.as_deref(),
-                obj.parent.as_deref(),
-                Some(obj.name.as_str()),
-            ],
-            _ => [
-                obj.catalog.as_deref(),
-                obj.schema.as_deref(),
-                None,
-                Some(obj.name.as_str()),
-            ],
-        };
-        parts
-            .into_iter()
-            .flatten()
-            .map(|part| self.quote_ident(part))
-            .collect::<Vec<_>>()
-            .join(".")
+        qualify_parts(self, obj)
     }
 
     /// Renders a value as a SQL literal.
@@ -137,9 +121,19 @@ pub trait Quoting: Send + Sync {
         "%_"
     }
 
-    /// The clause that limits a `SELECT` to `n` rows, appended at its end: `LIMIT n`.
+    /// The clause that limits a `SELECT` to `n` rows, appended at its end: `LIMIT n`. Not used
+    /// when [`Quoting::top_clause`] returns a clause.
     fn limit_clause(&self, n: u64) -> String {
         format!("LIMIT {n}")
+    }
+
+    /// The clause that limits a `SELECT` to `n` rows when it goes right after `SELECT` instead
+    /// of at the end (M4): `None` by default; [`BracketQuoting`] `TOP (n)`. When this is `Some`,
+    /// [`crate::sql::select_table_data`] writes `SELECT <top> * FROM ...` and no
+    /// [`Quoting::limit_clause`].
+    fn top_clause(&self, n: u64) -> Option<String> {
+        let _ = n;
+        None
     }
 
     /// Where strings, quoted identifiers and comments start and end (for
@@ -147,6 +141,32 @@ pub trait Quoting: Send + Sync {
     fn lex_rules(&self) -> LexRules {
         LexRules::default()
     }
+}
+
+/// The default [`Quoting::qualify`]: the parts of `obj` that are set, each quoted with `q`,
+/// joined with `.` (see the trait method for which parts a kind uses).
+fn qualify_parts<Q: Quoting + ?Sized>(q: &Q, obj: &ObjectRef) -> String {
+    let parts: [Option<&str>; 4] = match obj.kind {
+        ObjectKind::ForeignKey | ObjectKind::Check => return q.quote_ident(&obj.name),
+        ObjectKind::Column => [
+            obj.catalog.as_deref(),
+            obj.schema.as_deref(),
+            obj.parent.as_deref(),
+            Some(obj.name.as_str()),
+        ],
+        _ => [
+            obj.catalog.as_deref(),
+            obj.schema.as_deref(),
+            None,
+            Some(obj.name.as_str()),
+        ],
+    };
+    parts
+        .into_iter()
+        .flatten()
+        .map(|part| q.quote_ident(part))
+        .collect::<Vec<_>>()
+        .join(".")
 }
 
 /// Lowercase hex of `bytes`.
@@ -189,13 +209,21 @@ fn wrap(ident: &str, open: char, close: char) -> String {
 
 /// Standard SQL quoting: `"ident"` and `X'..'` binary literals (SQLite and standard SQL).
 ///
-/// Not for PostgreSQL, where `X'..'` is a bit string: use [`PgQuoting`].
+/// Not for PostgreSQL, where `X'..'` is a bit string: use [`PgQuoting`]. Its
+/// [`LexRules::bracket_identifiers`] is on, because SQLite reads `[...]` as an identifier (M4).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AnsiQuoting;
 
 impl Quoting for AnsiQuoting {
     fn quote_ident(&self, ident: &str) -> String {
         wrap(ident, '"', '"')
+    }
+
+    fn lex_rules(&self) -> LexRules {
+        LexRules {
+            bracket_identifiers: true,
+            ..LexRules::default()
+        }
     }
 }
 
@@ -285,13 +313,25 @@ impl Quoting for BacktickQuoting {
     }
 }
 
-/// SQL Server quoting: `[ident]`, `N'...'` Unicode strings, `0x..` binary and `1`/`0` booleans.
+/// SQL Server quoting: `[ident]` (`]]` escapes `]`), `N'...'` Unicode strings, `0x..` binary,
+/// `1`/`0` booleans, `@Pn` placeholders, `SELECT TOP (n)` (M4).
+///
+/// Names are qualified without the database (`[schema].[name]`): a SQL Server session reads
+/// one database (`DatabaseScope::Session`, as on PostgreSQL), several statements (`CREATE
+/// VIEW`, `CREATE TRIGGER`, `CREATE FUNCTION`, ...) refuse a database prefix, and services run
+/// statements on a session of `obj.catalog`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct BracketQuoting;
 
 impl Quoting for BracketQuoting {
     fn quote_ident(&self, ident: &str) -> String {
         wrap(ident, '[', ']')
+    }
+
+    fn qualify(&self, obj: &ObjectRef) -> String {
+        let mut local = obj.clone();
+        local.catalog = None;
+        qualify_parts(self, &local)
     }
 
     fn placeholder(&self, n: usize) -> String {
@@ -308,6 +348,23 @@ impl Quoting for BracketQuoting {
 
     fn like_specials(&self) -> &'static str {
         "%_["
+    }
+
+    /// `OFFSET 0 ROWS FETCH NEXT n ROWS ONLY`, which T-SQL accepts only after an `ORDER BY`;
+    /// statements without one use [`Quoting::top_clause`].
+    fn limit_clause(&self, n: u64) -> String {
+        format!("OFFSET 0 ROWS FETCH NEXT {n} ROWS ONLY")
+    }
+
+    fn top_clause(&self, n: u64) -> Option<String> {
+        Some(format!("TOP ({n})"))
+    }
+
+    fn lex_rules(&self) -> LexRules {
+        LexRules {
+            bracket_identifiers: true,
+            ..LexRules::default()
+        }
     }
 
     fn quote_str(&self, s: &str) -> String {
@@ -349,8 +406,19 @@ mod tests {
         );
         let col = t.child(ObjectKind::Column, "id");
         assert_eq!(
-            BracketQuoting.qualify(&col),
-            "[shop].[public].[Order Items].[id]"
+            AnsiQuoting.qualify(&col),
+            "\"shop\".\"public\".\"Order Items\".\"id\""
+        );
+        // SQL Server names never carry the database (one database per session, M4).
+        assert_eq!(BracketQuoting.qualify(&col), "[public].[Order Items].[id]");
+        assert_eq!(BracketQuoting.qualify(&t), "[public].[Order Items]");
+        assert_eq!(
+            BracketQuoting.qualify(&t.child(ObjectKind::Index, "i]x")),
+            "[public].[i]]x]"
+        );
+        assert_eq!(
+            BracketQuoting.qualify(&t.child(ObjectKind::Check, "ck")),
+            "[ck]"
         );
         // Constraints are named without qualification.
         assert_eq!(
@@ -438,9 +506,27 @@ mod tests {
         assert!(!BacktickQuoting.nulls_ordering() && !BracketQuoting.nulls_ordering());
         assert_eq!(BracketQuoting.like_specials(), "%_[");
         assert_eq!(AnsiQuoting.limit_clause(10), "LIMIT 10");
+        assert_eq!(AnsiQuoting.top_clause(10), None);
+        assert_eq!(PgQuoting.top_clause(10), None);
+        assert_eq!(BacktickQuoting.top_clause(10), None);
+        assert_eq!(BracketQuoting.top_clause(10).as_deref(), Some("TOP (10)"));
+        assert_eq!(
+            BracketQuoting.limit_clause(10),
+            "OFFSET 0 ROWS FETCH NEXT 10 ROWS ONLY"
+        );
+        assert!(BracketQuoting.lex_rules().bracket_identifiers);
+        assert!(AnsiQuoting.lex_rules().bracket_identifiers);
+        assert!(!PgQuoting.lex_rules().bracket_identifiers);
+        assert!(!BacktickQuoting.lex_rules().bracket_identifiers);
         assert!(PgQuoting.lex_rules().dollar_quotes && PgQuoting.lex_rules().e_strings);
         assert!(BacktickQuoting.lex_rules().backslash_escapes);
-        assert_eq!(AnsiQuoting.lex_rules(), LexRules::default());
+        assert_eq!(
+            AnsiQuoting.lex_rules(),
+            LexRules {
+                bracket_identifiers: true,
+                ..LexRules::default()
+            }
+        );
     }
 
     /// DDL literals (comments, literal defaults) are escaped by the dialect: quotes,

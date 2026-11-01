@@ -25,6 +25,9 @@ oxbase-designer.workspace = true
 oxbase-pg.workspace = true
 oxbase-mysql.workspace = true
 oxbase-sqlite.workspace = true
+# M4: SQL Server. Registered in `default_drivers` / `default_dialects` once the driver and the
+# dialect streams uncomment their lines there.
+oxbase-mssql.workspace = true
 chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true

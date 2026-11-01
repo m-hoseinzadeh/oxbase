@@ -171,6 +171,13 @@ tokio-postgres-rustls = { version = "0.14.0", default-features = false, features
 # off per connection, but deny.toml must allow that license.
 mysql_async = { version = "0.37.1", default-features = false, features = ["default-rustls-ring"] }
 rusqlite = { version = "0.41.1", features = ["bundled"] }
+# M4: SQL Server (TDS 7.4) client, MIT OR Apache-2.0. Built WITHOUT any TLS backend: its `rustls`
+# feature pulls tokio-rustls with default features (aws-lc-rs) and hard-codes the aws-lc
+# provider, and `native-tls` / `vendored-openssl` are OpenSSL. oxbase-mssql runs the TLS
+# handshake itself with rustls + ring (docs/m4-contracts.md §2). `tds73` = date/time/datetime2/
+# datetimeoffset types; `chrono` = conversions. Never enable `rustls`, `native-tls`,
+# `vendored-openssl`, `winauth`, `integrated-auth-gssapi` or the default features.
+tiberius = { version = "0.13.0", default-features = false, features = ["tds73", "chrono"] }
 
 # --- network: TLS (rustls + ring) and SSH (russh + ring) ---
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12", "logging"] }
