@@ -380,6 +380,69 @@ fn tsql_passwords() {
             "EXEC sp_addlinkedserver @server = N'S', @provstr = N'Server=x;Password=pw'",
             "EXEC sp_addlinkedserver @server = N'S', @provstr = N'Server=x;Password=***'",
         ),
+        // `"..."` is a string under `SET QUOTED_IDENTIFIER OFF`.
+        (
+            "SET QUOTED_IDENTIFIER OFF; CREATE LOGIN l WITH PASSWORD = \"S3cret!\"",
+            "SET QUOTED_IDENTIFIER OFF; CREATE LOGIN l WITH PASSWORD = '***'",
+        ),
+        (
+            "CREATE CREDENTIAL c WITH IDENTITY = 'u', SECRET = \"pw\"",
+            "CREATE CREDENTIAL c WITH IDENTITY = 'u', SECRET = '***'",
+        ),
+        (
+            "ALTER SERVICE MASTER KEY WITH NEW_ACCOUNT = 'acct', NEW_PASSWORD = 'pw'",
+            "ALTER SERVICE MASTER KEY WITH NEW_ACCOUNT = 'acct', NEW_PASSWORD = '***'",
+        ),
+        // Declared variables: a type (and its size) may sit before `=`.
+        (
+            "DECLARE @password nvarchar(50) = N'pw'",
+            "DECLARE @password nvarchar(50) = N'***'",
+        ),
+        (
+            "DECLARE @n int = 1, @AdminPwd AS [nvarchar](max) = 'pw', @m int = 2",
+            "DECLARE @n int = 1, @AdminPwd AS [nvarchar](max) = '***', @m int = 2",
+        ),
+        (
+            "DECLARE @secret sys.sysname = N'pw', @k decimal(10, 2) = 1",
+            "DECLARE @secret sys.sysname = N'***', @k decimal(10, 2) = 1",
+        ),
+        // Named and positional arguments of system procedures.
+        (
+            "EXEC sp_password @old = 'a', @new = 'b', @loginame = 'l'",
+            "EXEC sp_password @old = '***', @new = '***', @loginame = 'l'",
+        ),
+        (
+            "EXEC sp_approlepassword @rolename = 'r', @newpwd = 'pw'",
+            "EXEC sp_approlepassword @rolename = 'r', @newpwd = '***'",
+        ),
+        (
+            "EXEC sp_addlogin 'l', 'pw', 'db'",
+            "EXEC sp_addlogin 'l', '***', 'db'",
+        ),
+        (
+            "EXEC sys.sp_password NULL, N'pw', 'l'",
+            "EXEC sys.sp_password NULL, N'***', 'l'",
+        ),
+        (
+            "EXEC sp_setapprole 'r', N'pw'; SELECT 'kept'",
+            "EXEC sp_setapprole 'r', N'***'; SELECT 'kept'",
+        ),
+        (
+            "EXEC master.dbo.sp_addlinkedsrvlogin 'srv', 'false', NULL, 'u', 'pw'",
+            "EXEC master.dbo.sp_addlinkedsrvlogin 'srv', 'false', NULL, 'u', '***'",
+        ),
+        (
+            "EXEC sp_change_users_login 'Auto_Fix', 'u', NULL, 'pw'",
+            "EXEC sp_change_users_login 'Auto_Fix', 'u', NULL, '***'",
+        ),
+        (
+            "EXEC sp_executesql @stmt, N'@pwd sysname', @pwd = N'pw'",
+            "EXEC sp_executesql @stmt, N'@pwd sysname', @pwd = N'***'",
+        ),
+        (
+            "SELECT PWDENCRYPT(N'pw'), PWDCOMPARE('pw2', password_hash) FROM sys.sql_logins",
+            "SELECT PWDENCRYPT(N'***'), PWDCOMPARE('***', password_hash) FROM sys.sql_logins",
+        ),
         // Multi-byte text and several batches.
         (
             "SELECT N'é😀'\nGO\nALTER LOGIN [ü] WITH PASSWORD = N'密码'\nGO",
@@ -398,6 +461,10 @@ fn tsql_passwords() {
         "SELECT 0x0102 AS b; UPDATE t SET h = 0xAB WHERE k = 'x'",
     );
     keeps(TSQL, "SELECT @@VERSION, N'x', [a]]b]");
+    keeps(TSQL, "IF @pwd IS NULL SELECT 'kept'");
+    keeps(TSQL, "SELECT \"kept\" FROM t WHERE @password = [x]");
+    keeps(TSQL, "EXEC sp_addlogin @l, @p; SELECT 'kept', 'too'");
+    keeps(TSQL, "EXEC sp_addlogin @loginame = 'l'");
 }
 
 #[test]

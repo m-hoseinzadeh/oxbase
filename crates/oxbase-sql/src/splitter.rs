@@ -10,10 +10,8 @@
 //! - [`Blocks`], which counts the compound bodies in which `;` does not end the statement
 //!   (PostgreSQL `BEGIN ATOMIC`, MySQL/MariaDB stored programs, SQLite trigger bodies).
 //!
-//! T-SQL ([`SqlDialect::TSql`]) uses [`tsql::Tracker`] in place of [`Blocks`], and collects
-//! the statements of a `GO` batch before emitting them: a batch that holds batch-scoped state
-//! (local variables, `DECLARE`, `SCOPE_IDENTITY`, ...) is emitted as one statement. A `;`
-//! directly followed by `ELSE` does not end a statement (`IF x SELECT 1; ELSE SELECT 2`).
+//! T-SQL ([`SqlDialect::TSql`]) has no terminator and no [`Blocks`]: only a `GO` line ends a
+//! statement (one statement = one batch), and `;` is ordinary content.
 //!
 //! Positions are computed incrementally (statement offsets only grow), so the whole split is
 //! linear in the length of the script.
@@ -24,8 +22,6 @@
 
 use crate::lex::{self, Rules, Token, TokenKind};
 use crate::{Position, SqlDialect, Statement, StatementKind};
-
-mod tsql;
 
 pub(crate) fn split(dialect: SqlDialect, text: &str) -> Vec<Statement> {
     let mut splitter = Splitter::new(dialect, text);
@@ -51,15 +47,6 @@ const QUERY_WORDS: [&[u8]; 11] = [
 /// T-SQL first keywords of statements that probably return rows.
 const TSQL_QUERY_WORDS: [&[u8]; 5] = [b"SELECT", b"WITH", b"EXEC", b"EXECUTE", b"VALUES"];
 
-/// A statement found inside the current T-SQL batch, not emitted yet.
-#[derive(Debug, Clone, Copy)]
-struct Piece {
-    start: usize,
-    end: usize,
-    segment_end: usize,
-    kind: StatementKind,
-}
-
 struct Splitter<'a> {
     rules: Rules,
     text: &'a str,
@@ -77,12 +64,6 @@ struct Splitter<'a> {
     blocks: Blocks,
     /// Only spaces and tabs since the last line feed (or the start of the text).
     at_line_start: bool,
-    /// T-SQL: blocks, module bodies and batch-scoped state of the current batch.
-    tsql: tsql::Tracker,
-    /// T-SQL: the statement a `;` just ended; taken back if `ELSE` follows.
-    tentative: Option<Piece>,
-    /// T-SQL: the statements of the current batch so far.
-    pieces: Vec<Piece>,
 }
 
 impl<'a> Splitter<'a> {
@@ -99,9 +80,6 @@ impl<'a> Splitter<'a> {
             kind: StatementKind::Other,
             blocks: Blocks::new(dialect, true),
             at_line_start: true,
-            tsql: tsql::Tracker::new(),
-            tentative: None,
-            pieces: Vec::new(),
         }
     }
 
@@ -122,11 +100,7 @@ impl<'a> Splitter<'a> {
             i = tok.end;
         }
         let end = self.end;
-        if self.rules.dialect == SqlDialect::TSql {
-            self.finish_batch(end);
-        } else {
-            self.finish(end);
-        }
+        self.finish(end);
     }
 
     /// A MySQL `DELIMITER` line or a T-SQL `GO` line at `i`: handles it and returns the end of
@@ -148,7 +122,7 @@ impl<'a> Splitter<'a> {
             }
             SqlDialect::TSql => {
                 let line_end = go_line(bytes, i)?;
-                self.finish_batch(line_end);
+                self.finish(line_end);
                 self.at_line_start = false;
                 Some(line_end)
             }
@@ -206,9 +180,13 @@ impl<'a> Splitter<'a> {
                     self.end = tok.end;
                 }
             }
-            _ if self.rules.dialect == SqlDialect::TSql => {
+            // T-SQL: a `;` before any content of the batch is an empty statement.
+            TokenKind::Punct
+                if self.rules.dialect == SqlDialect::TSql
+                    && self.start.is_none()
+                    && bytes[tok.start] == b';' =>
+            {
                 self.at_line_start = false;
-                self.on_tsql_content(tok);
             }
             _ => {
                 self.at_line_start = false;
@@ -231,125 +209,25 @@ impl<'a> Splitter<'a> {
         }
     }
 
-    /// A T-SQL content token: feeds [`tsql::Tracker`] and ends the statement at a `;` outside
-    /// blocks and module bodies (tentatively: an `ELSE` next takes the cut back).
-    fn on_tsql_content(&mut self, tok: Token) {
-        let bytes = self.text.as_bytes();
-        let signal = match tok.kind {
-            TokenKind::Word => tsql::Signal::Word(tsql::Kw::of(&bytes[tok.start..tok.end])),
-            TokenKind::Punct if tok.end == tok.start + 1 => tsql::Signal::Punct(bytes[tok.start]),
-            _ => tsql::Signal::Other,
-        };
-        let semicolon = signal == tsql::Signal::Punct(b';');
-        if semicolon && self.start.is_none() {
-            // An empty segment: `;;`, or a `;` at the start of a batch.
-            return;
-        }
-        if let Some(piece) = self.tentative.take() {
-            if signal == tsql::Signal::Word(tsql::Kw::Else) {
-                // `IF ... ; ELSE ...`: one statement after all.
-                self.start = Some(piece.start);
-                self.kind = piece.kind;
-                self.tsql.resume_statement();
-            } else {
-                self.pieces.push(piece);
-            }
-        }
-        if self.start.is_none() {
-            self.start = Some(tok.start);
-            self.kind = statement_kind(self.rules.dialect, bytes, tok);
-        }
-        self.tsql.feed(signal);
-        if semicolon && self.tsql.can_cut() {
-            if let Some(start) = self.start.take() {
-                self.tentative = Some(Piece {
-                    start,
-                    end: self.end,
-                    segment_end: tok.end,
-                    kind: self.kind,
-                });
-            }
-            self.tsql.new_statement();
-            return;
-        }
-        self.end = tok.end;
-    }
-
-    /// Ends the current T-SQL batch at `segment_end` (the end of its `GO` line, or of the
-    /// text): emits its statements, or the whole batch as one statement when it holds
-    /// batch-scoped state.
-    fn finish_batch(&mut self, segment_end: usize) {
-        let mut pieces = std::mem::take(&mut self.pieces);
-        pieces.extend(self.tentative.take());
-        if let Some(start) = self.start.take() {
-            pieces.push(Piece {
-                start,
-                end: self.end,
-                segment_end: self.end,
-                kind: self.kind,
-            });
-        }
-        if let Some(last) = pieces.last_mut() {
-            last.segment_end = last.segment_end.max(segment_end);
-        }
-        if self.tsql.scoped()
-            && let (Some(first), Some(last)) = (pieces.first().copied(), pieces.last().copied())
-            && pieces.len() > 1
-        {
-            let kind = if pieces.iter().all(|p| p.kind == StatementKind::Query) {
-                StatementKind::Query
-            } else {
-                StatementKind::Other
-            };
-            pieces.clear();
-            pieces.push(Piece {
-                start: first.start,
-                end: last.end,
-                segment_end: last.segment_end,
-                kind,
-            });
-        }
-        for piece in &pieces {
-            self.emit(*piece);
-        }
-        pieces.clear();
-        self.pieces = pieces;
-        self.tsql.reset();
-    }
-
     /// Ends the pending segment at `segment_end`: emits its statement, if it has content.
     fn finish(&mut self, segment_end: usize) {
         if let Some(start) = self.start.take() {
-            self.emit(Piece {
-                start,
-                end: self.end,
-                segment_end,
+            let end = self.end;
+            let start_pos = self.positions.at(start);
+            let end_pos = self.positions.at(end);
+            self.out.push(Statement {
+                range: start..end,
+                segment_end: segment_end.max(end),
+                start: start_pos,
+                end: end_pos,
+                text: self
+                    .text
+                    .get(start..end)
+                    .map_or_else(String::new, str::to_owned),
                 kind: self.kind,
             });
         }
         self.blocks.reset();
-    }
-
-    fn emit(&mut self, piece: Piece) {
-        let Piece {
-            start,
-            end,
-            segment_end,
-            kind,
-        } = piece;
-        let start_pos = self.positions.at(start);
-        let end_pos = self.positions.at(end);
-        self.out.push(Statement {
-            range: start..end,
-            segment_end: segment_end.max(end),
-            start: start_pos,
-            end: end_pos,
-            text: self
-                .text
-                .get(start..end)
-                .map_or_else(String::new, str::to_owned),
-            kind,
-        });
     }
 }
 

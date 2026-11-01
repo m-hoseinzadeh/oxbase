@@ -19,11 +19,24 @@
 //! T-SQL (`docs/m4-contracts.md` §6): `PASSWORD =` and `SECRET =` cover `CREATE` / `ALTER
 //! LOGIN`, `CREATE USER ... WITH PASSWORD`, `ENCRYPTION` / `DECRYPTION BY PASSWORD`,
 //! credentials (`IDENTITY = '...', SECRET = '...'`) and application roles; `OLD_PASSWORD =`
-//! too. An `N'...'` secret keeps its `N` (`N'***'`). Also masked: a hashed password
-//! `PASSWORD = 0x... HASHED`, `MEDIAPASSWORD = '...'`, `KEY_SOURCE = '...'`, and the
-//! arguments and variables `@password`, `@passwd`, `@rmtpassword`, `@secret`, ... `= '...'`
-//! (`sp_addlinkedsrvlogin`, `SET @password = N'...'`). Dynamic SQL in `EXEC ('...')` /
-//! `sp_executesql N'...'` literals is redacted like any nested SQL.
+//! and `NEW_PASSWORD =` (`ALTER SERVICE MASTER KEY`) too. An `N'...'` secret keeps its `N`
+//! (`N'***'`); a `"..."` secret (a string under `SET QUOTED_IDENTIFIER OFF`) is masked too.
+//! Also masked (best effort):
+//!
+//! - a hashed password `PASSWORD = 0x... HASHED`, `MEDIAPASSWORD = '...'`, `KEY_SOURCE =
+//!   '...'`, the first argument of `PWDENCRYPT(...)` / `PWDCOMPARE(...)`;
+//! - the value assigned to a variable or named argument whose name holds `password`,
+//!   `passwd`, `pwd` or `secret`, or is `@pw`, `@pass`, `@new` or `@old` (`sp_password`):
+//!   `@rmtpassword = N'...'`, `SET @NewPwd = '...'`, `DECLARE @password nvarchar(128) =
+//!   N'...'` (a type name and its `(n)` / `(max)` may sit between the name and `=`);
+//! - the password position of system procedures called with positional arguments:
+//!   `sp_addlogin` (2nd), `sp_password` (1st and 2nd), `sp_setapprole`, `sp_addapprole`,
+//!   `sp_approlepassword`, `sp_control_dbmasterkey_password` (2nd), `sp_change_users_login`
+//!   (4th) and `sp_addlinkedsrvlogin` (5th).
+//!
+//! Dynamic SQL in `EXEC ('...')` / `sp_executesql N'...'` literals is redacted like any nested
+//! SQL. Not masked: the values of `sp_executesql` parameters (`@p = N'...'` with a name that
+//! does not look like a secret), since nothing in the text says which one is a secret.
 //!
 //! Deliberate narrowings:
 //!
@@ -69,6 +82,18 @@ enum State {
     ForUser,
     /// A secret was just masked (`REPLACE '<old>'` may follow).
     AfterSecret,
+    /// T-SQL: after a secret variable or argument (`@password`); `=` arms. `typed`: a type
+    /// name followed (`DECLARE @pwd nvarchar`); `open`: inside its `(n)` / `(max)`.
+    VarDecl {
+        typed: bool,
+        open: bool,
+    },
+    /// T-SQL: the positional arguments of a system procedure; bit `arg` of `secrets` set: the
+    /// current argument is a password.
+    Positional {
+        secrets: u8,
+        arg: u8,
+    },
 }
 
 /// The first word of the current statement, as far as `KEY` arming cares.
@@ -96,27 +121,44 @@ enum Word {
     Plugin,
     For,
     Replace,
+    /// T-SQL: a variable or argument whose name looks like a secret (`@password`, `@pwd`).
+    SecretVar,
+    /// T-SQL: a system procedure with a password among its positional arguments (bit `i`:
+    /// argument `i`, from 0).
+    Proc(u8),
     Other,
 }
 
 impl Word {
     fn of(dialect: SqlDialect, word: &[u8]) -> Self {
         let tsql = dialect == SqlDialect::TSql;
-        // T-SQL: `@password = '...'` (procedure arguments, variables) arms like `PASSWORD`.
-        let bare = match word {
-            [b'@', rest @ ..] if tsql => rest,
-            _ => word,
-        };
-        let secret = |k: &str| bare.eq_ignore_ascii_case(k.as_bytes());
+        if tsql {
+            // `@name`: a variable or argument, never a keyword (`@@name`: a function).
+            if let [b'@', name @ ..] = word
+                && name.first() != Some(&b'@')
+            {
+                return if secret_variable(name) {
+                    Self::SecretVar
+                } else {
+                    Self::Other
+                };
+            }
+            if let Some(&(_, secrets)) = TSQL_PROCEDURES
+                .iter()
+                .find(|(name, _)| word.eq_ignore_ascii_case(name.as_bytes()))
+            {
+                return Self::Proc(secrets);
+            }
+        }
         let is = |k: &str| word.eq_ignore_ascii_case(k.as_bytes());
-        if secret("PASSWORD") {
+        if is("PASSWORD") {
             Self::Secret { password: true }
-        } else if secret("IDENTIFIED")
-            || secret("MASTER_PASSWORD")
-            || secret("SOURCE_PASSWORD")
-            || secret("OLD_PASSWORD")
-            || secret("SECRET")
-            || (tsql && TSQL_SECRET_WORDS.iter().any(|k| secret(k)))
+        } else if is("IDENTIFIED")
+            || is("MASTER_PASSWORD")
+            || is("SOURCE_PASSWORD")
+            || is("OLD_PASSWORD")
+            || is("SECRET")
+            || (tsql && TSQL_SECRET_WORDS.iter().any(|k| is(k)))
         {
             Self::Secret { password: false }
         } else if is("KEY") || is("REKEY") || is("HEXKEY") || is("HEXREKEY") {
@@ -136,9 +178,61 @@ impl Word {
 }
 
 /// T-SQL words that arm besides the common ones: `BACKUP ... MEDIAPASSWORD = '...'`,
-/// `CREATE SYMMETRIC KEY ... KEY_SOURCE = '...'`, and the arguments `@rmtpassword` /
-/// `@passwd` of `sp_addlinkedsrvlogin` / `sp_addlogin` (the `@` is stripped before matching).
-const TSQL_SECRET_WORDS: &[&str] = &["MEDIAPASSWORD", "KEY_SOURCE", "RMTPASSWORD", "PASSWD"];
+/// `CREATE SYMMETRIC KEY ... KEY_SOURCE = '...'`, `ALTER SERVICE MASTER KEY ... NEW_PASSWORD =
+/// '...'`, and the functions `PWDENCRYPT('...')` / `PWDCOMPARE('...', hash)`.
+const TSQL_SECRET_WORDS: &[&str] = &[
+    "MEDIAPASSWORD",
+    "KEY_SOURCE",
+    "NEW_PASSWORD",
+    "PWDENCRYPT",
+    "PWDCOMPARE",
+];
+
+/// Parts of T-SQL variable and argument names (after the `@`, case-insensitive) that make
+/// the assigned value a secret.
+const TSQL_SECRET_NAME_PARTS: &[&str] = &["password", "passwd", "pwd", "secret"];
+
+/// T-SQL variable and argument names (after the `@`) that are secrets as a whole:
+/// `sp_password @old = ..., @new = ...`.
+const TSQL_SECRET_NAMES: &[&str] = &["pw", "pass", "new", "old"];
+
+/// T-SQL system procedures and the positional arguments (bit `i`: argument `i`, from 0) that
+/// hold a password.
+const TSQL_PROCEDURES: &[(&str, u8)] = &[
+    // @loginame, @passwd
+    ("sp_addlogin", 0b10),
+    // @old, @new
+    ("sp_password", 0b11),
+    // @rolename, @password
+    ("sp_setapprole", 0b10),
+    ("sp_addapprole", 0b10),
+    // @rolename, @newpwd
+    ("sp_approlepassword", 0b10),
+    // @db_name, @password
+    ("sp_control_dbmasterkey_password", 0b10),
+    // @Action, @UserNamePattern, @LoginName, @Password
+    ("sp_change_users_login", 0b1000),
+    // @rmtsrvname, @useself, @locallogin, @rmtuser, @rmtpassword
+    ("sp_addlinkedsrvlogin", 0b1_0000),
+];
+
+/// Whether a T-SQL variable or argument name (without its `@`) names a secret.
+fn secret_variable(name: &[u8]) -> bool {
+    TSQL_SECRET_NAMES
+        .iter()
+        .any(|k| name.eq_ignore_ascii_case(k.as_bytes()))
+        || TSQL_SECRET_NAME_PARTS.iter().any(|part| {
+            name.windows(part.len())
+                .any(|w| w.eq_ignore_ascii_case(part.as_bytes()))
+        })
+}
+
+/// Whether positional argument `arg` is a password in a [`State::Positional`] mask.
+fn secret_arg(secrets: u8, arg: u8) -> bool {
+    secrets
+        .checked_shr(u32::from(arg))
+        .is_some_and(|bits| bits & 1 == 1)
+}
 
 /// One replacement: `start..end` of the text becomes `text`.
 type Edit = (usize, usize, Cow<'static, str>);
@@ -209,6 +303,10 @@ impl Redactor<'_> {
         self.rules.dialect == SqlDialect::Sqlite
     }
 
+    fn tsql(&self) -> bool {
+        self.rules.dialect == SqlDialect::TSql
+    }
+
     /// Replaces `start..end` with [`REDACTED_LITERAL`].
     fn mask(&mut self, start: usize, end: usize) -> State {
         self.edits
@@ -216,9 +314,20 @@ impl Redactor<'_> {
         State::AfterSecret
     }
 
+    /// [`Self::mask`] for a positional procedure argument: the next arguments still count.
+    fn mask_argument(&mut self, start: usize, end: usize) -> State {
+        let state = self.state;
+        self.mask(start, end);
+        state
+    }
+
     fn on_str(&mut self, start: usize, end: usize, inner_start: usize, inner_end: usize) -> State {
-        if let State::Armed { .. } = self.state {
-            return self.mask(start, end);
+        match self.state {
+            State::Armed { .. } => return self.mask(start, end),
+            State::Positional { secrets, arg } if secret_arg(secrets, arg) => {
+                return self.mask_argument(start, end);
+            }
+            _ => {}
         }
         if let Some(content) = redact_literal(
             self.rules,
@@ -237,6 +346,7 @@ impl Redactor<'_> {
                 password: false,
             },
             State::ForUser => State::ForUser,
+            State::Positional { .. } => self.state,
             _ => State::Off,
         }
     }
@@ -248,6 +358,24 @@ impl Redactor<'_> {
             State::Armed { paren: false, .. } if self.sqlite() && quote == b'"' => {
                 self.mask(start, end)
             }
+            // T-SQL with `QUOTED_IDENTIFIER OFF`: `"..."` is a string.
+            State::Armed { .. } if self.tsql() && quote == b'"' => self.mask(start, end),
+            State::Positional { secrets, arg } => {
+                if quote == b'"' && secret_arg(secrets, arg) {
+                    self.mask_argument(start, end)
+                } else {
+                    state
+                }
+            }
+            // `DECLARE @pwd [nvarchar](50)`, `@pwd [sys].[sysname]`.
+            State::VarDecl {
+                typed: false,
+                open: false,
+            } => State::VarDecl {
+                typed: true,
+                open: false,
+            },
+            State::VarDecl { open: true, .. } => state,
             State::Plugin { paren } => State::Armed {
                 paren,
                 password: false,
@@ -281,6 +409,33 @@ impl Redactor<'_> {
                 paren: false,
                 password,
             },
+            (_, Word::SecretVar) => State::VarDecl {
+                typed: false,
+                open: false,
+            },
+            (_, Word::Proc(secrets)) => State::Positional { secrets, arg: 0 },
+            (State::Positional { secrets, arg }, _) => {
+                self.on_positional_word(secrets, arg, start, end)
+            }
+            // `DECLARE @pwd AS nvarchar(50) = ...`
+            (
+                State::VarDecl {
+                    typed: false,
+                    open: false,
+                },
+                Word::Filler,
+            )
+            | (State::VarDecl { open: true, .. }, _) => state,
+            (
+                State::VarDecl {
+                    typed: false,
+                    open: false,
+                },
+                _,
+            ) => State::VarDecl {
+                typed: true,
+                open: false,
+            },
             (State::Armed { paren, .. }, Word::Filler) | (State::Plugin { paren }, _) => {
                 State::Armed {
                     paren,
@@ -313,6 +468,31 @@ impl Redactor<'_> {
         }
     }
 
+    /// A word among the positional arguments of a [`TSQL_PROCEDURES`] call: `NULL`,
+    /// `DEFAULT`, a number, a variable and the `N` of `N'...'` are arguments (a number in a
+    /// password position is masked); any other word ends the call.
+    fn on_positional_word(&mut self, secrets: u8, arg: u8, start: usize, end: usize) -> State {
+        let sql = self.sql;
+        let bytes = sql.as_bytes();
+        let word = &bytes[start..end];
+        let stay = State::Positional { secrets, arg };
+        if is_introducer(self.rules.dialect, bytes, end, word)
+            || word.eq_ignore_ascii_case(b"NULL")
+            || word.eq_ignore_ascii_case(b"DEFAULT")
+            || word.first() == Some(&b'@')
+        {
+            return stay;
+        }
+        if word.first().is_some_and(u8::is_ascii_digit) {
+            return if secret_arg(secrets, arg) {
+                self.mask_argument(start, end)
+            } else {
+                stay
+            };
+        }
+        State::Off
+    }
+
     fn on_punct(&mut self, start: usize, end: usize) -> State {
         let sql = self.sql;
         let bytes = sql.as_bytes();
@@ -333,11 +513,42 @@ impl Redactor<'_> {
                 password,
             },
             (State::Armed { .. }, b'=' | b'&') if c == b'=' || unicode_amp => self.state,
-            (State::ForUser, b'=') => State::Armed {
+            // `SET PASSWORD FOR u = '...'`, `@pwd nvarchar(50) = '...'`.
+            (State::ForUser | State::VarDecl { open: false, .. }, b'=') => State::Armed {
                 paren: false,
                 password: false,
             },
             (State::ForUser, c) if c != b';' => State::ForUser,
+            (
+                State::VarDecl {
+                    typed: true,
+                    open: false,
+                },
+                b'(',
+            ) => State::VarDecl {
+                typed: true,
+                open: true,
+            },
+            (State::VarDecl { open: true, .. }, b',') => self.state,
+            (State::VarDecl { open: true, .. }, b')') => State::VarDecl {
+                typed: true,
+                open: false,
+            },
+            // `@pwd sys.sysname`
+            (
+                State::VarDecl {
+                    typed: true,
+                    open: false,
+                },
+                b'.',
+            ) => State::VarDecl {
+                typed: false,
+                open: false,
+            },
+            (State::Positional { secrets, arg }, b',') => State::Positional {
+                secrets,
+                arg: arg.saturating_add(1),
+            },
             _ => State::Off,
         }
     }

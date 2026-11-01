@@ -81,22 +81,15 @@
 //! - **batches**: a line holding only `GO` (case-insensitive, optionally indented with spaces
 //!   or tabs, optionally followed by a repeat count and a `--` comment) ends a batch. `GO`
 //!   inside a string, an identifier or a comment, or with other text on its line (`GOTO x`,
-//!   `SELECT 1 GO`), is not a separator. The `GO` line is not part of any statement, and the
-//!   last statement of a batch owns it (its `segment_end` is the end of the `GO` line). The
+//!   `SELECT 1 GO`), is not a separator. The `GO` line is not part of any statement; the
+//!   batch before it owns it (its `segment_end` is the end of the `GO` line). The
 //!   repeat count is accepted and ignored (the batch runs once);
-//! - **statements within a batch**: `;` ends a statement, except inside a block
-//!   (`BEGIN ... END`, `BEGIN TRY ... END TRY BEGIN CATCH ... END CATCH` as one block,
-//!   `CASE ... END`) and except in a module definition: a statement starting with
-//!   `CREATE [OR ALTER] {PROC|PROCEDURE|FUNCTION|TRIGGER|VIEW}`,
-//!   `ALTER {PROC|PROCEDURE|FUNCTION|TRIGGER|VIEW}` or `CREATE {RULE|DEFAULT}` runs to the end
-//!   of its batch. `BEGIN TRAN[SACTION]`, `BEGIN DISTRIBUTED|DIALOG|CONVERSATION ...` and
-//!   `END CONVERSATION` are ordinary statements. A `;` followed by `ELSE` does not end the
-//!   statement (`IF x SELECT 1; ELSE SELECT 2`);
-//! - **batch-scoped state keeps the batch whole**: a batch that uses a local variable
-//!   (`@name`), `DECLARE`, `SCOPE_IDENTITY`, `@@ROWCOUNT`, `@@ERROR`, `GOTO` or `RETURN`
-//!   outside module bodies is one statement (from its first to its last statement, without
-//!   the final `;`), because each statement runs as its own batch and these do not survive
-//!   from one batch to the next.
+//! - **one statement = one batch** (`docs/m4-contracts.md` §6): `;` never splits, inside a
+//!   batch it is ordinary content (T-SQL batches are sent whole: `DECLARE`d variables,
+//!   `#temp` tables, `IF ... RETURN` and `CREATE PROCEDURE`, which must be alone in its batch,
+//!   all keep working). A batch's trailing `;` stays in its text (`MERGE` needs it); `;`
+//!   before the first content of a batch is dropped, so a batch of only `;` is no statement.
+//!   [`statement_at`] therefore returns the `GO` batch around the offset.
 //!
 //! [`StatementKind`] is only a hint for the UI (whether the statement probably returns rows);
 //! the query runner never relies on it.
@@ -152,8 +145,7 @@ pub struct Position {
 pub enum StatementKind {
     /// Starts with `SELECT`, `WITH`, `VALUES`, `TABLE`, `SHOW`, `DESCRIBE`/`DESC`, `EXPLAIN`,
     /// `PRAGMA`, `CALL`, `FETCH` or `(` (first keyword, case-insensitive). T-SQL: `SELECT`,
-    /// `WITH`, `EXEC`, `EXECUTE`, `VALUES` or `(`; a whole batch (batch-scoped state) is a
-    /// query only when each of its statements is.
+    /// `WITH`, `EXEC`, `EXECUTE`, `VALUES` or `(` as the first keyword of the batch.
     Query,
     Other,
 }
