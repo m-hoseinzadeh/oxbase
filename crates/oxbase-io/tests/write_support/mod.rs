@@ -127,9 +127,9 @@ pub fn sample() -> RecordBatch {
         ])),
         Arc::new(StringArray::from(vec![
             Some("=SUM(A1)"),
-            Some("+1"),
+            Some("+1+1"),
             None,
-            Some("-2"),
+            Some("-2-2"),
         ])),
         Arc::new(StringArray::from(vec![
             Some("{\"a\": [1, 2.50]}"),

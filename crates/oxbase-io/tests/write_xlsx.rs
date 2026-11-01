@@ -103,7 +103,7 @@ fn typed_cells_and_exact_fallbacks() {
     assert_eq!(cell(&range, 2, 2), text("18446744073709551615"));
     assert_eq!(cell(&range, 2, 5), text("-12345678901234567890.0123456789"));
     assert_eq!(cell(&range, 2, 6), text(TRICKY));
-    assert_eq!(cell(&range, 2, 7), text("+1"));
+    assert_eq!(cell(&range, 2, 7), text("+1+1"));
     // Before 1900: no Excel date.
     assert_eq!(cell(&range, 2, 10), text("1899-12-31"));
 
@@ -115,7 +115,7 @@ fn typed_cells_and_exact_fallbacks() {
     // Row 4.
     assert_eq!(cell(&range, 4, 1), text("-9223372036854775808"));
     assert_eq!(cell(&range, 4, 6), text(UNICODE));
-    assert_eq!(cell(&range, 4, 7), text("-2"));
+    assert_eq!(cell(&range, 4, 7), text("-2-2"));
 
     // No cell holds a formula.
     let formulas = book.worksheet_formula("Sheet1").unwrap();
@@ -155,7 +155,7 @@ fn formula_guard_marks_cells_with_a_quote_prefix() {
     for path in [&guarded, &plain] {
         let range = open(path).worksheet_range("Sheet1").unwrap();
         assert_eq!(cell(&range, 1, 7), text("=SUM(A1)"));
-        assert_eq!(cell(&range, 4, 7), text("-2"));
+        assert_eq!(cell(&range, 4, 7), text("-2-2"));
     }
 }
 

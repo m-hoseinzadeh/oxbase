@@ -38,7 +38,7 @@ fn expected_rows() -> Vec<Vec<String>> {
             "-1.5e300",
             "-12345678901234567890.0123456789",
             TRICKY,
-            "'+1",
+            "'+1+1",
             "[true,null]",
             "0x",
             "1899-12-31",
@@ -57,7 +57,7 @@ fn expected_rows() -> Vec<Vec<String>> {
             "1.0",
             "0.0000000000",
             UNICODE,
-            "'-2",
+            "'-2-2",
             "not json",
             "0x616263",
             "9999-12-31",
@@ -137,7 +137,7 @@ fn formula_guard_can_be_turned_off() {
         &mut csv::ReaderBuilder::new(),
     );
     let formulas: Vec<&str> = rows.iter().map(|r| r[7].as_str()).collect();
-    assert_eq!(formulas, ["=SUM(A1)", "+1", "", "-2"]);
+    assert_eq!(formulas, ["=SUM(A1)", "+1+1", "", "-2-2"]);
     // Numbers are never guarded, with or without the option.
     assert_eq!(rows[3][1], "-9223372036854775808");
 }

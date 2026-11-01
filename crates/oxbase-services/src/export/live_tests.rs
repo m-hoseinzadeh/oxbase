@@ -412,7 +412,8 @@ async fn format_round_trips(
 ) {
     let key = live.key;
     let original = table_rows(live, main, &SAMPLE_COLUMNS).await;
-    // Every column of every format; XLSX keeps times to the millisecond (Excel serial dates).
+    // Every column of every format; XLSX keeps times to the millisecond (Excel serial dates,
+    // digits below a millisecond dropped).
     let formats: [(&str, WriteOptions, ReadOptions, Precision); 4] = [
         (
             "csv",
@@ -553,7 +554,8 @@ enum Precision {
 
 /// Normalized rows compared across formats: a timestamp at midnight is the date it names (a
 /// format without a date type may bring a date back as a timestamp), and with
-/// [`Precision::Millis`] times are rounded to the millisecond.
+/// [`Precision::Millis`] times are cut to the millisecond (the XLSX writer drops the digits
+/// below a millisecond, with a report warning; it does not round).
 fn loose(rows: &[Vec<String>], precision: Precision) -> Vec<Vec<String>> {
     rows.iter()
         .map(|row| row.iter().map(|v| loose_value(v, precision)).collect())
@@ -568,7 +570,7 @@ fn loose_value(value: &str, precision: Precision) -> String {
         Precision::Exact => ts,
         Precision::Millis => {
             let micros = ts.and_utc().timestamp_micros();
-            let rounded = (micros + 500).div_euclid(1_000) * 1_000;
+            let rounded = micros.div_euclid(1_000) * 1_000;
             match chrono::DateTime::from_timestamp_micros(rounded) {
                 Some(t) => t.naive_utc(),
                 None => ts,
@@ -595,6 +597,10 @@ fn loose_values_compare_across_formats() {
     );
     assert_eq!(
         loose_value("2000-01-01 00:00:07.000623", Precision::Millis),
+        "2000-01-01 00:00:07.000000"
+    );
+    assert_eq!(
+        loose_value("2000-01-01 00:00:07.001999", Precision::Millis),
         "2000-01-01 00:00:07.001000"
     );
     assert_eq!(

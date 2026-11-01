@@ -602,7 +602,7 @@ impl<'a> Pipeline<'a> {
         if let Some(batch) = first {
             self.batch(batch).await?;
             loop {
-                match next_batch(&mut stream, &token).await {
+                match self.heartbeat(next_batch(&mut stream, &token)).await {
                     None => break,
                     Some(Err(e)) => return Err(e),
                     Some(Ok(batch)) => self.batch(batch).await?,
@@ -640,7 +640,7 @@ impl<'a> Pipeline<'a> {
 
     async fn commit(&mut self) -> Result<()> {
         if let Some(tx) = self.tx.take() {
-            tx.commit().await?;
+            self.heartbeat(tx.commit()).await?;
         }
         self.st.rows_committed = self.st.rows_inserted;
         if self.st.ddl_in_open_tx {
@@ -807,13 +807,15 @@ impl<'a> Pipeline<'a> {
         let load = self
             .loader
             .load(session, &self.target, chunk, token.clone());
-        cancellable(&token, self.clock, load).await.map_err(|e| {
-            if e.is_cancelled() {
-                e
-            } else {
-                in_rows(e, first, last)
-            }
-        })?;
+        self.heartbeat(cancellable(&token, self.clock, load))
+            .await
+            .map_err(|e| {
+                if e.is_cancelled() {
+                    e
+                } else {
+                    in_rows(e, first, last)
+                }
+            })?;
         self.st.rows_inserted += u64::try_from(chunk.num_rows()).unwrap_or(u64::MAX);
         if let Some(every) = self.commit_every
             && self.st.rows_inserted / every > self.st.rows_committed / every
@@ -833,6 +835,27 @@ impl<'a> Pipeline<'a> {
             rows_committed: self.st.rows_committed,
             rows_skipped: self.st.rows_skipped,
             elapsed_ms: millis(self.started),
+        }
+    }
+
+    /// Awaits `work` (a load call, a commit, the next batch of the reader) and sends a progress
+    /// event every `progress_interval` while it runs, so a slow step (a server checkpoint
+    /// during a commit, a lock wait) never leaves the consumer without news for long: events
+    /// keep coming with the same counters and a growing `elapsedMs`. No heartbeat with a zero
+    /// interval (tests: an event after every batch, nothing in between).
+    async fn heartbeat<T>(&self, work: impl Future<Output = T>) -> T {
+        let every = self.job.config.progress_interval;
+        if every.is_zero() {
+            return work.await;
+        }
+        let mut work = std::pin::pin!(work);
+        loop {
+            tokio::select! {
+                out = &mut work => return out,
+                () = tokio::time::sleep(every) => {
+                    let _ = self.job.events.try_send(self.progress_event());
+                }
+            }
         }
     }
 
