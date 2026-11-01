@@ -22,7 +22,7 @@ fn dialect(engine: Engine) -> Dialect {
 }
 
 fn fmt_with(engine: Engine, text: &str, options: FormatOptions) -> String {
-    format(&dialect(engine), text, options).unwrap()
+    format(&dialect(engine), text, &options).unwrap()
 }
 
 fn fmt(engine: Engine, text: &str) -> String {
