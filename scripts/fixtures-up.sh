@@ -25,7 +25,7 @@ mounted_material=(
     "$OXBASE_REPO_ROOT/target/fixtures/ssh/ssh_host_ed25519_key.pub"
     "$OXBASE_REPO_ROOT/target/fixtures/ssh/authorized_keys"
 )
-material_services=(postgres mysql mariadb ssh)
+material_services=(postgres mysql mariadb mssql ssh)
 material_digest() {
     # cksum is POSIX (no sha256sum/shasum split between Linux and macOS); this only detects change.
     cksum "${mounted_material[@]}" 2>/dev/null || true

@@ -199,7 +199,7 @@ jobs:
       # Compile before the containers start so their startup overlaps nothing slow
       # and a compile error does not leave a stack running.
       - name: Build conformance harness and M1/M2 live tests
-        run: cargo test -p oxbase-conformance -p oxbase-net -p oxbase-pg -p oxbase-mysql -p oxbase-sqlite -p oxbase-services --locked --no-run
+        run: cargo test -p oxbase-conformance -p oxbase-net -p oxbase-pg -p oxbase-mysql -p oxbase-sqlite -p oxbase-mssql -p oxbase-services --locked --no-run
 
       # Test CA, server/client certificates and SSH keys for the TLS/SSH fixtures (openssl and
       # ssh-keygen ship with the runner image). Compose bind-mounts these files and refuses to
@@ -235,7 +235,7 @@ jobs:
       - name: Run M1/M2/M3 live tests
         env:
           OXBASE_SERVICES_REQUIRE_M3_CELLS: "1"
-        run: cargo test -p oxbase-net -p oxbase-pg -p oxbase-mysql -p oxbase-sqlite -p oxbase-services --locked -- --include-ignored --test-threads 1
+        run: cargo test -p oxbase-net -p oxbase-pg -p oxbase-mysql -p oxbase-sqlite -p oxbase-mssql -p oxbase-services --locked -- --include-ignored --test-threads 1
 
       - name: Dump fixture logs
         if: failure()

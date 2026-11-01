@@ -97,8 +97,10 @@
 
 mod conn;
 mod error;
+mod prelogin;
 mod tls;
 pub mod types;
+mod wire;
 
 use std::sync::Arc;
 
@@ -106,7 +108,7 @@ use async_trait::async_trait;
 use oxbase_driver::{ConnectParams, Connection, Driver, DriverRegistry};
 use oxbase_types::{Engine, Result};
 
-pub use conn::MsSqlConnection;
+pub use conn::{CANCEL_DRAIN, DEFAULT_APPLICATION_NAME, DEFAULT_CONNECT_TIMEOUT, MsSqlConnection};
 
 /// The SQL Server [`Driver`].
 #[derive(Debug, Clone, Copy, Default)]
@@ -115,6 +117,15 @@ pub struct MsSqlDriver;
 impl MsSqlDriver {
     pub fn new() -> Self {
         Self
+    }
+
+    /// Like [`Driver::connect`], returning the concrete connection type.
+    #[allow(
+        clippy::unused_self,
+        reason = "a method so it reads like the other drivers' connect_*"
+    )]
+    pub async fn connect_mssql(&self, params: &ConnectParams) -> Result<MsSqlConnection> {
+        conn::connect(params).await
     }
 }
 
@@ -125,8 +136,7 @@ impl Driver for MsSqlDriver {
     }
 
     async fn connect(&self, params: &ConnectParams) -> Result<Box<dyn Connection>> {
-        let _ = params;
-        unimplemented!("m4: driver")
+        Ok(Box::new(conn::connect(params).await?))
     }
 }
 

@@ -256,11 +256,34 @@ services:
     # once (rebuilding oxbase_test if an earlier seed did not finish), then marks the container as
     # seeded.
     entrypoint: ["/bin/bash", "/oxbase-init/entrypoint.sh"]
+    # M4 TLS (docs/m4-contracts.md §5.1): the wrapper copies the fixture certificate and key
+    # (host files are 0600, owned by the host user) to /etc/oxbase-tls and writes mssql.conf, so
+    # it starts as root; sqlservr then runs as root too (supported by the image), which keeps
+    # the key readable without a privilege drop.
+    user: root
     ports:
       - "127.0.0.1:15433:1433"
     volumes:
       - mssql-data:/var/opt/mssql
       - ./init/mssql:/oxbase-init:ro
+      - type: bind
+        source: ../../target/fixtures/tls/ca.pem
+        target: /oxbase-tls-src/ca.pem
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ../../target/fixtures/tls/server.pem
+        target: /oxbase-tls-src/server.pem
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ../../target/fixtures/tls/server-key.pem
+        target: /oxbase-tls-src/server-key.pem
+        read_only: true
+        bind:
+          create_host_path: false
     healthcheck:
       test:
         - CMD-SHELL

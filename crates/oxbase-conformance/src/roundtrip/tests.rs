@@ -156,7 +156,7 @@ fn missing_roles_name_what_a_cell_needs() {
     );
     // No driver yet: nothing runs, whatever is registered.
     assert_eq!(
-        runnable_kinds(&toy, Engine::MsSql),
+        runnable_kinds(&toy, Engine::MongoDb),
         Vec::<ObjectKind>::new()
     );
     assert_eq!(

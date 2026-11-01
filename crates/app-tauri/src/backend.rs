@@ -143,14 +143,15 @@ mod tests {
     }
 
     #[test]
-    fn ships_the_m1_drivers() {
+    fn ships_the_m1_and_m4_drivers() {
         assert_eq!(
             driver_registry().engines(),
             vec![
                 Engine::Postgres,
                 Engine::MySql,
                 Engine::MariaDb,
-                Engine::Sqlite
+                Engine::Sqlite,
+                Engine::MsSql
             ]
         );
     }

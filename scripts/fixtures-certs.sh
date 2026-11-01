@@ -22,7 +22,7 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # --- keep in sync with tests/fixtures.toml ---------------------------------------------------
 tls_dir="$repo_root/target/fixtures/tls"
 ssh_dir="$repo_root/target/fixtures/ssh"
-server_dns_sans=(localhost postgres mysql mariadb)
+server_dns_sans=(localhost postgres mysql mariadb mssql)
 server_ip_sans=(127.0.0.1)
 client_cn="oxbase_tls"
 valid_days=825
