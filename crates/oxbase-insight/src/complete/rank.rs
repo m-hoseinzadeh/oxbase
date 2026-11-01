@@ -11,7 +11,8 @@ use tokio_util::sync::CancellationToken;
 use super::{Completion, CompletionKind, CompletionList, RecentNames};
 use crate::{CursorContext, Dialect, Expected};
 
-/// How well a name matched what was typed. Ranks before everything else.
+/// How well a name matched what was typed. Fuzzy matches rank after every prefix match;
+/// among prefix matches an exact match ranks first in its group.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum Tier {
     /// The whole name was typed.
@@ -127,10 +128,16 @@ impl Pattern {
 }
 
 /// The order of the list (derived `Ord`: field order is the ranking).
+///
+/// `docs/m6-contracts.md` §4.3: prefix matches first and fuzzy matches fill the rest of the
+/// list; within each, the group (the most likely expected kind first), then an exact match
+/// before other prefix matches of its group, then recently used names, then score, shorter
+/// label, label.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct SortKey {
-    tier: Tier,
+    fuzzy: bool,
     group: u16,
+    tier: Tier,
     recent: u8,
     /// `u32::MAX - score`: higher scores first.
     inv_score: u32,
@@ -176,6 +183,10 @@ pub(super) struct Collector<'a> {
 const SLACK: usize = 32;
 /// `cancel` is checked every this many names.
 const CANCEL_EVERY: usize = 4096;
+/// Most slots kept for schemas at the end of a list that was cut (at most a quarter of it).
+const RESERVED_SCHEMAS: usize = 4;
+/// Most hits a quoted-prefix search asks the cache for while looking for exact-case matches.
+const QUOTED_SCAN_MAX: usize = 1 << 16;
 
 impl<'a> Collector<'a> {
     pub(super) fn new(
@@ -282,8 +293,9 @@ impl<'a> Collector<'a> {
     /// Adds `item` ranked by `rank`.
     pub(super) fn push(&mut self, item: Completion, rank: Rank<'_>) {
         let key = SortKey {
-            tier: rank.tier,
+            fuzzy: rank.tier == Tier::Fuzzy,
             group: rank.group,
+            tier: rank.tier,
             recent: rank.recent.map_or(2, |n| self.recent.rank(n)),
             inv_score: u32::MAX - rank.score,
             len: item.label.chars().count(),
@@ -293,20 +305,34 @@ impl<'a> Collector<'a> {
         self.items.push((key, item));
     }
 
-    /// The ranked, de-duplicated list of at most `limit` items.
+    /// The ranked, de-duplicated list of at most `limit` items. When the list is cut, a few
+    /// slots at its end are kept for schemas (after `FROM` with nothing typed, the relations
+    /// of a large schema would otherwise leave no room for them).
     pub(super) fn finish(mut self) -> CompletionList {
         self.items.sort_by(|a, b| a.0.cmp(&b.0));
         let mut seen: HashSet<(CompletionKind, String)> = HashSet::new();
-        let mut items = Vec::with_capacity(self.limit.min(self.items.len()));
-        let mut total = 0_usize;
+        let mut items: Vec<Completion> = Vec::with_capacity(self.items.len());
         for (_, item) in self.items {
-            if !seen.insert((item.kind, item.insert_text.clone())) {
-                continue;
-            }
-            total += 1;
-            if items.len() < self.limit {
+            if seen.insert((item.kind, item.insert_text.clone())) {
                 items.push(item);
             }
+        }
+        let total = items.len();
+        if total > self.limit {
+            let schema = CompletionKind::Schema;
+            let reserve = (self.limit / 4).min(RESERVED_SCHEMAS);
+            let in_head = items[..self.limit]
+                .iter()
+                .filter(|i| i.kind == schema)
+                .count();
+            let want = reserve.saturating_sub(in_head);
+            let extra: Vec<Completion> = items
+                .drain(self.limit..)
+                .filter(|i| i.kind == schema)
+                .take(want)
+                .collect();
+            items.truncate(self.limit - extra.len());
+            items.extend(extra);
         }
         for (i, item) in items.iter_mut().enumerate() {
             item.sort_key = format!("{i:06}");
@@ -333,22 +359,38 @@ impl<'a> Collector<'a> {
         if pass == Pass::Fuzzy && (self.pattern.quoted || self.pattern.is_empty()) {
             return Vec::new();
         }
-        let limit = if relation.is_some() {
+        let mut limit = if relation.is_some() {
             usize::MAX
         } else {
             self.cap.saturating_add(extra)
         };
-        let hits = cache.search(&NameQuery {
-            pattern: &self.pattern.raw,
-            mode: pass.mode(),
-            kinds,
-            schema,
-            relation,
-            limit,
-        });
-        if hits.len() >= limit {
-            self.overflow = true;
+        loop {
+            let hits = cache.search(&NameQuery {
+                pattern: &self.pattern.raw,
+                mode: pass.mode(),
+                kinds,
+                schema,
+                relation,
+                limit,
+            });
+            let full = hits.len() >= limit;
+            let kept = self.keep(cache, pass, hits);
+            // The cache matches case-insensitively: inside quotes, names that differ only in
+            // case may have filled the hits. Ask again for more until enough exact-case
+            // matches are found or the names run out.
+            if full && self.pattern.quoted && kept.len() < self.cap && limit < QUOTED_SCAN_MAX {
+                limit = limit.saturating_mul(8).min(QUOTED_SCAN_MAX);
+                continue;
+            }
+            if full {
+                self.overflow = true;
+            }
+            return kept;
         }
+    }
+
+    /// The hits of one search that match in `pass`, with their tier.
+    fn keep(&self, cache: &SchemaCache, pass: Pass, hits: Vec<NameHit>) -> Vec<(NameHit, Tier)> {
         let pattern = &self.pattern;
         hits.into_iter()
             .filter_map(|hit| {

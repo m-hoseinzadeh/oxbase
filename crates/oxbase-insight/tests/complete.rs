@@ -1069,3 +1069,325 @@ fn snippets_follow_the_engine() {
     let list = complete(&c, &my, None, &snippets, 50, &CancellationToken::new()).unwrap();
     assert_eq!(only_snippets(&list), ["mine", "mine2"]);
 }
+
+// --- review fixes: ranking rule, keyword flood, closing quotes, shadowing, star --------------
+
+#[test]
+fn the_group_ranks_before_an_exact_match_of_another_kind() {
+    // §4.3: group first; an exact match ranks first only within its group.
+    let cache = cache(Engine::Postgres);
+    let mut c = ctx("SELECT o<|> FROM orders o", SELECT_LIST, Clause::SelectList);
+    c.scope = vec![named("orders", Some("o"))];
+    let list = run(&c, &pg(), Some(&cache));
+    assert_well_formed(&list, &c);
+    assert!(position(&list, "order") < position(&list, "o"));
+    assert_eq!(list.items[0].kind, CompletionKind::Column);
+
+    // Fuzzy matches only fill the list: every prefix match comes first.
+    let mut c = ctx(
+        "SELECT * FROM orders WHERE cus<|>",
+        SELECT_LIST,
+        Clause::Where,
+    );
+    c.scope = vec![named("orders", None)];
+    let list = run(&c, &pg(), Some(&cache));
+    assert_eq!(list.items[0].label, "customer_id");
+    let prefix_end = list
+        .items
+        .iter()
+        .rposition(|i| i.label.to_lowercase().starts_with("cus"))
+        .unwrap();
+    assert!(
+        list.items[..prefix_end]
+            .iter()
+            .all(|i| i.label.to_lowercase().starts_with("cus"))
+    );
+}
+
+#[test]
+fn other_keywords_only_at_statement_level() {
+    // Inside a clause with no listed keywords: no keyword flood.
+    let c = ctx(
+        "SELECT * FROM t WHERE c<|>",
+        &[Expected::Keyword],
+        Clause::Where,
+    );
+    assert_eq!(run(&c, &pg(), None).items.len(), 0);
+    // At a statement start every keyword of the dialect is offered.
+    let c = ctx("c<|>", &[Expected::Keyword], Clause::Start);
+    let list = run(&c, &pg(), None);
+    assert!(list.items.iter().any(|i| i.label == "create"));
+    assert!(list.items.iter().all(|i| i.kind == CompletionKind::Keyword));
+}
+
+#[test]
+fn a_closing_quote_inside_the_word_is_replaced_too() {
+    // Monaco types `""` in pairs: `word` covers the closing quote and the item replaces it.
+    let cache = cache(Engine::Postgres);
+    let text = "SELECT * FROM \"Ord<|>\"";
+    let mut c = ctx(text, FROM, Clause::From);
+    let plain = text.replace("<|>", "");
+    assert_eq!(&plain[c.word.end..=c.word.end], "\"");
+    c.word.end += 1;
+    let list = run(&c, &pg(), Some(&cache));
+    assert_well_formed(&list, &c);
+    let item = find(&list, "Order Lines");
+    let applied = format!(
+        "{}{}{}",
+        &plain[..item.replace.start],
+        item.insert_text,
+        &plain[item.replace.end..]
+    );
+    assert_eq!(applied, "SELECT * FROM \"Order Lines\"");
+    // Brackets on SQL Server.
+    let mssql = Dialect::builtin(Engine::MsSql).unwrap();
+    let ms_cache = self::cache(Engine::MsSql);
+    let text = "SELECT * FROM [Order<|>]";
+    let mut c = ctx(text, FROM, Clause::From);
+    let plain = text.replace("<|>", "");
+    c.word.end += 1;
+    let item = run(&c, &mssql, Some(&ms_cache)).items[0].clone();
+    let applied = format!(
+        "{}{}{}",
+        &plain[..item.replace.start],
+        item.insert_text,
+        &plain[item.replace.end..]
+    );
+    assert_eq!(applied, "SELECT * FROM [Order Lines]");
+}
+
+/// `WITH <name> AS (SELECT ...) ...` as the outline reports it: block 0 the main query,
+/// block 1 the CTE body selecting `output` (and `*` when `star`) from `from`.
+fn with_cte(
+    c: &mut CursorContext,
+    name: &str,
+    columns: &[&str],
+    output: &[&str],
+    star: bool,
+    from: Vec<ScopeRelation>,
+) {
+    let cte = Cte {
+        name: ident(name),
+        columns: columns.iter().copied().map(ident).collect(),
+        query: Some(1),
+        range: 5..6,
+    };
+    let top = QueryBlock {
+        range: 0..c.statement.end,
+        parent: None,
+        ctes: vec![cte.clone()],
+        relations: c.scope.clone(),
+        output: vec![],
+        star: false,
+        clauses: vec![],
+    };
+    let body = QueryBlock {
+        range: 6..7,
+        parent: Some(0),
+        ctes: vec![],
+        relations: from,
+        output: output.iter().copied().map(ident).collect(),
+        star,
+        clauses: vec![],
+    };
+    c.outline = Outline {
+        range: 0..c.statement.end,
+        class: StatementClass::Select,
+        queries: vec![top, body],
+        refs: vec![],
+    };
+    c.ctes = vec![cte];
+}
+
+#[test]
+fn a_cte_hides_a_table_of_the_same_name() {
+    let cache = cache(Engine::Postgres);
+    let mut c = ctx(
+        "WITH orders AS (SELECT 1 AS x) SELECT o.<|> FROM orders o",
+        SELECT_LIST,
+        Clause::SelectList,
+    );
+    // The outline may report the CTE reference as a plain name.
+    c.scope = vec![named("orders", Some("o"))];
+    with_cte(&mut c, "orders", &["x"], &["x"], false, vec![]);
+    assert_eq!(labels(&run(&c, &pg(), Some(&cache))), ["x"]);
+    // No join conditions from the table the CTE hides.
+    let mut j = ctx(
+        "WITH orders AS (SELECT 1 AS x) SELECT * FROM orders o JOIN <|>",
+        FROM,
+        Clause::Join,
+    );
+    j.scope = vec![named("orders", Some("o"))];
+    with_cte(&mut j, "orders", &["x"], &["x"], false, vec![]);
+    let list = run(&j, &pg(), Some(&cache));
+    assert!(list.items.iter().all(|i| i.kind != CompletionKind::Join));
+}
+
+#[test]
+fn a_qualifier_of_an_unknown_relation_in_scope_guesses_nothing() {
+    // `orders` here is a table function's alias, not the catalog table.
+    let cache = cache(Engine::Postgres);
+    let mut c = ctx(
+        "SELECT orders.<|> FROM json_each(x) orders",
+        SELECT_LIST,
+        Clause::SelectList,
+    );
+    c.scope = vec![ScopeRelation {
+        source: RelationSource::Function(vec![ident("json_each")]),
+        alias: Some(ident("orders")),
+        column_aliases: vec![],
+        range: 0..0,
+    }];
+    assert_eq!(run(&c, &pg(), Some(&cache)).items.len(), 0);
+    // A table missing from the cache: nothing either.
+    let mut c = ctx(
+        "SELECT customers.<|> FROM archive_customers customers",
+        SELECT_LIST,
+        Clause::SelectList,
+    );
+    c.scope = vec![named("archive_customers", Some("customers"))];
+    assert_eq!(run(&c, &pg(), Some(&cache)).items.len(), 0);
+}
+
+#[test]
+fn star_expands_with_named_outputs_and_through_ctes() {
+    let cache = cache(Engine::Postgres);
+    // `WITH x AS (SELECT *, 1 AS one FROM customers) SELECT x.<|> FROM x`
+    let mut c = ctx(
+        "WITH x AS (SELECT *, 1 AS one FROM customers) SELECT x.<|> FROM x",
+        SELECT_LIST,
+        Clause::SelectList,
+    );
+    c.scope = vec![ScopeRelation {
+        source: RelationSource::Cte { query: 0, index: 0 },
+        alias: None,
+        column_aliases: vec![],
+        range: 0..0,
+    }];
+    with_cte(
+        &mut c,
+        "x",
+        &[],
+        &["one"],
+        true,
+        vec![named("customers", None)],
+    );
+    let list = run(&c, &pg(), Some(&cache));
+    assert_eq!(labels(&list), ["id", "one", "name", "Email Address"]);
+    assert_eq!(
+        find(&list, "Email Address").detail.as_deref(),
+        Some("text · nullable")
+    );
+
+    // An explicit column list is not expanded.
+    with_cte(
+        &mut c,
+        "x",
+        &["a", "b"],
+        &["one"],
+        true,
+        vec![named("customers", None)],
+    );
+    assert_eq!(labels(&run(&c, &pg(), Some(&cache))), ["a", "b"]);
+
+    // A derived table selecting `*` from a CTE: `SELECT d.<|> FROM (SELECT * FROM x) d`.
+    let mut d = ctx(
+        "WITH x AS (SELECT id FROM orders) SELECT d.<|> FROM (SELECT * FROM x) d",
+        SELECT_LIST,
+        Clause::SelectList,
+    );
+    with_cte(
+        &mut d,
+        "x",
+        &["id"],
+        &["id"],
+        false,
+        vec![named("orders", None)],
+    );
+    d.outline.queries.push(QueryBlock {
+        range: 40..60,
+        parent: Some(0),
+        ctes: vec![],
+        relations: vec![named("x", None)],
+        output: vec![],
+        star: true,
+        clauses: vec![],
+    });
+    d.scope = vec![ScopeRelation {
+        source: RelationSource::Derived {
+            query: 2,
+            columns: vec![],
+        },
+        alias: Some(ident("d")),
+        column_aliases: vec![],
+        range: 0..0,
+    }];
+    let list = run(&d, &pg(), Some(&cache));
+    assert_eq!(labels(&list), ["id"]);
+    assert_eq!(
+        list.items[0].detail.as_deref(),
+        Some("bigint · not null · PK")
+    );
+}
+
+#[test]
+fn a_recursive_star_stops() {
+    // `WITH RECURSIVE r AS (SELECT * FROM r) SELECT r.<|> FROM r`: no loop, no panic.
+    let cache = cache(Engine::Postgres);
+    let mut c = ctx(
+        "WITH RECURSIVE r AS (SELECT * FROM r) SELECT r.<|> FROM r",
+        SELECT_LIST,
+        Clause::SelectList,
+    );
+    c.scope = vec![named("r", None)];
+    with_cte(&mut c, "r", &[], &[], true, vec![named("r", None)]);
+    assert_eq!(run(&c, &pg(), Some(&cache)).items.len(), 0);
+}
+
+#[test]
+fn quoted_prefixes_find_exact_case_names_past_many_case_variants() {
+    let mut snap = CatalogSnapshot::new(Engine::Postgres, ServerVersion::new(16, 0, 0), "db");
+    snap.default_schema = Some("public".into());
+    snap.search_path = vec!["public".into()];
+    let mut public = CatalogSchema::new("public");
+    public.relations = (0..300)
+        .map(|i| rel(&format!("ab{i}"), RelationKind::Table, vec![], vec![]))
+        .chain(std::iter::once(rel(
+            "Ab_target",
+            RelationKind::Table,
+            vec![],
+            vec![],
+        )))
+        .collect();
+    snap.schemas = vec![public];
+    let cache = SchemaCache::new(snap);
+    let c = ctx("SELECT * FROM \"Ab<|>", FROM, Clause::From);
+    let list = complete(&c, &pg(), Some(&cache), &[], 10, &CancellationToken::new()).unwrap();
+    assert_eq!(labels(&list), ["Ab_target"]);
+    assert_eq!(list.items[0].insert_text, "\"Ab_target\"");
+}
+
+#[test]
+fn a_cut_list_keeps_room_for_schemas() {
+    let big = SchemaCache::new(oxbase_schema_cache::synthetic::snapshot(
+        &oxbase_schema_cache::synthetic::SyntheticSpec {
+            tables: 500,
+            columns_per_table: 2,
+            routines: 10,
+            ..oxbase_schema_cache::synthetic::SyntheticSpec::exit_check()
+        },
+    ));
+    let c = ctx("SELECT * FROM <|>", FROM, Clause::From);
+    let list = complete(&c, &pg(), Some(&big), &[], 40, &CancellationToken::new()).unwrap();
+    assert_eq!(list.items.len(), 40);
+    assert!(list.incomplete);
+    assert_well_formed(&list, &c);
+    let schemas = list
+        .items
+        .iter()
+        .filter(|i| i.kind == CompletionKind::Schema)
+        .count();
+    assert!(schemas >= 1, "{:?}", labels(&list));
+    assert_eq!(list.items[39].kind, CompletionKind::Schema);
+    assert_ne!(list.items[0].kind, CompletionKind::Schema);
+}

@@ -11,11 +11,17 @@
 //! 2. A first pass collects case-insensitive **prefix** matches (inside a quoted identifier:
 //!    exact-case prefix matches). When it finds fewer than `limit` items, a second pass fills
 //!    the list with **fuzzy** matches ([`oxbase_schema_cache::fuzzy_score`]).
-//! 3. Items are ranked (`rank.rs`) by: match tier (exact, then prefix, then fuzzy), group (the
-//!    most likely kind first, in [`CursorContext::expected`] order; aliases and CTEs right
-//!    after it; names outside the search path or outside the scope after those), recently used
-//!    names ([`RecentNames`]), match score, shorter label, label. The returned
-//!    [`Completion::sort_key`] encodes that order.
+//! 3. Items are ranked (`rank.rs`, `docs/m6-contracts.md` §4.3): prefix matches before the
+//!    fuzzy matches that fill the list; then group (the most likely kind first, in
+//!    [`CursorContext::expected`] order; aliases and CTEs right after it; names outside the
+//!    search path or outside the scope after those); then an exact match before the other
+//!    prefix matches of its group; then recently used names ([`RecentNames`]), match score,
+//!    shorter label, label. The returned [`Completion::sort_key`] encodes that order. When the
+//!    list is cut at `limit`, a few slots at its end are kept for schemas.
+//!
+//! The item replaces [`CursorContext::word`]. A name typed inside quotes is inserted with
+//! both quotes, so `word` must cover a closing quote that is already there (Monaco types
+//! quotes and brackets in pairs): `"Ord‸"` is replaced as a whole by `"Orders"`.
 //!
 //! The work is bounded: cache searches ask for at most `limit` plus a small slack per source
 //! (the index search is a binary search for prefixes), and nothing walks every column of the
@@ -124,8 +130,8 @@ pub fn complete(
     )
 }
 
-/// [`complete`] with a list of recently used names: among items of the same match tier and
-/// group, names in `recent` rank first (the most recent ones before older ones). The app keeps
+/// [`complete`] with a list of recently used names: among items of the same group and match
+/// tier, names in `recent` rank first (the most recent ones before older ones). The app keeps
 /// one [`RecentNames`] per schema cache, fed with the relations and routines of the statements
 /// the user edits.
 pub fn complete_with_recent(

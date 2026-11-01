@@ -12,10 +12,12 @@ use oxbase_types::{
 use super::CompletionKind;
 use super::rank::{Collector, Pass, Rank, Tier, adapt_case, escape_snippet, quote_with, sub};
 use crate::outline::Clause;
-use crate::{Expected, Ident, RelationSource, ScopeRelation};
+use crate::{Cte, Expected, Ident, RelationSource, ScopeRelation};
 
 /// Most join conditions offered after `JOIN`.
 const MAX_JOINS: usize = 50;
+/// How deep `*` is expanded through CTEs and derived tables (also stops a recursive CTE).
+const MAX_STAR_DEPTH: usize = 8;
 
 /// Columns a scope relation contributes.
 enum Columns {
@@ -61,11 +63,11 @@ fn relation_kind(kind: RelationKind) -> CompletionKind {
     }
 }
 
-/// `type · null / not null · PK / FK → table` of a catalog column.
+/// `type · nullable / not null · PK / FK → table` of a catalog column.
 fn column_detail(rel: &CatalogRelation, col: &CatalogColumn) -> String {
     let mut out = col.native_type.clone();
     out.push_str(if col.nullable {
-        " · null"
+        " · nullable"
     } else {
         " · not null"
     });
@@ -114,6 +116,14 @@ fn resolve_named(cache: &SchemaCache, parts: &[Ident]) -> Option<RelationId> {
         })
 }
 
+/// `true` when `a` and `b` are the same names (ignoring case).
+fn same_names(a: &[Ident], b: &[Ident]) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .zip(b)
+            .all(|(x, y)| x.text.to_lowercase() == y.text.to_lowercase())
+}
+
 fn part(text: &str) -> Ident {
     Ident {
         text: text.to_owned(),
@@ -122,6 +132,22 @@ fn part(text: &str) -> Ident {
 }
 
 impl Collector<'_> {
+    /// The CTE a one-part relation name refers to (a CTE hides a table of the same name),
+    /// except the CTE whose body is block `inside` (a non-recursive CTE does not see itself)
+    /// and a CTE whose definition contains the cursor.
+    fn cte_for(&self, parts: &[Ident], inside: Option<usize>) -> Option<&Cte> {
+        let [one] = parts else {
+            return None;
+        };
+        let case = self.rules.relations;
+        let offset = self.ctx.offset;
+        self.ctx.ctes.iter().find(|c| {
+            case.matches(&one.text, one.quoted, &c.name.text)
+                && (inside.is_none() || c.query != inside)
+                && !c.range.contains(&offset)
+        })
+    }
+
     /// An identifier of the statement as it was written (quoted when it was).
     fn as_written(&self, ident: &Ident) -> String {
         if ident.quoted {
@@ -200,7 +226,9 @@ impl Collector<'_> {
             };
             self.push(item, rank);
         }
-        if !listed.is_empty() && ctx.clause != Clause::Start {
+        // Every other keyword of the dialect only at statement level (§4.3); inside a clause
+        // the context's list is all there is.
+        if ctx.clause != Clause::Start {
             return Ok(());
         }
         for kw in self.dialect.language.keywords {
@@ -689,6 +717,7 @@ impl Collector<'_> {
                 taken.insert(w.text.to_lowercase());
             }
             if let (RelationSource::Named(parts), Some(w)) = (&r.source, written)
+                && self.cte_for(parts, None).is_none()
                 && let Some(id) = resolve_named(cache, parts)
             {
                 anchors.push((id, self.as_written(w)));
@@ -857,27 +886,19 @@ impl Collector<'_> {
         }
         let columns = match &rel.source {
             RelationSource::Named(parts) => {
-                let found = self.cache.and_then(|cache| resolve_named(cache, parts));
-                match (found, parts.as_slice()) {
-                    (Some(id), _) => Columns::Catalog(id),
-                    // A CTE written as a plain name.
-                    (None, [one]) => {
-                        let case = self.rules.relations;
-                        let cte = ctx
-                            .ctes
-                            .iter()
-                            .find(|c| case.matches(&one.text, one.quoted, &c.name.text))?;
-                        Columns::Listed(self.block_columns(&cte.columns, cte.query))
-                    }
-                    (None, _) => return None,
+                // A CTE written as a plain name hides a catalog relation of that name.
+                if let Some(cte) = self.cte_for(parts, None) {
+                    Columns::Listed(self.block_columns(&cte.columns, cte.query, 0))
+                } else {
+                    Columns::Catalog(resolve_named(self.cache?, parts)?)
                 }
             }
             RelationSource::Cte { query, index } => {
                 let cte = ctx.outline.queries.get(*query)?.ctes.get(*index)?;
-                Columns::Listed(self.block_columns(&cte.columns, cte.query))
+                Columns::Listed(self.block_columns(&cte.columns, cte.query, 0))
             }
             RelationSource::Derived { query, columns } => {
-                Columns::Listed(self.block_columns(columns, Some(*query)))
+                Columns::Listed(self.block_columns(columns, Some(*query), 0))
             }
             RelationSource::Values { columns } => {
                 Columns::Listed(columns.iter().map(|c| (c.text.clone(), None)).collect())
@@ -887,55 +908,108 @@ impl Collector<'_> {
         Some(Source { handle, columns })
     }
 
-    /// The output columns of a CTE body or derived table: `names` with the catalog detail of
-    /// the column each comes from when one of the block's relations has it; every column of
-    /// the block's relations when `names` is empty and the block selects `*`.
+    /// The output columns of a CTE body or derived table `block`: `names` (the block's own
+    /// output names when empty) with the catalog detail of the column each comes from when
+    /// one of the block's relations has it; when the block selects `*` (and `names` are its
+    /// outputs, not an explicit column list), also every column of the block's relations,
+    /// through CTEs and derived tables up to [`MAX_STAR_DEPTH`] levels.
     fn block_columns(
         &self,
         names: &[Ident],
         block: Option<usize>,
+        depth: usize,
     ) -> Vec<(String, Option<String>)> {
-        let ctx = self.ctx;
-        let relations: Vec<RelationId> = match (self.cache, block) {
-            (Some(cache), Some(b)) => ctx.outline.queries.get(b).map_or_else(Vec::new, |q| {
-                q.relations
-                    .iter()
-                    .filter_map(|r| match &r.source {
-                        RelationSource::Named(parts) => resolve_named(cache, parts),
-                        _ => None,
-                    })
-                    .collect()
-            }),
+        let q = block.and_then(|b| self.ctx.outline.queries.get(b));
+        let outputs = q.map_or(&[][..], |q| q.output.as_slice());
+        let star = q.is_some_and(|q| q.star) && (names.is_empty() || same_names(names, outputs));
+        let names = if names.is_empty() { outputs } else { names };
+        let relations: Vec<RelationId> = match (self.cache, q) {
+            (Some(cache), Some(q)) => q
+                .relations
+                .iter()
+                .filter_map(|r| match &r.source {
+                    RelationSource::Named(parts) if self.cte_for(parts, block).is_none() => {
+                        resolve_named(cache, parts)
+                    }
+                    _ => None,
+                })
+                .collect(),
             _ => Vec::new(),
         };
-        let Some(cache) = self.cache else {
-            return names.iter().map(|n| (n.text.clone(), None)).collect();
-        };
-        let star = block
-            .and_then(|b| ctx.outline.queries.get(b))
-            .is_some_and(|q| q.star);
-        if names.is_empty() && star {
-            return relations
-                .iter()
-                .filter_map(|id| cache.relation(*id))
-                .flat_map(|rel| {
-                    rel.columns
-                        .iter()
-                        .map(move |c| (c.name.clone(), Some(column_detail(rel, c))))
-                })
-                .collect();
-        }
-        names
+        let mut out: Vec<(String, Option<String>)> = names
             .iter()
             .map(|n| {
-                let detail = relations.iter().find_map(|id| {
-                    let c = cache.resolve_column(*id, n)?;
-                    let rel = cache.relation(*id)?;
-                    Some(column_detail(rel, rel.columns.get(c as usize)?))
+                let detail = self.cache.and_then(|cache| {
+                    relations.iter().find_map(|id| {
+                        let c = cache.resolve_column(*id, n)?;
+                        let rel = cache.relation(*id)?;
+                        Some(column_detail(rel, rel.columns.get(c as usize)?))
+                    })
                 });
                 (n.text.clone(), detail)
             })
-            .collect()
+            .collect();
+        if let Some(q) = q.filter(|_| star && depth < MAX_STAR_DEPTH) {
+            let mut seen: HashSet<String> = out.iter().map(|(n, _)| n.to_lowercase()).collect();
+            for r in &q.relations {
+                for (name, detail) in self.relation_columns(r, block, depth + 1) {
+                    if seen.insert(name.to_lowercase()) {
+                        out.push((name, detail));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Every column relation `r` of block `inside` contributes (for `*`).
+    fn relation_columns(
+        &self,
+        r: &ScopeRelation,
+        inside: Option<usize>,
+        depth: usize,
+    ) -> Vec<(String, Option<String>)> {
+        if !r.column_aliases.is_empty() {
+            return r
+                .column_aliases
+                .iter()
+                .map(|c| (c.text.clone(), None))
+                .collect();
+        }
+        match &r.source {
+            RelationSource::Named(parts) => {
+                if let Some(cte) = self.cte_for(parts, inside) {
+                    return self.block_columns(&cte.columns, cte.query, depth);
+                }
+                let Some(cache) = self.cache else {
+                    return Vec::new();
+                };
+                resolve_named(cache, parts)
+                    .and_then(|id| cache.relation(id))
+                    .map_or_else(Vec::new, |rel| {
+                        rel.columns
+                            .iter()
+                            .map(|c| (c.name.clone(), Some(column_detail(rel, c))))
+                            .collect()
+                    })
+            }
+            RelationSource::Cte { query, index } => self
+                .ctx
+                .outline
+                .queries
+                .get(*query)
+                .and_then(|b| b.ctes.get(*index))
+                .map_or_else(Vec::new, |cte| {
+                    self.block_columns(&cte.columns, cte.query, depth)
+                }),
+            RelationSource::Derived { query, columns } => {
+                self.block_columns(columns, Some(*query), depth)
+            }
+            RelationSource::Values { columns } => {
+                columns.iter().map(|c| (c.text.clone(), None)).collect()
+            }
+            RelationSource::Function(_) => Vec::new(),
+        }
     }
 
     /// The CTE `q` names (in scope without an alias, else any visible one) as a column source.
@@ -963,19 +1037,22 @@ impl Collector<'_> {
             .find(|c| case.matches(&q.text, q.quoted, &c.name.text))?;
         Some(Source {
             handle: None,
-            columns: Columns::Listed(self.block_columns(&cte.columns, cte.query)),
+            columns: Columns::Listed(self.block_columns(&cte.columns, cte.query, 0)),
         })
     }
 
     pub(super) fn columns(&mut self, pass: Pass) -> Result<()> {
         let ctx = self.ctx;
         let qualified = !ctx.qualifier.is_empty();
-        let mut sources: Vec<Source> = ctx
-            .column_sources(self.rules.relations)
+        let scoped = ctx.column_sources(self.rules.relations);
+        // The qualifier names a relation in scope (even one whose columns are unknown, like a
+        // table function): no fallback below may guess other columns for it.
+        let in_scope = !scoped.is_empty();
+        let mut sources: Vec<Source> = scoped
             .into_iter()
             .filter_map(|r| self.source_of(r))
             .collect();
-        if sources.is_empty()
+        if !in_scope
             && let [q] = ctx.qualifier.as_slice()
             && let Some(source) = self.cte_named(q)
         {
@@ -983,6 +1060,7 @@ impl Collector<'_> {
             sources.push(source);
         }
         if sources.is_empty()
+            && !in_scope
             && qualified
             && let Some(cache) = self.cache
         {

@@ -345,6 +345,10 @@ jobs:
     timeout-minutes: 45
     env:
       OXBASE_REQUIRE_M6_PERF: "1"
+      # The budget covers context_at + complete together (§5): on main and the integration
+      # branch the test fails while context_at is still a skeleton instead of timing
+      # complete() alone over hand-built contexts.
+      OXBASE_REQUIRE_M6_CONTEXT: ${{ (github.ref == 'refs/heads/main' || endsWith(github.ref, '-integrate')) && '1' || '0' }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -360,8 +364,13 @@ jobs:
       - name: Build the completion perf test (perf profile)
         run: cargo test -p oxbase-insight --profile perf --locked --test complete_perf --no-run
 
-      - name: Completion latency on the synthetic 5k-table cache
+      - name: Completion latency on the synthetic 5k-table cache (perf profile)
         run: cargo test -p oxbase-insight --profile perf --locked --test complete_perf -- --ignored --nocapture
+
+      # The same check in the release profile itself (thin LTO): the perf profile above is
+      # the slower, conservative one the contract names; both must stay within budget.
+      - name: Completion latency on the synthetic 5k-table cache (release)
+        run: cargo test -p oxbase-insight --release --locked --test complete_perf -- --ignored --nocapture
 
       # The live variant belongs to the cache stream; until it lands there is nothing to run.
       - name: Look for the live 5k-table test

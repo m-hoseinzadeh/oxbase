@@ -350,7 +350,8 @@ where
 }
 
 /// A keywords-only context at byte `offset` (texts too large to parse on every keystroke):
-/// the word before the cursor is the prefix.
+/// the word before the cursor is the prefix. It reads as a statement start, so `complete`
+/// offers every keyword of the dialect (inside a clause it offers only the context's list).
 fn keyword_context(dialect: &Dialect, text: &str, offset: usize) -> CursorContext {
     let extra = dialect.language.ident_chars;
     let is_word = |c: char| c.is_alphanumeric() || c == '_' || extra.contains(c);
@@ -368,7 +369,7 @@ fn keyword_context(dialect: &Dialect, text: &str, offset: usize) -> CursorContex
         offset,
         statement: offset..offset,
         class: StatementClass::Other,
-        clause: Clause::Other,
+        clause: Clause::Start,
         word: start..end,
         prefix: text[start..offset].to_owned(),
         quote: None,
@@ -1020,6 +1021,10 @@ mod tests {
         assert_eq!(c.word, 3..9);
         assert_eq!(c.prefix, "sel");
         assert_eq!(c.expected, [Expected::Keyword]);
+        assert_eq!(c.clause, Clause::Start);
+        let list =
+            oxbase_insight::complete(&c, &d, None, &[], 50, &CancellationToken::new()).unwrap();
+        assert!(list.items.iter().any(|i| i.label == "select"));
         let c = keyword_context(&d, "", 0);
         assert_eq!(c.word, 0..0);
         assert_eq!(c.prefix, "");
