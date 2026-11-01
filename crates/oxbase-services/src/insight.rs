@@ -1036,7 +1036,7 @@ mod tests {
                 text: "orders".into(),
                 quoted: false,
             }],
-            ranges: vec![14..20],
+            ranges: Vec::from([14..20]),
             role: oxbase_insight::RefRole::Relation,
             query: Some(0),
             clause: Clause::From,
