@@ -255,35 +255,55 @@ impl ColumnBuilder {
     }
 
     fn append_value(&mut self, value: &ColumnData<'static>) -> Appended {
-        let fixed = |ok: Option<()>| ok.map(|()| FIXED_CELL_BYTES);
         match self {
             Self::Null(_) => None,
-            Self::Bool(b) => fixed(match value {
-                ColumnData::Bit(Some(v)) => Some(b.append_value(*v)),
-                _ => None,
-            }),
-            Self::Int(b) => fixed(int_value(value).map(|v| b.append_value(v))),
-            Self::Float(b) => fixed(match value {
-                ColumnData::F32(Some(v)) => Some(b.append_value(f64::from(*v))),
-                ColumnData::F64(Some(v)) => Some(b.append_value(*v)),
-                _ => None,
-            }),
-            Self::Money(b) => fixed(match value {
-                ColumnData::F64(Some(v)) => money_scaled(*v).map(|v| b.append_value(v)),
-                ColumnData::F32(Some(v)) => money_scaled(f64::from(*v)).map(|v| b.append_value(v)),
-                _ => None,
-            }),
-            Self::Date(b) => fixed(match value {
-                ColumnData::Date(Some(d)) => Some(b.append_value(date32(d.days()))),
-                _ => None,
-            }),
-            Self::Time(b) => fixed(match value {
-                ColumnData::Time(Some(t)) => {
-                    Some(b.append_value(time_micros(t.increments(), t.scale())))
-                }
-                _ => None,
-            }),
-            Self::Timestamp(b) => fixed(timestamp_micros(value).map(|v| b.append_value(v))),
+            Self::Bool(b) => {
+                let ColumnData::Bit(Some(v)) = value else {
+                    return None;
+                };
+                b.append_value(*v);
+                Some(FIXED_CELL_BYTES)
+            }
+            Self::Int(b) => {
+                b.append_value(int_value(value)?);
+                Some(FIXED_CELL_BYTES)
+            }
+            Self::Float(b) => {
+                let v = match value {
+                    ColumnData::F32(Some(v)) => f64::from(*v),
+                    ColumnData::F64(Some(v)) => *v,
+                    _ => return None,
+                };
+                b.append_value(v);
+                Some(FIXED_CELL_BYTES)
+            }
+            Self::Money(b) => {
+                let v = match value {
+                    ColumnData::F64(Some(v)) => money_scaled(*v)?,
+                    ColumnData::F32(Some(v)) => money_scaled(f64::from(*v))?,
+                    _ => return None,
+                };
+                b.append_value(v);
+                Some(FIXED_CELL_BYTES)
+            }
+            Self::Date(b) => {
+                let ColumnData::Date(Some(d)) = value else {
+                    return None;
+                };
+                b.append_value(date32(d.days()));
+                Some(FIXED_CELL_BYTES)
+            }
+            Self::Time(b) => {
+                let ColumnData::Time(Some(t)) = value else {
+                    return None;
+                };
+                b.append_value(time_micros(t.increments(), t.scale()));
+                Some(FIXED_CELL_BYTES)
+            }
+            Self::Timestamp(b) => {
+                b.append_value(timestamp_micros(value)?);
+                Some(FIXED_CELL_BYTES)
+            }
             Self::Text(b) => {
                 let text = value_text(value)?;
                 let n = text.len();
@@ -973,7 +993,9 @@ mod tests {
         assert_eq!(b.take_lossy(), [("n".to_owned(), 1)]);
         let batch = b.finish().unwrap();
         assert!(batch.column(0).is_null(0));
-        assert!(batch.column(1).is_null(0));
+        // NullArray has no validity buffer: every slot is logically NULL.
+        assert_eq!(batch.column(1).data_type(), &DataType::Null);
+        assert_eq!(batch.column(1).logical_null_count(), 1);
         assert_eq!(b.rows(), 0);
         assert_eq!(b.bytes(), 0);
     }

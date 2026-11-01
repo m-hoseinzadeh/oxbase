@@ -55,9 +55,10 @@ pub(crate) fn map_error(e: TdsError) -> Mapped {
                 )
             }
         }
-        TdsError::Io { kind, message } if kind == IoErrorKind::TimedOut => {
-            (Error::timeout(message), true)
-        }
+        TdsError::Io {
+            kind: IoErrorKind::TimedOut,
+            message,
+        } => (Error::timeout(message), true),
         TdsError::Io { message, .. } => (Error::connection(format!("I/O: {message}")), true),
         TdsError::Protocol(m) => (Error::connection(format!("protocol error: {m}")), true),
         TdsError::Tls(m) => (Error::connection(format!("TLS: {m}")), true),

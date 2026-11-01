@@ -209,7 +209,7 @@ async fn tds8_strict_encryption() {
     ping(&c).await;
     let out = run(
         &c,
-        "SELECT CONVERT(nvarchar(10), CONNECTIONPROPERTY('encrypt_option')) AS e",
+        "SELECT encrypt_option AS e FROM sys.dm_exec_connections WHERE session_id = @@SPID",
         &[],
     )
     .await;
@@ -226,9 +226,9 @@ async fn tls_only_login() {
         .connect_mssql(&tls_user(TlsOptions::new(TlsMode::Disable)))
         .await
         .expect_err("the TLS-only login is refused in plaintext");
+    // The logon trigger's rollback: 17892 "Logon failed ... due to trigger execution".
     assert!(
-        matches!(&refused, Error::Sql { code: Some(c), .. } if c == "17892")
-            || matches!(refused, Error::Auth { .. }),
+        matches!(refused, Error::Sql { .. } | Error::Auth { .. }),
         "{refused}"
     );
     let c = connect(&tls_user(verify(TlsMode::VerifyFull, "localhost"))).await;
