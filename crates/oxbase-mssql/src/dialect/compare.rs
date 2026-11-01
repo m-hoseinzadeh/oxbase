@@ -19,7 +19,8 @@
 //!   primary key's `clustered` (absent = clustered unless another index is), an index's
 //!   `clustered` / `index_kind` (absent = nonclustered) and `include_columns` (absent = none);
 //!   identity columns are always `always = true` and auto-increment, and computed columns are
-//!   compared without their nullability (the server derives it from the expression).
+//!   compared without their type and nullability (the server derives both from the
+//!   expression).
 
 use std::sync::Arc;
 
@@ -132,7 +133,12 @@ fn normalize_column(c: &mut ColumnDef) {
         });
     }
     if c.generated.is_some() {
+        // The server derives a computed column's type and nullability from its expression.
         c.nullable = true;
+        c.native_type = String::new();
+        c.data_type = DataType::Other {
+            name: "computed".to_owned(),
+        };
     }
 }
 

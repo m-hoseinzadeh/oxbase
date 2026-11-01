@@ -566,7 +566,7 @@ mod tests {
             let made = plan(&edit, &t, &key(), &[]);
             match made {
                 Err(Error::InvalidInput { message }) => {
-                    assert!(message.contains(name), "{message}")
+                    assert!(message.contains(name), "{message}");
                 }
                 other => panic!("{name}: {other:?}"),
             }

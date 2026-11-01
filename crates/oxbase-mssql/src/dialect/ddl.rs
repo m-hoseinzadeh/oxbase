@@ -185,16 +185,12 @@ impl DdlGenerator for MsSqlDdl {
             }
             ObjectKind::Column => {
                 let table = owner(r)?;
-                match ctx.table.filter(|t| t.column(&r.name).is_some()) {
-                    Some(current) => {
-                        let target = without_column(current, &r.name);
-                        return alter_table(ctx.version, current, &target, ctx);
-                    }
-                    None => {
-                        s.push_step(drop_default_step(&table, &r.name, None));
-                        s.push_step(drop_column_step(&table, &r.name));
-                    }
+                if let Some(current) = ctx.table.filter(|t| t.column(&r.name).is_some()) {
+                    let target = without_column(current, &r.name);
+                    return alter_table(ctx.version, current, &target, ctx);
                 }
+                s.push_step(drop_default_step(&table, &r.name, None));
+                s.push_step(drop_column_step(&table, &r.name));
             }
             ObjectKind::Index => {
                 let table = owner(r)?;
@@ -1026,48 +1022,43 @@ fn drop_constraint_step(table: &ObjectRef, kind: ObjectKind, name: &str, gone: b
 
 /// Drops the primary key: by name, else looked up in `sys.key_constraints`.
 fn drop_pk_step(table: &ObjectRef, name: Option<&str>, gone: bool) -> ScriptStep {
-    match name.filter(|n| !n.is_empty()) {
-        Some(name) => drop_constraint_step(table, ObjectKind::Table, name, gone),
-        None => {
-            let t = table_sql(table);
-            let step = ScriptStep::new(format!(
-                "DECLARE @pk sysname = (SELECT name FROM sys.key_constraints WHERE \
-                 parent_object_id = OBJECT_ID({}) AND type = 'PK'); IF @pk IS NOT NULL EXEC \
-                 (N'ALTER TABLE ' + {} + N' DROP CONSTRAINT ' + QUOTENAME(@pk))",
-                lit(&t),
-                lit(&t)
-            ))
-            .described("Drop the primary key");
-            if gone { step.destructive() } else { step }
-        }
+    if let Some(name) = name.filter(|n| !n.is_empty()) {
+        return drop_constraint_step(table, ObjectKind::Table, name, gone);
     }
+    let t = table_sql(table);
+    let step = ScriptStep::new(format!(
+        "DECLARE @pk sysname = (SELECT name FROM sys.key_constraints WHERE parent_object_id = \
+         OBJECT_ID({}) AND type = 'PK'); IF @pk IS NOT NULL EXEC (N'ALTER TABLE ' + {} + N' \
+         DROP CONSTRAINT ' + QUOTENAME(@pk))",
+        lit(&t),
+        lit(&t)
+    ))
+    .described("Drop the primary key");
+    if gone { step.destructive() } else { step }
 }
 
 /// Drops the default constraint of `column`: by name, else looked up in
 /// `sys.default_constraints` (nothing happens when there is none).
 fn drop_default_step(table: &ObjectRef, column: &str, name: Option<&str>) -> ScriptStep {
-    match name.filter(|n| !n.is_empty()) {
-        Some(name) => ScriptStep::new(format!(
+    if let Some(name) = name.filter(|n| !n.is_empty()) {
+        return ScriptStep::new(format!(
             "ALTER TABLE {} DROP CONSTRAINT {}",
             table_sql(table),
             ident(name)
         ))
-        .described(format!("Drop the default of column {column}")),
-        None => {
-            let t = table_sql(table);
-            ScriptStep::new(format!(
-                "DECLARE @df sysname = (SELECT d.name FROM sys.default_constraints AS d JOIN \
-                 sys.columns AS c ON c.object_id = d.parent_object_id AND c.column_id = \
-                 d.parent_column_id WHERE d.parent_object_id = OBJECT_ID({}) AND c.name = {}); \
-                 IF @df IS NOT NULL EXEC (N'ALTER TABLE ' + {} + N' DROP CONSTRAINT ' + \
-                 QUOTENAME(@df))",
-                lit(&t),
-                lit(column),
-                lit(&t)
-            ))
-            .described(format!("Drop the default of column {column}"))
-        }
+        .described(format!("Drop the default of column {column}"));
     }
+    let t = table_sql(table);
+    ScriptStep::new(format!(
+        "DECLARE @df sysname = (SELECT d.name FROM sys.default_constraints AS d JOIN sys.columns \
+         AS c ON c.object_id = d.parent_object_id AND c.column_id = d.parent_column_id WHERE \
+         d.parent_object_id = OBJECT_ID({}) AND c.name = {}); IF @df IS NOT NULL EXEC (N'ALTER \
+         TABLE ' + {} + N' DROP CONSTRAINT ' + QUOTENAME(@df))",
+        lit(&t),
+        lit(column),
+        lit(&t)
+    ))
+    .described(format!("Drop the default of column {column}"))
 }
 
 fn add_default_step(table: &ObjectRef, c: &ColumnDef, name: &str) -> Result<ScriptStep> {
@@ -2097,7 +2088,12 @@ fn alter_table(
         match new.indexes.iter().find(|i| i.name == idx.name) {
             None => index_drops.push((idx, true)),
             Some(after) => {
-                let blocked = index_uses(idx, &touched);
+                // A filter that names an altered column blocks it in every case.
+                let blocked = index_uses(idx, &touched)
+                    || idx
+                        .predicate
+                        .as_deref()
+                        .is_some_and(|p| altered.iter().any(|n| mentions_column(p, n)));
                 if index_changed(table, idx, after) || blocked {
                     index_drops.push((idx, false));
                     index_adds.push(after);
