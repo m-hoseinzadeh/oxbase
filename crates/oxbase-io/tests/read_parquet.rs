@@ -12,8 +12,8 @@ use arrow_array::builder::{ListBuilder, StringBuilder};
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Float64Type, TimestampMicrosecondType};
 use arrow_array::{
-    ArrayRef, BinaryArray, Date32Array, Decimal128Array, Float64Array, Int32Array, Int64Array,
-    RecordBatch, StringArray, Time64NanosecondArray, TimestampMicrosecondArray,
+    Array, ArrayRef, BinaryArray, Date32Array, Decimal128Array, Float64Array, Int32Array,
+    Int64Array, RecordBatch, StringArray, Time64NanosecondArray, TimestampMicrosecondArray,
     TimestampNanosecondArray,
 };
 use arrow_schema::{DataType as ArrowType, Field, Schema, TimeUnit};

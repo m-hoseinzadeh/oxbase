@@ -328,7 +328,7 @@ fn days(date: NaiveDate) -> Result<i32, String> {
 /// types hold microseconds. Spreadsheet date-times are not checked (their nanoseconds are
 /// float rounding, not digits of the source).
 fn whole_micros(cell: Cell<'_>, nanosecond: u32) -> Result<(), String> {
-    if matches!(cell, Cell::Text(_)) && nanosecond % 1_000 != 0 {
+    if matches!(cell, Cell::Text(_)) && !nanosecond.is_multiple_of(1_000) {
         Err(format!("{} has sub-microsecond digits", describe(cell)))
     } else {
         Ok(())
