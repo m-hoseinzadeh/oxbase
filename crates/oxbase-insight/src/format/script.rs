@@ -102,6 +102,16 @@ fn touches_next(text: &str, next: &str) -> bool {
         && glued(text.chars().last(), next.chars().next())
 }
 
+/// `true` when `text` starts with the word `DELIMITER`: at the start of a line it would become
+/// a MySQL client directive, so such a statement is never moved to the start of a line.
+fn starts_with_delimiter(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    bytes
+        .get(..9)
+        .is_some_and(|b| b.eq_ignore_ascii_case(b"DELIMITER"))
+        && bytes.get(9).is_none_or(u8::is_ascii_whitespace)
+}
+
 /// Columns of `text` with tabs counted as `tab` columns.
 pub(super) fn columns(text: &str, tab: usize) -> usize {
     text.chars().map(|c| if c == '\t' { tab } else { 1 }).sum()
@@ -197,6 +207,10 @@ impl Writer<'_> {
     /// The gap `text` between `statement` (just written) and the next statement; ends on a new
     /// line, ready for the next statement.
     pub fn between(&mut self, text: &str, statement: &str, next: &str) {
+        if starts_with_delimiter(next) && !text.contains('\n') {
+            self.out.push_str(text);
+            return;
+        }
         let g = gap(self.dialect, text);
         let lines = self.attach(&g, statement);
         let blank = self.blank();
@@ -227,6 +241,11 @@ impl Writer<'_> {
 
     /// The gap before the first statement (`statement`) or a text without statements.
     pub fn leading(&mut self, text: &str, statement: Option<&str>) {
+        let last_line = &text[text.rfind('\n').map_or(0, |nl| nl + 1)..];
+        if statement.is_some_and(starts_with_delimiter) && !last_line.trim().is_empty() {
+            self.out.push_str(text);
+            return;
+        }
         let g = gap(self.dialect, text);
         let blank = self.blank();
         for (k, l) in g.lines.iter().enumerate() {
@@ -265,7 +284,51 @@ impl Writer<'_> {
 }
 
 /// The whole of `text` formatted (statements from `statements`, the split of `text`).
+///
+/// From the first token of `text` that runs unterminated to its end (an open string,
+/// identifier or comment) the text is kept as typed: every character after it belongs to that
+/// token. The statement holding it, or the gap holding it and everything after, is copied.
 pub(super) fn whole(w: &mut Writer<'_>, text: &str, statements: &[Statement]) {
+    let open = tokenize(w.dialect.sql, text)
+        .find(|t| !t.is_terminated(text))
+        .map(|t| t.start);
+    let Some(open) = open else {
+        whole_closed(w, text, statements);
+        return;
+    };
+    // Statements laid out, where the verbatim rest starts, and whether the gap before it is
+    // laid out (the rest starts at a statement).
+    let (count, cut, gap_before_cut) = match statements.iter().position(|s| s.range.end > open) {
+        Some(k) if statements[k].range.start <= open => (k, statements[k].range.start, true),
+        Some(k) => (
+            k,
+            k.checked_sub(1).map_or(0, |p| statements[p].range.end),
+            false,
+        ),
+        None => (
+            statements.len(),
+            statements.last().map_or(0, |s| s.range.end),
+            false,
+        ),
+    };
+    if let Some(first) = statements.first()
+        && (count > 0 || gap_before_cut)
+    {
+        w.leading(&text[..first.range.start], Some(&first.text));
+        for (k, s) in statements[..count].iter().enumerate() {
+            w.statement(&s.text, 0);
+            if let Some(next) = statements.get(k + 1)
+                && (k + 1 < count || gap_before_cut)
+            {
+                w.between(&text[s.range.end..next.range.start], &s.text, &next.text);
+            }
+        }
+    }
+    w.out.push_str(&text[cut..]);
+}
+
+/// [`whole`] for a text whose tokens are all terminated.
+fn whole_closed(w: &mut Writer<'_>, text: &str, statements: &[Statement]) {
     let Some(first) = statements.first() else {
         w.leading(text, None);
         if !w.out.is_empty() && text.ends_with('\n') {

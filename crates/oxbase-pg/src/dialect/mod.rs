@@ -67,6 +67,8 @@ mod compare;
 mod ddl;
 mod dml;
 mod fetch;
+// M6: keywords, functions and types for code insight.
+mod language;
 mod rows;
 mod sql;
 mod types;
@@ -129,6 +131,8 @@ pub fn register(reg: &mut DialectRegistry) {
     reg.register_quoting(engine, Arc::new(PgQuoting));
     // M5: import bulk loads with COPY ... FROM STDIN (bulk.rs).
     reg.register_bulk_loader(engine, Arc::new(PgBulkLoader));
+    // M6: language data for code insight (language.rs).
+    reg.register_language(engine, language::LANGUAGE);
     reg.mark_not_applicable_except(engine, &APPLICABLE);
 }
 

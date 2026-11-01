@@ -60,6 +60,8 @@ mod compare;
 mod ddl;
 mod dml;
 mod fetch;
+// M6: keywords, functions and types for code insight.
+mod language;
 mod parse;
 mod types;
 
@@ -231,6 +233,8 @@ pub fn register(reg: &mut DialectRegistry) {
         .register_dml_writer(engine, dml)
         // M5: import bulk loads as batched multi-row INSERTs (bulk.rs).
         .register_bulk_loader(engine, Arc::new(SqliteBulkLoader::new()))
+        // M6: language data for code insight (language.rs).
+        .register_language(engine, language::LANGUAGE)
         .mark_not_applicable_except(engine, APPLICABLE);
 }
 

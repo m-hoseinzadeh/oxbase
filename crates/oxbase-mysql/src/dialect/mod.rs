@@ -63,6 +63,8 @@ mod ddl_text;
 mod dml;
 mod event;
 mod expr;
+// M6: keywords, functions and types for code insight.
+mod language;
 mod native;
 mod routine;
 mod rows;
@@ -121,6 +123,13 @@ pub fn register(reg: &mut DialectRegistry) {
         reg.register_dml_writer(engine, Arc::new(dml::MySqlDmlWriter { mariadb }));
         // M5: import bulk loads as batched multi-row INSERTs (bulk.rs).
         reg.register_bulk_loader(engine, Arc::new(MySqlBulkLoader::new(engine)));
+        // M6: language data for code insight (language.rs).
+        let language = if mariadb {
+            language::MARIADB_LANGUAGE
+        } else {
+            language::LANGUAGE
+        };
+        reg.register_language(engine, language);
         reg.register_fetcher(
             engine,
             ObjectKind::Database,

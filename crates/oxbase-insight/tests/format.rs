@@ -21,12 +21,12 @@ fn dialect(engine: Engine) -> Dialect {
     Dialect::builtin(engine).unwrap()
 }
 
-fn fmt_with(engine: Engine, text: &str, options: &FormatOptions) -> String {
+fn fmt_with(engine: Engine, text: &str, options: FormatOptions) -> String {
     format(&dialect(engine), text, options).unwrap()
 }
 
 fn fmt(engine: Engine, text: &str) -> String {
-    fmt_with(engine, text, &FormatOptions::default())
+    fmt_with(engine, text, FormatOptions::default())
 }
 
 fn narrow() -> FormatOptions {
@@ -59,7 +59,7 @@ fn clauses_go_on_their_own_lines() {
 fn long_lists_break_one_item_per_line() {
     let text = "select aaaaaaaaaa, bbbbbbbbbb, cccccccccc, dddddddddd from t";
     assert_eq!(
-        fmt_with(Engine::Postgres, text, &narrow()),
+        fmt_with(Engine::Postgres, text, narrow()),
         "SELECT\n    aaaaaaaaaa,\n    bbbbbbbbbb,\n    cccccccccc,\n    dddddddddd\nFROM t"
     );
     let leading = FormatOptions {
@@ -68,7 +68,7 @@ fn long_lists_break_one_item_per_line() {
         ..narrow()
     };
     assert_eq!(
-        fmt_with(Engine::Postgres, text, &leading),
+        fmt_with(Engine::Postgres, text, leading),
         "SELECT\n  aaaaaaaaaa\n  , bbbbbbbbbb\n  , cccccccccc\n  , dddddddddd\nFROM t"
     );
     let tabs = FormatOptions {
@@ -76,7 +76,7 @@ fn long_lists_break_one_item_per_line() {
         ..narrow()
     };
     assert_eq!(
-        fmt_with(Engine::Postgres, text, &tabs),
+        fmt_with(Engine::Postgres, text, tabs),
         "SELECT\n\taaaaaaaaaa,\n\tbbbbbbbbbb,\n\tcccccccccc,\n\tdddddddddd\nFROM t"
     );
 }
@@ -105,7 +105,7 @@ fn case_arms_break_when_too_long() {
         "SELECT CASE WHEN a = 1 THEN 'one' WHEN a = 2 THEN 'two' ELSE 'many' END AS label\nFROM t"
     );
     assert_eq!(
-        fmt_with(Engine::Postgres, text, &narrow()),
+        fmt_with(Engine::Postgres, text, narrow()),
         "SELECT\n    CASE\n        WHEN a = 1 THEN 'one'\n        WHEN a = 2 THEN 'two'\n        \
          ELSE 'many'\n    END AS label\nFROM t"
     );
@@ -144,7 +144,7 @@ fn keyword_case_options() {
         ..FormatOptions::default()
     };
     assert_eq!(
-        fmt_with(Engine::Postgres, "SELECT A FROM T", &lower),
+        fmt_with(Engine::Postgres, "SELECT A FROM T", lower),
         "select A\nfrom T"
     );
     let preserve = FormatOptions {
@@ -152,7 +152,7 @@ fn keyword_case_options() {
         ..FormatOptions::default()
     };
     assert_eq!(
-        fmt_with(Engine::Postgres, "Select a From t", &preserve),
+        fmt_with(Engine::Postgres, "Select a From t", preserve),
         "Select a\nFrom t"
     );
     // Names that are also keywords keep their spelling.
@@ -200,7 +200,7 @@ fn statements_are_separated_as_the_options_say() {
         ..FormatOptions::default()
     };
     assert_eq!(
-        fmt_with(Engine::Postgres, "select 1;\n\n\nselect 2;\n", &tight),
+        fmt_with(Engine::Postgres, "select 1;\n\n\nselect 2;\n", tight),
         "SELECT 1;\nSELECT 2;\n"
     );
     assert_eq!(
@@ -295,6 +295,7 @@ fn format_range_replaces_the_overlapping_statements() {
     // Out-of-range offsets are clamped, never panic.
     let edit = format_range(&pg, text, 10_000..20_000, &o).unwrap();
     assert!(edit.range.end <= text.len());
+    #[allow(clippy::reversed_empty_ranges)] // a reversed range must not panic either
     let edit = format_range(&pg, "select 'é'", 9..8, &o).unwrap();
     assert!(edit.range.end <= "select 'é'".len());
 }
@@ -353,11 +354,11 @@ fn option_matrix() -> Vec<FormatOptions> {
 
 /// Formats `text` and checks the invariants: the result passes `check_format` and formatting
 /// it again changes nothing. The violation, described, otherwise.
-fn properties(d: &Dialect, text: &str, o: &FormatOptions) -> Result<(), String> {
-    let once = format(d, text, o)
+fn properties(d: &Dialect, text: &str, o: FormatOptions) -> Result<(), String> {
+    let once = format(d, text, &o)
         .map_err(|e| format!("{:?}: format failed ({e}) on {text:?}", d.engine))?;
     check_format(d, text, &once).map_err(|e| format!("{e} on {text:?}"))?;
-    let twice = format(d, &once, o).map_err(|e| format!("{e} on the output {once:?}"))?;
+    let twice = format(d, &once, &o).map_err(|e| format!("{e} on the output {once:?}"))?;
     if twice != once {
         return Err(format!(
             "{:?} not idempotent on {text:?} with {o:?}:\n first: {once:?}\nsecond: {twice:?}",
@@ -375,7 +376,7 @@ struct Violations {
 }
 
 impl Violations {
-    fn check(&mut self, d: &Dialect, text: &str, o: &FormatOptions) {
+    fn check(&mut self, d: &Dialect, text: &str, o: FormatOptions) {
         if let Err(e) = properties(d, text, o) {
             self.count += 1;
             if self.seen.len() < 25 && !self.seen.contains(&e) {
@@ -403,9 +404,9 @@ fn corpus_with_every_option_combination() {
         let all = corpus(engine).join(";\n");
         for o in &options {
             for text in corpus(engine) {
-                violations.check(&d, text, o);
+                violations.check(&d, text, *o);
             }
-            violations.check(&d, &all, o);
+            violations.check(&d, &all, *o);
         }
     }
     violations.assert_none();
@@ -452,13 +453,13 @@ fn fuzzed_inputs_keep_the_invariants() {
         for text in corpus(engine) {
             // Every prefix (incomplete SQL is the normal case).
             for (at, _) in text.char_indices() {
-                violations.check(&sql, &text[..at], &wide);
+                violations.check(&sql, &text[..at], wide);
             }
             // Every single-token deletion.
             let tokens: Vec<_> = oxbase_sql::tokenize(sql.sql, text).collect();
             for token in &tokens {
                 let cut = [&text[..token.start], &text[token.end..]].concat();
-                violations.check(&sql, &cut, &narrow);
+                violations.check(&sql, &cut, narrow);
             }
             // Random insertions.
             for _ in 0..40 {
@@ -467,7 +468,7 @@ fn fuzzed_inputs_keep_the_invariants() {
                     let at = floor(&mutated, rng.below(mutated.len() + 1));
                     mutated.insert_str(at, JUNK[rng.below(JUNK.len())]);
                 }
-                let options = if rng.below(2) == 0 { &wide } else { &narrow };
+                let options = if rng.below(2) == 0 { wide } else { narrow };
                 violations.check(&sql, &mutated, options);
             }
         }
