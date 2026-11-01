@@ -8,6 +8,16 @@ use oxbase_types::{Engine, Error, ObjectKind, Result, ServerVersion};
 
 use crate::{Capabilities, Comparator, DdlGenerator, DmlWriter, Fetcher, Quoting, TreeLayout};
 
+/// The kinds the M3 table designer and the round-trip conformance cells need a
+/// [`DdlGenerator`] and a [`Comparator`] for, on every SQL engine.
+pub const DESIGNER_KINDS: [ObjectKind; 5] = [
+    ObjectKind::Table,
+    ObjectKind::Column,
+    ObjectKind::Index,
+    ObjectKind::ForeignKey,
+    ObjectKind::Check,
+];
+
 /// Roles filled per (engine, object kind).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum CellRole {
@@ -233,6 +243,20 @@ struct EngineEntry {
 ///
 /// `oxbase_services::default_dialects()` calls every engine's `register`, the way
 /// `default_drivers()` registers drivers; the app, the CLI and the conformance harness use it.
+///
+/// # Registration (M3)
+///
+/// The same `register` also adds, for each SQL engine:
+///
+/// - a [`DdlGenerator`] and a [`Comparator`] (`compare::RulesComparator` with the engine's
+///   rules) for every kind of [`DESIGNER_KINDS`];
+/// - its [`DmlWriter`];
+/// - [`Capabilities::designer`](crate::Capabilities::designer) in its existing capabilities.
+///
+/// [`DialectRegistry::missing_designer_roles`] must be empty for PostgreSQL, MySQL, MariaDB and
+/// SQLite. Services resolve `(engine, Table) → DdlGenerator / Comparator` for the designer and
+/// `engine → DmlWriter / Quoting` for grid edits; a missing role is `Error::Unsupported`, which
+/// the UI shows as "read-only on this engine".
 #[derive(Default, Clone)]
 pub struct DialectRegistry {
     cells: HashMap<(Engine, ObjectKind), Cell>,
@@ -422,6 +446,27 @@ impl DialectRegistry {
             .into_iter()
             .filter(|&k| self.fetcher(engine, k).is_err())
             .collect()
+    }
+
+    /// What `engine` still lacks for the M3 designer and grid editing: a description per
+    /// missing [`DdlGenerator`] / [`Comparator`] of [`DESIGNER_KINDS`], [`DmlWriter`],
+    /// [`Quoting`] or [`Capabilities`]. Engine streams assert this is empty.
+    pub fn missing_designer_roles(&self, engine: Engine) -> Vec<String> {
+        let mut out = Vec::new();
+        for kind in DESIGNER_KINDS {
+            if self.ddl(engine, kind).is_err() {
+                out.push(format!("{engine}/{kind}: no DdlGenerator"));
+            }
+            if self.comparator(engine, kind).is_err() {
+                out.push(format!("{engine}/{kind}: no Comparator"));
+            }
+        }
+        for role in EngineRole::ALL {
+            if !self.engine_roles(engine).contains(&role) {
+                out.push(format!("{engine}: no {}", role.name()));
+            }
+        }
+        out
     }
 
     /// Engines that registered anything (a cell, an engine role, a layout or a

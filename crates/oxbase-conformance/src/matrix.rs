@@ -4,9 +4,10 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use oxbase_dialect::DialectRegistry;
+use oxbase_dialect::{DESIGNER_KINDS, DialectRegistry};
 
 use crate::adapter::{self, Engine, ObjectKind};
+use crate::roundtrip;
 
 /// Detail of an applicable `fetch_list` cell whose engine registered no [`Fetcher`] for the
 /// kind (yet).
@@ -15,10 +16,11 @@ use crate::adapter::{self, Engine, ObjectKind};
 pub const PENDING_NO_FETCHER: &str = "pending (no Fetcher registered)";
 /// Detail of an applicable `fetch_list` cell that has a fetcher but has not run (yet).
 pub const PENDING_NOT_RUN: &str = "pending (Fetcher registered; not run)";
-/// Detail of an applicable `roundtrip` cell: it needs DDL generation and comparison.
-pub const PENDING_ROUNDTRIP: &str = "pending (M3: needs DdlGenerator and Comparator cells)";
-/// Detail of an applicable `capabilities` cell: no live capability probe exists yet.
-pub const PENDING_CAPABILITIES: &str = "pending (no live capability probe yet)";
+/// Detail of an applicable `roundtrip` cell of a kind outside the M3 designer kinds: no
+/// round trip is defined for it yet.
+pub const PENDING_ROUNDTRIP: &str = "pending (no round trip for this kind in M3)";
+/// Detail of an applicable `capabilities` cell of a kind outside the M3 designer kinds.
+pub const PENDING_CAPABILITIES: &str = "pending (no live capability probe for this kind yet)";
 
 /// The milestone that brings `engine`'s driver, for engines that have none yet.
 pub const fn driver_milestone(engine: Engine) -> Option<&'static str> {
@@ -39,7 +41,11 @@ pub fn pending_detail(
     if let Some(m) = driver_milestone(engine) {
         return format!("pending ({m}: no driver yet)");
     }
+    let designer = DESIGNER_KINDS.contains(&kind);
     let detail = match check {
+        Check::Roundtrip | Check::Capabilities if designer => {
+            return roundtrip::pending_detail(registry, engine, kind, check);
+        }
         Check::Roundtrip => PENDING_ROUNDTRIP,
         Check::Capabilities => PENDING_CAPABILITIES,
         Check::FetchList if registry.fetcher(engine, kind).is_ok() => PENDING_NOT_RUN,
@@ -219,8 +225,19 @@ mod tests {
                 .detail
                 .clone()
         };
+        // Designer kinds name the roles they still need; other kinds have no round trip.
+        let table_rt = detail(ObjectKind::Table, Check::Roundtrip).unwrap();
+        assert!(
+            table_rt.starts_with("pending (missing: table DdlGenerator, table Comparator"),
+            "{table_rt}"
+        );
+        let table_caps = detail(ObjectKind::Table, Check::Capabilities).unwrap();
+        assert!(
+            table_caps.starts_with("pending (needs the round trip; missing: "),
+            "{table_caps}"
+        );
         assert_eq!(
-            detail(ObjectKind::Table, Check::Roundtrip).as_deref(),
+            detail(ObjectKind::View, Check::Roundtrip).as_deref(),
             Some(PENDING_ROUNDTRIP)
         );
         assert_eq!(
@@ -228,7 +245,7 @@ mod tests {
             Some(PENDING_NO_FETCHER)
         );
         assert_eq!(
-            detail(ObjectKind::Table, Check::Capabilities).as_deref(),
+            detail(ObjectKind::View, Check::Capabilities).as_deref(),
             Some(PENDING_CAPABILITIES)
         );
         let redis = plan("r", Engine::Redis);

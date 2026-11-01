@@ -1,5 +1,6 @@
 /**
- * TypeScript mirrors of the M2 workbench payloads (docs/m2-contracts.md §5).
+ * TypeScript mirrors of the workbench payloads: M2 (docs/m2-contracts.md §5) and M3 table data,
+ * grid editing and the table designer (docs/m3-contracts.md §7).
  *
  * Two naming conventions meet here, exactly as the Rust serde forms produce them:
  * - command wrapper types (tree nodes, run events, history) are camelCase;
@@ -8,9 +9,9 @@
  *
  * Result rows never appear here: pages are Arrow IPC bytes decoded with `apache-arrow`.
  */
-import type { Engine, ErrorCategory } from "../connections/types";
+import type { Engine, ErrorCategory, ServerVersion } from "../connections/types";
 
-export type { Engine, ErrorCategory };
+export type { Engine, ErrorCategory, ServerVersion };
 
 // --- core model (oxbase-types, snake_case) -------------------------------------------------
 
@@ -386,4 +387,341 @@ export interface HistorySettings {
   enabled: boolean;
   /** 0 = unlimited. */
   maxEntries: number;
+}
+
+// --- M3: filter and sort (oxbase_types::filter, camelCase) ----------------------------------
+
+export type FilterOp =
+  | "eq"
+  | "ne"
+  | "lt"
+  | "le"
+  | "gt"
+  | "ge"
+  | "like"
+  | "notLike"
+  | "contains"
+  | "notContains"
+  | "startsWith"
+  | "endsWith"
+  | "in"
+  | "notIn"
+  | "isNull"
+  | "isNotNull"
+  | "between"
+  | "notBetween";
+
+/**
+ * `oxbase_types::Filter`. Values are typed `Value`s; the UI may send what the user typed as
+ * `{ type: "text" }` values and the core converts them with the column's type.
+ * `rawSql` is RAW SQL typed by the user (one boolean expression; no `;`, no comments).
+ */
+export type Filter =
+  | { type: "and"; items: Filter[] }
+  | { type: "or"; items: Filter[] }
+  | { type: "not"; item: Filter }
+  | { type: "condition"; column: string; op: FilterOp; values?: Value[] }
+  | { type: "rawSql"; sql: string };
+
+export type NullsOrder = "first" | "last";
+
+export interface SortKey {
+  column: string;
+  descending?: boolean;
+  nulls?: NullsOrder;
+}
+
+/** `SELECT * FROM table [WHERE filter] [ORDER BY sort] [LIMIT limit]`. */
+export interface TableDataQuery {
+  table: ObjectRef;
+  filter?: Filter;
+  sort?: SortKey[];
+  limit?: number;
+}
+
+/** How many values each operator takes (mirrors `FilterOp::arity`). */
+export function filterOpArity(op: FilterOp): "none" | "one" | "two" | "many" {
+  switch (op) {
+    case "isNull":
+    case "isNotNull":
+      return "none";
+    case "between":
+    case "notBetween":
+      return "two";
+    case "in":
+    case "notIn":
+      return "many";
+    default:
+      return "one";
+  }
+}
+
+// --- M3: grid editing (oxbase_services::edit, camelCase) ------------------------------------
+
+/** How the UI edits one column. */
+export type InputKind =
+  | { type: "text" }
+  | { type: "integer" }
+  | { type: "decimal" }
+  | { type: "float" }
+  | { type: "boolean" }
+  | { type: "date" }
+  | { type: "time" }
+  | { type: "timestamp" }
+  | { type: "timestampTz" }
+  | { type: "uuid" }
+  | { type: "json" }
+  | { type: "bytes" }
+  | { type: "enum"; labels: string[] }
+  | { type: "other" };
+
+/** `oxbase_types::RowKey` (core model, snake_case). */
+export interface RowKey {
+  table: ObjectRef;
+  kind: "primary" | "unique";
+  columns: string[];
+}
+
+export interface EditColumn {
+  name: string;
+  /** Position in the result. */
+  index: number;
+  dataType: DataType;
+  nativeType: string;
+  nullable: boolean;
+  hasDefault: boolean;
+  key: boolean;
+  editable: boolean;
+  readOnlyReason?: string;
+  input: InputKind;
+}
+
+/** `edit_begin`: whether and how a table-data result can be edited. */
+export interface Editability {
+  runId: RunId;
+  resultIndex: number;
+  table: ObjectRef;
+  editable: boolean;
+  readOnlyReason?: string;
+  key?: RowKey;
+  columns: EditColumn[];
+  /**
+   * `false` when the table's writes cannot be rolled back (MySQL / MariaDB `MyISAM`, ...): an
+   * apply that stops keeps, and reports `applied`, the edits that ran before it.
+   */
+  transactional: boolean;
+  /** Shown with the grid (for example why a failed apply may still have saved changes). */
+  warning?: string;
+}
+
+/** What the user typed into a cell: NULL, the column default (new rows only), or text. */
+export type CellInput = { type: "null" } | { type: "default" } | { type: "text"; text: string };
+
+export interface CellEdit {
+  column: string;
+  input: CellInput;
+}
+
+/** One unsaved edit. `row` is a grid row number. */
+export type PendingEdit =
+  | { op: "update"; row: number; cells: CellEdit[] }
+  | { op: "insert"; cells: CellEdit[] }
+  | { op: "delete"; row: number };
+
+/** The UI's buffer of unsaved edits, sent whole to `edit_apply` (helpers in `./pending`). */
+export interface PendingChanges {
+  edits: PendingEdit[];
+}
+
+export type EditStatus = "applied" | "conflict" | "failed" | "rolledBack" | "notRun";
+
+export interface EditOutcome {
+  status: EditStatus;
+  error?: ErrorInfo;
+  /** The grid row; for an applied insert, its new row number. */
+  row?: number;
+  /** The row read back, as edit texts in result-column order (`null` = NULL). */
+  values?: (string | null)[];
+  warning?: string;
+}
+
+export interface ApplyReport {
+  /** Every edit was applied. `false` with some `applied` only on a non-transactional table. */
+  committed: boolean;
+  /** One per pending edit, same order. */
+  outcomes: EditOutcome[];
+}
+
+export interface FormField {
+  column: string;
+  /** Edit text; absent means NULL. */
+  text?: string;
+}
+
+/** `row_get_form`: one row for the form / JSON view. */
+export interface FormRow {
+  row: number;
+  fields: FormField[];
+  /** Pretty-printed JSON object of the row. */
+  json: string;
+}
+
+// --- M3: table designer (oxbase_designer / oxbase_services::designer, camelCase) -----------
+
+export type Support = "native" | "rebuild" | "unsupported";
+
+/** `oxbase_dialect::DesignerCapabilities`. */
+export interface DesignerCapabilities {
+  transactionalDdl: boolean;
+  createTable: boolean;
+  dropTable: boolean;
+  renameTable: Support;
+  tableComment: Support;
+  addColumn: Support;
+  dropColumn: Support;
+  renameColumn: Support;
+  alterColumnType: Support;
+  alterColumnNullability: Support;
+  alterColumnDefault: Support;
+  columnComment: Support;
+  columnCollation: Support;
+  reorderColumns: Support;
+  autoIncrement: boolean;
+  identity: boolean;
+  generatedStored: boolean;
+  generatedVirtual: boolean;
+  changePrimaryKey: Support;
+  addIndex: Support;
+  dropIndex: Support;
+  uniqueConstraints: boolean;
+  partialIndexes: boolean;
+  expressionIndexes: boolean;
+  descendingIndexes: boolean;
+  indexPrefixLengths: boolean;
+  indexMethods: string[];
+  addForeignKey: Support;
+  dropForeignKey: Support;
+  fkActions: FkAction[];
+  deferrableConstraints: boolean;
+  addCheck: Support;
+  dropCheck: Support;
+  checksEnforced: boolean;
+  maxIdentifierLength: number | null;
+  notes: string[];
+}
+
+/** `capabilities_get`. */
+export interface EngineCapabilities {
+  engine: Engine;
+  serverVersion: ServerVersion;
+  designer: DesignerCapabilities;
+  gridEditing: boolean;
+  nullsOrdering: boolean;
+}
+
+export interface DesignColumn {
+  /** Index in `original.columns`; absent for a new column. */
+  origin?: number;
+  column: ColumnDef;
+  /** A default typed as a plain value; the dialect quotes it. */
+  defaultLiteral?: string;
+}
+
+export interface DesignItem<T> {
+  origin?: number;
+  def: T;
+}
+
+/** `oxbase_designer::TableDesign`: the designer's editable model, sent back whole. */
+export interface TableDesign {
+  /** The table as loaded; absent for a new table. Send it back unchanged. */
+  original?: TableDef;
+  table: ObjectRef;
+  columns: DesignColumn[];
+  primaryKey?: PrimaryKeyDef;
+  indexes: DesignItem<IndexDef>[];
+  foreignKeys: DesignItem<ForeignKeyDef>[];
+  checks: DesignItem<CheckDef>[];
+  comment?: string;
+  extras: Extras;
+}
+
+/** An empty design for a new table (`TableDesign::new_table`). */
+export function newTableDesign(table: ObjectRef): TableDesign {
+  return { table, columns: [], indexes: [], foreignKeys: [], checks: [], extras: {} };
+}
+
+export type DiffKind = "added" | "removed" | "changed";
+
+/** `oxbase_types::PropertyDiff` (core model, snake_case). */
+export interface PropertyDiff {
+  object: ObjectRef;
+  /** Property id (`name`, `data_type`, `nullable`, ...); absent for a whole object. */
+  prop?: string;
+  kind: DiffKind;
+  old?: Value;
+  new?: Value;
+}
+
+/** `oxbase_types::ScriptStep` (core model, snake_case). */
+export interface ScriptStep {
+  sql: string;
+  description?: string;
+  destructive: boolean;
+  transactional: boolean;
+  phase: "prepare" | "main" | "finally";
+  check: "none" | "expect_no_rows";
+  capture?: string;
+  only_if?: { capture: string; equals: string };
+}
+
+export interface Script {
+  steps: ScriptStep[];
+  warnings?: string[];
+}
+
+export interface DesignIssue {
+  severity: "error" | "warning";
+  /** Path into the design: `columns[2].name`, `checks[0].expression`, ... */
+  path: string;
+  message: string;
+}
+
+/** `designer_preview`. */
+export interface DesignPreview {
+  diffs: PropertyDiff[];
+  script: Script;
+  sql: string;
+  atomic: boolean;
+  destructive: boolean;
+  issues: DesignIssue[];
+  notes: string[];
+}
+
+export interface DesignApplyOptions {
+  /** The user confirmed a destructive script. */
+  confirmDestructive?: boolean;
+}
+
+export type StepStatus = "done" | "failed" | "skipped" | "rolledBack" | "notRun";
+
+export interface StepOutcome {
+  index: number;
+  status: StepStatus;
+  error?: ErrorInfo;
+  elapsedMs: number;
+}
+
+export interface ScriptOutcome {
+  committed: boolean;
+  atomic: boolean;
+  steps: StepOutcome[];
+  warnings: string[];
+}
+
+/** `designer_apply`. */
+export interface DesignApplyReport {
+  outcome: ScriptOutcome;
+  /** The table as it is now (reloaded). */
+  design?: TableDesign;
 }

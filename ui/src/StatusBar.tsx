@@ -24,7 +24,7 @@ export function StatusBar() {
   }
 
   return (
-    <footer className="status-bar">
+    <footer className="status-bar" data-testid="status-bar">
       <span className="status-bar__item" data-testid="core-version">
         {text}
       </span>

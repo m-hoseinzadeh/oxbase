@@ -45,7 +45,7 @@ impl ColumnValue {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum RowEdit {
-    /// A new row. Columns not listed take their defaults.
+    /// A new row. Columns not listed take their defaults (no values at all: a row of defaults).
     Insert { values: Vec<ColumnValue> },
     /// Changes to an existing row identified by `key` (values in [`RowKey::columns`] order).
     Update {
@@ -66,7 +66,8 @@ impl RowKey {
     }
 
     /// Checks that an edit can be written with this key: the key is non-empty, key values have
-    /// the key's arity and contain no NULL, and updates/inserts change at least one column.
+    /// the key's arity and contain no NULL, and updates change at least one column. An insert
+    /// with no values is valid: it inserts a row of defaults.
     pub fn validate(&self, edit: &RowEdit) -> Result<()> {
         if self.columns.is_empty() {
             return Err(Error::invalid_input(format!(
@@ -75,12 +76,8 @@ impl RowKey {
             )));
         }
         let key = match edit {
-            RowEdit::Insert { values } => {
-                if values.is_empty() {
-                    return Err(Error::invalid_input("insert with no values"));
-                }
-                return Ok(());
-            }
+            // An insert with no values inserts a row of defaults (M3).
+            RowEdit::Insert { .. } => return Ok(()),
             RowEdit::Update { key, changes } => {
                 if changes.is_empty() {
                     return Err(Error::invalid_input("update with no changes"));
@@ -149,6 +146,7 @@ mod tests {
             values: vec![ColumnValue::new("a", 1)],
         };
         assert!(k.validate(&ins).is_ok());
+        assert!(k.validate(&RowEdit::Insert { values: vec![] }).is_ok());
         let none = RowKey::new(ObjectRef::table(None, None, "t"), KeyKind::Unique, vec![]);
         assert!(none.validate(&ins).is_err());
     }

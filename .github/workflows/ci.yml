@@ -214,19 +214,27 @@ jobs:
           bash scripts/ci-fixtures.sh up
 
       # Prints the object-kind matrix (M2: fetch_list cells list and load the [m2] seed objects
-      # through every registered Fetcher) and the M1 connection table (plain, TLS, SSH, TLS over
+      # through every registered Fetcher; M3: the round-trip table) and the M1 connection table (plain, TLS, SSH, TLS over
       # SSH, cancel, 200k-row stream). One thread so the cancel timings do not compete with probes.
       # Every lane also requires each M2 engine (PostgreSQL, MySQL, MariaDB, SQLite) to register
       # its tree layout and pass its fetch_list cells (all four M2 dialects are merged).
+      # M3 exit check: the roundtrip / capabilities cells (table, column, index, foreign key,
+      # check) must pass on PostgreSQL, MySQL, MariaDB and SQLite; a pending or failing one fails
+      # the job (all three M3 dialect streams are merged).
       - name: Run conformance harness
         env:
           OXBASE_CONFORMANCE_REQUIRE_M2_FETCH: "1"
+          OXBASE_CONFORMANCE_REQUIRE_M3_ROUNDTRIP: "1"
         run: cargo test -p oxbase-conformance --locked -- --include-ignored --nocapture --test-threads 1
 
       # Driver, tunnel and connection-manager live tests (SSH bastion, TLS-only users, cancel),
       # M2 dialect fetcher tests (pg, mysql/mariadb, sqlite) and query-run tests (services).
       # oxbase-sql has no ignored tests, so it runs in the Linux test job only.
-      - name: Run M1/M2 live tests
+      # M3: the dialect DDL / DML live tests and the services edit and designer live tests on
+      # every M3 engine; a missing engine cell or seed table fails instead of being pending.
+      - name: Run M1/M2/M3 live tests
+        env:
+          OXBASE_SERVICES_REQUIRE_M3_CELLS: "1"
         run: cargo test -p oxbase-net -p oxbase-pg -p oxbase-mysql -p oxbase-sqlite -p oxbase-services --locked -- --include-ignored --test-threads 1
 
       - name: Dump fixture logs
@@ -236,6 +244,100 @@ jobs:
       - name: Tear down database fixtures
         if: always()
         run: bash scripts/ci-fixtures.sh down
+
+  # The built app driven through its real webview (docs/m3-contracts.md §9, ui/e2e/README.md):
+  # a debug app serving ui/dist, tauri-driver in front of WebKitWebDriver under Xvfb, the
+  # PostgreSQL fixture only. Full lane, plus the fast lane of the e2e, app and integration
+  # branches (wip/*-e2e, wip/*-app, wip/*-integrate). macOS has no WebDriver for WKWebView, so there is no macOS job.
+  webview-smoke:
+    name: Webview smoke (Linux)
+    if: >-
+      !startsWith(github.ref, 'refs/heads/wip/')
+      || endsWith(github.ref, '-e2e')
+      || endsWith(github.ref, '-app')
+      || endsWith(github.ref, '-integrate')
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      # Apache-2.0 OR MIT; a binary tool, not a dependency of the workspace.
+      TAURI_DRIVER_VERSION: "2.1.0"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Tauri Linux system libraries, WebKitWebDriver and Xvfb
+        run: |
+          bash scripts/ci-install-linux-deps.sh
+          sudo apt-get install -y -q --no-install-recommends webkit2gtk-driver xvfb xauth dbus
+          command -v WebKitWebDriver
+
+      # Restores the Linux test job's dependency cache (debug profile); never saves its own.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test
+          save-if: false
+
+      - uses: pnpm/action-setup@v6
+        with:
+          version: ${{ env.PNPM_VERSION }}
+          package_json_file: ui/package.json
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+          cache-dependency-path: ui/pnpm-lock.yaml
+
+      - name: Build the UI
+        working-directory: ui
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm run build
+
+      - name: Cache tauri-driver
+        id: tauri-driver-cache
+        uses: actions/cache@v6
+        with:
+          path: ~/.cargo/bin/tauri-driver
+          key: tauri-driver-${{ runner.os }}-${{ env.TAURI_DRIVER_VERSION }}
+
+      - name: Install tauri-driver
+        if: steps.tauri-driver-cache.outputs.cache-hit != 'true'
+        run: cargo install tauri-driver --locked --version "$TAURI_DRIVER_VERSION"
+
+      # What `tauri build --debug --no-bundle` builds: a debug app with ui/dist embedded.
+      - name: Build the debug app
+        run: cargo build -p app-tauri --locked --features tauri/custom-protocol
+
+      - name: Start the PostgreSQL fixture
+        run: bash scripts/e2e-fixtures.sh up
+
+      # M3: the table-data edit step is mandatory (a skip fails the job).
+      - name: Webview smoke test
+        env:
+          OXBASE_E2E_OUT: ${{ runner.temp }}/e2e
+          OXBASE_E2E_REQUIRE_EDIT: "1"
+        run: bash scripts/e2e-smoke.sh
+
+      - name: Upload e2e results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: webview-smoke-linux
+          path: ${{ runner.temp }}/e2e
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Dump fixture logs
+        if: failure()
+        run: bash scripts/e2e-fixtures.sh logs
+
+      - name: Tear down the fixture
+        if: always()
+        run: bash scripts/e2e-fixtures.sh down
 
   cargo-deny:
     name: cargo-deny (${{ matrix.checks }})

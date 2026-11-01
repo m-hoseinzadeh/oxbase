@@ -109,7 +109,7 @@ use oxbase_dialect::{DatabaseScope, DialectRegistry};
 use oxbase_driver::{Notice, NoticeSeverity, ResultItem, ResultStream};
 use oxbase_sql::{SqlDialect, StatementKind};
 use oxbase_store::HistoryStatus;
-use oxbase_types::{Engine, Error, ErrorCategory, Result};
+use oxbase_types::{BoundStatement, Engine, Error, ErrorCategory, Result, Value};
 
 use crate::history::{HistoryRecord, HistoryService};
 use crate::results::{AppendOutcome, ByteBudget, ResultStore, RunDir};
@@ -589,6 +589,8 @@ struct Run {
     results: Mutex<Vec<RunResult>>,
     /// Taken by `close` (and the service's drop), which delete the directory right away.
     dir: Mutex<Option<Arc<RunDir>>>,
+    /// M3: the session the run executes on, once it is open (`QueryService::run_session`).
+    session: Mutex<Option<SessionHandle>>,
 }
 
 impl Run {
@@ -651,6 +653,67 @@ impl QueryService {
         &self,
         target: RunTarget,
         script: &str,
+        options: RunOptions,
+    ) -> Result<RunHandle> {
+        self.start(&target, script.to_owned(), None, options).await
+    }
+
+    /// Starts a run of exactly one statement with bound parameters. Same editor rules, events,
+    /// paging, cancel and close as [`QueryService::run`]; the statement is not split, and its
+    /// [`RunEvent::Started`] lists one statement spanning the whole SQL text. History records
+    /// the SQL text (redacted, never the parameter values) unless `options.record_history` is
+    /// off.
+    pub async fn run_bound(
+        &self,
+        target: RunTarget,
+        statement: BoundStatement,
+        options: RunOptions,
+    ) -> Result<RunHandle> {
+        let BoundStatement { sql, params } = statement;
+        self.start(&target, sql, Some(params), options).await
+    }
+
+    /// The session run `run` executed on (its editor's session), for edits that must run on
+    /// the same session. `NotFound` for an unknown or closed run, or when that session is gone.
+    pub fn run_session(&self, run: RunId) -> Result<SessionHandle> {
+        let found = self
+            .registry
+            .run(run)
+            .ok_or_else(|| Error::not_found(format!("no open query run {run}")))?;
+        let session = lock(&found.session).clone().ok_or_else(|| {
+            Error::not_found(format!("query run {run} has no session (it never started)"))
+        })?;
+        if self.manager.get(session.id()).is_none() {
+            return Err(Error::not_found(format!(
+                "the session of query run {run} was closed; run the query again"
+            )));
+        }
+        // A stopped statement that did not wind down may still be draining on this session,
+        // or the driver may be about to close it (see `RunContext::stop`).
+        let unclean = lock(&self.registry.editors)
+            .get(&found.editor)
+            .is_some_and(|e| e.unclean && e.child.as_ref().is_some_and(|c| c.id() == session.id()));
+        if unclean {
+            return Err(Error::invalid_input(format!(
+                "the cancelled query run {run} may still be stopping on its connection; run the \
+                 query again"
+            )));
+        }
+        Ok(session)
+    }
+
+    /// Where run `run` is; `None` when unknown or closed.
+    pub fn run_state(&self, run: RunId) -> Option<RunState> {
+        self.registry.run(run).map(|found| found.state())
+    }
+
+    /// [`QueryService::run`] of `script`, or with `params` [`QueryService::run_bound`] of the
+    /// single statement `script`.
+    async fn start(
+        &self,
+        target: &RunTarget,
+        script: String,
+        params: Option<Vec<Value>>,
         options: RunOptions,
     ) -> Result<RunHandle> {
         target.editor.validate()?;
@@ -723,6 +786,7 @@ impl QueryService {
             statements: Mutex::new(Vec::new()),
             results: Mutex::new(Vec::new()),
             dir: Mutex::new(Some(Arc::clone(&dir))),
+            session: Mutex::new(None),
         });
         lock(&self.registry.runs).insert(run_id, Arc::clone(&run));
         if let Some(editor) = lock(&self.registry.editors).get_mut(&target.editor) {
@@ -730,7 +794,7 @@ impl QueryService {
         }
 
         let opened = match self
-            .editor_session(&target, engine, previous, unclean, &options, &run.token)
+            .editor_session(target, engine, previous, unclean, &options, &run.token)
             .await
         {
             // Closed (or cancelled) while the session was opening.
@@ -775,6 +839,7 @@ impl QueryService {
             editor.child = Some(session.clone());
             editor.database.clone_from(&database);
         }
+        *lock(&run.session) = Some(session.clone());
 
         let (tx, rx) = mpsc::channel(self.config.event_capacity.max(1));
         let context = RunContext {
@@ -789,7 +854,8 @@ impl QueryService {
             profile_id: base.summary().profile_id,
             session: Mutex::new(session),
             dialect,
-            script: script.to_owned(),
+            script,
+            params,
             options,
             dir,
             memory: Arc::new(ByteBudget::new(self.config.memory_budget_bytes)),
@@ -1091,6 +1157,8 @@ struct RunContext {
     profile_id: Uuid,
     dialect: SqlDialect,
     script: String,
+    /// M3 `run_bound`: the script is one statement with these bound parameters (not split).
+    params: Option<Vec<Value>>,
     options: RunOptions,
     dir: Arc<RunDir>,
     memory: Arc<ByteBudget>,
@@ -1157,7 +1225,11 @@ async fn supervise(context: RunContext) {
 /// The run task: see the module docs.
 async fn execute(context: RunContext) {
     let started = Instant::now();
-    let statements = split_script(context.dialect, &context.script);
+    let statements = if context.params.is_some() {
+        vec![whole_statement(context.dialect, &context.script)]
+    } else {
+        split_script(context.dialect, &context.script)
+    };
     let spans: Vec<StatementSpan> = statements
         .iter()
         .enumerate()
@@ -1330,6 +1402,7 @@ impl RunContext {
             editor.unclean = false;
         }
         *lock(&self.session) = new.clone();
+        *lock(&self.run.session) = Some(new.clone());
         let manager = Arc::clone(&self.manager);
         let id = old.id();
         tokio::spawn(async move { close_session(&manager, id).await });
@@ -1372,10 +1445,11 @@ impl RunContext {
                 () = token.cancelled() => return Outcome::Cancelled { rows_returned: None },
                 guard = session.exclusive() => guard,
             };
+            let params = self.params.as_deref().unwrap_or_default();
             let executed = tokio::select! {
                 biased;
                 () = token.cancelled() => return Outcome::Cancelled { rows_returned: None },
-                executed = session.connection().execute(sql, &[], statement_token.clone()) => executed,
+                executed = session.connection().execute(sql, params, statement_token.clone()) => executed,
             };
             match executed {
                 // The session was found closed before the statement started, after an earlier
@@ -1697,6 +1771,22 @@ async fn close_session(manager: &ConnectionManager, id: SessionId) {
 /// The statements of `script`.
 fn split_script(dialect: SqlDialect, script: &str) -> Vec<oxbase_sql::Statement> {
     oxbase_sql::split(dialect, script)
+}
+
+/// `sql` as one statement spanning the whole text (a bound statement is never split). Its kind
+/// is the splitter's hint for the first statement it finds.
+fn whole_statement(dialect: SqlDialect, sql: &str) -> oxbase_sql::Statement {
+    let kind = oxbase_sql::split(dialect, sql)
+        .first()
+        .map_or(StatementKind::Other, |s| s.kind);
+    oxbase_sql::Statement {
+        range: 0..sql.len(),
+        segment_end: sql.len(),
+        start: oxbase_sql::position_at(sql, 0),
+        end: oxbase_sql::position_at(sql, sql.len()),
+        text: sql.to_owned(),
+        kind,
+    }
 }
 
 /// Deletes the spill directory of `run` now.

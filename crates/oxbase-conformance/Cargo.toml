@@ -32,6 +32,8 @@ serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
 thiserror.workspace = true
+# M3 round trip (src/roundtrip/exec.rs): script captures read the first cell of a catalog answer.
+arrow-array.workspace = true
 
 [dev-dependencies]
 pretty_assertions.workspace = true
@@ -41,4 +43,3 @@ oxbase-driver = { workspace = true, features = ["mock"] }
 # The fetch_list run on a real SQLite session (src/fetch.rs tests): seed scripts in a temp dir,
 # names read from the Arrow batches.
 tempfile.workspace = true
-arrow-array.workspace = true

@@ -171,6 +171,9 @@ impl MySqlDriver {
             .db_name(params.database.clone())
             // Never switch to a local Unix socket: it would bypass the tunnel and TLS.
             .prefer_socket(false)
+            // An UPDATE reports matched rows, not changed ones, so writing the value a row
+            // already has still counts 1 (the grid editor's "exactly one row" check, M3).
+            .client_found_rows(true)
             .tcp_nodelay(true);
         if let Some(name) = &params.application_name {
             base = base.connect_attribute("program_name", name.clone());

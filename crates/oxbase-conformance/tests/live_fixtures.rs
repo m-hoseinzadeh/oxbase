@@ -17,17 +17,26 @@
 //! also requires every M2 engine (PostgreSQL, MySQL, MariaDB, SQLite) to have registered its
 //! tree layout in `oxbase_services::default_dialects`, so a registration left out fails the
 //! job instead of leaving its cells pending.
+//!
+//! `OXBASE_CONFORMANCE_REQUIRE_M3_ROUNDTRIP=1` (the integrator sets it in the conformance CI
+//! step once the M3 engine streams are merged) requires every `roundtrip` and `capabilities`
+//! cell of the designer kinds (table, column, index, foreign key, check) on PostgreSQL, MySQL,
+//! MariaDB and SQLite to pass, and `missing_designer_roles` to be empty for each of them
+//! ([`roundtrip::gate`]). Without it, those cells may pass or stay pending, never fail. It
+//! cannot be combined with `OXBASE_CONFORMANCE_SKIP_ROUNDTRIP` (the test fails), and only
+//! `OXBASE_CONFORMANCE_ALLOW_MISSING` (unreachable fixtures) excuses skipped cells then.
 
 use oxbase_conformance::adapter::{self, Engine};
 use oxbase_conformance::fixtures::Fixtures;
 use oxbase_conformance::matrix::{CellStatus, Check};
-use oxbase_conformance::{fetch, fixtures, report, runner};
+use oxbase_conformance::{fetch, fixtures, report, roundtrip, runner};
 
 /// M0 exit criterion (the harness runs against all engines), the M1 connection checks (every
-/// applicable check of the M1 engines passes, engines without a driver report pending) and the
+/// applicable check of the M1 engines passes, engines without a driver report pending), the
 /// M2 `fetch_list` cells ([`fetch::gate`]): every cell with a registered Fetcher and a seed
 /// object passes, every kind of a registered tree layout passes or is n/a, each engine with a
-/// layout passes at least one cell, and n/a never hides a seeded kind.
+/// layout passes at least one cell, and n/a never hides a seeded kind; and the M3 `roundtrip`
+/// / `capabilities` cells ([`roundtrip::gate`]).
 #[test]
 #[ignore = "needs the Docker fixtures (scripts/fixtures-up.sh); run with --include-ignored"]
 fn harness_runs_against_all_engines_and_m1_connection_checks_pass() {
@@ -53,18 +62,28 @@ fn harness_runs_against_all_engines_and_m1_connection_checks_pass() {
     let fx = Fixtures::from_path(&path).unwrap();
     let resolved = fx.resolve().unwrap();
     let registry = adapter::registry();
-    for c in report.cells.iter().filter(|c| c.check != Check::FetchList) {
-        // roundtrip and capabilities have no runner before M3.
-        assert!(
-            !matches!(c.status, CellStatus::Pass | CellStatus::Fail),
-            "{} {} {}: {:?} {:?}",
-            c.engine,
-            c.object_kind,
-            c.check,
-            c.status,
-            c.detail
-        );
-    }
+    let m3 = roundtrip::GateOptions::for_run(&opts, roundtrip::GateOptions::require_m3_from_env())
+        .unwrap_or_else(|e| panic!("{e}"));
+    let problems = roundtrip::gate(&report.cells, &fx, &resolved, &registry, m3);
+    assert!(
+        problems.is_empty(),
+        "roundtrip / capabilities gate ({m3:?}):\n  {}",
+        problems.join("\n  ")
+    );
+    let ran = |check: Check| {
+        report
+            .cells
+            .iter()
+            .filter(|c| c.check == check && c.status == CellStatus::Pass)
+            .count()
+    };
+    println!(
+        "roundtrip cells passed: {}, capabilities cells passed: {} ({}: {})",
+        ran(Check::Roundtrip),
+        ran(Check::Capabilities),
+        roundtrip::REQUIRE_ENV,
+        m3.require_m3
+    );
     let gate = fetch::GateOptions {
         skipped_ok: opts.allow_missing || opts.skip_fetch,
         require_m2: std::env::var("OXBASE_CONFORMANCE_REQUIRE_M2_FETCH")

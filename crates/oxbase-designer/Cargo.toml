@@ -12,5 +12,11 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
+# M3: the table designer model, validation and DDL preview (pure; no I/O).
+oxbase-types.workspace = true
+oxbase-dialect.workspace = true
+serde.workspace = true
 
 [dev-dependencies]
+pretty_assertions.workspace = true
+serde_json.workspace = true

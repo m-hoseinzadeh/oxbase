@@ -5,10 +5,10 @@
  * expand/collapse, Home/End jump, Enter toggles (or retries a failed load), F5 refreshes.
  */
 import { type KeyboardEvent, useCallback, useEffect, useId, useRef, useState } from "react";
-import { type TreeNodeRef, treeChildren } from "../../api";
+import { type ObjectRef, type TreeNodeRef, treeChildren } from "../../api";
 import { cancelRequest, newRequestId, toCommandError } from "../../connections/api";
 import { useConnections } from "../../connections/store";
-import { openQueryEditor } from "../layout";
+import { openQueryEditor, openTableData, openTableDesigner } from "../layout";
 import {
   type ChildrenState,
   cachedDescendants,
@@ -18,6 +18,41 @@ import {
 } from "./treeModel";
 
 type NodeRow = Extract<Row, { type: "node" }>;
+
+/** Kinds whose rows open in a table-data tab. */
+const DATA_KINDS: ReadonlySet<string> = new Set(["table", "view", "mat_view"]);
+
+/** The object a row's data or design opens, if it is a table (or view, for data). */
+function dataObject(row: Row | null): ObjectRef | null {
+  if (row?.type !== "node" || row.ref.type !== "object") return null;
+  return DATA_KINDS.has(row.ref.object.kind) ? row.ref.object : null;
+}
+
+/** Where a new table goes when `row` is selected: its schema, or its database. */
+export function newTableTarget(row: Row | null): ObjectRef | null {
+  if (row?.type !== "node") return null;
+  const ref = row.ref;
+  const object = ref.type === "object" ? ref.object : ref.type === "folder" ? ref.parent : null;
+  if (!object) return null;
+  if (object.kind === "schema") {
+    return {
+      kind: "table",
+      ...(object.catalog ? { catalog: object.catalog } : {}),
+      schema: object.name,
+      name: "",
+    };
+  }
+  if (object.kind === "database") return { kind: "table", catalog: object.name, name: "" };
+  if (object.kind === "table" || object.kind === "view") {
+    return {
+      kind: "table",
+      ...(object.catalog ? { catalog: object.catalog } : {}),
+      ...(object.schema ? { schema: object.schema } : {}),
+      name: "",
+    };
+  }
+  return null;
+}
 
 function isNavigable(row: Row): boolean {
   return row.type === "node" || row.type === "error";
@@ -163,6 +198,27 @@ export function ObjectTreePanel() {
     });
   }
 
+  function openData(row: Row | null = selectedRow) {
+    const object = dataObject(row);
+    if (row?.type === "node" && object) openTableData({ sessionId: row.sessionId, table: object });
+  }
+
+  function design() {
+    const row = selectedRow;
+    const object = dataObject(row);
+    if (row?.type === "node" && object?.kind === "table") {
+      openTableDesigner({ sessionId: row.sessionId, table: object });
+    }
+  }
+
+  function newTable() {
+    const row = selectedRow;
+    const target = newTableTarget(row);
+    if (row?.type === "node" && target) {
+      openTableDesigner({ sessionId: row.sessionId, table: target, isNew: true });
+    }
+  }
+
   function select(id: string) {
     setSelected(id);
     document.getElementById(`${domId}-${id}`)?.scrollIntoView?.({ block: "nearest" });
@@ -198,6 +254,10 @@ export function ObjectTreePanel() {
         else if (row?.parentId) target = items.find((r) => r.id === row.parentId);
         break;
       case "Enter":
+        if (row && dataObject(row)) openData(row);
+        else if (row?.type === "node") setOpen(row, !row.expanded);
+        else if (row?.type === "error") dropChildren([row.parentId]);
+        break;
       case " ":
         if (row?.type === "node") setOpen(row, !row.expanded);
         else if (row?.type === "error") dropChildren([row.parentId]);
@@ -231,6 +291,31 @@ export function ObjectTreePanel() {
           disabled={sessions.length === 0}
         >
           New query
+        </button>
+        <button
+          type="button"
+          className="button"
+          onClick={() => openData()}
+          disabled={!dataObject(selectedRow)}
+          title="Open the rows (double-click or Enter)"
+        >
+          Open
+        </button>
+        <button
+          type="button"
+          className="button"
+          onClick={design}
+          disabled={dataObject(selectedRow)?.kind !== "table"}
+        >
+          Design
+        </button>
+        <button
+          type="button"
+          className="button"
+          onClick={newTable}
+          disabled={newTableTarget(selectedRow) === null}
+        >
+          New table
         </button>
         <label className="checkbox tree__system">
           <input type="checkbox" checked={showSystem} onChange={toggleSystem} />
@@ -308,7 +393,10 @@ export function ObjectTreePanel() {
                   setSelected(row.id);
                   treeRef.current?.focus();
                 }}
-                onDoubleClick={() => setOpen(row, !row.expanded)}
+                onDoubleClick={() => {
+                  if (dataObject(row)) openData(row);
+                  else setOpen(row, !row.expanded);
+                }}
               >
                 <span
                   className={`tree__twisty${row.expandable ? "" : " tree__twisty--leaf"}${row.expanded ? " tree__twisty--open" : ""}`}

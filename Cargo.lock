@@ -156,6 +156,7 @@ dependencies = [
  "arrow-ipc",
  "arrow-schema",
  "async-trait",
+ "oxbase-designer",
  "oxbase-driver",
  "oxbase-net",
  "oxbase-services",
@@ -3734,6 +3735,13 @@ dependencies = [
 [[package]]
 name = "oxbase-designer"
 version = "0.0.1"
+dependencies = [
+ "oxbase-dialect",
+ "oxbase-types",
+ "pretty_assertions",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "oxbase-dialect"
@@ -3744,6 +3752,7 @@ dependencies = [
  "oxbase-driver",
  "oxbase-types",
  "pretty_assertions",
+ "serde",
  "serde_json",
  "tokio",
 ]
@@ -3875,6 +3884,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "futures",
+ "oxbase-designer",
  "oxbase-dialect",
  "oxbase-driver",
  "oxbase-mysql",

@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use crate::adapter::{Engine, engine_from_fixture_kind};
+use crate::adapter::{Engine, ObjectKind, engine_from_fixture_kind};
 use crate::probe::Target;
 
 /// The `schema_version` this harness understands.
@@ -83,6 +83,9 @@ pub struct Fixtures {
     /// M2: the seed objects the fetchers must find (`[m2]` and `[m2.<engine>]`).
     #[serde(default)]
     pub m2: Option<M2Fixture>,
+    /// M3: round-trip scratch names and the editable seed tables (`[m3]` and `[m3.<engine>]`).
+    #[serde(default)]
+    pub m3: Option<M3Fixture>,
     /// Where the file came from, for error messages. Not part of the TOML.
     #[serde(skip)]
     pub origin: String,
@@ -298,7 +301,73 @@ impl M2Fixture {
     }
 }
 
+/// The `[m3]` table (shape documented next to it in `tests/fixtures.toml`). Every field is
+/// optional so a partial table never breaks the earlier checks; keys the harness does not know
+/// are kept in `other` (the `[m3.<engine>]` tables among them), so another stream adding a key
+/// cannot break the run.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct M3Fixture {
+    /// Start of every round-trip scratch table name (`m3_rt_`).
+    pub roundtrip_prefix: Option<String>,
+    /// The kinds whose `roundtrip` cells run (`table`, `column`, `index`, `foreign_key`, `check`).
+    pub roundtrip_kinds: Vec<String>,
+    /// Scratch tables whose token is older than this are dropped when a run starts.
+    pub stale_after_secs: Option<u64>,
+    pub edit_pk_table: Option<String>,
+    pub edit_unique_table: Option<String>,
+    pub edit_nokey_table: Option<String>,
+    pub edit_view: Option<String>,
+    pub edit_seed_rows: Option<u64>,
+    /// `[m3.<engine>]` tables and any other key, as written.
+    #[serde(flatten)]
+    pub other: BTreeMap<String, toml::Value>,
+}
+
+/// One `[m3.<engine>]` table: where the engine's M3 objects live.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct M3EngineSeed {
+    /// The engine's M3 init script (seed tables), relative to the workspace root. The round trip
+    /// does not need it: it creates its own scratch tables.
+    pub init_sql: Option<String>,
+    /// The database the scratch tables live in (`main` on SQLite).
+    pub database: Option<String>,
+    /// PostgreSQL: the schema the scratch tables live in.
+    pub schema: Option<String>,
+}
+
+impl M3Fixture {
+    /// The `[m3.<name>]` table, if there is one and it parses.
+    pub fn engine(&self, name: &str) -> Option<M3EngineSeed> {
+        match self.other.get(name)? {
+            toml::Value::Table(t) => t.clone().try_into().ok(),
+            _ => None,
+        }
+    }
+
+    /// `roundtrip_kinds` as object kinds, in the order written. `Err` names an entry that is not
+    /// an object kind.
+    pub fn kinds(&self) -> Result<Vec<ObjectKind>, String> {
+        self.roundtrip_kinds
+            .iter()
+            .map(|k| {
+                k.parse::<ObjectKind>()
+                    .map_err(|_| format!("m3.roundtrip_kinds: {k:?} is not an object kind"))
+            })
+            .collect()
+    }
+}
+
 impl Fixtures {
+    /// The M3 table of the fixture `name` (falling back to the engine kind's name), with the
+    /// shared `[m3]` table.
+    pub fn m3_seed(&self, name: &str, engine: Engine) -> Option<(&M3Fixture, M3EngineSeed)> {
+        let m3 = self.m3.as_ref()?;
+        let seed = m3.engine(name).or_else(|| m3.engine(engine.as_str()))?;
+        Some((m3, seed))
+    }
+
     /// The M2 seed of the fixture `name` (falling back to the engine kind's name), with the
     /// shared `[m2]` table.
     pub fn m2_seed(&self, name: &str, engine: Engine) -> Option<(&M2Fixture, &M2EngineSeed)> {
@@ -359,6 +428,7 @@ impl Fixtures {
             )));
         }
         fixtures.validate_m2()?;
+        fixtures.validate_m3()?;
         Ok(fixtures)
     }
 
@@ -390,6 +460,23 @@ impl Fixtures {
                 M2Entry::Other(_) => {
                     return Err(self.invalid(format!("m2: unknown key `{name}`")));
                 }
+            }
+        }
+        Ok(())
+    }
+
+    /// Rejects an `[m3]` the round trip would misread: a `roundtrip_kinds` entry that is not an
+    /// object kind, or an `[m3.<name>]` table whose known keys have the wrong type.
+    fn validate_m3(&self) -> Result<(), FixturesError> {
+        let Some(m3) = &self.m3 else {
+            return Ok(());
+        };
+        m3.kinds().map_err(|e| self.invalid(e))?;
+        for (name, value) in &m3.other {
+            if let toml::Value::Table(t) = value
+                && let Err(e) = t.clone().try_into::<M3EngineSeed>()
+            {
+                return Err(self.invalid(format!("m3.{name}: {}", e.to_string().trim())));
             }
         }
         Ok(())
@@ -655,6 +742,21 @@ path = "target/fixtures/t.sqlite"
             assert!(seed.database.is_some(), "[m2.{name}] database");
             assert!(!seed.objects.is_empty(), "[m2.{name}] objects");
         }
+        // The M3 round trip runs on the same four engines (m3-contracts §8).
+        let m3 = fx.m3.as_ref().expect("[m3]");
+        assert_eq!(
+            m3.kinds().unwrap(),
+            oxbase_dialect::DESIGNER_KINDS.to_vec(),
+            "[m3] roundtrip_kinds"
+        );
+        assert!(m3.roundtrip_prefix.is_some(), "[m3] roundtrip_prefix");
+        for name in ["postgres", "mysql", "mariadb", "sqlite"] {
+            let e = engines.iter().find(|e| e.name == name).unwrap();
+            let (_, seed) = fx
+                .m3_seed(name, e.engine)
+                .unwrap_or_else(|| panic!("[m3.{name}]"));
+            assert!(seed.database.is_some(), "[m3.{name}] database");
+        }
         let dbg = format!("{ssh:?} {:?}", fx.engines["postgres"]);
         assert!(!dbg.contains(&ssh.password), "{dbg}");
         for e in &engines {
@@ -662,5 +764,54 @@ path = "target/fixtures/t.sqlite"
                 assert!(port > 1024, "{} uses privileged port {port}", e.name);
             }
         }
+    }
+
+    const M3: &str = r#"
+schema_version = 1
+[engines.lite]
+kind = "sqlite"
+path = "x.sqlite"
+[m3]
+roundtrip_prefix = "m3_rt_"
+roundtrip_kinds = ["table", "foreign_key"]
+stale_after_secs = 60
+edit_pk_table = "m3_edit_pk"
+some_future_key = "kept"
+[m3.sqlite]
+init_sql = "tests/x.sql"
+database = "main"
+also_future = 1
+"#;
+
+    #[test]
+    fn m3_table_parses_and_tolerates_new_keys() {
+        let fx = Fixtures::parse(M3, "m3").unwrap();
+        let m3 = fx.m3.as_ref().unwrap();
+        assert_eq!(m3.roundtrip_prefix.as_deref(), Some("m3_rt_"));
+        assert_eq!(m3.stale_after_secs, Some(60));
+        assert_eq!(
+            m3.kinds().unwrap(),
+            vec![ObjectKind::Table, ObjectKind::ForeignKey]
+        );
+        // Found by the engine kind's name when no table has the fixture's name.
+        let (_, seed) = fx.m3_seed("lite", Engine::Sqlite).unwrap();
+        assert_eq!(seed.database.as_deref(), Some("main"));
+        assert_eq!(seed.schema, None);
+        assert!(fx.m3_seed("lite", Engine::Postgres).is_none());
+        // No [m3] at all is fine.
+        assert!(Fixtures::parse(SAMPLE, "s").unwrap().m3.is_none());
+    }
+
+    #[test]
+    fn m3_table_rejects_bad_kinds_and_types() {
+        let bad_kind = M3.replace("\"foreign_key\"]", "\"foreign_keys\"]");
+        let err = Fixtures::parse(&bad_kind, "m3").unwrap_err().to_string();
+        assert!(
+            err.contains("\"foreign_keys\" is not an object kind"),
+            "{err}"
+        );
+        let bad_type = M3.replace("database = \"main\"", "database = 3");
+        let err = Fixtures::parse(&bad_type, "m3").unwrap_err().to_string();
+        assert!(err.contains("m3.sqlite"), "{err}");
     }
 }

@@ -3,12 +3,13 @@
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
+use oxbase_dialect::DESIGNER_KINDS;
 use serde::{Deserialize, Serialize};
 
 use crate::adapter::{Engine, ObjectKind};
 use crate::connect::{ConnCell, ConnCheck};
 use crate::fixtures::in_workspace;
-use crate::matrix::{Cell, CellStatus, Check};
+use crate::matrix::{Cell, CellStatus, Check, driver_milestone};
 use crate::probe::{ProbeOutcome, Target};
 
 /// Bumped when the JSON layout changes incompatibly.
@@ -328,11 +329,13 @@ impl Report {
             let _ = writeln!(
                 out,
                 "No object-kind cell ran: fetch_list cells run once an engine registers its \
-                 fetchers in oxbase_services::default_dialects (M2), roundtrip needs M3 (M4 for \
-                 mssql, M7 for mongodb and redis)."
+                 fetchers in oxbase_services::default_dialects (M2), roundtrip and capabilities \
+                 once it registers its DdlGenerator and Comparator cells (M3; M4 for mssql, M7 \
+                 for mongodb and redis)."
             );
         }
         self.render_fetch_details(&mut out);
+        self.render_roundtrip(&mut out);
         if !self.connections.is_empty() {
             out.push('\n');
             self.render_connections(&mut out);
@@ -363,6 +366,66 @@ impl Report {
                 c.status.label(),
                 c.detail.as_deref().unwrap_or("")
             );
+        }
+    }
+
+    /// The M3 table: engine x designer kind, each cell `roundtrip` then `capabilities` glyph,
+    /// followed by one line per cell (what ran, or why it is pending) for the engines that have
+    /// a driver.
+    fn render_roundtrip(&self, out: &mut String) {
+        let engines: Vec<&EngineStatus> = self
+            .engines
+            .iter()
+            .filter(|e| driver_milestone(e.kind).is_none())
+            .collect();
+        if engines.is_empty() {
+            return;
+        }
+        out.push('\n');
+        let _ = writeln!(
+            out,
+            "Round trip and capabilities (M3): each cell is roundtrip / capabilities."
+        );
+        let mut header = vec!["ENGINE"];
+        header.extend(DESIGNER_KINDS.map(ObjectKind::as_str));
+        let rows: Vec<Vec<String>> = engines
+            .iter()
+            .map(|e| {
+                let mut row = vec![e.name.clone()];
+                for kind in DESIGNER_KINDS {
+                    let glyph = |check| {
+                        self.status(&e.name, kind, check)
+                            .map_or('?', CellStatus::glyph)
+                    };
+                    row.push(format!(
+                        "{}{}",
+                        glyph(Check::Roundtrip),
+                        glyph(Check::Capabilities)
+                    ));
+                }
+                row
+            })
+            .collect();
+        write_table(out, &header, &rows);
+        let _ = writeln!(out, "Details:");
+        for e in &engines {
+            for kind in DESIGNER_KINDS {
+                for check in [Check::Roundtrip, Check::Capabilities] {
+                    if let Some(c) = self
+                        .cells
+                        .iter()
+                        .find(|c| c.engine == e.name && c.object_kind == kind && c.check == check)
+                    {
+                        let _ = writeln!(
+                            out,
+                            "  {} {kind} {check} {}: {}",
+                            c.engine,
+                            c.status.label(),
+                            c.detail.as_deref().unwrap_or("")
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -521,6 +584,34 @@ mod tests {
         text.lines()
             .find(|l| l.starts_with(prefix))
             .unwrap_or_else(|| panic!("no line starting with {prefix:?} in:\n{text}"))
+    }
+
+    #[test]
+    fn renders_the_m3_table_for_engines_with_a_driver() {
+        let text = sample(true, false).render();
+        assert!(
+            text.contains(
+                "Round trip and capabilities (M3): each cell is roundtrip / capabilities."
+            ),
+            "{text}"
+        );
+        assert_eq!(
+            line_starting(&text, "ENGINE    table"),
+            "ENGINE    table  column  index  foreign_key  check"
+        );
+        assert_eq!(
+            line_starting(&text, "postgres  pp"),
+            "postgres  pp     pp      pp     pp           pp"
+        );
+        assert!(
+            text.contains(
+                "  postgres table roundtrip pending: pending (missing: table DdlGenerator, table \
+                 Comparator, table Fetcher, Quoting, Capabilities)"
+            ),
+            "{text}"
+        );
+        // Redis has no driver before M7: no M3 rows.
+        assert!(!text.contains("  redis table roundtrip"), "{text}");
     }
 
     #[test]
@@ -715,10 +806,8 @@ mod tests {
         assert_eq!(cell["object_kind"], "database");
         assert_eq!(cell["check"], "roundtrip");
         assert_eq!(cell["status"], "pending");
-        assert_eq!(
-            cell["detail"],
-            "pending (M3: needs DdlGenerator and Comparator cells)"
-        );
+        // Databases have no round trip (only the designer kinds do).
+        assert_eq!(cell["detail"], crate::matrix::PENDING_ROUNDTRIP);
         assert!(cell.get("elapsed_ms").is_none());
         let back: Report = serde_json::from_value(json).unwrap();
         assert_eq!(back.summary, report.summary);

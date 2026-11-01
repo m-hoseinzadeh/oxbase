@@ -27,6 +27,8 @@ oxbase-types.workspace = true
 oxbase-net.workspace = true
 oxbase-store.workspace = true
 oxbase-services.workspace = true
+# M3: the table designer payloads (TableDesign, DesignPreview).
+oxbase-designer.workspace = true
 tauri.workspace = true
 # Native file pickers (SQLite file, CA / client certificate / key files).
 tauri-plugin-dialog.workspace = true

@@ -4,7 +4,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{ObjectRef, PropId, Value};
+use crate::{ObjectKind, ObjectRef, PropId, Value};
 
 /// What kind of difference a [`PropertyDiff`] records.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -101,10 +101,34 @@ impl fmt::Display for PropertyDiff {
     }
 }
 
+/// An object renamed by the table designer (M3): `old` → `new`, unquoted names exactly as the
+/// server spells them. `kind` is `Table` for the table itself, or the child kind (`Column`,
+/// `Index`, `ForeignKey`, `Check`) for one of its children.
+///
+/// A comparator cannot tell a rename from a drop plus an add, so the designer passes renames to
+/// the DDL generator (`DdlContext::renames`), which renames first and then applies the other
+/// changes to the renamed object.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Rename {
+    pub kind: ObjectKind,
+    pub old: String,
+    pub new: String,
+}
+
+impl Rename {
+    pub fn new(kind: ObjectKind, old: impl Into<String>, new: impl Into<String>) -> Self {
+        Self {
+            kind,
+            old: old.into(),
+            new: new.into(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ObjectKind, props};
+    use crate::props;
     use pretty_assertions::assert_eq;
 
     #[test]

@@ -68,6 +68,21 @@
 //! - [`history::HistoryService`] records executed statements (redacted) in a
 //!   [`HistoryRepository`](oxbase_store::HistoryRepository).
 //!
+//! # M3: table data, grid editing, table designer
+//!
+//! Contracts in `docs/m3-contracts.md`:
+//!
+//! - [`edit::EditService`] opens a table's rows in the grid with a typed filter and sort
+//!   (`SELECT * ... WHERE ... ORDER BY` with bound values, run through the M2 query path),
+//!   reports whether they can be edited (primary key, else a NOT NULL unique key; otherwise a
+//!   read-only reason), applies the UI's pending changes in one transaction with optimistic
+//!   concurrency (every update and delete must hit exactly one row) and reads single rows for
+//!   the form / JSON view. [`convert`] turns Arrow cells and edit text into typed values.
+//! - [`designer::DesignerService`] loads a table into an `oxbase_designer::TableDesign`,
+//!   previews the DDL of an edited design (diff, script, atomic or not, destructive or not) and
+//!   applies it on a dedicated session; [`designer::DesignerService::capabilities`] tells the UI
+//!   what the engine offers.
+//!
 //! **Sessions.** A session opened with [`ConnectionManager::open`] is a *base* session: the
 //! object tree reads metadata through it. Query editors never run on a base session; each
 //! editor gets a *child* session ([`ConnectionManager::open_child`]) with the same resolved
@@ -97,8 +112,11 @@ pub use oxbase_store::{
 use oxbase_store::{PemRef, ProfileAddress, SshAuthSettings, SshSettings, TlsSettings};
 use oxbase_types::{Engine, Error, KnownHostsPolicy, Result, Secret, ServerVersion};
 
+pub mod convert;
+pub mod designer;
 mod dialects;
 mod drivers;
+pub mod edit;
 pub mod history;
 pub mod profiles;
 pub mod query;

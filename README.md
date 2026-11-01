@@ -5,7 +5,7 @@ React + TypeScript UI. v1 targets PostgreSQL, MySQL, MariaDB, SQLite, SQL Server
 Redis on Linux, macOS and Windows. The core is headless, so every feature also works from
 `oxbase-cli` and from tests. See [PLAN.md](PLAN.md) for the architecture and milestones.
 
-## What works (M2)
+## What works (M3)
 
 On PostgreSQL, MySQL, MariaDB and SQLite (M1 connections: plain, TLS, SSH, keychain secrets):
 
@@ -30,6 +30,29 @@ On PostgreSQL, MySQL, MariaDB and SQLite (M1 connections: plain, TLS, SSH, keych
   row count. Password and key literals are masked first. You can search, reopen, delete, clear,
   or turn history off.
 
+- **Table data** (M3): double-click a table in the tree to open its rows. **Filter & sort**
+  builds nested AND / OR / NOT groups of conditions (equals, ranges, `LIKE`-style contains /
+  starts / ends with, `IN`, `BETWEEN`, `IS NULL`) and sort keys with NULLS first / last; raw SQL
+  conditions are allowed but marked and checked to be one expression. Every value is sent as a
+  bound parameter, never formatted into SQL.
+- **Grid editing** (M3): a table with a primary key, or a NOT NULL unique key, is editable;
+  otherwise (no key, a view, a query result) the grid is read-only and says why. Edit cells in
+  a typed editor (NULL is not the empty string, `DEFAULT` for new rows), add, duplicate,
+  delete and revert rows; changes stay pending until **Apply**, which runs them in **one
+  transaction** and requires every update and delete to hit exactly one row, so a row changed
+  or deleted by someone else rolls the whole apply back. Rows are read back after the commit
+  (generated columns and keys included). **Form** and **JSON** views show the selected rows.
+- **Table designer** (M3): **Design** or **New table** in the Objects panel. Tabs for columns,
+  indexes, foreign keys, checks and options; renames are tracked as renames, not drop + add.
+  The preview shows the exact script, which statements are destructive (they need a
+  confirmation), and whether it runs in one transaction (PostgreSQL, SQLite) or step by step
+  (MySQL and MariaDB commit each DDL statement). SQLite changes it cannot make in place run as
+  the table rebuild in one transaction, keeping rows, indexes, triggers and views, with foreign
+  keys switched off only for the copy. Apply refuses when the table changed on the server since
+  it was loaded. What each engine and version supports comes from its capabilities.
+
+Contracts: [docs/m3-contracts.md](docs/m3-contracts.md). SQL Server follows in M4.
+
 ## Layout
 
 ```
@@ -49,10 +72,10 @@ crates/
   oxbase-conformance                              cross-engine conformance harness
   app-tauri                                       Tauri 2 shell (no logic)
 ui/                                               React + TS + Vite front end
-tests/fixtures.toml                               test DB connection params and M2 seed object names
-                                                  (single source of truth)
+tests/fixtures.toml                               test DB connection params and M2/M3 seed object
+                                                  names (single source of truth)
 docs/                                             frozen contracts per milestone (m1-contracts.md,
-                                                  m2-contracts.md)
+                                                  m2-contracts.md, m3-contracts.md)
 ```
 
 ## Prerequisites
@@ -156,9 +179,17 @@ project.
    cell shows three checks: `roundtrip` / `fetch_list` / `capabilities`. From M2, `fetch_list`
    runs the registered `Fetcher` of every (engine, kind): it lists the `[m2]` seed objects of
    `tests/fixtures.toml` under their parent, checks the refs, the order and `system = false`,
-   and loads each one (the definition must survive a JSON round trip). `roundtrip` and
-   `capabilities` stay pending until M3; mssql waits for M4, mongodb and redis for M7. The
-   harness also proves each fixture answers its handshake.
+   and loads each one (the definition must survive a JSON round trip). From M3, `roundtrip`
+   and `capabilities` run for table, column, index, foreign key and check: on scratch tables
+   `m3_rt_<kind>_<token>` the harness creates, fetches and compares (the diff must be empty),
+   then alters step by step (for columns: add, fill, NOT NULL, default, comment, type, rename,
+   drop), fetching and comparing after every step, with a seeded row (quotes, a backslash,
+   non-ASCII text) that must survive every alter, a reserved-word column `order` and a column
+   renamed to `sel"ect_ü`, and finally drops. `capabilities` checks that what the engine's
+   `DesignerCapabilities` claims (native, rebuild, unsupported; transactional DDL and check
+   enforcement, both probed) matches what the generator does. Other kinds stay pending;
+   mssql waits for M4, mongodb and redis for M7. The harness also proves each fixture answers
+   its handshake.
 2. **Connection checks** (M1), through the real drivers, `ConnectionManager` and russh provider:
    `connect` (plain, server version equals `version_prefix`), `tls` (`VerifyFull` with the
    fixture CA as `oxbase_tls`, `tls_in_use`; plaintext and a wrong server name refused), `ssh`
@@ -205,15 +236,30 @@ command can follow the script name, e.g.
 runs the services live tests with the keychain test included. CI runs the script on Linux, macOS
 and Windows (`keychain` job).
 
-Last verified 2026-10-31 in the GitHub Actions conformance job (Linux x86_64, M2 integration)
-with all 7 fixtures up: every fixture reachable (PostgreSQL 18.6, MySQL 8.4.13, MariaDB 11.8.9,
-SQL Server 2025, MongoDB 7.0.45, Redis, SQLite 3.54.1 file).
+Last verified 2026-11-01 in the GitHub Actions conformance job (Linux x86_64, M3 integration,
+run 41254616693) with all 7 fixtures up: every fixture reachable (PostgreSQL 18.6, MySQL
+8.4.13, MariaDB 11.8.9, SQL Server 2025, MongoDB 7.0.45, Redis, SQLite 3.54.1 file).
 
-- Object-kind matrix, 420 cells: **42 pass, 0 fail**, 198 pending, 180 n/a. The 42 passes
-  are every M2 `fetch_list` cell: PostgreSQL 13 (database, schema, table, column, index,
-  foreign key, check, view, materialized view, function, procedure, trigger, sequence), MySQL
-  10 and MariaDB 11 (the same without schema and materialized view; sequence on MariaDB only),
-  SQLite 8 (database, table, column, index, foreign key, check, view, trigger).
+- Object-kind matrix, 420 cells: **82 pass, 0 fail**, 158 pending, 180 n/a. The 42
+  `fetch_list` passes are every M2 cell: PostgreSQL 13 (database, schema, table, column,
+  index, foreign key, check, view, materialized view, function, procedure, trigger,
+  sequence), MySQL 10 and MariaDB 11 (the same without schema and materialized view; sequence
+  on MariaDB only), SQLite 8 (database, table, column, index, foreign key, check, view,
+  trigger). The 40 M3 passes are `roundtrip` and `capabilities` for table, column, index,
+  foreign key and check on each of PostgreSQL, MySQL, MariaDB and SQLite (the M3 exit check;
+  CI sets `OXBASE_CONFORMANCE_REQUIRE_M3_ROUNDTRIP=1`, so a pending or failing one fails the
+  job). The only skipped operations are the ones the contract allows: table and column
+  comments on SQLite.
+
+  | Engine | table | column | index | foreign key | check |
+  |---|---|---|---|---|---|
+  | PostgreSQL | pass / pass | pass / pass | pass / pass | pass / pass | pass / pass |
+  | MySQL | pass / pass | pass / pass | pass / pass | pass / pass | pass / pass |
+  | MariaDB | pass / pass | pass / pass | pass / pass | pass / pass | pass / pass |
+  | SQLite | pass / pass | pass / pass | pass / pass | pass / pass | pass / pass |
+
+  (`roundtrip` / `capabilities`.) SQLite does NOT NULL, default, foreign key and check changes
+  as the table rebuild; MySQL and MariaDB DDL is not transactional (probed).
 - Connection checks, 42: 21 pass (postgres, mysql, mariadb, sqlite), 18 pending (mssql M4,
   mongodb/redis M7), 3 n/a (SQLite TLS/SSH), 0 fail.
 - Query runs (`oxbase-services` live tests, 8 MiB memory budget so the result spills; CI run
@@ -233,7 +279,14 @@ SQL Server 2025, MongoDB 7.0.45, Redis, SQLite 3.54.1 file).
   `SELECT 1` ran on a new session. On PostgreSQL and SQLite it ran on the same session.
 
 The dialect, driver, tunnel and connection-manager live tests and the keychain tests passed in
-the same CI run.
+the same CI run, as did the M3 live tests: the DDL / DML cells of each engine
+(`oxbase-pg` `m3_live` 10, `oxbase-mysql` `m3_live` 19 for MySQL and MariaDB, `oxbase-sqlite`
+`m3` 16) and the `oxbase-services` edit and designer tests on all four engines (open
+`m3_edit_pk` filtered and sorted; insert / update / delete with read-back; a conflict when
+another session deleted the row; `m3_edit_uq` editable by `code`; `m3_edit_nokey` and
+`m3_edit_view` read-only; designer create / alter / reload, and a conflict when the table
+changed in between). CI runs them with `OXBASE_SERVICES_REQUIRE_M3_CELLS=1`, so a missing
+engine cell or seed table fails instead of reporting "pending".
 
 Disk: the full stack needs about 4-5 GB on top of the images already present (the SQL Server,
 MongoDB and Redis images alone are about 4 GB, and SQL Server keeps writing while it runs).
@@ -246,7 +299,9 @@ Plain `cargo test` skips the live tests (they are `#[ignore]`). An unreachable f
 run; `OXBASE_CONFORMANCE_ALLOW_MISSING=1` (or `--allow-missing` on the binary) reports it as skipped
 instead. A failed connection check always fails the run. Other knobs:
 `OXBASE_CONFORMANCE_PROBE_TIMEOUT_MS`, `OXBASE_CONFORMANCE_TCP_ONLY=1`,
-`OXBASE_CONFORMANCE_SKIP_CONNECT=1` (or `--skip-connect`: no connection checks).
+`OXBASE_CONFORMANCE_SKIP_CONNECT=1` (or `--skip-connect`: no connection checks),
+`OXBASE_CONFORMANCE_REQUIRE_M2_FETCH=1` and `OXBASE_CONFORMANCE_REQUIRE_M3_ROUNDTRIP=1` (a
+pending M2 / M3 cell fails; CI sets both).
 
 ## App data
 
@@ -287,6 +342,43 @@ pnpm tauri build                          # release bundles for the current OS
 5. **History** lists past statements. Search them, **Open in editor**, **Delete**, clear them
    all, or turn history off.
 
+### Editing data and designing tables
+
+1. With the fixture, expand `oxbase_test` > `m3` > **Tables** and double-click `m3_edit_pk`.
+   **Filter & sort** narrows and orders the rows (the query is re-run on the server).
+2. Double-click a cell (or start typing) to edit it, **Add row** / **Duplicate row** /
+   **Delete row** to change rows, **Revert row** to drop a row's pending changes. Pending
+   changes are coloured; **Apply** writes them all in one transaction, **Discard** drops them.
+   `m3_edit_nokey` and `m3_edit_view` open read-only and say why. **Form** and **JSON** show
+   the selected rows.
+3. **Design** (in the tab, or in the Objects panel with a table selected) opens the table
+   designer; **New table** starts an empty one. Change columns, indexes, foreign keys, checks
+   or options, then **Preview** shows the script. **Apply** runs it (destructive statements
+   need a confirmation) and reloads the table.
+
+### Webview smoke test
+
+`ui/e2e/smoke.mjs` drives the built app through its real webview (WebKitGTK, Linux only) with
+`tauri-driver` and `WebKitWebDriver`: connect, a 1 000 000-row query, Arrow pages decoded in the
+webview, scrolling, page latency, cancel, and a table-data cell edit applied and seen after a
+reload. See [ui/e2e/README.md](ui/e2e/README.md). Locally (needs `webkit2gtk-driver`,
+`cargo install tauri-driver --locked --version 2.1.0`, Docker, and `xvfb-run` without a
+display):
+
+```sh
+(cd ui && pnpm install --frozen-lockfile && pnpm run build)
+cargo build -p app-tauri --locked --features tauri/custom-protocol
+scripts/e2e-fixtures.sh up
+scripts/e2e-smoke.sh            # results in target/e2e (e2e-perf.json, failure screenshot)
+scripts/e2e-fixtures.sh down
+```
+
+In CI (job **Webview smoke (Linux)**, run 41254616693) page requests through Tauri IPC plus
+Arrow decoding in the webview took p50 2 ms / p95 11 ms / max 11 ms (the grid's own 7 pages,
+`window.__oxbasePerf`; 60 random 200-row probe pages: p50 1 ms, p95 2 ms, max 6 ms; limit
+p95 < 250 ms); Stop ended a streaming query 33 ms after the click; the edit step committed
+and showed the new value after a reload.
+
 ## CI
 
 - `.github/workflows/ci.yml` has two lanes. **Fast lane**, on pushes to `wip/**` branches:
@@ -294,8 +386,9 @@ pnpm tauri build                          # release bundles for the current OS
   **Full lane**, on pull requests, pushes to main, weekly and manual runs: fmt + clippy on Linux;
   `cargo test --workspace` on Linux, macOS and Windows; the OS keychain tests
   (`scripts/keychain-tests.sh`) on Linux, macOS and Windows; UI lint, typecheck, test and build;
-  the conformance harness against the Docker fixtures; `cargo deny` (advisories, bans,
-  licenses, sources).
+  the conformance harness and the M1-M3 live tests against the Docker fixtures; the webview
+  smoke test (Linux; also on the fast lane of `wip/*-e2e`, `wip/*-app` and `wip/*-integrate`);
+  `cargo deny` (advisories, bans, licenses, sources).
 - `.github/workflows/bundle.yml` (push to main, manual): Tauri dev bundles for Linux x86_64,
   Windows x86_64 and macOS aarch64/x86_64, uploaded as workflow artifacts.
   `scripts/ci-verify-signing.mjs` checks what was produced: `codesign --verify --deep --strict`,

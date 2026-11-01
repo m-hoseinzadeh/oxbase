@@ -27,6 +27,16 @@ const COMMANDS: &[&str] = &[
     "history_clear",
     "history_get_settings",
     "history_set_settings",
+    // M3 table data and editing (src/data.rs).
+    "table_data_open",
+    "edit_begin",
+    "edit_apply",
+    "row_get_form",
+    // M3 table designer (src/designer.rs).
+    "designer_load",
+    "designer_preview",
+    "designer_apply",
+    "capabilities_get",
 ];
 
 fn main() {

@@ -22,7 +22,8 @@
 //!
 //! The driver starts sessions with `DateStyle=ISO` and `bytea_output=hex`, the formats its text
 //! decoder reads. A session that changes them later gets NULLs (with a warning notice) for
-//! values it cannot read.
+//! values it cannot read. It also pins `standard_conforming_strings=on`, which the SQL lexer
+//! assumes; generated DDL writes backslash literals as `E'...'`, so it means the same either way.
 //!
 //! # Results
 //!
