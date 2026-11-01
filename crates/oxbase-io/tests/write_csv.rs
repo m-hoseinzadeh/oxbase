@@ -288,7 +288,7 @@ fn single_byte_encodings_write_or_refuse() {
         &cp1252,
         &csv(options),
         &WriteContext::default(),
-        &[euro.clone()],
+        std::slice::from_ref(&euro),
     )
     .unwrap();
     assert_eq!(std::fs::read(&cp1252).unwrap(), b"s\n\x805\n\xe9\n");
