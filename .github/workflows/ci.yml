@@ -198,7 +198,7 @@ jobs:
 
       # Compile before the containers start so their startup overlaps nothing slow
       # and a compile error does not leave a stack running.
-      - name: Build conformance harness and M1/M2 live tests
+      - name: Build conformance harness and M1-M4 live tests
         run: cargo test -p oxbase-conformance -p oxbase-net -p oxbase-pg -p oxbase-mysql -p oxbase-sqlite -p oxbase-mssql -p oxbase-services --locked --no-run
 
       # Test CA, server/client certificates and SSH keys for the TLS/SSH fixtures (openssl and
@@ -221,6 +221,11 @@ jobs:
       # M3 exit check: the roundtrip / capabilities cells (table, column, index, foreign key,
       # check) must pass on PostgreSQL, MySQL, MariaDB and SQLite; a pending or failing one fails
       # the job (all three M3 dialect streams are merged).
+      # M4: SQL Server runs every cell its registered roles allow; the live test
+      # mssql_seed_scripts_created_every_named_object checks the 03-06 init scripts through the
+      # catalog. The integrator adds OXBASE_CONFORMANCE_REQUIRE_M4: "1" here once the SQL Server
+      # dialect cells are registered (docs/m4-contracts.md §8.1): then all five SQL engines must
+      # pass every M1-M3 cell, nothing pending or skipped.
       - name: Run conformance harness
         env:
           OXBASE_CONFORMANCE_REQUIRE_M2_FETCH: "1"
@@ -232,7 +237,7 @@ jobs:
       # oxbase-sql has no ignored tests, so it runs in the Linux test job only.
       # M3: the dialect DDL / DML live tests and the services edit and designer live tests on
       # every M3 engine; a missing engine cell or seed table fails instead of being pending.
-      - name: Run M1/M2/M3 live tests
+      - name: Run M1-M4 live tests
         env:
           OXBASE_SERVICES_REQUIRE_M3_CELLS: "1"
         run: cargo test -p oxbase-net -p oxbase-pg -p oxbase-mysql -p oxbase-sqlite -p oxbase-mssql -p oxbase-services --locked -- --include-ignored --test-threads 1

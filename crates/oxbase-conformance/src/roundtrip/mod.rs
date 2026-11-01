@@ -82,6 +82,7 @@ pub use exec::{cell_text, exec, first_text, run_script};
 use crate::adapter;
 use crate::connect::{Ctx, millis};
 use crate::fixtures::{Fixtures, M3EngineSeed, ResolvedEngine};
+use crate::guard::{self, M4_ENGINES};
 use crate::matrix::{Cell, CellStatus, Check, driver_milestone};
 use crate::runner::RunOptions;
 
@@ -797,6 +798,10 @@ pub struct GateOptions {
     /// fixture must pass, every M3 engine must have no `missing_designer_roles`, and the
     /// fixtures must have its `[m3.<engine>]` ([`REQUIRE_ENV`]).
     pub require_m3: bool,
+    /// The same for every [`M4_ENGINES`] fixture, SQL Server included (the 5-engine guard,
+    /// [`guard::REQUIRE_ENV`]). Build it with [`GateOptions::for_run`] passing
+    /// `require_m3 || require_m4`, so skipping cannot pass it either.
+    pub require_m4: bool,
 }
 
 impl GateOptions {
@@ -813,6 +818,7 @@ impl GateOptions {
         Ok(Self {
             skipped_ok: opts.allow_missing || opts.skip_roundtrip,
             require_m3,
+            require_m4: false,
         })
     }
 
@@ -859,22 +865,27 @@ pub fn gate(
             ));
         }
     }
-    if !opts.require_m3 {
+    let m4: &[Engine] = &M4_ENGINES;
+    let m3: &[Engine] = &M3_ENGINES;
+    let (required, env) = if opts.require_m4 {
+        (m4, guard::REQUIRE_ENV)
+    } else if opts.require_m3 {
+        (m3, REQUIRE_ENV)
+    } else {
         return problems;
-    }
-    for e in engines.iter().filter(|e| M3_ENGINES.contains(&e.engine)) {
+    };
+    for e in engines.iter().filter(|e| required.contains(&e.engine)) {
         let missing = registry.missing_designer_roles(e.engine);
         if !missing.is_empty() {
             problems.push(format!(
-                "{}: missing designer roles in oxbase_services::default_dialects ({REQUIRE_ENV} \
-                 is set): {}",
+                "{}: missing designer roles in oxbase_services::default_dialects ({env} is set): {}",
                 e.name,
                 missing.join(", ")
             ));
         }
         if fixtures.m3_seed(&e.name, e.engine).is_none() {
             problems.push(format!(
-                "{}: tests/fixtures.toml has no [m3.{}] ({REQUIRE_ENV} is set)",
+                "{}: tests/fixtures.toml has no [m3.{}] ({env} is set)",
                 e.name, e.name
             ));
         }
@@ -889,7 +900,7 @@ pub fn gate(
                 });
                 if !ok {
                     problems.push(format!(
-                        "{} {kind} {check}: {} ({REQUIRE_ENV} is set: must pass)",
+                        "{} {kind} {check}: {} ({env} is set: must pass)",
                         e.name,
                         cell.map_or_else(
                             || "no cell".to_owned(),

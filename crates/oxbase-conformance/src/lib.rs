@@ -14,6 +14,9 @@
 //! create → fetch → compare → alter → fetch → diff → drop on scratch tables named from
 //! `tests/fixtures.toml` `[m3]`, and the designer capabilities checked against what the round
 //! trip and two live probes saw; cells whose engine has not registered the roles stay pending.
+//! Since M4 SQL Server runs all of these: its `fetch_list` cells list the `[m2]` names (schema
+//! `m2`) plus the `[m4]` types and indexed-view children ([`seeds::m4_groups`]), its round trip
+//! uses `[m3.mssql]` (schema `m3`), and [`guard`] is the 5-engine exit check.
 //! Results go to stdout and to `target/conformance/report.json` ([`report`]).
 //!
 //! Environment:
@@ -29,15 +32,18 @@
 //! | `OXBASE_CONFORMANCE_SKIP_ROUNDTRIP=1` | Skip the M3 `roundtrip` / `capabilities` cells (reported as skipped) |
 //! | `OXBASE_CONFORMANCE_REQUIRE_M2_FETCH=1` | Live test only: every M2 engine must register its tree layout ([`fetch::gate`]); set by the full CI lane |
 //! | `OXBASE_CONFORMANCE_REQUIRE_M3_ROUNDTRIP=1` | Live test only: every `roundtrip` and `capabilities` cell of the designer kinds on PostgreSQL, MySQL, MariaDB and SQLite must pass, and no designer role may be missing ([`roundtrip::gate`]); the integrator sets it in the conformance CI step once the engine streams are merged |
+//! | `OXBASE_CONFORMANCE_REQUIRE_M4=1` | Live test only, the M4 exit check ([`guard`]): every M1-M3 cell of PostgreSQL, MySQL, MariaDB, SQLite **and SQL Server** must pass (connection checks, `fetch_list` of every tree-layout kind, `roundtrip` / `capabilities` of the designer kinds), nothing skipped; the integrator sets it in the conformance CI step once the SQL Server dialect cells are registered |
 //! | `CARGO_TARGET_DIR` | Where `conformance/report.json` is written (default `<workspace>/target`) |
 
 pub mod adapter;
 pub mod connect;
 pub mod fetch;
 pub mod fixtures;
+pub mod guard;
 pub mod matrix;
 pub mod probe;
 pub mod report;
 pub mod roundtrip;
 pub mod runner;
+pub mod seed_check;
 pub mod seeds;

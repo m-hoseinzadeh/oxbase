@@ -41,6 +41,7 @@ use oxbase_types::{Engine, ObjectDef, ObjectKind, ObjectRef, ObjectSummary, Valu
 use crate::adapter;
 use crate::connect::{Ctx, millis};
 use crate::fixtures::{Fixtures, M2EngineSeed, ResolvedEngine, in_workspace};
+use crate::guard::{self, M4_ENGINES};
 use crate::matrix::{Cell, CellStatus, Check, driver_milestone};
 use crate::seeds::{self, SeedGroup};
 
@@ -100,12 +101,17 @@ pub fn runnable_kinds(registry: &DialectRegistry, engine: Engine) -> Vec<ObjectK
         .collect()
 }
 
-/// The seed groups of `kind` for the fixture `e` (empty when the fixtures seed nothing).
+/// The seed groups of `kind` for the fixture `e` (empty when the fixtures seed nothing): the
+/// `[m2]` groups, then the `[m4]` ones of an engine with an `[m4.<engine>]` table.
 pub fn groups_for(fixtures: &Fixtures, e: &ResolvedEngine, kind: ObjectKind) -> Vec<SeedGroup> {
-    fixtures
+    let mut groups = fixtures
         .m2_seed(&e.name, e.engine)
         .map(|(m2, seed)| seeds::seed_groups(m2, seed, kind))
-        .unwrap_or_default()
+        .unwrap_or_default();
+    if let Some((m4, seed)) = fixtures.m4_seed(&e.name, e.engine) {
+        groups.extend(seeds::m4_groups(m4, &seed, kind));
+    }
+    groups
 }
 
 /// The scratch directory a SQLite fixture is seeded in; removed after the run.
@@ -579,7 +585,28 @@ pub struct GateOptions {
     /// `[m2.<engine>]` seed (`OXBASE_CONFORMANCE_REQUIRE_M2_FETCH=1`, set by the full CI lane),
     /// so a dialect registration left out of `oxbase_services::default_dialects` fails.
     pub require_m2: bool,
+    /// The same for every [`M4_ENGINES`] fixture, SQL Server included (the 5-engine guard,
+    /// `OXBASE_CONFORMANCE_REQUIRE_M4=1`, [`crate::guard`]).
+    pub require_m4: bool,
 }
+
+impl GateOptions {
+    /// The engines that must have a layout and a seed, and the variable that asked for it.
+    fn required(&self) -> Option<(&'static [Engine], &'static str)> {
+        let m4: &'static [Engine] = &M4_ENGINES;
+        let m2: &'static [Engine] = &M2_ENGINES;
+        if self.require_m4 {
+            Some((m4, guard::REQUIRE_ENV))
+        } else if self.require_m2 {
+            Some((m2, REQUIRE_M2_ENV))
+        } else {
+            None
+        }
+    }
+}
+
+/// The environment variable that makes every M2 engine's tree layout and seed required.
+pub const REQUIRE_M2_ENV: &str = "OXBASE_CONFORMANCE_REQUIRE_M2_FETCH";
 
 /// Checks the `fetch_list` cells of a report and returns every problem (empty = acceptable):
 ///
@@ -634,18 +661,19 @@ pub fn gate(
                 e.name, e.engine
             ));
         }
-        if opts.require_m2 && M2_ENGINES.contains(&e.engine) {
+        if let Some((required, env)) = opts.required()
+            && required.contains(&e.engine)
+        {
             if layout.is_none() {
                 problems.push(format!(
                     "{}: {} registers no tree layout in oxbase_services::default_dialects \
-                     (OXBASE_CONFORMANCE_REQUIRE_M2_FETCH is set)",
+                     ({env} is set)",
                     e.name, e.engine
                 ));
             }
             if fixtures.m2_seed(&e.name, e.engine).is_none() {
                 problems.push(format!(
-                    "{}: tests/fixtures.toml has no [m2.{}] (OXBASE_CONFORMANCE_REQUIRE_M2_FETCH \
-                     is set)",
+                    "{}: tests/fixtures.toml has no [m2.{}] ({env} is set)",
                     e.name, e.name
                 ));
             }
@@ -1351,6 +1379,31 @@ objects = [\"t_parent\", \"t_child\", \"m2_view\", \"t_trg\"]
             ..opts
         };
         assert_eq!(problems(&skipped, ok), Vec::<String>::new());
+    }
+
+    #[test]
+    fn gate_requires_a_layout_for_m4_engines_when_guarded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (fx, engines) = sqlite_fixture(tmp.path(), "lite_m4", SEED_SQL);
+        let reg = adapter::provisional_registry();
+        let cells = plan_engine_in(&reg, "lite_m4", Engine::Sqlite);
+        let p = gate(
+            &cells,
+            &fx,
+            &engines,
+            &reg,
+            GateOptions {
+                require_m4: true,
+                ..GateOptions::default()
+            },
+        );
+        assert_eq!(
+            p,
+            [
+                "lite_m4: sqlite registers no tree layout in oxbase_services::default_dialects \
+              (OXBASE_CONFORMANCE_REQUIRE_M4 is set)"
+            ]
+        );
     }
 
     #[test]

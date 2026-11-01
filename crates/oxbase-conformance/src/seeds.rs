@@ -8,10 +8,13 @@
 //! Everything is derived from the fixtures file; the only names written here are the seed
 //! table columns, which `tests/fixtures.toml` documents as part of the shape but does not list
 //! as data ([`PARENT_COLUMNS`], [`CHILD_COLUMNS`]).
+//!
+//! Since M4 an engine with an `[m4.<engine>]` table (SQL Server) adds the groups of
+//! [`m4_groups`]: the kinds its tree layout has beyond the M2 shape (types, view children).
 
 use oxbase_types::{ObjectKind, ObjectRef};
 
-use crate::fixtures::{M2EngineSeed, M2Fixture};
+use crate::fixtures::{M2EngineSeed, M2Fixture, M4EngineSeed, M4Fixture};
 
 /// Columns of the parent seed table (`[m2] tables[0]`), in ordinal order.
 pub const PARENT_COLUMNS: [&str; 3] = ["id", "code", "note"];
@@ -110,6 +113,35 @@ pub fn seed_groups(m2: &M2Fixture, seed: &M2EngineSeed, kind: ObjectKind) -> Vec
         _ => Vec::new(),
     };
     groups.into_iter().flatten().collect()
+}
+
+/// The extra list calls of the `[m4]` seed (`docs/m4-contracts.md` §5.3) on an engine with an
+/// `[m4.<engine>]` table: what the M2 shape does not cover but the engine's tree layout has.
+/// Types (alias and table types) under the `[m4]` schema, and the indexed view's index and
+/// INSTEAD OF trigger under the view (`parent_kind` = view). Empty when the fixtures do not name
+/// the database or the schema.
+pub fn m4_groups(m4: &M4Fixture, seed: &M4EngineSeed, kind: ObjectKind) -> Vec<SeedGroup> {
+    let (Some(db), Some(schema)) = (
+        seed.database.as_deref().filter(|d| !d.is_empty()),
+        m4.schema.as_deref().filter(|s| !s.is_empty()),
+    ) else {
+        return Vec::new();
+    };
+    let container = ObjectRef::database(db).child(ObjectKind::Schema, schema);
+    let names = |items: &[&Option<String>]| -> Vec<String> {
+        items.iter().filter_map(|n| (*n).clone()).collect()
+    };
+    let view = m4
+        .indexed_view
+        .as_ref()
+        .map(|v| container.child(ObjectKind::View, v.clone()));
+    let group = match kind {
+        ObjectKind::Type => SeedGroup::new(container, names(&[&m4.alias_type, &m4.table_type])),
+        ObjectKind::Index => view.and_then(|v| SeedGroup::new(v, names(&[&m4.indexed_view_index]))),
+        ObjectKind::Trigger => view.and_then(|v| SeedGroup::new(v, names(&[&m4.view_trigger]))),
+        _ => None,
+    };
+    group.into_iter().collect()
 }
 
 fn owned_names(names: &[&str]) -> Vec<String> {
@@ -273,6 +305,95 @@ mod tests {
             .child(ObjectKind::ForeignKey, "m2_child_parent_fk");
         assert_eq!(fk.parent.as_deref(), Some("m2_child"));
         assert_eq!(fk.catalog.as_deref(), Some("oxbase_test"));
+    }
+
+    #[test]
+    fn mssql_seed_lives_in_schema_m2_and_m4_adds_types_and_view_children() {
+        let fx = repo();
+        let g = |k| groups(&fx, "mssql", k);
+        assert_eq!(
+            g(ObjectKind::Database),
+            [(
+                "database:".to_owned(),
+                v(&["oxbase_test", "oxbase_m2_other"])
+            )]
+        );
+        assert_eq!(
+            g(ObjectKind::Schema),
+            [("database:oxbase_test".to_owned(), v(&["m2"]))]
+        );
+        assert_eq!(
+            g(ObjectKind::Sequence),
+            [("schema:oxbase_test.m2".to_owned(), v(&["m2_seq"]))]
+        );
+        assert_eq!(
+            g(ObjectKind::Trigger),
+            [("table:oxbase_test.m2.m2_child".to_owned(), v(&["m2_trg"]))]
+        );
+        assert_eq!(g(ObjectKind::MatView), NONE);
+
+        let (m4, seed) = fx.m4_seed("mssql", Engine::MsSql).unwrap();
+        let m4g = |k| -> Vec<(ObjectRef, Vec<String>)> {
+            m4_groups(m4, &seed, k)
+                .into_iter()
+                .map(|g| (g.parent, g.names))
+                .collect()
+        };
+        let schema = ObjectRef::database("oxbase_test").child(ObjectKind::Schema, "m4");
+        assert_eq!(
+            m4g(ObjectKind::Type),
+            [(schema.clone(), v(&["m4_code_t", "m4_rows_t"]))]
+        );
+        let view = schema.child(ObjectKind::View, "m4_iview");
+        assert_eq!(
+            m4g(ObjectKind::Index),
+            [(view.clone(), v(&["m4_iview_ix"]))]
+        );
+        assert_eq!(
+            m4g(ObjectKind::Trigger),
+            [(view.clone(), v(&["m4_view_trg"]))]
+        );
+        // View children say so; the ref a fetcher must list is parent.child(kind, name).
+        let ix = view.child(ObjectKind::Index, "m4_iview_ix");
+        assert_eq!(ix.parent_kind, Some(ObjectKind::View));
+        assert_eq!(ix.parent.as_deref(), Some("m4_iview"));
+        assert_eq!(ix.schema.as_deref(), Some("m4"));
+        assert_eq!(
+            m4g(ObjectKind::Table),
+            Vec::<(ObjectRef, Vec<String>)>::new()
+        );
+        // No [m4.<engine>] elsewhere.
+        assert!(fx.m4_seed("postgres", Engine::Postgres).is_none());
+    }
+
+    #[test]
+    fn m4_groups_need_a_database_and_a_schema() {
+        let m4 = M4Fixture {
+            alias_type: Some("t".to_owned()),
+            ..M4Fixture::default()
+        };
+        let seed = M4EngineSeed {
+            database: Some("db".to_owned()),
+            ..M4EngineSeed::default()
+        };
+        assert_eq!(
+            m4_groups(&m4, &seed, ObjectKind::Type),
+            Vec::<SeedGroup>::new()
+        );
+        let m4 = M4Fixture {
+            schema: Some("s".to_owned()),
+            ..m4
+        };
+        assert_eq!(m4_groups(&m4, &seed, ObjectKind::Type).len(), 1);
+        assert_eq!(
+            m4_groups(&m4, &M4EngineSeed::default(), ObjectKind::Type),
+            Vec::<SeedGroup>::new()
+        );
+        // No indexed view named: no view children.
+        assert_eq!(
+            m4_groups(&m4, &seed, ObjectKind::Index),
+            Vec::<SeedGroup>::new()
+        );
     }
 
     #[test]

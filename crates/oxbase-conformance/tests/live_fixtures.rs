@@ -25,11 +25,15 @@
 //! ([`roundtrip::gate`]). Without it, those cells may pass or stay pending, never fail. It
 //! cannot be combined with `OXBASE_CONFORMANCE_SKIP_ROUNDTRIP` (the test fails), and only
 //! `OXBASE_CONFORMANCE_ALLOW_MISSING` (unreachable fixtures) excuses skipped cells then.
+//!
+//! `OXBASE_CONFORMANCE_REQUIRE_M4=1` (the M4 exit check, set by the integrator once the SQL
+//! Server dialect cells are registered) extends both requirements to SQL Server, so all five SQL
+//! engines must pass, and refuses every skip option ([`guard`]).
 
 use oxbase_conformance::adapter::{self, Engine};
 use oxbase_conformance::fixtures::Fixtures;
 use oxbase_conformance::matrix::{CellStatus, Check};
-use oxbase_conformance::{fetch, fixtures, report, roundtrip, runner};
+use oxbase_conformance::{fetch, fixtures, guard, report, roundtrip, runner, seed_check};
 
 /// M0 exit criterion (the harness runs against all engines), the M1 connection checks (every
 /// applicable check of the M1 engines passes, engines without a driver report pending), the
@@ -41,6 +45,10 @@ use oxbase_conformance::{fetch, fixtures, report, roundtrip, runner};
 #[ignore = "needs the Docker fixtures (scripts/fixtures-up.sh); run with --include-ignored"]
 fn harness_runs_against_all_engines_and_m1_connection_checks_pass() {
     let opts = runner::RunOptions::from_env();
+    let require_m4 = guard::require_from_env();
+    if require_m4 {
+        guard::check_run(&opts).unwrap_or_else(|e| panic!("{e}"));
+    }
     let path = fixtures::fixtures_path();
     let report =
         runner::run_path(&path, &opts).unwrap_or_else(|e| panic!("cannot load fixtures: {e}"));
@@ -62,8 +70,12 @@ fn harness_runs_against_all_engines_and_m1_connection_checks_pass() {
     let fx = Fixtures::from_path(&path).unwrap();
     let resolved = fx.resolve().unwrap();
     let registry = adapter::registry();
-    let m3 = roundtrip::GateOptions::for_run(&opts, roundtrip::GateOptions::require_m3_from_env())
-        .unwrap_or_else(|e| panic!("{e}"));
+    let mut m3 = roundtrip::GateOptions::for_run(
+        &opts,
+        roundtrip::GateOptions::require_m3_from_env() || require_m4,
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    m3.require_m4 = require_m4;
     let problems = roundtrip::gate(&report.cells, &fx, &resolved, &registry, m3);
     assert!(
         problems.is_empty(),
@@ -86,8 +98,9 @@ fn harness_runs_against_all_engines_and_m1_connection_checks_pass() {
     );
     let gate = fetch::GateOptions {
         skipped_ok: opts.allow_missing || opts.skip_fetch,
-        require_m2: std::env::var("OXBASE_CONFORMANCE_REQUIRE_M2_FETCH")
+        require_m2: std::env::var(fetch::REQUIRE_M2_ENV)
             .is_ok_and(|v| matches!(v.trim(), "1" | "true" | "yes" | "on")),
+        require_m4,
     };
     let problems = fetch::gate(&report.cells, &fx, &resolved, &registry, gate);
     assert!(
@@ -115,6 +128,23 @@ fn harness_runs_against_all_engines_and_m1_connection_checks_pass() {
         .filter(|c| c.check == Check::FetchList && c.status == CellStatus::Pass)
         .count();
     println!("fetch_list cells passed: {passed}");
+
+    let problems = guard::gate(&report, &resolved);
+    assert!(
+        !require_m4 || problems.is_empty(),
+        "5-engine guard ({}):\n  {}",
+        guard::REQUIRE_ENV,
+        problems.join("\n  ")
+    );
+    println!(
+        "5-engine guard ({}: {require_m4}): {}",
+        guard::REQUIRE_ENV,
+        if problems.is_empty() {
+            "nothing open".to_owned()
+        } else {
+            format!("{} open: {}", problems.len(), problems.join("; "))
+        }
+    );
 
     for c in &report.connections {
         // Engines with a driver (M1, plus SQL Server since M4) must pass; the others are pending.
@@ -160,4 +190,31 @@ fixture_reachable! {
     mongodb_fixture_reachable => Engine::MongoDb,
     redis_fixture_reachable => Engine::Redis,
     sqlite_fixture_reachable => Engine::Sqlite,
+}
+
+/// M4 fixtures: the SQL Server init scripts (`tests/docker/init/mssql/0[3-6]-*.sql`) created
+/// every object `[m2.mssql]`, `[m3]` / `[m3.mssql]` and `[m4]` name, with the seed rows and the
+/// byte-exact non-ASCII values of `m4_types` row 1 ([`seed_check`]). Read through the server's
+/// catalog with the real driver, so it holds before the SQL Server fetchers are registered.
+#[test]
+#[ignore = "needs the Docker fixtures (scripts/fixtures-up.sh); run with --include-ignored"]
+fn mssql_seed_scripts_created_every_named_object() {
+    let path = fixtures::fixtures_path();
+    let fx = Fixtures::from_path(&path).unwrap_or_else(|e| panic!("cannot load fixtures: {e}"));
+    let resolved = fx.resolve().unwrap();
+    let engines: Vec<_> = resolved
+        .iter()
+        .filter(|e| e.engine == Engine::MsSql)
+        .collect();
+    assert!(
+        !engines.is_empty(),
+        "no mssql fixture in {}",
+        path.display()
+    );
+    for e in engines {
+        match seed_check::run(&fx, e) {
+            Ok(summary) => println!("{}: {summary}", e.name),
+            Err(problems) => panic!("{} seed check:\n  {problems}", e.name),
+        }
+    }
 }

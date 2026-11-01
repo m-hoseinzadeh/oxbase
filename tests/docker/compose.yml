@@ -19,7 +19,11 @@
 # "oxbase_tls" (init/<engine>/03-tls-user.sql, plus tls/pg_hba.conf for PostgreSQL). The normal
 # "oxbase" user keeps working with and without TLS. The "ssh" service is an OpenSSH bastion with
 # TCP forwarding enabled that reaches the engines by service name (postgres:5432, mysql:3306,
-# mariadb:3306).
+# mariadb:3306, mssql:1433).
+# M4: mssql serves the same certificate (TLS offered, not forced; TDS 8.0 strict too) and has a
+# TLS-only login "oxbase_tls" enforced by a LOGON trigger. Its entrypoint applies
+# init/mssql/*.sql in name order with sqlcmd and records their SHA-256 in oxbase_test; a partial
+# or outdated seed is dropped and rebuilt, and a failing script stops the container.
 # A service only reports "healthy" once its seed has finished, so `up --wait` returning means
 # the fixtures are ready for the conformance harness.
 #

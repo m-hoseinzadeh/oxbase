@@ -211,6 +211,41 @@ fn set(cells: &mut [Cell], kind: ObjectKind, check: Check, status: CellStatus) {
 }
 
 #[test]
+fn the_m4_guard_also_requires_sql_server() {
+    let reg = adapter::provisional_registry();
+    let fx = Fixtures::parse("schema_version = 1\n", "t").unwrap();
+    let engines = vec![engine("ms", Engine::MsSql)];
+    let cells = plan_engine_in(&reg, "ms", Engine::MsSql);
+    let m3 = GateOptions {
+        skipped_ok: false,
+        require_m3: true,
+        require_m4: false,
+    };
+    // SQL Server is not an M3 engine: pending is fine without the guard.
+    assert_eq!(gate(&cells, &fx, &engines, &reg, m3), Vec::<String>::new());
+    let m4 = GateOptions {
+        require_m4: true,
+        ..m3
+    };
+    let problems = gate(&cells, &fx, &engines, &reg, m4);
+    assert!(
+        problems[0].starts_with("ms: missing designer roles"),
+        "{problems:#?}"
+    );
+    assert!(
+        problems
+            .iter()
+            .all(|p| p.contains("OXBASE_CONFORMANCE_REQUIRE_M4 is set")),
+        "{problems:#?}"
+    );
+    assert_eq!(
+        problems.iter().filter(|p| p.contains("must pass")).count(),
+        10,
+        "{problems:#?}"
+    );
+}
+
+#[test]
 fn gate_accepts_pending_unless_m3_is_required() {
     let reg = adapter::provisional_registry();
     let fx = Fixtures::parse("schema_version = 1\n", "t").unwrap();
@@ -224,6 +259,7 @@ fn gate_accepts_pending_unless_m3_is_required() {
     let required = GateOptions {
         skipped_ok: false,
         require_m3: true,
+        require_m4: false,
     };
     let problems = gate(&cells, &fx, &engines, &reg, required);
     assert!(
@@ -790,6 +826,7 @@ fn toy_sqlite_round_trip_passes_every_cell_and_cleans_up() {
     let required = GateOptions {
         skipped_ok: false,
         require_m3: true,
+        require_m4: false,
     };
     // Every cell passes; at most the roles the toy does not provide (a DmlWriter) are left.
     for p in gate(&cells, &fx, &engines, &reg, required) {
@@ -931,6 +968,7 @@ fn a_required_change_both_sides_skip_leaves_the_cell_pending() {
     let required = GateOptions {
         skipped_ok: false,
         require_m3: true,
+        require_m4: false,
     };
     let problems = gate(&cells, &fx, &engines, &reg, required);
     assert!(
