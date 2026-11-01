@@ -26,6 +26,7 @@
 //!   the comparator rules (ddl stream) fold the parentheses.
 //! - Listings are sorted by name in binary (Rust string) order; columns by `column_id`.
 
+pub(super) mod catalog_bulk;
 mod rows;
 mod sql;
 mod text;
