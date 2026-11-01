@@ -404,10 +404,10 @@ async fn m4_types_decode_exactly() {
     let vector: Vec<f64> = serde_json::from_str(&text(b, "c_vector")).unwrap();
     assert_eq!(vector, [1.0, 2.0, 3.0]);
     assert_eq!(text(b, "c_variant"), "42");
-    assert!(!bytes(b, "c_hierarchyid").is_empty());
+    assert_ne!(bytes(b, "c_hierarchyid").len(), 0);
     assert_eq!(text(b, "h_text"), "/1/2/");
-    assert!(!bytes(b, "c_geometry").is_empty());
-    assert!(!bytes(b, "c_geography").is_empty());
+    assert_ne!(bytes(b, "c_geometry").len(), 0);
+    assert_ne!(bytes(b, "c_geography").len(), 0);
     assert_eq!(bytes(b, "c_rowversion").len(), 8);
 
     // Row 2: everything NULL but the key and the row version.

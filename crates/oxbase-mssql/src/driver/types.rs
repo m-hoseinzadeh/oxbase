@@ -868,8 +868,8 @@ mod tests {
                 12_345_678_901_234_567_890_123_456_780_123_456_789,
                 10,
             ))),
-            ColumnData::F64(Some(123_456.7891)),
-            ColumnData::F64(Some(-214_748.3648)),
+            ColumnData::F64(Some(123_456.789_1)),
+            ColumnData::F64(Some(-214_748.364_8)),
             ColumnData::F32(Some(3.25)),
             ColumnData::Date(Some(Date::new(0))),
             ColumnData::Time(Some(Time::new(863_991_234_567, 7))),
@@ -916,7 +916,7 @@ mod tests {
             ColumnData::Xml(None),
             ColumnData::String(None),
         ]);
-        assert!(b.take_lossy().is_empty());
+        assert_eq!(b.take_lossy(), Vec::<(String, u64)>::new());
         let batch = b.finish().unwrap();
         assert_eq!(batch.num_rows(), 2);
         let int = |i: usize| batch.column(i).as_primitive::<Int64Type>().value(0);
@@ -1016,7 +1016,7 @@ mod tests {
     #[test]
     fn money_scaling() {
         assert_eq!(money_scaled(0.0001), Some(1));
-        assert_eq!(money_scaled(-214_748.3648), Some(-2_147_483_648));
+        assert_eq!(money_scaled(-214_748.364_8), Some(-2_147_483_648));
         assert_eq!(money_scaled(f64::NAN), None);
         assert_eq!(money_scaled(1e30), None);
         assert_eq!(money_scaled(123_456_789.123_4), Some(1_234_567_891_234));

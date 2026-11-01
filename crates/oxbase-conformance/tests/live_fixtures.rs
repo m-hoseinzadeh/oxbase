@@ -117,9 +117,10 @@ fn harness_runs_against_all_engines_and_m1_connection_checks_pass() {
     println!("fetch_list cells passed: {passed}");
 
     for c in &report.connections {
+        // Engines with a driver (M1, plus SQL Server since M4) must pass; the others are pending.
         let m1 = matches!(
             c.engine_kind,
-            Engine::Postgres | Engine::MySql | Engine::MariaDb | Engine::Sqlite
+            Engine::Postgres | Engine::MySql | Engine::MariaDb | Engine::Sqlite | Engine::MsSql
         );
         let ok = match c.status {
             CellStatus::Pass => m1,
