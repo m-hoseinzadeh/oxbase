@@ -412,33 +412,34 @@ async fn format_round_trips(
 ) {
     let key = live.key;
     let original = table_rows(live, main, &SAMPLE_COLUMNS).await;
-    let formats: [(&str, WriteOptions, ReadOptions, usize); 4] = [
+    // Every column of every format; XLSX keeps times to the millisecond (Excel serial dates).
+    let formats: [(&str, WriteOptions, ReadOptions, Precision); 4] = [
         (
             "csv",
             WriteOptions::Csv(CsvWriteOptions::default()),
             ReadOptions::Csv(CsvReadOptions::default()),
-            6,
+            Precision::Exact,
         ),
         (
             "json",
             WriteOptions::Json(JsonWriteOptions::default()),
             ReadOptions::Json(JsonReadOptions::default()),
-            4,
+            Precision::Exact,
         ),
         (
             "xlsx",
             WriteOptions::Xlsx(XlsxWriteOptions::default()),
             ReadOptions::Xlsx(XlsxReadOptions::default()),
-            4,
+            Precision::Millis,
         ),
         (
             "parquet",
             WriteOptions::Parquet(ParquetWriteOptions::default()),
             ReadOptions::Parquet(ParquetReadOptions::default()),
-            6,
+            Precision::Exact,
         ),
     ];
-    for (ext, write, read, compared) in formats {
+    for (ext, write, read, precision) in formats {
         let path = dir.join(format!("round.{ext}"));
         let handle = export
             .start(
@@ -497,12 +498,12 @@ async fn format_round_trips(
             .await
             .unwrap_or_else(|e| panic!("{key}: {ext}: import: {e}"));
         assert_finished(key, &drain_import(handle.events).await);
-        let copied = table_rows(live, &copy, &SAMPLE_COLUMNS[..compared]).await;
-        let expected: Vec<Vec<String>> = original
-            .iter()
-            .map(|row| row[..compared].to_vec())
-            .collect();
-        assert_eq!(copied, expected, "{key}: {ext} round trip");
+        let copied = table_rows(live, &copy, &SAMPLE_COLUMNS).await;
+        assert_eq!(
+            loose(&copied, precision),
+            loose(&original, precision),
+            "{key}: {ext} round trip"
+        );
         live.drop_table(&copy).await;
     }
 
@@ -540,6 +541,67 @@ async fn format_round_trips(
         live.drop_table(&copy).await;
     }
     report(&format!("{key}: file round trips ok"));
+}
+
+/// How exactly a format keeps times.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Precision {
+    Exact,
+    /// Times to the millisecond.
+    Millis,
+}
+
+/// Normalized rows compared across formats: a timestamp at midnight is the date it names (a
+/// format without a date type may bring a date back as a timestamp), and with
+/// [`Precision::Millis`] times are rounded to the millisecond.
+fn loose(rows: &[Vec<String>], precision: Precision) -> Vec<Vec<String>> {
+    rows.iter()
+        .map(|row| row.iter().map(|v| loose_value(v, precision)).collect())
+        .collect()
+}
+
+fn loose_value(value: &str, precision: Precision) -> String {
+    let Ok(ts) = chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f") else {
+        return value.to_owned();
+    };
+    let ts = match precision {
+        Precision::Exact => ts,
+        Precision::Millis => {
+            let micros = ts.and_utc().timestamp_micros();
+            let rounded = (micros + 500).div_euclid(1_000) * 1_000;
+            match chrono::DateTime::from_timestamp_micros(rounded) {
+                Some(t) => t.naive_utc(),
+                None => ts,
+            }
+        }
+    };
+    if ts.time() == chrono::NaiveTime::MIN {
+        ts.format("%Y-%m-%d").to_string()
+    } else {
+        ts.format("%Y-%m-%d %H:%M:%S%.6f").to_string()
+    }
+}
+
+#[test]
+fn loose_values_compare_across_formats() {
+    assert_eq!(
+        loose_value("1970-02-07 00:00:00.000000", Precision::Exact),
+        "1970-02-07"
+    );
+    assert_eq!(loose_value("1970-02-07", Precision::Exact), "1970-02-07");
+    assert_eq!(
+        loose_value("2000-01-01 00:00:07.000123", Precision::Exact),
+        "2000-01-01 00:00:07.000123"
+    );
+    assert_eq!(
+        loose_value("2000-01-01 00:00:07.000623", Precision::Millis),
+        "2000-01-01 00:00:07.001000"
+    );
+    assert_eq!(
+        loose_value("2000-01-01 00:00:07.000499", Precision::Millis),
+        "2000-01-01 00:00:07.000000"
+    );
+    assert_eq!(loose_value("name 1", Precision::Millis), "name 1");
 }
 
 macro_rules! per_engine {

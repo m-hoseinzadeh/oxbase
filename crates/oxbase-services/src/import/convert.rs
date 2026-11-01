@@ -661,7 +661,12 @@ impl Converter {
             }
             other => return Err(cannot(other, to_type)),
         };
-        if bits < 64 && v.is_finite() && v.abs() > f64::from(f32::MAX) {
+        // `NaN` and the infinities: several engines refuse them, which would fail the whole
+        // import; as row issues the error policy decides.
+        if !v.is_finite() {
+            return Err(format!("{v} is not a finite number"));
+        }
+        if bits < 64 && v.abs() > f64::from(f32::MAX) {
             return Err(format!("{v} is outside the range of {to_type}"));
         }
         Ok(Val::F64(v))
@@ -711,10 +716,12 @@ impl Converter {
             Val::Ts { micros, .. } => i32::try_from(micros.div_euclid(MICROS_PER_DAY))
                 .map(Val::Date)
                 .map_err(|_| "the date is out of range".to_owned()),
-            Val::Str(text) => parse_date(&text, &self.formats)
-                .and_then(date_days)
-                .map(Val::Date)
-                .ok_or_else(|| format!("{} is not a date", shown(&text))),
+            Val::Str(text) => {
+                let date = parse_date(&text, &self.formats)?;
+                date_days(date)
+                    .map(Val::Date)
+                    .ok_or_else(|| format!("{} is out of range", shown(&text)))
+            }
             other => Err(cannot(&other, to_type)),
         }
     }
@@ -1176,14 +1183,25 @@ pub(super) fn parse_canonical(text: &str) -> Option<Number> {
     })
 }
 
-fn parse_date(text: &str, formats: &ValueFormats) -> Option<NaiveDate> {
+/// A date from text: with `date_format`, or `YYYY-MM-DD`, or a timestamp at midnight. A
+/// timestamp with any other time of day is a row issue (the date column would drop the time).
+fn parse_date(text: &str, formats: &ValueFormats) -> std::result::Result<NaiveDate, String> {
     let t = text.trim();
-    match &formats.date_format {
-        Some(format) => NaiveDate::parse_from_str(t, format).ok(),
-        None => NaiveDate::parse_from_str(t, "%Y-%m-%d").ok().or_else(|| {
-            // A timestamp's date part.
-            parse_naive_timestamp(t).map(|ts| ts.date())
-        }),
+    let not_a_date = || format!("{} is not a date", shown(text));
+    if let Some(format) = &formats.date_format {
+        return NaiveDate::parse_from_str(t, format).map_err(|_| not_a_date());
+    }
+    if let Ok(date) = NaiveDate::parse_from_str(t, "%Y-%m-%d") {
+        return Ok(date);
+    }
+    let timestamp = parse_naive_timestamp(t).ok_or_else(not_a_date)?;
+    if timestamp.time() == NaiveTime::MIN {
+        Ok(timestamp.date())
+    } else {
+        Err(format!(
+            "{} has a time of day, which a date column would drop",
+            shown(text)
+        ))
     }
 }
 
@@ -1435,6 +1453,25 @@ mod tests {
         assert_eq!(hex(&[0, 255, 16]), "0x00ff10");
     }
 
+    #[test]
+    fn dates_from_text_never_drop_a_time_of_day() {
+        let f = ValueFormats::default();
+        let day = NaiveDate::from_ymd_opt(2024, 1, 1).unwrap();
+        assert_eq!(parse_date("2024-01-01", &f), Ok(day));
+        assert_eq!(parse_date(" 2024-01-01 00:00:00 ", &f), Ok(day));
+        assert_eq!(parse_date("2024-01-01T00:00", &f), Ok(day));
+        let dropped = parse_date("2024-01-01 10:30:00", &f).unwrap_err();
+        assert!(dropped.contains("time of day"), "{dropped}");
+        let bad = parse_date("soon", &f).unwrap_err();
+        assert!(bad.contains("is not a date"), "{bad}");
+        let custom = ValueFormats {
+            date_format: Some("%d/%m/%Y".into()),
+            ..ValueFormats::default()
+        };
+        assert_eq!(parse_date("01/01/2024", &custom), Ok(day));
+        assert!(parse_date("2024-01-01", &custom).is_err());
+    }
+
     fn load(name: &str, data_type: DataType, nullable: bool) -> LoadColumn {
         LoadColumn {
             name: name.into(),
@@ -1544,6 +1581,35 @@ mod tests {
         assert_eq!(issues.len(), 0, "{issues:?}");
         assert_eq!(out.column(0).as_string::<i32>().value(0), "hé");
         assert_eq!(cut.truncated_texts, 1);
+
+        // NaN and the infinities are row issues, not server errors.
+        let floats = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("f", ArrowType::Utf8, true)])),
+            vec![Arc::new(StringArray::from(vec![
+                "1.5",
+                "NaN",
+                "inf",
+                "-infinity",
+            ]))],
+        )
+        .unwrap();
+        let columns = vec![(0, DataType::Text, load("f", DataType::FLOAT64, true))];
+        let mut finite = Converter::new(
+            &columns,
+            ConversionOptions::default(),
+            ValueFormats::default(),
+        );
+        let (out, issues) = finite.convert(&floats).unwrap();
+        let rows: Vec<usize> = issues.iter().map(|i| i.batch_row).collect();
+        assert_eq!(rows, [1, 2, 3]);
+        assert!(
+            issues
+                .iter()
+                .all(|i| i.message.contains("not a finite number")),
+            "{issues:?}"
+        );
+        assert!(out.column(0).is_valid(0));
+        assert_eq!(out.column(0).null_count(), 3);
     }
 
     #[test]

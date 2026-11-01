@@ -23,9 +23,12 @@
 //! 4. **Run** ([`ImportService::start`]): the same checks, then on a **dedicated child
 //!    session** of the target's base session (`ConnectionManager::open_child` on the table's
 //!    database; closed at the end), so the tree and the editors stay usable:
+//!    - open the source first: `oxbase_io::open` + `oxbase_io::spawn_reader` (at most
+//!      [`ImportConfig::reader_capacity`] batches buffered: bounded memory), check that its
+//!      schema is the one the request's column specs describe, and read the first batch. A
+//!      file that was moved, a missing sheet or a broken workbook therefore fails the import
+//!      **before** any DDL runs;
 //!    - target mode DDL ([`TargetMode`]);
-//!    - read: `oxbase_io::open` + `oxbase_io::spawn_reader` (at most
-//!      [`ImportConfig::reader_capacity`] batches buffered: bounded memory);
 //!    - per batch: apply [`ConversionOptions`], turn the source batch into the *load schema*
 //!      of the target columns (`oxbase_dialect::LoadTarget::schema`, value conversions with
 //!      range / length / NOT NULL checks), collect row issues of the reader and of the
@@ -53,7 +56,12 @@
 //! truncate on MySQL / MariaDB and replace outside a single transaction as `destructive`, and
 //! the UI confirms those. A cancel stops reading at once, cancels the running load statement
 //! (driver cancel) and rolls back the open transaction; the run ends with
-//! [`ImportEvent::Cancelled`] **within 2 s** of [`ImportService::cancel`].
+//! [`ImportEvent::Cancelled`] **within 2 s** of [`ImportService::cancel`]. Every wait after
+//! the cancel (the load stopping, the rollback, ending the bulk load, dropping the created
+//! table, closing the work session) shares one budget measured from the cancel
+//! (`deadline::CANCEL_BUDGET`). When the budget runs out while the created table is being
+//! dropped, the drop goes on in the background (the work session closes after it) and the
+//! report says so instead of claiming `table_dropped`.
 //!
 //! # Errors
 //!
@@ -99,6 +107,7 @@ use crate::tree::TreeService;
 use crate::{CancellationToken, ConnectionManager, SessionHandle, SessionId, check_cancelled};
 
 mod convert;
+pub(crate) mod deadline;
 mod run;
 
 #[cfg(test)]
@@ -541,6 +550,18 @@ impl ImportService {
     ) -> Result<ImportHandle> {
         self.start_with(source, request, Box::new(move || Ok(reader)))
             .await
+    }
+
+    /// [`ImportService::start`] with `open` in place of `oxbase_io::open` (tests: sources
+    /// that fail to open).
+    #[cfg(test)]
+    pub(crate) async fn start_with_opener(
+        &self,
+        source: &ImportSource,
+        request: ImportRequest,
+        open: impl FnOnce() -> Result<Box<dyn oxbase_io::SourceReader>> + Send + 'static,
+    ) -> Result<ImportHandle> {
+        self.start_with(source, request, Box::new(open)).await
     }
 
     async fn start_with(

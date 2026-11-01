@@ -451,6 +451,17 @@ async fn result_export_pages_every_spilled_row() {
         )
         .await
         .unwrap();
+    let mut slow_events = running.events;
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(10), slow_events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        if matches!(event, RunEvent::Rows { total_so_far, .. } if total_so_far >= 20) {
+            break;
+        }
+        assert!(!event.is_terminal(), "{event:?}");
+    }
     let destination = slow.destination("s.csv", false);
     let make = memory(&destination.path, false, &written, Duration::ZERO);
     let e = slow
@@ -469,7 +480,37 @@ async fn result_export_pages_every_spilled_row() {
         .await
         .unwrap_err();
     assert!(e.to_string().contains("still running"), "{e}");
+
+    // A cancelled run exports the rows it kept, flagged as not the whole result.
     assert!(slow.query.cancel(running.id));
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(10), slow_events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        if event.is_terminal() {
+            assert!(matches!(event, RunEvent::Cancelled { .. }), "{event:?}");
+            break;
+        }
+    }
+    let kept = Written::default();
+    let events = slow
+        .export(
+            ExportSource::Result {
+                run_id: running.id,
+                result_index: 0,
+            },
+            "kept.csv",
+            &kept,
+        )
+        .await;
+    let report = finished(&events);
+    assert!(report.source_truncated, "{report:?}");
+    assert!(
+        report.sink.rows >= 20 && report.sink.rows < 500,
+        "{report:?}"
+    );
+    assert_eq!(ids(&kept).len(), usize::try_from(report.sink.rows).unwrap());
 }
 
 #[tokio::test]

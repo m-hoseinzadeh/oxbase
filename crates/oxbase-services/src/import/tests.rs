@@ -1095,6 +1095,204 @@ async fn failed_create_drops_the_table_when_ddl_commits() {
     );
 }
 
+/// A source whose first batch fails (a broken file found only when reading).
+struct BrokenReader {
+    schema: arrow_schema::SchemaRef,
+}
+
+impl oxbase_io::SourceReader for BrokenReader {
+    fn schema(&self) -> arrow_schema::SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    fn total_bytes(&self) -> u64 {
+        100
+    }
+
+    fn bytes_read(&self) -> u64 {
+        0
+    }
+
+    fn next_batch(&mut self) -> Result<Option<oxbase_io::SourceBatch>> {
+        Err(Error::invalid_input("byte 12: the file is not a workbook"))
+    }
+}
+
+/// Statements that change the table (DDL, emptying, loading, a transaction).
+fn changes(log: &[String]) -> Vec<String> {
+    log.iter()
+        .filter(|l| {
+            [
+                "CREATE", "DROP", "TRUNCATE", "DELETE", "BEGIN", "LOAD", "tx:",
+            ]
+            .iter()
+            .any(|word| l.starts_with(word))
+        })
+        .cloned()
+        .collect()
+}
+
+#[tokio::test]
+async fn a_source_that_fails_to_open_changes_nothing() {
+    // DDL that commits on its own (MySQL / MariaDB): replace would drop the old table first.
+    let setup = Setup {
+        transactional_ddl: false,
+        ..Setup::default()
+    };
+    let specs = text_specs(&["id", "code"]);
+    let mapping = vec![map(0, "id"), map(1, "code")];
+
+    // The file is gone (or the sheet is missing) when the run opens it.
+    let h = harness(setup).await;
+    let request = h.request(specs.clone(), mapping.clone(), "t", TargetMode::Replace);
+    let plan = h
+        .import
+        .plan(&h.source(), &request, CancellationToken::new())
+        .await
+        .unwrap();
+    assert!(plan.destructive, "{plan:?}");
+    let handle = h
+        .import
+        .start_with_opener(&h.source(), request, || {
+            Err(Error::not_found("data.csv: the file was moved"))
+        })
+        .await
+        .unwrap();
+    let events = drain(handle.events).await;
+    assert!(failure(&events).message.contains("moved"), "{events:?}");
+    assert_eq!(changes(&h.log()), Vec::<String>::new(), "{:?}", h.log());
+    let report = report_of(&events);
+    assert!(!report.table_created, "{report:?}");
+    assert!(!report.table_dropped, "{report:?}");
+    assert!(
+        report.left_behind.contains("old table is as it was"),
+        "{}",
+        report.left_behind
+    );
+
+    // The file has another shape than the request describes (options changed after the
+    // preview): truncate, which commits at once on these engines, does not run.
+    let h = harness(setup).await;
+    let request = h.request(specs.clone(), mapping.clone(), "t", TargetMode::Truncate);
+    let wider = text_specs(&["id", "code", "extra"]);
+    let reader = MemoryReader::new(&wider, Vec::new());
+    let handle = h
+        .import
+        .start_with_reader(&h.source(), request, Box::new(reader))
+        .await
+        .unwrap();
+    let events = drain(handle.events).await;
+    assert!(
+        failure(&events)
+            .message
+            .contains("the file has 3 columns, the request describes 2"),
+        "{events:?}"
+    );
+    assert_eq!(changes(&h.log()), Vec::<String>::new(), "{:?}", h.log());
+    assert!(
+        report_of(&events).left_behind.contains("is as it was"),
+        "{}",
+        report_of(&events).left_behind
+    );
+
+    // Same column count, another type.
+    let h = harness(setup).await;
+    let request = h.request(specs.clone(), mapping.clone(), "t", TargetMode::Truncate);
+    let typed = vec![
+        ColumnSpec::new("id", DataType::INT64),
+        ColumnSpec::new("code", DataType::Text),
+    ];
+    let reader = MemoryReader::new(&typed, Vec::new());
+    let handle = h
+        .import
+        .start_with_reader(&h.source(), request, Box::new(reader))
+        .await
+        .unwrap();
+    let events = drain(handle.events).await;
+    assert!(
+        failure(&events).message.contains("column 1 ('id')"),
+        "{events:?}"
+    );
+    assert_eq!(changes(&h.log()), Vec::<String>::new(), "{:?}", h.log());
+
+    // A file that opens but cannot be read.
+    let h = harness(setup).await;
+    let request = h.request(specs.clone(), mapping, "t", TargetMode::Replace);
+    let schema = ColumnSpec::schema(&specs);
+    let handle = h
+        .import
+        .start_with_reader(&h.source(), request, Box::new(BrokenReader { schema }))
+        .await
+        .unwrap();
+    let events = drain(handle.events).await;
+    assert!(
+        failure(&events).message.contains("not a workbook"),
+        "{events:?}"
+    );
+    assert_eq!(changes(&h.log()), Vec::<String>::new(), "{:?}", h.log());
+}
+
+#[tokio::test]
+async fn cancel_drops_the_created_table_within_the_deadline() {
+    let h = harness(Setup {
+        transactional_ddl: false,
+        delay: Duration::from_millis(50),
+        ..Setup::default()
+    })
+    .await;
+    let mut request = h.request(
+        text_specs(&["id"]),
+        vec![map(0, "id")],
+        "fresh",
+        TargetMode::Create,
+    );
+    request.transaction = TransactionPolicy::Batches { rows: 4 };
+    let batches: Vec<(RecordBatch, Vec<RowIssue>)> = (0..200)
+        .map(|_| (text_batch_of(&["1", "2", "3", "4"]), Vec::new()))
+        .collect();
+    let reader = MemoryReader::new(&request.columns, batches).slow(Duration::from_millis(5));
+    let handle = h
+        .import
+        .start_with_reader(&h.source(), request, Box::new(reader))
+        .await
+        .unwrap();
+    let mut events = handle.events;
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(10), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        if matches!(event, ImportEvent::Committed { rows_committed } if rows_committed >= 4) {
+            break;
+        }
+        assert!(!event.is_terminal(), "{event:?}");
+    }
+    let asked = Instant::now();
+    assert!(h.import.cancel(handle.id));
+    let rest = drain(events).await;
+    assert!(
+        asked.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        asked.elapsed()
+    );
+    assert!(
+        matches!(rest.last(), Some(ImportEvent::Cancelled { .. })),
+        "{rest:?}"
+    );
+    let report = report_of(&rest);
+    assert!(report.table_created && report.table_dropped, "{report:?}");
+    assert_eq!(
+        report.left_behind,
+        "the table the import created was dropped"
+    );
+    assert_eq!(
+        h.log().last().map(String::as_str),
+        Some("DROP TABLE fresh"),
+        "{:?}",
+        h.log()
+    );
+}
+
 fn text_batch_of(values: &[&str]) -> RecordBatch {
     let values: Vec<Option<&str>> = values.iter().map(|v| Some(*v)).collect();
     testing::text_batch(&values)

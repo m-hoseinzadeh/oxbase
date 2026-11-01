@@ -15,8 +15,9 @@
 //! - [`ExportSource::Result`]: a result set of a query run (`QueryService`): every row the
 //!   run's `ResultStore` holds, **including spilled rows**, read page by page with
 //!   `QueryService::page` ([`ExportConfig::page_rows`] per page). The run must not be running
-//!   (`InvalidInput` "wait for the query to finish"); a truncated result exports what was
-//!   kept and says so in the report.
+//!   (`InvalidInput` "wait for the query to finish"); a truncated result, or one the run
+//!   never completed (cancelled or failed partway), exports what was kept and says so in the
+//!   report (`sourceTruncated`).
 //!
 //! Rows stream from the source into an `oxbase_io::WriterHandle` (bounded queue), so memory
 //! stays at a few batches whatever the size.
@@ -63,6 +64,7 @@ use uuid::Uuid;
 
 use crate::convert::parse_input;
 use crate::edit::CellInput;
+use crate::import::deadline::CancelClock;
 use crate::import::{close_work_session, work_session};
 use crate::query::{ErrorInfo, QueryService, RunId, RunState};
 use crate::tree::TreeService;
@@ -149,8 +151,8 @@ pub struct ExportReport {
     /// Rows, bytes, sheets and writer warnings.
     #[serde(flatten)]
     pub sink: SinkReport,
-    /// The source result was truncated (`max_rows` or the spill cap): not every row of the
-    /// query was exported.
+    /// The source result was truncated (`max_rows` or the spill cap) or never completed (the
+    /// run was cancelled or failed partway): not every row of the query was exported.
     pub source_truncated: bool,
     pub elapsed_ms: u64,
 }
@@ -423,7 +425,8 @@ impl ExportService {
                     run_id: *run_id,
                     result_index: *result_index,
                     total_rows: result.rows,
-                    truncated: result.truncated,
+                    // A run that was cancelled or failed partway keeps only some rows.
+                    truncated: result.truncated || !result.complete,
                     engine,
                 })
             }
@@ -572,7 +575,11 @@ enum Resolved {
     },
 }
 
-/// How long the writer may take to delete its temporary file after a cancel or failure.
+// After a cancel these waits are also cut to what is left of the cancel budget
+// (`crate::import::deadline`), so `cancelled` comes within 2 s.
+
+/// How long the writer may take to delete its temporary file after a cancel or failure (it
+/// finishes deleting it in the background after that).
 const ABORT_WAIT: Duration = Duration::from_millis(1_500);
 /// How long a server-side cancel and closing the work session may take before the terminal
 /// event.
@@ -603,6 +610,7 @@ struct Output {
 impl Job {
     async fn run(self, make: WriterFactory) {
         let started = Instant::now();
+        let clock = CancelClock::start(&self.token);
         let total_rows = match &self.source {
             Resolved::Result { total_rows, .. } => Some(*total_rows),
             Resolved::Statement { .. } => None,
@@ -641,6 +649,7 @@ impl Job {
                     make,
                     &mut output,
                     started,
+                    &clock,
                 )
                 .await
             }
@@ -666,7 +675,7 @@ impl Job {
         if outcome.is_err()
             && let Some(writer) = output.writer.take()
         {
-            let _ = tokio::time::timeout(ABORT_WAIT, writer.abort()).await;
+            let _ = tokio::time::timeout(clock.limit(ABORT_WAIT), writer.abort()).await;
         }
         self.running
             .lock()
@@ -761,6 +770,7 @@ impl Job {
         make: WriterFactory,
         output: &mut Output,
         started: Instant,
+        clock: &CancelClock,
     ) -> Result<()> {
         let work = work_session(
             &self.manager,
@@ -775,9 +785,9 @@ impl Job {
             .await;
         if result.is_err() && self.token.is_cancelled() {
             let cancel = work.handle.connection().cancel_running();
-            let _ = tokio::time::timeout(CLOSE_WAIT, cancel).await;
+            let _ = tokio::time::timeout(clock.limit(CLOSE_WAIT), cancel).await;
         }
-        close_work_session(&self.manager, work, CLOSE_WAIT).await;
+        close_work_session(&self.manager, work, clock.limit(CLOSE_WAIT)).await;
         result
     }
 

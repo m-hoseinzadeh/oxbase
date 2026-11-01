@@ -6,7 +6,11 @@
 //!   batches; truncate, delete_all and replace, each checked by its row count;
 //! - failures per target mode and transaction policy (`docs/m5-contracts.md` §5.2): a server
 //!   error rolls a single transaction back, keeps the committed batches, empties the table on
-//!   engines whose TRUNCATE commits, and drops a table the import created;
+//!   engines whose TRUNCATE commits, rolls a `DELETE` back, rolls a `CREATE` back (or drops
+//!   the table where DDL commits), keeps or loses the old table of a replace per engine, and
+//!   drops a table the import created;
+//! - text fidelity: NULL versus empty text, astral characters, CR / LF / tab, backslashes,
+//!   quotes and a long text;
 //! - the skip policy with conversion errors; plan rejections;
 //! - cancel ends with `Cancelled` within 2 s and leaves exactly the committed rows;
 //! - with the file readers in place (read stream): every sample format into a new table and
@@ -342,7 +346,8 @@ async fn import_cycle(key: &'static str, engine: Engine) {
     let skip = name("skip");
     let req = name("req");
     let slow = name("slow");
-    for t in [&main, &fresh, &skip, &req, &slow] {
+    let fid = name("fid");
+    for t in [&main, &fresh, &skip, &req, &slow, &fid] {
         live.drop_table(t).await;
     }
 
@@ -450,6 +455,30 @@ async fn import_cycle(key: &'static str, engine: Engine) {
         assert_eq!(left, 5_300, "{key}: rolled back: {}", failed.left_behind);
     }
 
+    // Truncate in batches with a failure: emptied, the committed batches stay.
+    let request = sample_request(
+        &live,
+        &main,
+        TargetMode::Truncate,
+        TransactionPolicy::Batches { rows: 5 },
+    );
+    let mut batches = sample_batches(1, 10, 10);
+    batches.extend(sample_batches(3, 1, 1));
+    let reader = MemoryReader::new(&request.columns, batches);
+    let failed = assert_failed(key, &run_import(&import, &file, request, reader).await);
+    assert_eq!(failed.rows_committed, 10, "{key}");
+    assert_eq!(
+        table_rows(&live, &main, &SAMPLE_COLUMNS).await,
+        expected_rows(1..=10),
+        "{key}: {}",
+        failed.left_behind
+    );
+    assert!(
+        failed.left_behind.contains("emptied"),
+        "{key}: {}",
+        failed.left_behind
+    );
+
     // Truncate, then delete_all, succeeding.
     let request = sample_request(
         &live,
@@ -474,6 +503,25 @@ async fn import_cycle(key: &'static str, engine: Engine) {
         "{key}"
     );
 
+    // delete_all in one transaction with a failure: the DELETE rolls back with the rows.
+    let request = sample_request(
+        &live,
+        &main,
+        TargetMode::DeleteAll,
+        TransactionPolicy::Single,
+    );
+    let mut batches = sample_batches(1, 10, 10);
+    batches.extend(sample_batches(5, 1, 1));
+    let reader = MemoryReader::new(&request.columns, batches);
+    let failed = assert_failed(key, &run_import(&import, &file, request, reader).await);
+    assert_eq!(failed.rows_committed, 0, "{key}");
+    assert_eq!(
+        table_rows(&live, &main, &SAMPLE_COLUMNS).await,
+        expected_rows(100..=124),
+        "{key}: {}",
+        failed.left_behind
+    );
+
     // Replace with fewer columns.
     let mut request = sample_request(&live, &main, TargetMode::Replace, TransactionPolicy::Single);
     request.mapping.truncate(2);
@@ -482,6 +530,48 @@ async fn import_cycle(key: &'static str, engine: Engine) {
     let rows = table_rows(&live, &main, &["id", "name"]).await;
     assert_eq!(rows.len(), 30, "{key}");
     assert_eq!(rows[0].len(), 2, "{key}");
+
+    // Replace in one transaction with a failure: the old table is intact where DDL is
+    // transactional; where it commits, the old table is gone and the new one dropped.
+    let request = sample_request(&live, &main, TargetMode::Replace, TransactionPolicy::Single);
+    let mut batches = sample_batches(1, 10, 10);
+    batches.extend(sample_batches(3, 1, 1));
+    let reader = MemoryReader::new(&request.columns, batches);
+    let failed = assert_failed(key, &run_import(&import, &file, request, reader).await);
+    if ddl_commits(engine) {
+        assert!(!live.exists(&main).await, "{key}: {}", failed.left_behind);
+        assert!(failed.table_dropped, "{key}: {}", failed.left_behind);
+        assert!(
+            failed.left_behind.contains("old table is gone"),
+            "{key}: {}",
+            failed.left_behind
+        );
+    } else {
+        let rows = table_rows(&live, &main, &["id", "name"]).await;
+        assert_eq!(rows.len(), 30, "{key}: {}", failed.left_behind);
+        assert!(!failed.table_created, "{key}: {}", failed.left_behind);
+        assert!(!failed.table_dropped, "{key}: {}", failed.left_behind);
+        assert!(
+            failed.left_behind.contains("old table is as it was"),
+            "{key}: {}",
+            failed.left_behind
+        );
+    }
+
+    // Replace in batches with a failure: the old table is gone, the new one dropped.
+    let request = sample_request(
+        &live,
+        &main,
+        TargetMode::Replace,
+        TransactionPolicy::Batches { rows: 5 },
+    );
+    let mut batches = sample_batches(1, 10, 10);
+    batches.extend(sample_batches(3, 1, 1));
+    let reader = MemoryReader::new(&request.columns, batches);
+    let failed = assert_failed(key, &run_import(&import, &file, request, reader).await);
+    assert_eq!(failed.rows_committed, 10, "{key}");
+    assert!(!live.exists(&main).await, "{key}: {}", failed.left_behind);
+    assert!(failed.table_dropped, "{key}: {}", failed.left_behind);
 
     // A failed create leaves no table, whether the CREATE rolled back or was dropped.
     let request = sample_request(
@@ -500,6 +590,28 @@ async fn import_cycle(key: &'static str, engine: Engine) {
         failed.table_dropped,
         "{key}: committed batches mean a committed CREATE"
     );
+
+    // The same in one transaction: the CREATE rolls back, or (DDL commits) is dropped.
+    let request = sample_request(&live, &fresh, TargetMode::Create, TransactionPolicy::Single);
+    let mut batches = sample_batches(1, 10, 10);
+    batches.extend(sample_batches(3, 1, 1));
+    let reader = MemoryReader::new(&request.columns, batches);
+    let failed = assert_failed(key, &run_import(&import, &file, request, reader).await);
+    assert!(!live.exists(&fresh).await, "{key}: {}", failed.left_behind);
+    if ddl_commits(engine) {
+        assert!(failed.table_created, "{key}: {}", failed.left_behind);
+        assert!(failed.table_dropped, "{key}: {}", failed.left_behind);
+    } else {
+        assert!(!failed.table_created, "{key}: {}", failed.left_behind);
+        assert!(!failed.table_dropped, "{key}: {}", failed.left_behind);
+        assert!(
+            failed.left_behind.contains("no table was created"),
+            "{key}: {}",
+            failed.left_behind
+        );
+    }
+
+    text_fidelity(&live, &import, &file, &fid).await;
 
     // Skip policy: conversion errors are skipped and listed.
     let columns = vec![
@@ -688,9 +800,77 @@ async fn import_cycle(key: &'static str, engine: Engine) {
         ));
     }
 
-    for t in [&main, &fresh, &skip, &req, &slow] {
+    for t in [&main, &fresh, &skip, &req, &slow, &fid] {
         live.drop_table(t).await;
     }
+}
+
+/// NULL versus empty text, astral characters, CR / LF / tab, backslashes (`\N` is NULL in
+/// PostgreSQL's COPY text), quotes and a long text survive the engine's loader.
+async fn text_fidelity(live: &Live, import: &ImportService, file: &Path, table: &ObjectRef) {
+    let key = live.key;
+    let long = format!("{}é", "x".repeat(5_000));
+    let notes: Vec<Option<&str>> = vec![
+        Some(""),
+        None,
+        Some("a\u{1F600}b \u{10348}"),
+        Some("line1\r\nline2\ttab\rend"),
+        Some(long.as_str()),
+        Some("  spaced  "),
+        Some("back\\slash \\N \\t 'q' \"d\" ;--"),
+    ];
+    let columns = vec![
+        ColumnSpec::new("id", DataType::INT64),
+        ColumnSpec::new("note", DataType::Text),
+    ];
+    let ids: Vec<i64> = (1..=i64::try_from(notes.len()).unwrap()).collect();
+    let batch = RecordBatch::try_new(
+        ColumnSpec::schema(&columns),
+        vec![
+            Arc::new(arrow_array::Int64Array::from(ids)),
+            Arc::new(arrow_array::StringArray::from(notes.clone())),
+        ],
+    )
+    .unwrap();
+    let request = ImportRequest {
+        options: ReadOptions::Csv(CsvReadOptions::default()),
+        columns: columns.clone(),
+        mapping: (0..columns.len())
+            .map(|source| ColumnMapping {
+                source,
+                target: Some(columns[source].name.clone()),
+                data_type: None,
+            })
+            .collect(),
+        target: ImportTarget {
+            session: live.session,
+            table: table.clone(),
+            mode: TargetMode::Create,
+        },
+        primary_key: vec!["id".into()],
+        conversion: ConversionOptions::default(),
+        errors: ErrorPolicy::Stop,
+        transaction: TransactionPolicy::Single,
+    };
+    let reader = MemoryReader::new(&columns, vec![(batch, Vec::new())]);
+    let done = assert_finished(key, &run_import(import, file, request, reader).await);
+    assert_eq!(done.rows_committed, 7, "{key}");
+    let expected: Vec<Vec<String>> = notes
+        .iter()
+        .enumerate()
+        .map(|(index, note)| {
+            vec![
+                (index + 1).to_string(),
+                note.map_or_else(|| "NULL".to_owned(), norm_text),
+            ]
+        })
+        .collect();
+    assert_eq!(
+        table_rows(live, table, &["id", "note"]).await,
+        expected,
+        "{key}: text fidelity"
+    );
+    report(&format!("{key}: text fidelity ok"));
 }
 
 /// One `id` (int) row.

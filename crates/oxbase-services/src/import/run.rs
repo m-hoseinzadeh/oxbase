@@ -9,31 +9,39 @@ use std::time::{Duration, Instant};
 use arrow_array::{BooleanArray, RecordBatch};
 use arrow_schema::SchemaRef;
 use futures::StreamExt;
-use oxbase_dialect::{
-    BulkLimits, BulkLoader, DialectRegistry, LoadColumn, LoadSession, LoadTarget,
-};
+use futures::stream::BoxStream;
+use oxbase_dialect::{BulkLoader, DialectRegistry, LoadColumn, LoadSession, LoadTarget};
 use oxbase_driver::{Connection, Tx};
-use oxbase_io::{SourceBatch, SourceReader};
+use oxbase_io::{ColumnSpec, SourceBatch, SourceReader};
 use oxbase_types::{BoundStatement, Error, Result, ScriptStep};
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 
 use super::convert::Converter;
+use super::deadline::CancelClock;
 use super::{
     ErrorPolicy, ImportConfig, ImportEvent, ImportId, ImportReport, ImportRequest, ImportRowError,
     Prepared, TargetMode, close_work_session, value_formats, work_session,
 };
 use crate::query::ErrorInfo;
-use crate::{CancellationToken, ConnectionManager, SessionHandle};
+use crate::{CancellationToken, ConnectionManager, SessionGuard, SessionHandle};
 
 /// Opens the source (`oxbase_io::open`, or a test reader). Runs on a blocking thread.
 pub(super) type Opener = Box<dyn FnOnce() -> Result<Box<dyn SourceReader>> + Send>;
+
+/// The batches of the opened source.
+type Batches = BoxStream<'static, Result<SourceBatch>>;
+
+// After a cancel, every wait below is also cut to what is left of the cancel budget
+// (`CancelClock::limit`).
 
 /// How long a cancelled load may take to stop on its own before it is abandoned.
 const CANCEL_GRACE: Duration = Duration::from_millis(800);
 /// How long a rollback may take before the transaction is dropped (the server then rolls it
 /// back when the session closes).
 const ROLLBACK_WAIT: Duration = Duration::from_millis(600);
-/// How long dropping the table the import created may take.
+/// How long dropping the table the import created may take before the terminal event (the
+/// drop goes on in the background after that).
 const DROP_WAIT: Duration = Duration::from_secs(5);
 /// How long `BulkLoader::finish` and closing the work session may take before the terminal
 /// event (they go on in the background).
@@ -76,6 +84,10 @@ struct State {
     /// The import dropped the table it had created.
     table_dropped: bool,
     drop_failed: Option<String>,
+    /// The drop of the created table was still running at the terminal event.
+    drop_pending: bool,
+    /// That drop, going on in the background (the work session closes after it).
+    drop_task: Option<JoinHandle<Result<()>>>,
     truncated_texts: u64,
     warnings: Vec<String>,
 }
@@ -84,6 +96,7 @@ impl Job {
     /// Runs the import to its terminal event.
     pub(super) async fn run(self, open: Opener) {
         let started = Instant::now();
+        let clock = CancelClock::start(&self.token);
         let mut st = State::default();
         let _ = self
             .events
@@ -106,9 +119,31 @@ impl Job {
             Err(e) => Err(e),
             Ok(session) => {
                 let outcome = self
-                    .on_session(&session.handle, open, &mut st, started)
+                    .on_session(&session.handle, open, &mut st, started, &clock)
                     .await;
-                close_work_session(&self.manager, session, FINISH_WAIT).await;
+                match st.drop_task.take() {
+                    // The drop needs the session: close it once the drop is over.
+                    Some(drop_task) => {
+                        st.drop_pending = true;
+                        let manager = Arc::clone(&self.manager);
+                        tokio::spawn(async move {
+                            match drop_task.await {
+                                Ok(Ok(())) => {}
+                                Ok(Err(e)) => tracing::warn!(
+                                    category = %e.category(),
+                                    "dropping the table an import created failed"
+                                ),
+                                Err(_) => tracing::warn!(
+                                    "dropping the table an import created stopped unexpectedly"
+                                ),
+                            }
+                            close_work_session(&manager, session, FINISH_WAIT).await;
+                        });
+                    }
+                    None => {
+                        close_work_session(&self.manager, session, clock.limit(FINISH_WAIT)).await;
+                    }
+                }
                 outcome
             }
         };
@@ -138,13 +173,13 @@ impl Job {
         open: Opener,
         st: &mut State,
         started: Instant,
+        clock: &CancelClock,
     ) -> Result<()> {
-        let _guard =
+        let guard =
             crate::until_cancelled(&self.token, async { Ok(session.exclusive().await) }).await?;
         let connection = session.connection().as_ref();
         let p = &self.prepared;
         let loader = self.dialects.bulk_loader(p.engine)?;
-        let limits = loader.limits(&p.version);
         let load_columns: Vec<LoadColumn> = p.columns.iter().map(|(_, _, c)| c.clone()).collect();
         let target = LoadTarget {
             table: &p.plan.table,
@@ -156,9 +191,9 @@ impl Job {
             connection,
             loader.as_ref(),
             target,
-            limits,
             st,
             started,
+            clock,
         );
         let result = pipeline.run(open).await;
         if result.is_err() {
@@ -174,7 +209,7 @@ impl Job {
                 &target,
                 CancellationToken::new(),
             );
-            match tokio::time::timeout(FINISH_WAIT, finish).await {
+            match tokio::time::timeout(clock.limit(FINISH_WAIT), finish).await {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => st
                     .warnings
@@ -185,27 +220,43 @@ impl Job {
             }
         }
         if result.is_err() {
-            self.clean_up(connection, st).await;
+            self.clean_up(session, guard, st, clock).await;
         }
         result
     }
 
-    /// After a failure: drops the table the import created when it exists for good.
-    async fn clean_up(&self, connection: &dyn Connection, st: &mut State) {
+    /// After a failure: drops the table the import created when it exists for good. The drop
+    /// runs in its own task (holding the session's guard) so that it is never cut off: when it
+    /// takes longer than [`DROP_WAIT`] or the cancel budget, it goes on in the background
+    /// ([`State::drop_task`]).
+    async fn clean_up(
+        &self,
+        session: &SessionHandle,
+        guard: SessionGuard,
+        st: &mut State,
+        clock: &CancelClock,
+    ) {
         if !st.created_committed || self.prepared.drop_new.is_empty() {
             return;
         }
-        let token = CancellationToken::new();
-        let dropping = async {
-            for step in &self.prepared.drop_new {
-                run_step(LoadSession::new(connection, None), step, &token).await?;
+        let connection = Arc::clone(session.connection());
+        let steps = self.prepared.drop_new.clone();
+        let mut dropping = tokio::spawn(async move {
+            let _guard = guard;
+            let token = CancellationToken::new();
+            for step in &steps {
+                let statement = BoundStatement::new(step.sql.clone(), Vec::new());
+                LoadSession::new(connection.as_ref(), None)
+                    .run(&statement, token.clone())
+                    .await?;
             }
             Ok::<(), Error>(())
-        };
-        match tokio::time::timeout(DROP_WAIT, dropping).await {
-            Ok(Ok(())) => st.table_dropped = true,
-            Ok(Err(e)) => st.drop_failed = Some(e.to_string()),
-            Err(_) => st.drop_failed = Some("it took too long".to_owned()),
+        });
+        match tokio::time::timeout(clock.limit(DROP_WAIT), &mut dropping).await {
+            Ok(Ok(Ok(()))) => st.table_dropped = true,
+            Ok(Ok(Err(e))) => st.drop_failed = Some(e.to_string()),
+            Ok(Err(_)) => st.drop_failed = Some("it stopped unexpectedly".to_owned()),
+            Err(_) => st.drop_task = Some(dropping),
         }
     }
 
@@ -282,6 +333,11 @@ impl Job {
                 };
                 let new = if st.table_dropped {
                     "the table the import created was dropped".to_owned()
+                } else if st.drop_pending {
+                    format!(
+                        "{table} was created; dropping it was still running when the import \
+                         ended and goes on in the background"
+                    )
                 } else if let Some(e) = &st.drop_failed {
                     format!(
                         "{table} was created and holds {committed} rows: dropping it failed \
@@ -318,17 +374,19 @@ async fn run_step(
     session: LoadSession<'_>,
     step: &ScriptStep,
     cancel: &CancellationToken,
+    clock: &CancelClock,
 ) -> Result<()> {
     let statement = BoundStatement::new(step.sql.clone(), Vec::new());
-    cancellable(cancel, session.run(&statement, cancel.clone()))
+    cancellable(cancel, clock, session.run(&statement, cancel.clone()))
         .await
         .map(|_| ())
 }
 
-/// Runs `fut` to its end, or, once `cancel` fires, gives it [`CANCEL_GRACE`] to stop and
-/// returns `Cancelled`.
+/// Runs `fut` to its end, or, once `cancel` fires, gives it [`CANCEL_GRACE`] (within the
+/// cancel budget) to stop and returns `Cancelled`.
 async fn cancellable<T>(
     cancel: &CancellationToken,
+    clock: &CancelClock,
     fut: impl Future<Output = Result<T>>,
 ) -> Result<T> {
     tokio::pin!(fut);
@@ -336,10 +394,49 @@ async fn cancellable<T>(
         biased;
         result = &mut fut => result,
         () = cancel.cancelled() => {
-            let _ = tokio::time::timeout(CANCEL_GRACE, &mut fut).await;
+            let _ = tokio::time::timeout(clock.limit(CANCEL_GRACE), &mut fut).await;
             Err(Error::Cancelled)
         }
     }
+}
+
+/// The next item of `stream`, or `Cancelled` once `cancel` fires.
+async fn next_batch(
+    stream: &mut Batches,
+    cancel: &CancellationToken,
+) -> Option<Result<SourceBatch>> {
+    tokio::select! {
+        biased;
+        () = cancel.cancelled() => Some(Err(Error::Cancelled)),
+        item = stream.next() => item,
+    }
+}
+
+/// Checks that the opened source has the schema the request's column specs describe
+/// (`oxbase_io::open` promises `ColumnSpec::schema`), so a file that changed since its preview
+/// fails before anything changes.
+fn check_source_schema(found: &SchemaRef, specs: &[ColumnSpec]) -> Result<()> {
+    let fields = found.fields();
+    if fields.len() != specs.len() {
+        return Err(Error::invalid_input(format!(
+            "the file has {} columns, the request describes {}",
+            fields.len(),
+            specs.len()
+        )));
+    }
+    let expected = ColumnSpec::schema(specs);
+    for (index, (field, want)) in fields.iter().zip(expected.fields().iter()).enumerate() {
+        if field.data_type() != want.data_type() {
+            return Err(Error::invalid_input(format!(
+                "column {} ('{}') of the file reads as {}, the request expects {}",
+                index + 1,
+                want.name(),
+                field.data_type(),
+                want.data_type()
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// `error` with the source rows of the failing call in front of its message.
@@ -388,6 +485,7 @@ struct Pipeline<'a> {
     last_progress: Instant,
     started: Instant,
     st: &'a mut State,
+    clock: &'a CancelClock,
 }
 
 impl<'a> Pipeline<'a> {
@@ -396,10 +494,11 @@ impl<'a> Pipeline<'a> {
         connection: &'a dyn Connection,
         loader: &'a dyn BulkLoader,
         target: LoadTarget<'a>,
-        limits: BulkLimits,
         st: &'a mut State,
         started: Instant,
+        clock: &'a CancelClock,
     ) -> Self {
+        let limits = loader.limits(&job.prepared.version);
         let commit_every = job.prepared.plan.transaction.commit_every;
         let mut call_rows = limits.rows_per_call.max(1);
         if let Some(every) = commit_every {
@@ -433,6 +532,7 @@ impl<'a> Pipeline<'a> {
             last_progress: Instant::now(),
             started,
             st,
+            clock,
         }
     }
 
@@ -444,11 +544,30 @@ impl<'a> Pipeline<'a> {
         let job = self.job;
         let p = &job.prepared;
         let token = job.token.clone();
+        let clock = self.clock;
 
-        // 1. DDL that commits on its own runs first, outside the transaction.
+        // 1. The reader, before anything changes: a file that cannot be opened, has another
+        //    shape than the request describes, or fails on its first batch changes nothing.
+        let opening = tokio::task::spawn_blocking(open);
+        let reader = crate::until_cancelled(&token, async {
+            opening
+                .await
+                .map_err(|_| Error::internal("opening the file stopped unexpectedly"))?
+        })
+        .await?;
+        check_source_schema(&reader.schema(), &job.request.columns)?;
+        let mut stream: Batches =
+            oxbase_io::spawn_reader(reader, token.clone(), job.config.reader_capacity);
+        let first = match next_batch(&mut stream, &token).await {
+            None => None,
+            Some(Ok(batch)) => Some(batch),
+            Some(Err(e)) => return Err(e),
+        };
+
+        // 2. DDL that commits on its own, outside the transaction.
         if !p.ddl_in_tx {
             for (index, step) in p.ddl.iter().enumerate() {
-                run_step(LoadSession::new(self.connection, None), step, &token).await?;
+                run_step(LoadSession::new(self.connection, None), step, &token, clock).await?;
                 if index + 1 == p.drops {
                     self.st.old_dropped = true;
                 }
@@ -456,9 +575,10 @@ impl<'a> Pipeline<'a> {
             self.ddl_committed();
         }
 
-        // 2. Session settings of the loader.
+        // 3. Session settings of the loader.
         cancellable(
             &token,
+            clock,
             self.loader.prepare(
                 LoadSession::new(self.connection, None),
                 &self.target,
@@ -468,40 +588,25 @@ impl<'a> Pipeline<'a> {
         .await?;
         self.loader_prepared = true;
 
-        // 3. The reader.
-        let reader = tokio::task::spawn_blocking(open)
-            .await
-            .map_err(|_| Error::internal("opening the file stopped unexpectedly"))??;
-        if reader.schema().fields().len() != job.request.columns.len() {
-            return Err(Error::invalid_input(format!(
-                "the file has {} columns, the request describes {}",
-                reader.schema().fields().len(),
-                job.request.columns.len()
-            )));
-        }
-        let mut stream = oxbase_io::spawn_reader(reader, token.clone(), job.config.reader_capacity);
-
         // 4. The transaction, with the transactional DDL.
         self.begin().await?;
         if p.ddl_in_tx && !p.ddl.is_empty() {
             for step in &p.ddl {
                 let tx = self.tx.as_deref();
-                run_step(LoadSession::new(self.connection, tx), step, &token).await?;
+                run_step(LoadSession::new(self.connection, tx), step, &token, clock).await?;
             }
             self.st.ddl_in_open_tx = true;
         }
 
         // 5. Batches.
-        loop {
-            let next = tokio::select! {
-                biased;
-                () = token.cancelled() => Some(Err(Error::Cancelled)),
-                item = stream.next() => item,
-            };
-            match next {
-                None => break,
-                Some(Err(e)) => return Err(e),
-                Some(Ok(batch)) => self.batch(batch).await?,
+        if let Some(batch) = first {
+            self.batch(batch).await?;
+            loop {
+                match next_batch(&mut stream, &token).await {
+                    None => break,
+                    Some(Err(e)) => return Err(e),
+                    Some(Ok(batch)) => self.batch(batch).await?,
+                }
             }
         }
         self.flush(true).await?;
@@ -514,7 +619,7 @@ impl<'a> Pipeline<'a> {
 
     async fn begin(&mut self) -> Result<()> {
         let begin = self.connection.begin();
-        self.tx = Some(cancellable(&self.job.token, begin).await?);
+        self.tx = Some(cancellable(&self.job.token, self.clock, begin).await?);
         Ok(())
     }
 
@@ -554,7 +659,7 @@ impl<'a> Pipeline<'a> {
     /// Rolls the open transaction back (bounded); the DDL in it goes with it.
     async fn abort(&mut self) {
         if let Some(tx) = self.tx.take() {
-            match tokio::time::timeout(ROLLBACK_WAIT, tx.rollback()).await {
+            match tokio::time::timeout(self.clock.limit(ROLLBACK_WAIT), tx.rollback()).await {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => self
                     .st
@@ -702,7 +807,7 @@ impl<'a> Pipeline<'a> {
         let load = self
             .loader
             .load(session, &self.target, chunk, token.clone());
-        cancellable(&token, load).await.map_err(|e| {
+        cancellable(&token, self.clock, load).await.map_err(|e| {
             if e.is_cancelled() {
                 e
             } else {
