@@ -555,4 +555,20 @@ the `miniz_oxide` backend (already in the graph), `zip` 9.2.1 (MIT, `deflate` on
 
 ## 13. Deviations (as built)
 
-None yet. Streams record deviations from this file here, with the reason.
+Streams record deviations from this file here, with the reason.
+
+**perf** (§9, `crates/oxbase-services/tests/import_perf.rs`, `tests/perf/`):
+
+- The generator writes the `csv` crate's `QuoteStyle::Necessary` form itself (byte-identical for
+  these values) instead of using the crate, so `oxbase-services` needs no new dev-dependency.
+  Fragments of `note` are fixed in `perf/generator.rs`; 10 000 000 rows are 1 238 093 427 bytes.
+- Before the big run each engine gets a 20 000-row probe import (create, one transaction) with
+  the checksum, so a conversion bug fails in seconds. `m5_perf_cancel` is pre-created by
+  importing a header-only file (create mode) rather than by engine DDL in the test.
+- The test does nothing without `OXBASE_PERF_DIR` (the conformance job runs every ignored test
+  of `oxbase-services`). While the CSV reader or `ImportService::start` is a skeleton it
+  reports *pending* and passes; `OXBASE_REQUIRE_M5_PERF=1` (integration) makes that a failure.
+- Webview smoke (§12, app): the import / export step needs a debug-only file hook in the app
+  (`--e2e-file-dir=<dir>`; contract in `ui/e2e/README.md`), which the app stream adds; the test
+  enables it only when the binary contains it. It exports a `query_run` result (`{"type":
+  "result"}`), not the grid through UI clicks. `OXBASE_E2E_REQUIRE_M5=1` makes it mandatory.

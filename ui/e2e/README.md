@@ -6,7 +6,8 @@ the binary `query_page` responses and their Arrow decoding inside WebKitGTK. The
 in `docs/m3-contracts.md` §9. CI runs it as the job **Webview smoke (Linux)** in
 `.github/workflows/ci.yml`. The job runs on the full lane and on the fast lane of the
 `wip/*-e2e`, `wip/*-app` and `wip/*-integrate` branches. Since M3 the job sets
-`OXBASE_E2E_REQUIRE_EDIT=1`, so the edit step must run.
+`OXBASE_E2E_REQUIRE_EDIT=1`, so the edit step must run. `OXBASE_E2E_REQUIRE_M5=1` does the same for the M5
+import / export step (step 9) once the integrator turns it on.
 
 ## What it checks
 
@@ -53,6 +54,44 @@ in `docs/m3-contracts.md` §9. CI runs it as the job **Webview smoke (Linux)** i
    - It clicks the tab's Refresh, which must send a new `table_data_open`, and the reloaded
      grid must show the new value.
    - Finally it deletes its row, also when the step fails.
+9. **Import and export (M5).** Native file dialogs cannot be driven through WebDriver, so this
+   step needs the app's debug-only file hook (below). Without it the step is **skipped** with a
+   `::warning::`.
+   - It picks `tests/data/m5/basic.csv` with `file_pick_open` (the hook returns its read
+     handle), previews it with `import_preview` (the seven column names must match the file)
+     and imports it with `import_run` into a new table `public.m5_t_e2e_<token>` (create mode,
+     primary key `id`, one transaction, stop at the first row issue). The import's `Channel`
+     events must end with `finished`, every row committed and none skipped; a `SELECT count(*)`
+     through IPC must find the five rows.
+   - It runs `SELECT * FROM public.m5_t_e2e_<token> ORDER BY id` with `query_run` (the run a
+     result grid shows), picks a save target with `file_pick_save` and exports that result with
+     `export_run` (`{"type": "result", ...}`, CSV with the default options). The export must end
+     with `finished` and five rows.
+   - It reads the written file from disk and compares it with the source: the same header, five
+     rows, and `id`, `name`, `amount` (exact decimal text), `born`, `active` and `note` equal,
+     where text starting with `=`, `+`, `-`, `@`, tab or CR carries the formula guard's leading
+     `'` (`=1+1` becomes `'=1+1`, `@SUM(A1)` becomes `'@SUM(A1)`).
+   - Finally it drops its table, also when the step fails.
+   - Until the M5 streams are merged, a failure of this step is also reported as a skip with a
+     warning. With `OXBASE_E2E_REQUIRE_M5=1` (the integrator sets it once the app, services,
+     read and write streams are merged) a skip or a failure fails the run.
+
+### The M5 file hook (app stream)
+
+What the test expects from the app, in **debug builds only** (`#[cfg(debug_assertions)]`, so a
+release build has neither the code nor the flag):
+
+- The app accepts the command-line argument `--e2e-file-dir=<absolute directory>`.
+- With it, `file_pick_open` shows no dialog and returns a read handle for the single regular
+  file in `<dir>/open/` (an error when there is not exactly one), and `file_pick_save` shows no
+  dialog and returns a write handle for `<dir>/save/<defaultName>` (`defaultName` validated as
+  always). Handles, their rules and every other command stay as they are.
+- The webview still never sends a path: the folder comes from the process arguments, which
+  only the test runner sets (through `tauri-driver`'s `tauri:options.args`).
+
+The test looks for the text `--e2e-file-dir` in the app binary. Only when it is there does it
+create `<OXBASE_E2E_OUT>/m5-files/{open,save}`, copy the sample into `open/` and start the app
+with the argument, so builds without the hook start exactly as before.
 
 How the test finds things in the UI: it first looks for a `data-testid`, then falls back to
 the M2 markup, so it works both before and after the app adds its test ids. The test ids are
@@ -76,9 +115,9 @@ listed in `HOOKS` at the top of `smoke.mjs`:
 
 The test reads grid cells from the accessibility table that Glide Data Grid renders inside its
 canvas (`table[role=grid]`). For timing, it wraps `window.fetch` for `ipc:` requests (Tauri 2
-sends commands that way). The wrapper does not change the requests or their results. The app
-has no test-only code path. The only setup is a temporary config directory with one saved
-profile.
+sends commands that way). The wrapper does not change the requests or their results. Apart
+from the debug-only M5 file hook above, the app has no test-only code path. The only setup is a
+temporary config directory with one saved profile (and, with the hook, the `m5-files` folder).
 
 ## Run it locally (Linux)
 

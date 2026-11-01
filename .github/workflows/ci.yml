@@ -253,6 +253,65 @@ jobs:
         if: always()
         run: bash scripts/ci-fixtures.sh down
 
+  # M5 exit check (docs/m5-contracts.md §9): a generated 1.24 GB CSV imported into PostgreSQL
+  # and MySQL with checksum, progress cadence, RSS bound and a cancel within 2 s; prints rows/s
+  # and MB/s (crates/oxbase-services/tests/import_perf.rs). A release-like build (`--profile
+  # perf`) and only the two fixtures it needs. Full lane, plus the fast lane of the perf and
+  # integration branches (wip/*-perf, wip/*-integrate). Until the read / services / load streams
+  # are merged the test reports "pending" and passes; OXBASE_REQUIRE_M5_PERF=1 (integration)
+  # makes that a failure.
+  import-perf:
+    name: Import perf (1 GB CSV)
+    if: >-
+      !startsWith(github.ref, 'refs/heads/wip/')
+      || endsWith(github.ref, '-perf')
+      || endsWith(github.ref, '-integrate')
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      OXBASE_PERF_DIR: ${{ runner.temp }}/m5-perf
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: perf
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # Compile before the containers start (same reason as the conformance job).
+      - name: Build the import perf test (perf profile)
+        run: cargo test -p oxbase-services --profile perf --locked --test import_perf --no-run
+
+      - name: Generate fixture TLS PKI and SSH keys
+        run: bash scripts/fixtures-certs.sh
+
+      - name: Start the PostgreSQL and MySQL fixtures
+        run: bash scripts/ci-fixtures.sh up postgres mysql
+
+      - name: Disk before the import
+        run: df -h / "$RUNNER_TEMP"
+
+      - name: 1 GB CSV import (PostgreSQL, MySQL)
+        run: cargo test -p oxbase-services --profile perf --locked --test import_perf -- --include-ignored --test-threads 1 --nocapture
+
+      - name: Delete the generated CSV
+        if: always()
+        run: |
+          df -h / "$RUNNER_TEMP"
+          rm -rf "$OXBASE_PERF_DIR"
+
+      - name: Dump fixture logs
+        if: failure()
+        run: bash scripts/ci-fixtures.sh logs postgres mysql
+
+      - name: Tear down database fixtures
+        if: always()
+        run: bash scripts/ci-fixtures.sh down
+
   # The built app driven through its real webview (docs/m3-contracts.md §9, ui/e2e/README.md):
   # a debug app serving ui/dist, tauri-driver in front of WebKitWebDriver under Xvfb, the
   # PostgreSQL fixture only. Full lane, plus the fast lane of the e2e, app and integration
