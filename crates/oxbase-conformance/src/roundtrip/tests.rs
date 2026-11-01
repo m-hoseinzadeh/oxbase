@@ -364,7 +364,7 @@ async fn values(conn: &dyn Connection, cancel: &CancellationToken) -> Option<Str
 #[tokio::test]
 async fn run_script_follows_phases_captures_and_checks() {
     let tmp = tempfile::tempdir().unwrap();
-    let (_ctx, s) = sqlite_session(tmp.path()).await;
+    let (_ctx, s) = Box::pin(sqlite_session(tmp.path())).await;
     let conn = s.connection().as_ref();
     let cancel = CancellationToken::new();
     exec(conn, "CREATE TABLE t (a INTEGER)", &[], &cancel)
@@ -1047,7 +1047,7 @@ path = \"target/conformance/lite_nom3-unused.sqlite\"
 #[tokio::test]
 async fn stale_scratch_tables_are_dropped_by_age() {
     let tmp = tempfile::tempdir().unwrap();
-    let (_ctx, s) = sqlite_session(tmp.path()).await;
+    let (_ctx, s) = Box::pin(sqlite_session(tmp.path())).await;
     let conn = s.connection().as_ref();
     let cancel = CancellationToken::new();
     let reg = adapter::registry();
