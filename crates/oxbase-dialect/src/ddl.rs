@@ -14,12 +14,19 @@ use oxbase_types::{Rename, ServerVersion, TableDef, TriggerDef};
 /// - `renames`: objects the designer renamed (`old` → `new`). A table `alter` renames first,
 ///   then compares and changes the renamed objects; a name that changed without a rename entry
 ///   is a drop plus an add.
+/// - `exact_values` (M5): the table is made to hold data copied from elsewhere (an import's new
+///   table, a SQL dump's `CREATE`). Columns without a native type then get a declaration that
+///   keeps every value exactly where the engine's usual one would not, with a script warning
+///   (SQLite: decimals of more than 15 digits as `DECIMAL_TEXT(p,s)`, which has `TEXT`
+///   affinity; a `DECIMAL` column has `NUMERIC` affinity and keeps about 15 significant
+///   digits). The designer leaves it off.
 #[derive(Debug, Clone, Copy)]
 pub struct DdlContext<'a> {
     pub version: &'a ServerVersion,
     pub table: Option<&'a TableDef>,
     pub triggers: &'a [TriggerDef],
     pub renames: &'a [Rename],
+    pub exact_values: bool,
 }
 
 impl<'a> DdlContext<'a> {
@@ -30,7 +37,15 @@ impl<'a> DdlContext<'a> {
             table: None,
             triggers: &[],
             renames: &[],
+            exact_values: false,
         }
+    }
+
+    /// Builder: column types that keep copied values exactly (`exact_values`).
+    #[must_use]
+    pub fn with_exact_values(mut self) -> Self {
+        self.exact_values = true;
+        self
     }
 
     /// Builder: the owning table as it is now.

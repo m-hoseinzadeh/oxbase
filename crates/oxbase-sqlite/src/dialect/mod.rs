@@ -1,6 +1,7 @@
 //! SQLite dialect cells: the object-tree layout, the [`Fetcher`]s, [`Capabilities`] and
 //! [`Quoting`] (M2); the [`DdlGenerator`] and [`Comparator`] of the table designer and the
-//! [`DmlWriter`] of grid editing (M3).
+//! [`DmlWriter`] of grid editing (M3); the import [`SqliteBulkLoader`] (M5, batched multi-row
+//! `INSERT`s in the import's transaction).
 //!
 //! Call [`register`] once on the app's [`DialectRegistry`] (`oxbase_services::default_dialects`
 //! does).
@@ -52,6 +53,7 @@
 //!   read-back `SELECT` (`last_insert_rowid()` for new rows); a rowid table without a key may be
 //!   edited by its `rowid` (see the `dml` module docs).
 
+mod bulk;
 mod caps;
 mod catalog;
 mod compare;
@@ -70,6 +72,7 @@ use oxbase_dialect::{
 };
 use oxbase_types::{Engine, ObjectKind, PropId, ServerVersion, props};
 
+pub use bulk::SqliteBulkLoader;
 pub use caps::designer_capabilities;
 pub use compare::SqliteRules;
 pub use ddl::{REBUILD_SUFFIX, SqliteDdl};
@@ -226,6 +229,8 @@ pub fn register(reg: &mut DialectRegistry) {
         .register_capabilities(engine, Arc::new(SqliteCapabilities))
         .register_quoting(engine, quoting)
         .register_dml_writer(engine, dml)
+        // M5: import bulk loads as batched multi-row INSERTs (bulk.rs).
+        .register_bulk_loader(engine, Arc::new(SqliteBulkLoader::new()))
         .mark_not_applicable_except(engine, APPLICABLE);
 }
 

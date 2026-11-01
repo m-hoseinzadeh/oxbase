@@ -23,6 +23,9 @@ arrow-schema.workspace = true
 async-trait.workspace = true
 futures.workspace = true
 tokio-util.workspace = true
+# M5: `cell_value` (Arrow cell → Value: dates, times, UUIDs).
+chrono.workspace = true
+uuid.workspace = true
 # mpsc channel behind `ProgressSink`; also the timer used by the mock.
 tokio.workspace = true
 

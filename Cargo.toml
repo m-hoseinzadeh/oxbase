@@ -154,6 +154,19 @@ arrow-ipc = "60.1.0"
 # M2: `concat_batches` for result pages that span stored batches (oxbase-services).
 arrow-select = "60.1.0"
 
+# --- M5 import / export (oxbase-io; docs/m5-contracts.md §11) ---
+# arrow-json and parquet stay on the arrow major above (60).
+arrow-json = "60.1.0"
+arrow-cast = "60.1.0"
+parquet = { version = "60.1.0", default-features = false, features = ["arrow", "snap", "lz4", "zstd", "brotli", "flate2-rust_backend"] }
+csv = "1.4.0"
+encoding_rs = "0.8.44"
+calamine = { version = "0.37.0", features = ["dates"] }
+rust_xlsxwriter = { version = "0.102.0", features = ["constant_memory", "chrono"] }
+# XLSX zip entries are inspected before calamine opens them (decompressed-size caps). Same
+# version and features as calamine's own dependency, so the lockfile gains no crate.
+zip = { version = "9.2.1", default-features = false, features = ["deflate"] }
+
 # --- observability ---
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
@@ -238,3 +251,10 @@ codegen-units = 16
 # exactly or the own TDS decoder (docs/m4-contracts.md §11) replaces tiberius.
 [patch.crates-io]
 tiberius = { path = "vendor/tiberius" }
+
+# M5: the 1 GB import exit check (docs/m5-contracts.md §9) runs optimized, without the slow
+# fat LTO link: `cargo test -p oxbase-services --profile perf --test import_perf`.
+[profile.perf]
+inherits = "release"
+lto = false
+codegen-units = 16

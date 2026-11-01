@@ -18,9 +18,14 @@ async-trait.workspace = true
 # M3: DesignerCapabilities (sent to the UI) and JSON values in PropertyDiffs.
 serde.workspace = true
 serde_json.workspace = true
+# M5: the BulkLoader role (load batches, generic multi-row INSERT loader).
+arrow-array.workspace = true
+arrow-schema.workspace = true
+futures.workspace = true
+# M5 integration: SQL dump date-time literals (`dump`).
+chrono.workspace = true
 
 [dev-dependencies]
-arrow-array.workspace = true
 oxbase-driver = { workspace = true, features = ["mock"] }
 pretty_assertions.workspace = true
 tokio.workspace = true

@@ -42,6 +42,8 @@ arrow-select.workspace = true
 async-trait.workspace = true
 futures.workspace = true
 tempfile.workspace = true
+# M5: import / export (file readers and writers, bulk loaders through oxbase-dialect).
+oxbase-io.workspace = true
 
 [dev-dependencies]
 oxbase-driver = { workspace = true, features = ["mock"] }

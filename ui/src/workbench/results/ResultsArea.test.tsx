@@ -157,4 +157,25 @@ describe("ResultsArea", () => {
     expect(screen.getByRole("tab", { name: "Messages" })).toHaveAttribute("aria-selected", "true");
     expect(screen.getByText("Run a query to see its results here.")).toBeInTheDocument();
   });
+
+  it("offers to export every row of the shown result once the run has ended", () => {
+    const onExport = vi.fn();
+    let run = apply(runReducer(IDLE_RUN, { type: "start", script: "SELECT 1" }), [
+      { type: "started", runId: "run-4", statements: [SPAN] },
+      resultSet(0),
+      { type: "rows", resultIndex: 0, totalSoFar: 10 },
+    ]);
+    const { rerender } = render(<ResultsArea run={run} onExport={onExport} />);
+    const button = screen.getByRole("button", { name: "Export…" });
+    expect(button).toBeDisabled();
+    run = apply(run, [
+      { type: "resultDone", resultIndex: 0, totalRows: 10, truncated: false },
+      { type: "finished", elapsedMs: 3 },
+    ]);
+    rerender(<ResultsArea run={run} onExport={onExport} />);
+    fireEvent.click(screen.getByRole("button", { name: "Export…" }));
+    expect(onExport).toHaveBeenCalledWith(
+      expect.objectContaining({ resultIndex: 0, rowCount: 10 }),
+    );
+  });
 });

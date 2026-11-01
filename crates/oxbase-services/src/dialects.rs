@@ -135,4 +135,22 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn every_sql_engine_registers_its_native_bulk_loader() {
+        // M5 integration (docs/m5-contracts.md §1, §4.4): no SQL engine falls back to the
+        // generic `InsertLoader`.
+        let reg = default_dialects();
+        for engine in [
+            Engine::Postgres,
+            Engine::MySql,
+            Engine::MariaDb,
+            Engine::Sqlite,
+            Engine::MsSql,
+        ] {
+            assert!(reg.has_bulk_loader(engine), "{engine}");
+        }
+        assert!(!reg.has_bulk_loader(Engine::MongoDb));
+        assert!(!reg.has_bulk_loader(Engine::Redis));
+    }
 }

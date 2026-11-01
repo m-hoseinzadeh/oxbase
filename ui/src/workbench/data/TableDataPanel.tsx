@@ -40,6 +40,7 @@ import {
 } from "../../api";
 import { Modal } from "../../components/Modal";
 import { toCommandError } from "../../connections/api";
+import { useConnections } from "../../connections/store";
 import { openTableDesigner } from "../layout";
 import { ResultPager } from "../results/pager";
 import { timedQueryPage } from "../results/perf";
@@ -52,6 +53,7 @@ import {
   singleRow,
 } from "../results/rowSelection";
 import { IDLE_RUN, isActive, rowCountLabel, runReducer } from "../results/runState";
+import { openExport } from "../transfer/store";
 import { CellEditor } from "./CellEditor";
 import {
   type AppliedState,
@@ -127,6 +129,7 @@ function plural(n: number, one: string, many: string): string {
 }
 
 export function TableDataPanel({ editorId, sessionId, table }: TableDataParams) {
+  const engine = useConnections().sessions.find((s) => s.id === sessionId)?.engine;
   const [caps, setCaps] = useState<EngineCapabilities | null>(null);
   const [run, dispatch] = useReducer(runReducer, IDLE_RUN);
   const [draft, setDraft] = useState<FilterDraft>(emptyDraft);
@@ -312,6 +315,20 @@ export function TableDataPanel({ editorId, sessionId, table }: TableDataParams) 
 
   function refresh() {
     guardPending(() => void open(query), "Refreshing");
+  }
+
+  /** Exports every row of the table with the applied filter and sort (not only the grid's). */
+  function exportTable() {
+    openExport({
+      source: {
+        type: "table",
+        session: sessionId,
+        query: { table, ...(query.filter ? { filter: query.filter } : {}), sort: query.sort },
+      },
+      ...(engine ? { engine } : {}),
+      label: `${table.kind === "table" ? "Table" : "View"} ${qualified(table)}${query.filter || query.sort.length > 0 ? " (filtered and sorted as shown)" : ""}`,
+      baseName: table.name,
+    });
   }
 
   function stop() {
@@ -738,6 +755,14 @@ export function TableDataPanel({ editorId, sessionId, table }: TableDataParams) 
           disabled={table.kind !== "table"}
         >
           Design
+        </button>
+        <button
+          type="button"
+          className="button"
+          onClick={exportTable}
+          title="Export every row with the filter and sort applied here"
+        >
+          Export…
         </button>
         <span
           className="query-editor__status"

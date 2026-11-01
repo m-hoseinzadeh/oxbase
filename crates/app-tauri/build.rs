@@ -37,6 +37,17 @@ const COMMANDS: &[&str] = &[
     "designer_preview",
     "designer_apply",
     "capabilities_get",
+    // M5 file handles (src/files.rs): native dialogs shown from Rust.
+    "file_pick_open",
+    "file_pick_save",
+    "file_release",
+    // M5 import and export (src/transfer.rs).
+    "import_preview",
+    "import_plan",
+    "import_run",
+    "import_cancel",
+    "export_run",
+    "export_cancel",
 ];
 
 fn main() {

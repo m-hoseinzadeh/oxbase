@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use oxbase_types::{Engine, Error, ObjectKind, Result, ServerVersion};
 
+use crate::bulk::{BulkLimits, BulkLoader, InsertLoader};
 use crate::{Capabilities, Comparator, DdlGenerator, DmlWriter, Fetcher, Quoting, TreeLayout};
 
 /// The kinds the M3 table designer and the round-trip conformance cells need a
@@ -220,6 +221,9 @@ struct EngineEntry {
     /// M2: the object-tree layout. Not an [`EngineRole`]: it is data, not a matrix role, so the
     /// conformance matrix does not change.
     tree: Option<Arc<TreeLayout>>,
+    /// M5: the import bulk loader. Not an [`EngineRole`] either: an engine without one falls
+    /// back to the generic [`InsertLoader`] (see [`DialectRegistry::bulk_loader`]).
+    bulk: Option<Arc<dyn BulkLoader>>,
 }
 
 /// Holds every dialect implementation, keyed by (engine, object kind) for per-kind roles and by
@@ -257,6 +261,15 @@ struct EngineEntry {
 /// SQLite, and from M4 for SQL Server (`oxbase_mssql::dialect::register`). Services resolve `(engine, Table) → DdlGenerator / Comparator` for the designer and
 /// `engine → DmlWriter / Quoting` for grid edits; a missing role is `Error::Unsupported`, which
 /// the UI shows as "read-only on this engine".
+///
+/// # Registration (M5)
+///
+/// Each SQL engine's `register` also adds its [`BulkLoader`]
+/// ([`DialectRegistry::register_bulk_loader`]; `docs/m5-contracts.md` §4): PostgreSQL `COPY`,
+/// MySQL / MariaDB the multi-row [`InsertLoader`] with their limits, SQLite prepared inserts,
+/// SQL Server TDS bulk load. Until an engine does, [`DialectRegistry::bulk_loader`] hands out
+/// an [`InsertLoader`] built from its [`Quoting`] and [`BulkLimits::for_engine`], so import
+/// works on every engine with a `Quoting`.
 #[derive(Default, Clone)]
 pub struct DialectRegistry {
     cells: HashMap<(Engine, ObjectKind), Cell>,
@@ -325,6 +338,16 @@ impl DialectRegistry {
 
     pub fn register_dml_writer(&mut self, engine: Engine, dml: Arc<dyn DmlWriter>) -> &mut Self {
         self.engine_mut(engine).dml = Some(dml);
+        self
+    }
+
+    /// Registers the import bulk loader of `engine` (M5), replacing an earlier one.
+    pub fn register_bulk_loader(
+        &mut self,
+        engine: Engine,
+        loader: Arc<dyn BulkLoader>,
+    ) -> &mut Self {
+        self.engine_mut(engine).bulk = Some(loader);
         self
     }
 
@@ -411,6 +434,27 @@ impl DialectRegistry {
             .get(&engine)
             .and_then(|e| e.dml.clone())
             .ok_or_else(|| Self::missing_engine(engine, EngineRole::DmlWriter))
+    }
+
+    /// The import bulk loader of `engine` (M5): the registered one, else an [`InsertLoader`]
+    /// over the engine's [`Quoting`] with [`BulkLimits::for_engine`]. `Error::Unsupported` when
+    /// the engine has neither (no SQL).
+    pub fn bulk_loader(&self, engine: Engine) -> Result<Arc<dyn BulkLoader>> {
+        if let Some(loader) = self.engines.get(&engine).and_then(|e| e.bulk.clone()) {
+            return Ok(loader);
+        }
+        let quoting = self.quoting(engine).map_err(|_| {
+            Error::unsupported(format!("{} cannot import rows", engine.display_name()))
+        })?;
+        Ok(Arc::new(InsertLoader::new(
+            quoting,
+            BulkLimits::for_engine(engine),
+        )))
+    }
+
+    /// `true` when `engine` registered a [`BulkLoader`] of its own (not the fallback).
+    pub fn has_bulk_loader(&self, engine: Engine) -> bool {
+        self.engines.get(&engine).is_some_and(|e| e.bulk.is_some())
     }
 
     /// The object-tree layout of `engine`; `Error::Unsupported` when none is registered.

@@ -2,7 +2,9 @@
 
 use std::fmt::Write as _;
 
-use oxbase_types::{ObjectKind, ObjectRef, Value};
+use oxbase_types::{ColumnDef, ObjectKind, ObjectRef, Value};
+
+use crate::dump::{DumpLiteral, DumpSession, IdentityInsert, push_datetime, push_time};
 
 /// Lexical rules the expression check ([`crate::sql::check_expression`]) needs to find where
 /// strings and quoted identifiers end on an engine.
@@ -30,7 +32,9 @@ pub struct LexRules {
 /// The provided methods follow standard SQL; engines override what differs. M3 added
 /// [`Quoting::placeholder`], [`Quoting::text_cast`], [`Quoting::nulls_ordering`],
 /// [`Quoting::like_specials`], [`Quoting::limit_clause`] and [`Quoting::lex_rules`], all with
-/// defaults. M4 added [`Quoting::top_clause`] (SQL Server `SELECT TOP (n)`).
+/// defaults. M4 added [`Quoting::top_clause`] (SQL Server `SELECT TOP (n)`). M5 added the SQL
+/// dump rules [`Quoting::dump_session`], [`Quoting::dump_literal`] and
+/// [`Quoting::dump_identity_insert`] (types in [`crate::dump`]).
 pub trait Quoting: Send + Sync {
     /// Quotes an identifier unconditionally, escaping embedded quote characters.
     fn quote_ident(&self, ident: &str) -> String;
@@ -141,6 +145,29 @@ pub trait Quoting: Send + Sync {
     fn lex_rules(&self) -> LexRules {
         LexRules::default()
     }
+
+    /// Statements a SQL dump of literal rows (M5) writes before everything else and after its
+    /// last statement, so the session reads the literals as this dialect writes them. `zoned`:
+    /// the dump writes timestamps with a time zone. Default: none.
+    fn dump_session(&self, zoned: bool) -> DumpSession {
+        let _ = zoned;
+        DumpSession::default()
+    }
+
+    /// `v` as a SQL dump literal (M5): [`Quoting::literal`] by default. Engines override the
+    /// forms their server does not read back exactly (date-times on MySQL / MariaDB and SQL
+    /// Server, decimals in SQLite `TEXT` columns).
+    fn dump_literal(&self, v: &Value) -> DumpLiteral {
+        DumpLiteral::exact(self.literal(v))
+    }
+
+    /// What a dump's `INSERT`s into `table` (already qualified with this quoting) need when
+    /// they write the values of `columns` (the written columns), some of which may be identity
+    /// or auto-increment columns. Default: nothing.
+    fn dump_identity_insert(&self, table: &str, columns: &[&ColumnDef]) -> IdentityInsert {
+        let _ = (table, columns);
+        IdentityInsert::default()
+    }
 }
 
 /// The default [`Quoting::qualify`]: the parts of `obj` that are set, each quoted with `q`,
@@ -225,12 +252,24 @@ impl Quoting for AnsiQuoting {
             ..LexRules::default()
         }
     }
+
+    /// Like [`Quoting::literal`], but decimals are quoted strings: SQLite reads an unquoted
+    /// number as a double before the column's affinity applies, so a `TEXT`-affinity decimal
+    /// column (the SQLite `DdlGenerator`'s `DECIMAL_TEXT`) would lose the digits past about 15.
+    /// Standard SQL converts the string to a numeric column's type.
+    fn dump_literal(&self, v: &Value) -> DumpLiteral {
+        match v {
+            Value::Decimal(d) => DumpLiteral::exact(self.quote_str(d)),
+            other => DumpLiteral::exact(self.literal(other)),
+        }
+    }
 }
 
 /// PostgreSQL quoting: like [`AnsiQuoting`], but bytes render as `'\xcafe'::bytea`.
 ///
-/// The `'\x..'` form relies on `standard_conforming_strings = on` (the default since 9.1), where a
-/// backslash in a plain string literal is an ordinary character.
+/// The `'\x..'` form and the plain string literals rely on `standard_conforming_strings = on`
+/// (the default since 9.1), where a backslash in a plain string literal is an ordinary
+/// character; SQL dumps set it first ([`Quoting::dump_session`]).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PgQuoting;
 
@@ -266,13 +305,40 @@ impl Quoting for PgQuoting {
             other => AnsiQuoting.literal(other),
         }
     }
+
+    /// `SET standard_conforming_strings = on` first: the literals are standard strings (a
+    /// backslash is an ordinary character, `'\x..'` bytes), and a session where the setting
+    /// is off (`ALTER DATABASE / ROLE ... SET`, `PGOPTIONS`, an old server configuration) would
+    /// read a backslash as an escape, so text ending in `\` could end the string early. Not
+    /// restored: `on` is the server default since 9.1.
+    fn dump_session(&self, zoned: bool) -> DumpSession {
+        let _ = zoned;
+        DumpSession {
+            prologue: vec!["SET standard_conforming_strings = on".to_owned()],
+            epilogue: Vec::new(),
+        }
+    }
+
+    /// `OVERRIDING SYSTEM VALUE` when a written column is a `GENERATED ALWAYS` identity (the
+    /// server refuses explicit values otherwise).
+    fn dump_identity_insert(&self, table: &str, columns: &[&ColumnDef]) -> IdentityInsert {
+        let _ = table;
+        let always = columns
+            .iter()
+            .any(|c| c.identity.as_ref().is_some_and(|i| i.always));
+        IdentityInsert {
+            overriding: always.then(|| "OVERRIDING SYSTEM VALUE".to_owned()),
+            ..IdentityInsert::default()
+        }
+    }
 }
 
 /// MySQL / MariaDB quoting: `` `ident` ``, and backslashes escaped in string literals (the
 /// default `sql_mode` treats `\` as an escape character).
 ///
 /// Under `sql_mode` `NO_BACKSLASH_ESCAPES` this escaping doubles every backslash in the stored
-/// data. Use bind parameters for data, or check the session's `sql_mode` before inlining.
+/// data. Use bind parameters for data, or check the session's `sql_mode` before inlining; SQL
+/// dumps turn the mode off for their statements ([`Quoting::dump_session`]).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct BacktickQuoting;
 
@@ -310,6 +376,54 @@ impl Quoting for BacktickQuoting {
         }
         out.push('\'');
         out
+    }
+
+    /// Saved and restored around the dump: `sql_mode` without `NO_BACKSLASH_ESCAPES` (the
+    /// literals escape backslashes and NULs), `SET NAMES utf8mb4` (the file is UTF-8) and,
+    /// with `zoned`, `time_zone = '+00:00'` (timestamps with a zone are written as UTC
+    /// wall-clock times, which a `TIMESTAMP` column reads in the session's zone).
+    fn dump_session(&self, zoned: bool) -> DumpSession {
+        let mut prologue = vec![
+            "SET @oxbase_sql_mode = @@session.sql_mode".to_owned(),
+            "SET sql_mode = TRIM(BOTH ',' FROM REPLACE(CONCAT(',', @@session.sql_mode, ','), \
+             ',NO_BACKSLASH_ESCAPES,', ','))"
+                .to_owned(),
+            "SET @oxbase_character_set_client = @@session.character_set_client".to_owned(),
+            "SET @oxbase_character_set_results = @@session.character_set_results".to_owned(),
+            "SET @oxbase_collation_connection = @@session.collation_connection".to_owned(),
+            "SET NAMES utf8mb4".to_owned(),
+        ];
+        let mut epilogue = Vec::new();
+        if zoned {
+            prologue.push("SET @oxbase_time_zone = @@session.time_zone".to_owned());
+            prologue.push("SET time_zone = '+00:00'".to_owned());
+            epilogue.push("SET time_zone = @oxbase_time_zone".to_owned());
+        }
+        epilogue.extend([
+            "SET character_set_client = @oxbase_character_set_client".to_owned(),
+            "SET character_set_results = @oxbase_character_set_results".to_owned(),
+            "SET collation_connection = @oxbase_collation_connection".to_owned(),
+            "SET sql_mode = @oxbase_sql_mode".to_owned(),
+        ]);
+        DumpSession { prologue, epilogue }
+    }
+
+    /// Date-times without an offset (MariaDB never reads one, MySQL not before 8.0.19), at
+    /// most 6 fractional digits: timestamps with a zone as their UTC wall-clock time (the dump
+    /// sets `time_zone = '+00:00'`, see [`Quoting::dump_session`]).
+    fn dump_literal(&self, v: &Value) -> DumpLiteral {
+        const DIGITS: u32 = 6;
+        let mut text = String::new();
+        let cut = match v {
+            Value::Timestamp(t) => push_datetime(t, ' ', DIGITS, &mut text),
+            Value::TimestampTz(t) => push_datetime(&t.naive_utc(), ' ', DIGITS, &mut text),
+            Value::Time(t) => push_time(*t, DIGITS, &mut text),
+            other => return DumpLiteral::exact(self.literal(other)),
+        };
+        DumpLiteral {
+            sql: self.quote_str(&text),
+            cut_to: cut.then_some(DIGITS),
+        }
     }
 }
 
@@ -384,6 +498,52 @@ impl Quoting for BracketQuoting {
                     lit
                 }
             }
+        }
+    }
+
+    /// Date-times with at most 7 fractional digits. A string converted to `datetime` may have
+    /// at most 3 (the driver reads `datetime` ticks as `…00.003333`) and `yyyy-mm-dd` follows
+    /// `DATEFORMAT` there, so timestamps without a zone are
+    /// `CAST(N'yyyy-mm-ddThh:mm:ss.fffffff' AS datetime2(7))`, which converts to every
+    /// date-time column type with rounding; timestamps with a zone keep their offset.
+    fn dump_literal(&self, v: &Value) -> DumpLiteral {
+        const DIGITS: u32 = 7;
+        let mut text = String::new();
+        let (cut, cast) = match v {
+            Value::Timestamp(t) => (push_datetime(t, 'T', DIGITS, &mut text), true),
+            Value::TimestampTz(t) => {
+                let cut = push_datetime(&t.naive_local(), 'T', DIGITS, &mut text);
+                text.push_str(&t.offset().to_string());
+                (cut, false)
+            }
+            Value::Time(t) => (push_time(*t, DIGITS, &mut text), false),
+            other => return DumpLiteral::exact(self.literal(other)),
+        };
+        let quoted = self.quote_str(&text);
+        DumpLiteral {
+            sql: if cast {
+                format!("CAST({quoted} AS datetime2(7))")
+            } else {
+                quoted
+            },
+            cut_to: cut.then_some(DIGITS),
+        }
+    }
+
+    /// `SET IDENTITY_INSERT <table> ON` / `OFF` around the inserts when a written column is an
+    /// identity (or auto-increment) column.
+    fn dump_identity_insert(&self, table: &str, columns: &[&ColumnDef]) -> IdentityInsert {
+        if columns
+            .iter()
+            .any(|c| c.identity.is_some() || c.auto_increment)
+        {
+            IdentityInsert {
+                overriding: None,
+                enable: Some(format!("SET IDENTITY_INSERT {table} ON")),
+                disable: Some(format!("SET IDENTITY_INSERT {table} OFF")),
+            }
+        } else {
+            IdentityInsert::default()
         }
     }
 }

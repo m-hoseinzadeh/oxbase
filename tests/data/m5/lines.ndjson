@@ -1,0 +1,4 @@
+{"id": 1, "name": "a", "nested": {"x": 1}}
+{"id": 2, "name": "b", "nested": [1, {"y": 2}]}
+
+{"id": 3, "name": null}

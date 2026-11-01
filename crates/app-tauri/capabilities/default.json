@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Main window. Grants exactly the app commands the UI calls (each declared in build.rs) and the dialog plugin's file-open picker (SQLite database, TLS certificate and key, SSH key files). No other core or plugin permission is granted.",
+  "description": "Main window. Grants exactly the app commands the UI calls (each declared in build.rs) and the dialog plugin's file-open picker (SQLite database, TLS certificate and key, SSH key files). Import and export files are picked by native dialogs shown from Rust (file_pick_open / file_pick_save return opaque handles), so they need no dialog, fs or shell permission here. No other core or plugin permission is granted.",
   "windows": [
     "main"
   ],
@@ -37,6 +37,15 @@
     "allow-designer-preview",
     "allow-designer-apply",
     "allow-capabilities-get",
+    "allow-file-pick-open",
+    "allow-file-pick-save",
+    "allow-file-release",
+    "allow-import-preview",
+    "allow-import-plan",
+    "allow-import-run",
+    "allow-import-cancel",
+    "allow-export-run",
+    "allow-export-cancel",
     "dialog:allow-open"
   ]
 }

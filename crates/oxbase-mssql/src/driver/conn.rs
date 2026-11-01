@@ -489,6 +489,12 @@ impl Connection for MsSqlConnection {
         }))
     }
 
+    /// M5: the bulk loader of this crate binds typed parameters on the session
+    /// ([`ParamSession`]).
+    fn as_any(&self) -> Option<&(dyn std::any::Any + Send + Sync)> {
+        Some(self)
+    }
+
     async fn close(&self) -> Result<()> {
         // A running statement is cancelled first; its task releases the session when done.
         self.shared.cancel_running();
@@ -553,6 +559,48 @@ impl Tx for MsSqlTx {
     async fn rollback(self: Box<Self>) -> Result<()> {
         self.finished.store(true, Ordering::SeqCst);
         run_simple(&self.shared, Some(ROLLBACK_SQL)).await
+    }
+
+    /// M5: the bulk loader of this crate binds typed parameters on the transaction's session
+    /// ([`ParamSession`]).
+    fn as_any(&self) -> Option<&(dyn std::any::Any + Send + Sync)> {
+        Some(self)
+    }
+}
+
+// ---- typed parameters (M5 bulk load) ----------------------------------------------------------
+
+/// The session behind an [`MsSqlConnection`] or one of its transactions, for statements whose
+/// parameters the caller declares itself (M5, `docs/m5-contracts.md` §4.3, §13). The bulk
+/// loader of this crate reaches it through `Connection::as_any` / `Tx::as_any`.
+///
+/// [`Connection::execute`] declares each parameter from its `Value`, so a NULL is
+/// `nvarchar(1)` and a decimal `decimal(38, <its scale>)`: the `@params` text of a multi-row
+/// `INSERT` then changes with every NULL pattern, and SQL Server compiles every statement anew.
+/// With one declaration per column the text repeats and the cached plan is reused. Everything
+/// else (session lock, pending rollback, attention-based cancel, errors) is
+/// [`Connection::execute`]'s.
+#[derive(Clone)]
+pub(crate) struct ParamSession(Arc<Shared>);
+
+impl ParamSession {
+    /// The session of `any` when it is an [`MsSqlConnection`] or a transaction of one.
+    pub(crate) fn from_any(any: &(dyn std::any::Any + Send + Sync)) -> Option<Self> {
+        if let Some(conn) = any.downcast_ref::<MsSqlConnection>() {
+            return Some(Self(Arc::clone(&conn.shared)));
+        }
+        any.downcast_ref::<MsSqlTx>()
+            .map(|tx| Self(Arc::clone(&tx.shared)))
+    }
+
+    /// Runs `sql` through `sp_executesql` with `params` as declared (`@P1 ... @Pn`).
+    pub(crate) async fn execute(
+        &self,
+        sql: &str,
+        params: Vec<Param>,
+        cancel: CancellationToken,
+    ) -> Result<ResultStream> {
+        execute_params(&self.0, sql, params, cancel).await
     }
 }
 
@@ -620,6 +668,19 @@ async fn execute(
         return Err(Error::Cancelled);
     }
     let params = params.iter().map(to_param).collect::<Result<Vec<_>>>()?;
+    execute_params(shared, sql, params, cancel).await
+}
+
+/// [`execute`] with parameters already converted (and declared) by the caller.
+async fn execute_params(
+    shared: &Arc<Shared>,
+    sql: &str,
+    params: Vec<Param>,
+    cancel: CancellationToken,
+) -> Result<ResultStream> {
+    if cancel.is_cancelled() {
+        return Err(Error::Cancelled);
+    }
     let guard = tokio::select! {
         biased;
         () = cancel.cancelled() => return Err(Error::Cancelled),

@@ -52,7 +52,9 @@ pub(crate) fn data_type(decl: &str) -> DataType {
         },
         "BOOLEAN" | "BOOL" => DataType::Bool,
         "REAL" | "DOUBLE" | "DOUBLE PRECISION" | "FLOAT" => DataType::FLOAT64,
-        "NUMERIC" | "DECIMAL" => DataType::Decimal {
+        // `DECIMAL_TEXT`: the exact decimal declaration of tables made for imported data
+        // (`TEXT` affinity, see `ddl::exact_decimal_type`).
+        "NUMERIC" | "DECIMAL" | "DECIMAL_TEXT" => DataType::Decimal {
             precision: first,
             scale: second,
         },
@@ -98,6 +100,28 @@ pub(crate) fn is_rowid_alias_type(decl: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exact_decimals_read_back_as_decimals() {
+        assert_eq!(
+            data_type("DECIMAL_TEXT(38,10)"),
+            DataType::Decimal {
+                precision: Some(38),
+                scale: Some(10)
+            }
+        );
+        assert_eq!(
+            data_type("decimal_text"),
+            DataType::Decimal {
+                precision: None,
+                scale: None
+            }
+        );
+        assert_eq!(
+            crate::convert::affinity(Some("DECIMAL_TEXT(38,10)")),
+            crate::convert::Affinity::Text
+        );
+    }
 
     #[test]
     fn maps_known_names_and_affinities() {

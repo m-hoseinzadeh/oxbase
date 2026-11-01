@@ -5,7 +5,7 @@ React + TypeScript UI. v1 targets PostgreSQL, MySQL, MariaDB, SQLite, SQL Server
 Redis on Linux, macOS and Windows. The core is headless, so every feature also works from
 `oxbase-cli` and from tests. See [PLAN.md](PLAN.md) for the architecture and milestones.
 
-## What works (M4)
+## What works (M5)
 
 On PostgreSQL, MySQL, MariaDB, SQLite and SQL Server (M1 connections: plain, TLS, SSH,
 keychain secrets; SQL Server since M4):
@@ -66,8 +66,28 @@ keychain secrets; SQL Server since M4):
   need a port. `money` is exact: tiberius is vendored with a patched money decoder
   (`vendor/tiberius/OXBASE.md`).
 
-Contracts: [docs/m3-contracts.md](docs/m3-contracts.md) and
-[docs/m4-contracts.md](docs/m4-contracts.md) (SQL Server).
+Contracts: [docs/m3-contracts.md](docs/m3-contracts.md),
+[docs/m4-contracts.md](docs/m4-contracts.md) (SQL Server) and
+[docs/m5-contracts.md](docs/m5-contracts.md) (import and export).
+
+- **Import and export** (M5): CSV / TSV, JSON (array or NDJSON), XLSX and Parquet in both
+  directions, SQL dumps out. **Import** (right-click a table or a database in the tree): pick a
+  file, set the format options (delimiter, encoding with BOM detection, header, NULL texts,
+  date and number formats, sheet), check the preview with inferred column types, map source
+  columns to target columns (skip, rename, change type), choose the target mode (create,
+  append, truncate, delete all, replace; destructive ones need a confirmation), the error
+  policy (stop, or skip up to N bad rows) and the transaction policy, and watch progress
+  (bytes, rows read, inserted, committed, skipped) with Cancel. Rows go through each engine's
+  bulk path: PostgreSQL `COPY FROM STDIN`, MySQL / MariaDB / SQLite / SQL Server multi-row
+  parameterized `INSERT`s sized to the engine's parameter limit (never `LOAD DATA LOCAL
+  INFILE`). The report says what a cancel or failure left in the table. **Export** any table
+  (with its filter and sort), query or result grid (all stored rows, spilled ones included) to
+  CSV, JSON, XLSX (sheets split at 1 048 576 rows), Parquet (Snappy, gzip, Brotli, LZ4, zstd) or
+  a SQL dump for any of the five engines. Files are written to a temporary file and renamed on
+  success, so a failed or cancelled export leaves nothing behind. CSV and XLSX output guards
+  formula-looking text against spreadsheet formula injection (on by default). Files are chosen
+  in native dialogs shown by the Rust side; the UI only holds opaque file handles. Contracts
+  and every deviation: [docs/m5-contracts.md](docs/m5-contracts.md).
 
 ## Layout
 
@@ -88,10 +108,12 @@ crates/
   oxbase-conformance                              cross-engine conformance harness
   app-tauri                                       Tauri 2 shell (no logic)
 ui/                                               React + TS + Vite front end
-tests/fixtures.toml                               test DB connection params and M2-M4 seed object
-                                                  names (single source of truth)
+tests/fixtures.toml                               test DB connection params, M2-M4 seed object
+                                                  names and the M5 import / export expectations
+                                                  (single source of truth)
+tests/data/m5/                                    small hand-written import samples (M5)
 docs/                                             frozen contracts per milestone (m1-contracts.md
-                                                  to m4-contracts.md)
+                                                  to m5-contracts.md)
 ```
 
 ## Prerequisites
@@ -186,6 +208,12 @@ M3 and M4 seeds: `[m3]` names the round-trip scratch tables and the editable see
 `[m2.mssql]`, `[m3.mssql]` and `[m4]` (M4) name the SQL Server seeds (schemas `m2`, `m3`, `m4` of
 `oxbase_test`, applied by the container's entrypoint wrapper), the TLS-only login `oxbase_tls`
 (enforced by a logon trigger) and the SSH target `mssql:1433`; see `docs/m4-contracts.md` §5.
+
+M5 adds no seed objects: import and export tests create and drop scratch tables
+`m5_t_<case>_<token>` (`[m5]`). `[m5.files."<name>"]` lists what each sample in `tests/data/m5`
+must read as (rows, columns, types, values, issues, encodings); XLSX and Parquet samples are
+built at runtime. `[m5.perf]` and `[m5.perf.checksum]` define the 1 GB import exit check, whose
+CSV is generated on the CI runner and never committed (`docs/m5-contracts.md` §8-9).
 
 The scripts only touch the `oxbase-fixtures` project. `OXBASE_FIXTURES_TIMEOUT` (default 300 s) sets
 how long `fixtures-up.sh` waits. CI uses `scripts/ci-fixtures.sh up|logs|down` on the same
@@ -323,6 +351,52 @@ file). CI sets `OXBASE_CONFORMANCE_REQUIRE_M4=1`: the 5-engine guard reported no
   `GO` batch (a `#temp` table across batches, a batch of two `SELECT`s giving two result sets)
   and reports no row counts for plain batches (a known tiberius gap).
 
+### Import and export (M5)
+
+Last verified 2026-11-01 in the M5 integration runs: the numbers below are from the full-lane
+CI run 41330355496 on `milestone/m5` at a424690 (green; its Conformance job passed on the second
+attempt after the SQL Server container stopped at startup on the first, see
+`scripts/ci-fixtures.sh`) and Bundle run 41330357469 on the same commit (green).
+
+The exit check, job **Import perf (1 GB CSV)** (`crates/oxbase-services/tests/import_perf.rs`,
+`--profile perf`): a generated CSV of 10 000 000 rows and 9 columns (integers, text with
+quotes, commas, LF / CRLF, Unicode and formula-looking values, decimals, floats, booleans,
+dates, microsecond timestamps, NULLs), 1 238 093 427 bytes, imported into a new table with a
+commit every 100 000 rows:
+
+| Engine | Method | Time | Rows/s | MB/s | Progress events (max gap) | Peak RSS growth | Checksum | Cancel at ~25% |
+|---|---|---|---|---|---|---|---|---|
+| PostgreSQL 18.6 | `COPY` (text) | 66.7 s | 149 992 | 18.6 | 224 (501 ms / 1.07% of the file) | 24 MiB | equal | `Cancelled` 0 ms after the call; 2 600 000 committed rows in the table, as reported |
+| MySQL 8.4.13 | multi-row `INSERT` | 106.0 s | 94 316 | 11.7 | 517 (286 ms / 0.58%) | 94 MiB | equal | `Cancelled` after 169 ms; 2 500 000 committed rows in the table, as reported |
+
+Limits asserted: progress at most 1.5 s or 1% of the file apart (never over 10 s), RSS growth
+under 512 MiB, cancel within 2 s, and a 20 000-row probe import read back column by column
+before the big run. The checksum (count, sums of `id`, `qty`, amount in cents, count and length
+of the notes) matched on both engines.
+
+Bulk loaders (`bulk_live.rs`, 100 000 rows of every canonical type, read back equal; debug
+build): PostgreSQL `COPY` 0.85 s, MySQL 3.29 s, MariaDB 1.57 s, SQLite 1.60 s, SQL Server
+20.44 s (parameterized multi-row inserts with typed parameters; no TDS bulk load yet, see
+`docs/m5-contracts.md` §13; an import plan into SQL Server says to expect about 4 000 to 7 000
+rows per second). Each loader also passes cancel mid-call (rolled back, nothing left)
+and duplicate-key failure.
+
+Round trips (`oxbase-services` import and export live tests, `OXBASE_SERVICES_REQUIRE_M5_IO=1`):
+on each of PostgreSQL, MySQL, MariaDB, SQLite and SQL Server a 1 000-row table was exported to
+CSV, JSON, XLSX and Parquet, imported again into a new table and compared equal (XLSX to the
+millisecond); the PostgreSQL and SQLite SQL dumps ran against the database and gave the same
+rows, and `oxbase-io`'s live test ran each engine's own dump on PostgreSQL, MySQL, MariaDB and
+SQL Server. Also on every engine: every target mode with one transaction and with batches,
+failure and cancel leaving exactly what §5.2 of the contract says, text fidelity (NULL vs empty,
+astral characters, CR / LF / tab, quotes, backslashes), the skip policy, plan rejections, every
+committed sample file, export of a filtered and sorted table, a query and a 300 000-row result
+spilled to disk, export cancel leaving no file, and no overwrite without permission.
+
+The webview smoke test (job **Webview smoke (Linux)**, with `OXBASE_E2E_REQUIRE_M5=1`) imports
+`tests/data/m5/basic.csv` through the app's IPC into PostgreSQL (`copy_text`, 5 rows), exports
+the query result to CSV and compares every value, using the debug-only `--e2e-file-dir` file
+hook (`ui/e2e/README.md`).
+
 The dialect, driver, tunnel and connection-manager live tests and the keychain tests passed in
 the same CI run, as did the M3 and M4 live tests: the DDL / DML cells of each engine
 (`oxbase-pg` `m3_live` 10, `oxbase-mysql` `m3_live` 19 for MySQL and MariaDB, `oxbase-sqlite`
@@ -439,9 +513,11 @@ value after a reload.
   **Full lane**, on pull requests, pushes to main, weekly and manual runs: fmt + clippy on Linux;
   `cargo test --workspace` on Linux, macOS and Windows; the OS keychain tests
   (`scripts/keychain-tests.sh`) on Linux, macOS and Windows; UI lint, typecheck, test and build;
-  the conformance harness and the M1-M4 live tests against the Docker fixtures; the webview
+  the conformance harness and the M1-M5 live tests against the Docker fixtures; the webview
   smoke test (Linux; also on the fast lane of `wip/*-e2e`, `wip/*-app` and `wip/*-integrate`);
-  `cargo deny` (advisories, bans, licenses, sources).
+  `cargo deny` (advisories, bans, licenses, sources); the `import-perf` job (M5, the 1 GB CSV
+  import exit check, `docs/m5-contracts.md` §9, with `OXBASE_REQUIRE_M5_PERF=1`): full lane,
+  plus the fast lane of `wip/*-perf` and `wip/*-integrate`.
 - `.github/workflows/bundle.yml` (push to main, manual): Tauri dev bundles for Linux x86_64,
   Windows x86_64 and macOS aarch64/x86_64, uploaded as workflow artifacts.
   `scripts/ci-verify-signing.mjs` checks what was produced: `codesign --verify --deep --strict`,
