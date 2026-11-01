@@ -16,6 +16,11 @@
 //!   empty cells NULL. **Formulas are read as their cached value**, never evaluated.
 //! - Progress: compressed bytes of the sheet's XML entry consumed (calamine reads through the
 //!   zip entry), mapped onto the file size; coarse but monotonic.
+//! - Hostile workbooks: before `calamine` opens the file, every XML part it loads whole is
+//!   decompressed and capped (256 MiB each, 512 MiB together; the zip's declared sizes are not
+//!   trusted), the shared-strings `uniqueCount` must fit the part, and the worksheet is scanned
+//!   once for oversized texts, tags and cells (16 MiB). A workbook over a limit is
+//!   `InvalidInput` naming the part.
 //!
 //! # Writing
 //!
@@ -54,8 +59,7 @@ pub fn preview(
     limits: PreviewLimits,
     cancel: &CancellationToken,
 ) -> Result<SourcePreview> {
-    let _ = (path, options, limits, cancel);
-    unimplemented!("m5: read")
+    crate::read::sheet::preview(path, options, limits, cancel)
 }
 
 /// Opens a worksheet for reading (see [`crate::open`]).
@@ -65,8 +69,7 @@ pub fn open(
     columns: &[ColumnSpec],
     batch_rows: usize,
 ) -> Result<Box<dyn SourceReader>> {
-    let _ = (path, options, columns, batch_rows);
-    unimplemented!("m5: read")
+    crate::read::sheet::open(path, options, columns, batch_rows)
 }
 
 /// The XLSX writer over `file` (see [`crate::create_writer`]).
