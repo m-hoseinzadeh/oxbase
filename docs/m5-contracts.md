@@ -650,3 +650,33 @@ Streams record deviations from this file here, with the reason.
   the server has ended the `COPY`, sending cancel requests if that takes more than 200 ms (a
   `COPY` blocked on a lock reads no input). The next statement (the service's `ROLLBACK`) runs
   after that.
+
+**perf** (§9, `crates/oxbase-services/tests/import_perf.rs`, `tests/perf/`):
+
+- The generator writes the `csv` crate's `QuoteStyle::Necessary` form itself (byte-identical for
+  these values) instead of using the crate, so `oxbase-services` needs no new dev-dependency.
+  Fragments of `note` are fixed in `perf/generator.rs`; 10 000 000 rows are 1 238 093 427 bytes.
+- Before the big run each engine gets a 20 000-row probe import (create, one transaction) with
+  the checksum, so a conversion bug fails in seconds. `m5_perf_cancel` is pre-created by
+  importing a header-only file (create mode) rather than by engine DDL in the test.
+- Stricter than §9.2: the probe table is read back ordered by `id` and every column of every
+  row must equal the generator's value (the six checksum numbers alone cannot see NULL vs 0,
+  `code`, `price`, `active`, `born` or `at`). Progress: besides the either/or rule of §9.2 (3),
+  no gap may exceed 10 s, the rule also applies from `started` to the first `progress`, and the
+  last `progress` must come at most 1.5 s before `finished` when it already reports every row
+  committed (10 s otherwise). The cancel latency is measured from just before the
+  `ImportService::cancel` call.
+- The test does nothing without `OXBASE_PERF_DIR`, even with `OXBASE_REQUIRE_M5_PERF=1` (the
+  conformance job runs every ignored test of `oxbase-services`). While the CSV reader or
+  `ImportService::start` is a skeleton it reports *pending* and passes;
+  `OXBASE_REQUIRE_M5_PERF=1` makes that a failure. The `import-perf` job sets it on its
+  `1 GB CSV import` step only, on the full lane and `wip/*-integrate` (never at workflow or job
+  level, which would reach the conformance job).
+- Webview smoke (§12, app): the import / export step needs a debug-only file hook in the app
+  (`--e2e-file-dir=<dir>`; contract in `ui/e2e/README.md`), which the app stream adds; the test
+  enables it only when the binary contains it. It exports a `query_run` result (`{"type":
+  "result"}`, the run a result grid shows), not the grid through UI clicks, and compares every
+  column of the file with the sample, `at` as an instant (`T` or space, any fraction digits, an
+  offset if written). `OXBASE_E2E_REQUIRE_M5=1` makes it mandatory; it has not run yet (the
+  webview smoke job skips `wip/*-perf`), so run it on `wip/*-app` or `wip/*-integrate` with the
+  hook before setting that.

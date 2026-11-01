@@ -4,7 +4,9 @@
 // a saved PostgreSQL connection opens with a prompted password, a 1,000,000-row query streams
 // its Channel events into the grid, `query_page` Arrow bytes decode in the webview, scrolling
 // loads pages, page latency (IPC + Arrow decode) stays under a bound, a running query cancels
-// within 2 s and, once the M3 UI exists, a table cell can be edited.
+// within 2 s, once the M3 UI exists a table cell can be edited and, once the app has the
+// debug-only file hook (M5), a CSV is imported and a query result exported to CSV through the
+// file-handle commands.
 //
 // Run it through scripts/e2e-smoke.sh, which prepares the profile, the data directories and
 // tauri-driver. How to run it and its limits: ui/e2e/README.md.
@@ -20,9 +22,12 @@
 //   OXBASE_E2E_CANCEL_LIMIT_MS cancel bound (default 2000)
 //   OXBASE_E2E_REQUIRE_EDIT   1: the M3 edit step must run; a skip fails the job. e2e-smoke.sh
 //                             sets it when the checkout has the M3 table-data UI and fixtures
+//   OXBASE_E2E_REQUIRE_M5     1: the M5 import / export step must run and pass; without it a
+//                             missing file hook or a failure of that step is a skip (warning)
 //   GITHUB_STEP_SUMMARY       if set, a Markdown summary is appended to it
 
-import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
+import { createReadStream } from "node:fs";
+import { appendFile, copyFile, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Keys, sleep, WebDriver } from "./webdriver.mjs";
@@ -40,6 +45,7 @@ const config = {
   p95LimitMs: Number(env.OXBASE_E2E_P95_LIMIT_MS || 250),
   cancelLimitMs: Number(env.OXBASE_E2E_CANCEL_LIMIT_MS || 2000),
   requireEdit: /^(1|true|yes)$/i.test(env.OXBASE_E2E_REQUIRE_EDIT || ""),
+  requireM5: /^(1|true|yes)$/i.test(env.OXBASE_E2E_REQUIRE_M5 || ""),
   rows: 1_000_000,
   probeSamples: 60,
   pageSize: 200,
@@ -53,6 +59,15 @@ const CANCEL_QUERY =
   "SELECT a.i * 10000 + b.i AS g, md5((a.i * 10000 + b.i)::text) " +
   "FROM generate_series(0, 9999) a(i), generate_series(1, 10000) b(i)";
 const MD5_OF_1 = "c4ca4238a0b923820dcc509a6f75849b";
+
+// M5 file hook (ui/e2e/README.md, "Import and export"): debug builds of the app accept
+// `--e2e-file-dir=<dir>`; `file_pick_open` then returns a read handle for the one file in
+// `<dir>/open/` and `file_pick_save` a write handle for `<dir>/save/<defaultName>`, without a
+// native dialog (WebDriver cannot drive one). The test passes the argument only when the app
+// binary contains it, so builds without the hook start exactly as before.
+const FILE_HOOK_ARG = "--e2e-file-dir";
+const M5_SAMPLE = path.resolve(here, "../../tests/data/m5/basic.csv");
+const M5_EXPORT_NAME = "m5-e2e-export.csv";
 
 // UI hooks. The `testids` are the `data-testid`s the app stream adds (docs/m3-contracts.md §9);
 // the fallbacks match the M2 UI so the test runs before and after they land.
@@ -188,15 +203,19 @@ const report = {
   startedAt: new Date().toISOString(),
   application: config.application,
   requireEdit: config.requireEdit,
+  requireM5: config.requireM5,
   query: null,
   pageLatency: null,
   scroll: [],
   cancel: null,
   edit: null,
+  m5: null,
   steps: results,
   pageErrors: [],
 };
 let wd = null;
+/** M5 step state: whether the app has the file hook and the folder it uses. */
+const m5 = { hook: false, dir: path.join(config.outDir, "m5-files") };
 
 function log(message) {
   console.log(`[e2e] ${message}`);
@@ -213,7 +232,11 @@ class SkipStep extends Error {}
 /** Thrown inside a `waitFor` condition to stop waiting at once. */
 class Fatal extends Error {}
 
-async function step(name, fn) {
+/** Which env var makes a skip of a step a failure (the M3 edit step by default). */
+const EDIT_GATE = { required: config.requireEdit, env: "OXBASE_E2E_REQUIRE_EDIT" };
+const M5_GATE = { required: config.requireM5, env: "OXBASE_E2E_REQUIRE_M5" };
+
+async function step(name, fn, gate = EDIT_GATE) {
   const started = Date.now();
   log(`--- ${name}`);
   try {
@@ -223,7 +246,7 @@ async function step(name, fn) {
     return true;
   } catch (error) {
     const message = String(error?.message ?? error);
-    if (error instanceof SkipStep && !config.requireEdit) {
+    if (error instanceof SkipStep && !gate.required) {
       results.push({ name, status: "skipped", ms: Date.now() - started, detail: message });
       // A warning annotation, so the skip shows on the run page and in scripts/ci-wait.mjs.
       annotate(`skipped: ${name}: ${message}`, "warning");
@@ -231,7 +254,7 @@ async function step(name, fn) {
       return true;
     }
     if (error instanceof SkipStep) {
-      const detail = `${message} (a skip fails the run: OXBASE_E2E_REQUIRE_EDIT=1)`;
+      const detail = `${message} (a skip fails the run: ${gate.env}=1)`;
       results.push({ name, status: "failed", ms: Date.now() - started, detail });
       annotate(`${name}: ${detail}`);
       log(`FAILED: ${name}: ${detail}`);
@@ -372,7 +395,17 @@ async function launch() {
   if (!config.application) throw new Error("OXBASE_E2E_APP is not set");
   await WebDriver.waitReady(config.driverUrl, 30_000);
   wd = new WebDriver(config.driverUrl);
-  await wd.newSession({ "tauri:options": { application: config.application, args: [] } });
+  const args = [];
+  m5.hook = await binaryContains(config.application, FILE_HOOK_ARG).catch((error) => {
+    log(`could not scan the app binary for ${FILE_HOOK_ARG}: ${error.message}`);
+    return false;
+  });
+  if (m5.hook) {
+    await prepareM5Files();
+    args.push(`${FILE_HOOK_ARG}=${m5.dir}`);
+  }
+  log(`M5 file hook ${m5.hook ? `found: ${FILE_HOOK_ARG}=${m5.dir}` : "not in this build"}`);
+  await wd.newSession({ "tauri:options": { application: config.application, args } });
   await wd.setTimeouts({ script: 180_000, pageLoad: 60_000, implicit: 0 });
   await waitFor(
     "the document to load",
@@ -1145,6 +1178,298 @@ async function editCell() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// M5: import and export through the file-handle commands
+
+/** True when `file` contains the ASCII text `marker` (read in chunks, never whole). */
+async function binaryContains(file, marker) {
+  const needle = Buffer.from(marker, "latin1");
+  const stream = createReadStream(file, { highWaterMark: 4 << 20 });
+  let tail = Buffer.alloc(0);
+  try {
+    for await (const chunk of stream) {
+      const buf = tail.length > 0 ? Buffer.concat([tail, chunk]) : chunk;
+      if (buf.indexOf(needle) !== -1) return true;
+      tail = buf.subarray(Math.max(0, buf.length - needle.length + 1));
+    }
+    return false;
+  } finally {
+    stream.destroy();
+  }
+}
+
+/** The hook's folder: `open/` holds the sample CSV, `save/` receives the export. */
+async function prepareM5Files() {
+  await rm(m5.dir, { recursive: true, force: true });
+  await mkdir(path.join(m5.dir, "open"), { recursive: true });
+  await mkdir(path.join(m5.dir, "save"), { recursive: true });
+  await copyFile(M5_SAMPLE, path.join(m5.dir, "open", path.basename(M5_SAMPLE)));
+}
+
+/** RFC 4180 records of `text` (doubled quotes, line breaks inside quotes kept as they are). */
+function parseCsv(text) {
+  const records = [];
+  let record = [];
+  let field = "";
+  let quoted = false;
+  for (let i = 0; i < text.length; i += 1) {
+    const c = text[i];
+    if (quoted) {
+      if (c === '"' && text[i + 1] === '"') {
+        field += '"';
+        i += 1;
+      } else if (c === '"') {
+        quoted = false;
+      } else {
+        field += c;
+      }
+    } else if (c === '"') {
+      quoted = true;
+    } else if (c === ",") {
+      record.push(field);
+      field = "";
+    } else if (c === "\n" || c === "\r") {
+      if (c === "\r" && text[i + 1] === "\n") i += 1;
+      record.push(field);
+      records.push(record);
+      record = [];
+      field = "";
+    } else {
+      field += c;
+    }
+  }
+  if (field !== "" || record.length > 0) {
+    record.push(field);
+    records.push(record);
+  }
+  return records;
+}
+
+/**
+ * A timestamp's text as a comparable instant key: `YYYY-MM-DD`, `T` or a space,
+ * `HH:MM:SS`, any number of fraction digits and an optional `Z` / `+HH:MM` / `+HHMM` offset
+ * (a text without one counts as UTC). `""` stays `""` (NULL); text that is not a timestamp gives
+ * `null`, which matches nothing.
+ */
+function instantKey(text) {
+  if (text === "") return "";
+  const m =
+    /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?(Z|[+-]\d{2}:?\d{2})?$/.exec(
+      text.trim(),
+    );
+  if (!m) return null;
+  const [, y, mo, d, h, mi, s, fraction = "", offset = "Z"] = m;
+  let seconds = Date.UTC(+y, +mo - 1, +d, +h, +mi, +s) / 1000;
+  if (offset !== "Z") {
+    const sign = offset[0] === "-" ? -1 : 1;
+    const digits = offset.slice(1).replace(":", "");
+    seconds -= sign * (Number(digits.slice(0, 2)) * 3600 + Number(digits.slice(2, 4)) * 60);
+  }
+  return `${seconds}.${fraction.padEnd(9, "0")}`;
+}
+
+/** What the CSV writer's default formula guard makes of a text value (docs/m5-contracts.md §3.8). */
+function guarded(text) {
+  return /^[=+\-@\t\r]/.test(text) ? `'${text}` : text;
+}
+
+// Runs in the webview: pick (hook) -> import_preview -> import_run into a new table -> the
+// table's rows as a query result (query_run, the run a result grid shows) -> pick a save
+// target (hook) -> export_run of that result to CSV. Every invoke and every wait has a bound,
+// so a command that never answers ends the script instead of hanging it.
+const IMPORT_EXPORT = `
+const [table, catalog, schema, exportName, done] = arguments;
+(async () => {
+  const T = window.__TAURI_INTERNALS__;
+  const bounded = (promise, what, ms) => Promise.race([promise, new Promise((_, reject) =>
+    setTimeout(() => reject(new Error(what + ": no answer in " + ms + " ms")), ms))]);
+  const invoke = (cmd, args, ms = 30000) => bounded(T.invoke(cmd, args), cmd, ms);
+  const channel = () => {
+    let finish;
+    const ended = new Promise((resolve) => { finish = resolve; });
+    const events = [];
+    const id = T.transformCallback((raw) => {
+      const m = raw && typeof raw === "object" && "message" in raw ? raw.message : raw;
+      if (!m || typeof m !== "object" || typeof m.type !== "string") return;
+      events.push(m.type);
+      if (m.type === "finished" || m.type === "failed" || m.type === "cancelled") finish(m);
+    });
+    return { arg: "__CHANNEL__:" + id, events, ended };
+  };
+  const filters = [{ name: "CSV", extensions: ["csv"] }];
+  const out = { steps: [] };
+  const picked = await invoke("file_pick_open", { filters, title: null });
+  if (!picked) throw new Error("file_pick_open returned null (no file in the hook's open folder?)");
+  out.picked = { name: picked.name, access: picked.access, size: picked.size };
+  const preview = await invoke("import_preview",
+    { file: picked.handle, options: { format: "csv" }, requestId: null });
+  out.preview = { columns: preview.columns.map((c) => c.name),
+    types: preview.columns.map((c) => c.dataType.type), rows: preview.rows.length };
+  const sessions = await invoke("list_open_connections", {});
+  if (!sessions.length) throw new Error("no open connection");
+  const session = sessions[0].id;
+  const request = {
+    options: { format: "csv" },
+    columns: preview.columns.map((c) => ({ name: c.name, dataType: c.dataType })),
+    mapping: preview.columns.map((c, i) => ({ source: i, target: c.name })),
+    target: { session, table: { kind: "table", catalog, schema, name: table }, mode: "create" },
+    primaryKey: ["id"],
+    errors: { type: "stop" },
+    transaction: { type: "single" },
+  };
+  const imp = channel();
+  out.importId = await invoke("import_run", { file: picked.handle, request, onEvent: imp.arg });
+  const impEnd = await bounded(imp.ended, "import_run events", 60000);
+  out.import = { end: impEnd.type, events: imp.events, report: impEnd.report || null,
+    error: impEnd.error ? impEnd.error.message : null };
+  if (impEnd.type !== "finished") return out;
+
+  const q = channel();
+  const editorId = "e2e-m5";
+  const runId = await invoke("query_run", { sessionId: session, editorId,
+    script: "SELECT * FROM " + schema + "." + table + " ORDER BY id", options: null, onEvent: q.arg });
+  try {
+    const qEnd = await bounded(q.ended, "query_run events", 30000);
+    out.query = { end: qEnd.type, runId };
+    if (qEnd.type !== "finished") return out;
+    const target = await invoke("file_pick_save", { defaultName: exportName, filters, title: null });
+    if (!target) throw new Error("file_pick_save returned null");
+    out.saved = { name: target.name, access: target.access, exists: target.exists };
+    const exp = channel();
+    out.exportId = await invoke("export_run", { file: target.handle,
+      request: { source: { type: "result", runId, resultIndex: 0 }, options: { format: "csv" } },
+      onEvent: exp.arg });
+    const expEnd = await bounded(exp.ended, "export_run events", 60000);
+    out.export = { end: expEnd.type, events: exp.events, report: expEnd.report || null,
+      error: expEnd.error ? expEnd.error.message : null };
+    return out;
+  } finally {
+    await T.invoke("query_close_editor", { editorId }).catch(() => {});
+  }
+})().then(done, (e) => done({ error: String(e && e.message || e) }));
+`;
+
+async function importExport() {
+  if (!m5.hook) {
+    throw new SkipStep(
+      `the app has no e2e file hook (${FILE_HOOK_ARG}, debug builds only; see ui/e2e/README.md), ` +
+        "so no file handle can be picked without a native dialog",
+    );
+  }
+  const table = `m5_t_e2e_${runToken()}`;
+  report.m5 = { table: `public.${table}`, cleanedUp: false };
+  try {
+    return await importExportSteps(table);
+  } catch (error) {
+    if (error instanceof SkipStep || config.requireM5) throw error;
+    // Until the M5 streams are merged (services, read / write, app) a failure here is a skip
+    // with a warning; OXBASE_E2E_REQUIRE_M5=1 turns it into a failure.
+    throw new SkipStep(`M5 import / export not working in this build yet: ${error.message}`);
+  } finally {
+    try {
+      await sqlViaIpc(`DROP TABLE IF EXISTS public.${table}`);
+      report.m5.cleanedUp = true;
+    } catch (error) {
+      log(`could not drop public.${table}: ${error.message}`);
+    }
+  }
+}
+
+async function importExportSteps(table) {
+  const out = await wd.executeAsync(IMPORT_EXPORT, table, "oxbase_test", "public", M5_EXPORT_NAME);
+  report.m5.ipc = out;
+  if (!out || out.error) throw new Error(`import / export through IPC failed: ${out?.error}`);
+
+  // 1. The pick and the preview.
+  const sample = parseCsv(await readFile(M5_SAMPLE, "utf8"));
+  const [header, ...rows] = sample;
+  if (out.picked?.name !== path.basename(M5_SAMPLE) || out.picked?.access !== "read") {
+    throw new Error(`file_pick_open gave ${JSON.stringify(out.picked)}`);
+  }
+  if (JSON.stringify(out.preview?.columns) !== JSON.stringify(header)) {
+    throw new Error(`preview columns ${JSON.stringify(out.preview?.columns)}, expected ${header}`);
+  }
+
+  // 2. The import: finished, every row committed, and the rows are in the table.
+  const imported = out.import;
+  if (imported?.end !== "finished") {
+    throw new Error(`import ended "${imported?.end}": ${imported?.error ?? ""}`);
+  }
+  if (imported.report?.rowsCommitted !== rows.length || imported.report?.rowsSkipped !== 0) {
+    throw new Error(`import report ${JSON.stringify(imported.report)}`);
+  }
+  if (!imported.events.includes("started") || imported.events.at(-1) !== "finished") {
+    throw new Error(`import events ${imported.events.join(", ")}`);
+  }
+  report.m5.imported = imported.report.rowsCommitted;
+  report.m5.importMethod = imported.report.method;
+  const counted = await sqlViaIpc(`SELECT count(*), sum(id) FROM public.${table}`);
+  if (counted[0]?.[0] !== String(rows.length)) {
+    throw new Error(`public.${table} holds ${JSON.stringify(counted)} rows after the import`);
+  }
+
+  // 3. The export of the query result: finished, the file has every row, values as written.
+  if (out.query?.end !== "finished") throw new Error(`the SELECT ended "${out.query?.end}"`);
+  if (out.saved?.name !== M5_EXPORT_NAME || out.saved?.access !== "write") {
+    throw new Error(`file_pick_save gave ${JSON.stringify(out.saved)}`);
+  }
+  const exported = out.export;
+  if (exported?.end !== "finished") {
+    throw new Error(`export ended "${exported?.end}": ${exported?.error ?? ""}`);
+  }
+  if (exported.report?.rows !== rows.length) {
+    throw new Error(`export report ${JSON.stringify(exported.report)}`);
+  }
+  report.m5.exported = exported.report.rows;
+  const file = path.join(m5.dir, "save", M5_EXPORT_NAME);
+  const text = await readFile(file, "utf8").catch((error) => {
+    throw new Error(`the export finished but ${M5_EXPORT_NAME} cannot be read: ${error.message}`);
+  });
+  report.m5.exportBytes = Buffer.byteLength(text);
+  const [outHeader, ...outRows] = parseCsv(text);
+  if (JSON.stringify(outHeader) !== JSON.stringify(header)) {
+    throw new Error(`exported header ${JSON.stringify(outHeader)}, expected ${header}`);
+  }
+  if (outRows.length !== rows.length) {
+    throw new Error(`the export has ${outRows.length} rows, expected ${rows.length}`);
+  }
+  // Every column. As text: id, name and note (formula guard on by default), amount (exact
+  // decimal), born (ISO date) and active (true / false). `at` as an instant: `T` or a space and
+  // the number of fraction digits are the writer's choice, the instant is not.
+  const col = (name) => header.indexOf(name);
+  const mismatches = [];
+  rows.forEach((source, r) => {
+    const got = outRows[r];
+    const want = {
+      id: source[col("id")],
+      name: guarded(source[col("name")]),
+      amount: source[col("amount")],
+      born: source[col("born")],
+      active: source[col("active")],
+      note: guarded(source[col("note")]),
+    };
+    for (const [name, value] of Object.entries(want)) {
+      if (got[col(name)] !== value) {
+        mismatches.push(
+          `row ${r + 1} ${name}: ${JSON.stringify(got[col(name)])} != ${JSON.stringify(value)}`,
+        );
+      }
+    }
+    const at = got[col("at")] ?? "";
+    const wantAt = instantKey(source[col("at")]);
+    if (wantAt === null || instantKey(at) !== wantAt) {
+      mismatches.push(
+        `row ${r + 1} at: ${JSON.stringify(at)} is not the instant ${JSON.stringify(source[col("at")])}`,
+      );
+    }
+  });
+  if (mismatches.length > 0) throw new Error(`exported values differ: ${mismatches.join("; ")}`);
+  return (
+    `imported ${rows.length} rows (${imported.report.method}) into public.${table}; exported the ` +
+    `query result to ${M5_EXPORT_NAME} (${report.m5.exportBytes} bytes), values match`
+  );
+}
+
+// ---------------------------------------------------------------------------------------------
 
 function markdownSummary() {
   const lines = ["## Webview smoke (Linux)", ""];
@@ -1156,9 +1481,10 @@ function markdownSummary() {
   if (results.some((r) => r.status === "skipped")) {
     lines.push(
       "",
-      "> **Warning:** a step was skipped (see its detail). Set `OXBASE_E2E_REQUIRE_EDIT=1` to make " +
-        "a skip fail; `scripts/e2e-smoke.sh` sets it when the checkout has the M3 table-data UI " +
-        "and the M3 PostgreSQL fixture.",
+      "> **Warning:** a step was skipped (see its detail). `OXBASE_E2E_REQUIRE_EDIT=1` makes a " +
+        "skip of the edit step fail (`scripts/e2e-smoke.sh` sets it when the checkout has the M3 " +
+        "table-data UI and the M3 PostgreSQL fixture); `OXBASE_E2E_REQUIRE_M5=1` does the same " +
+        "for the M5 import / export step.",
     );
   }
   const pl = report.pageLatency;
@@ -1207,6 +1533,14 @@ function markdownSummary() {
         `test row ${report.edit.cleanedUp ? "deleted" : "NOT deleted"} afterwards.`,
     );
   }
+  if (report.m5) {
+    const m = report.m5;
+    lines.push(
+      `M5: imported ${m.imported ?? "?"} rows from basic.csv into ${m.table ?? "?"}` +
+        ` (${m.importMethod ?? "?"}), exported ${m.exported ?? "?"} rows to ${M5_EXPORT_NAME}` +
+        ` (${m.exportBytes ?? "?"} bytes); table ${m.cleanedUp ? "dropped" : "NOT dropped"} afterwards.`,
+    );
+  }
   if (report.cancel) {
     lines.push(
       `Cancel: "Cancelled" ${report.cancel.ms} ms after Stop (limit ${config.cancelLimitMs} ms), ` +
@@ -1225,7 +1559,14 @@ async function main() {
   if (ok) ok = await step("Scroll the grid (pages load at each position)", scrollGrid);
   if (ok) ok = await step("Page latency through IPC + Arrow decode", measurePages);
   if (ok) ok = await step("Cancel a running large query", cancelRun);
-  if (ok) await step("Edit a table cell (M3 table data UI)", editCell);
+  if (ok) ok = await step("Edit a table cell (M3 table data UI)", editCell);
+  if (ok) {
+    await step(
+      "Import a CSV and export a query result to CSV (M5 file handles)",
+      importExport,
+      M5_GATE,
+    );
+  }
 
   const failed = results.some((r) => r.status === "failed");
   if (wd?.sessionId) {
