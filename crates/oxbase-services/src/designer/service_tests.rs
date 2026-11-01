@@ -1001,8 +1001,9 @@ async fn failed_applies_report_steps_and_reload_only_when_not_atomic() {
 // The default registry
 // ---------------------------------------------------------------------------------------------
 
-/// Every M3 engine registers all designer and grid-editing roles, or (until its stream lands)
-/// none of the M3 ones; with `OXBASE_SERVICES_REQUIRE_M3_CELLS=1` none missing is required.
+/// Every M3 engine (and SQL Server since M4) registers all designer and grid-editing roles, or
+/// (until its stream lands) none of the M3 ones; with `OXBASE_SERVICES_REQUIRE_M3_CELLS=1` none
+/// missing is required.
 #[test]
 fn default_dialects_have_every_designer_role() {
     let registry = crate::default_dialects();
@@ -1014,6 +1015,7 @@ fn default_dialects_have_every_designer_role() {
         Engine::MySql,
         Engine::MariaDb,
         Engine::Sqlite,
+        Engine::MsSql,
     ] {
         let missing = registry.missing_designer_roles(engine);
         let pending = !require && missing.len() == nothing;

@@ -190,7 +190,7 @@ mod tests {
                 );
             }
         }
-        // SQL Server, MongoDB and Redis register nothing before M4/M7.
+        // MongoDB and Redis register nothing before M7.
         assert!(!applies(&reg, Engine::Redis, ObjectKind::Table));
     }
 }

@@ -17,14 +17,10 @@
 //! # Registration
 //!
 //! - Driver: [`register`] adds [`MsSqlDriver`] for [`Engine::MsSql`](oxbase_types::Engine::MsSql)
-//!   to a `DriverRegistry`; `oxbase_services::default_drivers` calls it once the driver stream's
-//!   line there is uncommented.
+//!   to a `DriverRegistry`; `oxbase_services::default_drivers` calls it.
 //! - Dialect: [`dialect::register`] adds the fetchers, tree layout, capabilities, quoting
 //!   ([`oxbase_dialect::BracketQuoting`]), DDL generators, comparators and the grid writer;
-//!   `oxbase_services::default_dialects` calls it once its line there is uncommented.
-//!
-//! Until those lines are uncommented SQL Server stays "pending (M4)" in the conformance matrix:
-//! the skeleton bodies are `unimplemented!("m4: <stream>")` and no test may reach them.
+//!   `oxbase_services::default_dialects` calls it.
 //!
 //! # Server versions
 //!

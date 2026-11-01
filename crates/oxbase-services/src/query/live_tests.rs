@@ -1,5 +1,5 @@
 //! M2 exit-check live tests of `QueryService` against the Docker fixtures (PostgreSQL, MySQL,
-//! MariaDB) and a SQLite file:
+//! MariaDB, SQL Server since M4) and a SQLite file:
 //!
 //! - (a) a 1,000,000-row query (`[m2] large_result_rows`) streams completely into a run whose
 //!   memory budget forces spilling; the first page is readable within 1 s of the start, 300
@@ -218,6 +218,12 @@ fn large_query(engine: Engine, rows: u64) -> String {
         Engine::Sqlite => format!(
             "WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < {rows}) \
              SELECT n AS id, 'row ' || n AS name, n * 2 AS twice FROM s"
+        ),
+        // `GENERATE_SERIES` (SQL Server 2022+) streams; no `ORDER BY`, so no sort blocks the
+        // first rows (the order is not asserted, see `check_large_page`).
+        Engine::MsSql => format!(
+            "SELECT CAST(value AS bigint) AS id, CONCAT('row ', value) AS name, \
+             CAST(value AS bigint) * 2 AS twice FROM GENERATE_SERIES(1, {rows})"
         ),
         other => panic!("no large query for {other}"),
     }
@@ -500,15 +506,34 @@ async fn cancel_mid_stream(key: &str, engine: Engine) {
     );
 }
 
+/// The multi-statement script of [`multi_statement`] (six statements; result sets from the
+/// third and the fifth).
+const MULTI_SCRIPT: &str = "CREATE TEMPORARY TABLE m2q_t (id INT, name VARCHAR(20));\n\
+                            INSERT INTO m2q_t (id, name) VALUES (1, 'a'), (2, 'b'), (3, 'c');\n\
+                            SELECT id, name FROM m2q_t ORDER BY id;\n\
+                            UPDATE m2q_t SET name = 'z' WHERE id > 1;\n\
+                            SELECT COUNT(*) AS n FROM m2q_t;\n\
+                            DROP TABLE m2q_t;";
+
+/// The same script in T-SQL: one statement per `GO` batch (`docs/m4-contracts.md` §6), a
+/// `#temp` table that must survive across batches of the session, and one batch holding two
+/// `SELECT`s, which must give two result sets of that one statement (§8.3).
+const MULTI_SCRIPT_TSQL: &str = "CREATE TABLE #m2q_t (id INT, name VARCHAR(20));\nGO\n\
+                                 INSERT INTO #m2q_t (id, name) VALUES (1, 'a'), (2, 'b'), (3, 'c');\nGO\n\
+                                 SELECT id, name FROM #m2q_t ORDER BY id;\nGO\n\
+                                 UPDATE #m2q_t SET name = 'z' WHERE id > 1;\nGO\n\
+                                 SELECT COUNT(*) AS n FROM #m2q_t; SELECT 2 AS b;\nGO\n\
+                                 DROP TABLE #m2q_t;";
+
 /// (c) a multi-statement script.
 async fn multi_statement(key: &str, engine: Engine) {
     let live = Live::plain(key, engine).await;
-    let script = "CREATE TEMPORARY TABLE m2q_t (id INT, name VARCHAR(20));\n\
-                  INSERT INTO m2q_t (id, name) VALUES (1, 'a'), (2, 'b'), (3, 'c');\n\
-                  SELECT id, name FROM m2q_t ORDER BY id;\n\
-                  UPDATE m2q_t SET name = 'z' WHERE id > 1;\n\
-                  SELECT COUNT(*) AS n FROM m2q_t;\n\
-                  DROP TABLE m2q_t;";
+    let tsql = engine == Engine::MsSql;
+    let script = if tsql {
+        MULTI_SCRIPT_TSQL
+    } else {
+        MULTI_SCRIPT
+    };
     let handle = live.start(script, RunOptions::default()).await;
     let run = handle.id;
     let mut events = handle.events;
@@ -536,7 +561,11 @@ async fn multi_statement(key: &str, engine: Engine) {
             _ => None,
         })
         .collect();
-    assert_eq!(results, [(0, 2), (1, 4)], "{engine}: {all:?}");
+    if tsql {
+        assert_eq!(results, [(0, 2), (1, 4), (2, 4)], "{engine}: {all:?}");
+    } else {
+        assert_eq!(results, [(0, 2), (1, 4)], "{engine}: {all:?}");
+    }
     let affected: BTreeMap<usize, Option<u64>> = all
         .iter()
         .filter_map(|e| match e {
@@ -549,8 +578,23 @@ async fn multi_statement(key: &str, engine: Engine) {
         })
         .collect();
     assert_eq!(affected.len(), 6, "{engine}: {all:?}");
-    assert_eq!(affected[&1], Some(3), "{engine}: INSERT");
-    assert_eq!(affected[&3], Some(2), "{engine}: UPDATE");
+    if tsql {
+        // A plain T-SQL batch reports no row count (tiberius drops DONE counts of SQL
+        // batches, `docs/m4-contracts.md` §11 gap 2); a count, when present, must be right.
+        assert!(
+            matches!(affected[&1], None | Some(3)),
+            "{engine}: INSERT {:?}",
+            affected[&1]
+        );
+        assert!(
+            matches!(affected[&3], None | Some(2)),
+            "{engine}: UPDATE {:?}",
+            affected[&3]
+        );
+    } else {
+        assert_eq!(affected[&1], Some(3), "{engine}: INSERT");
+        assert_eq!(affected[&3], Some(2), "{engine}: UPDATE");
+    }
     let first = live.service.page(run, 0, 0, 10).await.unwrap();
     assert_eq!(first.num_rows(), 3);
     let names = first
@@ -572,6 +616,12 @@ async fn multi_statement(key: &str, engine: Engine) {
         live.service.page(run, 1, 0, 10).await.unwrap().num_rows(),
         1
     );
+    if tsql {
+        assert_eq!(
+            live.service.page(run, 2, 0, 10).await.unwrap().num_rows(),
+            1
+        );
+    }
     report(&format!(
         "{engine} script: {} statements, {} result sets, rows affected {affected:?}",
         affected.len(),
@@ -593,9 +643,17 @@ async fn history_records(key: &str, engine: Engine) {
         Engine::MySql | Engine::MariaDb => {
             "ALTER USER 'm2q_nobody'@'%' IDENTIFIED BY 'marker-secret-77'"
         }
+        // The login does not exist, so nothing changes on the server; history keeps the
+        // failed statement, redacted.
+        Engine::MsSql => "ALTER LOGIN m2q_nobody WITH PASSWORD = N'marker-secret-77'",
         _ => "PRAGMA key = 'marker-secret-77'",
     };
-    let script = format!("SELECT 'm2q-history' AS marker;\n{secret_statement};\nSELECT 2 AS two");
+    let script = if engine == Engine::MsSql {
+        // One statement per `GO` batch.
+        format!("SELECT 'm2q-history' AS marker\nGO\n{secret_statement}\nGO\nSELECT 2 AS two")
+    } else {
+        format!("SELECT 'm2q-history' AS marker;\n{secret_statement};\nSELECT 2 AS two")
+    };
     let options = RunOptions {
         stop_on_error: false,
         ..RunOptions::default()
@@ -666,4 +724,8 @@ live_tests! {
     sqlite_cancel_mid_stream: cancel_mid_stream("sqlite", Engine::Sqlite);
     sqlite_multi_statement: multi_statement("sqlite", Engine::Sqlite);
     sqlite_history: history_records("sqlite", Engine::Sqlite);
+    mssql_large_result: large_result("mssql", Engine::MsSql);
+    mssql_cancel_mid_stream: cancel_mid_stream("mssql", Engine::MsSql);
+    mssql_multi_statement: multi_statement("mssql", Engine::MsSql);
+    mssql_history: history_records("mssql", Engine::MsSql);
 }

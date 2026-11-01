@@ -6,11 +6,9 @@
 //! `oxbase_mssql::dialect::register` (the registry the app uses). Scripts run like the designer
 //! runs them: every main step in one transaction.
 //!
-//! **Re-fetch.** The SQL Server catalog fetchers belong to the fetch stream and are not in this
-//! branch yet, so these tests read tables back with their own minimal catalog loader
-//! ([`load_table`]: `sys.*` views, bound parameters) and compare with the registered
-//! comparator. The integrator replaces `load_table` with the registry's `Table` fetcher
-//! (`reg.fetcher(Engine::MsSql, ObjectKind::Table)`), which must pass the same assertions.
+//! **Re-fetch.** Every table is read back through the registry's `Table` fetcher
+//! (`reg.fetcher(Engine::MsSql, ObjectKind::Table)`, [`load_table`]) and compared with the
+//! registered comparator, so the generator, the fetcher and the comparator must agree.
 //!
 //! Scratch tables are named `m3_rt_ddl<kind>_<token>` in schema `m3` (the `[m3]`
 //! `roundtrip_prefix`, so the conformance stale cleanup also removes leftovers of killed runs)
@@ -35,10 +33,10 @@ use oxbase_dialect::{Comparator, DdlContext, DdlGenerator, DialectRegistry, DmlT
 use oxbase_driver::{CancellationToken, Collected, ConnectParams, Connection, collect};
 use oxbase_mssql::{MsSqlConnection, MsSqlDriver, extras};
 use oxbase_types::{
-    CheckDef, ColumnDef, ColumnValue, DataType, Engine, Extras, FkAction, ForeignKeyDef,
-    GeneratedColumn, IdentityDef, IndexColumn, IndexDef, KeyKind, ObjectDef, ObjectKind, ObjectRef,
-    PrimaryKeyDef, Rename, RowEdit, RowKey, Script, ServerVersion, TableDef, TlsMode, TlsOptions,
-    Value, props,
+    CheckDef, ColumnDef, ColumnValue, DataType, Engine, ErrorCategory, Extras, FkAction,
+    ForeignKeyDef, GeneratedColumn, IdentityDef, IndexColumn, IndexDef, KeyKind, ObjectDef,
+    ObjectKind, ObjectRef, PrimaryKeyDef, Rename, RowEdit, RowKey, Script, ServerVersion, TableDef,
+    TlsMode, TlsOptions, Value, props,
 };
 
 type Step<T> = Result<T, String>;
@@ -225,303 +223,29 @@ fn int(v: Option<&Option<String>>) -> i64 {
     text(v).and_then(|t| t.parse().ok()).unwrap_or(0)
 }
 
-fn yes(v: Option<&Option<String>>) -> bool {
-    text(v).as_deref() == Some("1")
-}
+// --- re-fetch through the registered Table fetcher ------------------------------------------
 
-// --- a minimal catalog loader (until the fetch stream's Table fetcher lands) ------------------
-
-/// The DDL spelling of a column type from `sys.types` and `sys.columns`.
-fn native_type(
-    name: &str,
-    schema: &str,
-    user: bool,
-    max_length: i64,
-    precision: i64,
-    scale: i64,
-) -> String {
-    if user {
-        return format!("{schema}.{name}");
-    }
-    let len = |n: i64| {
-        if n < 0 {
-            "max".to_owned()
-        } else {
-            n.to_string()
-        }
-    };
-    match name {
-        "varchar" | "char" | "varbinary" | "binary" => format!("{name}({})", len(max_length)),
-        "nvarchar" | "nchar" => format!(
-            "{name}({})",
-            if max_length < 0 {
-                "max".to_owned()
-            } else {
-                (max_length / 2).to_string()
-            }
-        ),
-        "decimal" | "numeric" => format!("{name}({precision},{scale})"),
-        "datetime2" | "time" | "datetimeoffset" => format!("{name}({scale})"),
-        "timestamp" => "rowversion".to_owned(),
-        other => other.to_owned(),
-    }
-}
-
-fn data_type_of(native: &str) -> DataType {
-    let base = native.split('(').next().unwrap_or(native);
-    let arg = native
-        .split_once('(')
-        .and_then(|(_, rest)| rest.trim_end_matches(')').split(',').next())
-        .and_then(|a| a.parse::<u32>().ok());
-    match base {
-        "bit" => DataType::Bool,
-        "tinyint" => DataType::Int {
-            bits: 8,
-            unsigned: true,
-        },
-        "smallint" => DataType::INT16,
-        "int" => DataType::INT32,
-        "bigint" => DataType::INT64,
-        "decimal" | "numeric" => DataType::Decimal {
-            precision: arg,
-            scale: None,
-        },
-        "varchar" | "nvarchar" if arg.is_some() => DataType::VarChar { length: arg },
-        "varchar" | "nvarchar" => DataType::Text,
-        "varbinary" => DataType::VarBinary { length: arg },
-        "date" => DataType::Date,
-        "datetime2" | "datetime" | "smalldatetime" => DataType::Timestamp { precision: None },
-        "json" => DataType::Json { binary: true },
-        "rowversion" => DataType::Binary { length: Some(8) },
-        other => DataType::Other {
-            name: other.to_owned(),
-        },
-    }
-}
-
-/// Loads `schema.name` from the catalog of the session's database, `None` when it is gone.
+/// Loads `schema.name` through the registry's SQL Server `Table` fetcher (the one the app and
+/// the conformance harness use), `None` when it is gone.
 async fn load_table(
     c: &dyn Connection,
     db: &str,
     schema: &str,
     name: &str,
 ) -> Step<Option<TableDef>> {
-    let id = query(
-        c,
-        "SELECT o.object_id FROM sys.objects AS o JOIN sys.schemas AS s ON s.schema_id = \
-         o.schema_id WHERE s.name = @P1 AND o.name = @P2 AND o.type = 'U'",
-        &[Value::Text(schema.into()), Value::Text(name.into())],
-    )
-    .await?;
-    let Some(id) = id.first().map(|r| int(r.first())) else {
-        return Ok(None);
-    };
-    let oid = [Value::Int(id)];
-    let mut t = TableDef::new(ObjectRef::table(Some(db), Some(schema), name));
-
-    let cols = query(
-        c,
-        "SELECT c.name, t.name, c.max_length, c.precision, c.scale, c.is_nullable, \
-         CAST(ic.seed_value AS bigint), CAST(ic.increment_value AS bigint), cc.definition, \
-         cc.is_persisted, dc.name, dc.definition, \
-         CASE WHEN c.collation_name COLLATE DATABASE_DEFAULT <> CAST(DATABASEPROPERTYEX(DB_NAME(), \
-         'Collation') AS nvarchar(128)) COLLATE DATABASE_DEFAULT THEN c.collation_name END, CAST(ep.value AS nvarchar(max)), \
-         SCHEMA_NAME(t.schema_id), t.is_user_defined, c.is_identity \
-         FROM sys.columns AS c JOIN sys.types AS t ON t.user_type_id = c.user_type_id \
-         LEFT JOIN sys.identity_columns AS ic ON ic.object_id = c.object_id AND ic.column_id = \
-         c.column_id \
-         LEFT JOIN sys.computed_columns AS cc ON cc.object_id = c.object_id AND cc.column_id = \
-         c.column_id \
-         LEFT JOIN sys.default_constraints AS dc ON dc.parent_object_id = c.object_id AND \
-         dc.parent_column_id = c.column_id \
-         LEFT JOIN sys.extended_properties AS ep ON ep.class = 1 AND ep.major_id = c.object_id \
-         AND ep.minor_id = c.column_id AND ep.name = N'MS_Description' \
-         WHERE c.object_id = @P1 ORDER BY c.column_id",
-        &oid,
-    )
-    .await?;
-    for r in &cols {
-        let native = native_type(
-            &text(r.get(1)).unwrap_or_default(),
-            &text(r.get(14)).unwrap_or_default(),
-            yes(r.get(15)),
-            int(r.get(2)),
-            int(r.get(3)),
-            int(r.get(4)),
-        );
-        let mut col = ColumnDef::new(text(r.first()).unwrap_or_default(), data_type_of(&native));
-        col.native_type.clone_from(&native);
-        col.nullable = yes(r.get(5));
-        if yes(r.get(16)) {
-            col.auto_increment = true;
-            col.identity = Some(IdentityDef {
-                always: true,
-                start: Some(i128::from(int(r.get(6)))),
-                increment: Some(i128::from(int(r.get(7)))),
-            });
-        }
-        if let Some(definition) = text(r.get(8)) {
-            col.generated = Some(GeneratedColumn {
-                expression: definition,
-                stored: yes(r.get(9)),
-            });
-        }
-        if let Some(df) = text(r.get(10)) {
-            col.extras.insert(extras::DEFAULT_CONSTRAINT, df);
-            col.default = text(r.get(11));
-        }
-        col.collation = text(r.get(12));
-        col.comment = text(r.get(13));
-        if native == "rowversion" {
-            col.extras.insert(extras::ROW_VERSION, true);
-        }
-        t.columns.push(col);
+    let fetcher = registry()
+        .fetcher(Engine::MsSql, ObjectKind::Table)
+        .map_err(|e| format!("table fetcher: {e}"))?;
+    let obj = ObjectRef::table(Some(db), Some(schema), name);
+    match fetcher.load(c, &obj, CancellationToken::new()).await {
+        Ok(ObjectDef::Table(t)) => Ok(Some(t)),
+        Ok(other) => Err(format!(
+            "load {schema}.{name}: not a table: {:?}",
+            other.kind()
+        )),
+        Err(e) if e.category() == ErrorCategory::NotFound => Ok(None),
+        Err(e) => Err(format!("load {schema}.{name}: {e}")),
     }
-
-    let indexes = query(
-        c,
-        "SELECT i.index_id, i.name, i.is_primary_key, i.is_unique, i.is_unique_constraint, \
-         i.type_desc, i.filter_definition, i.fill_factor FROM sys.indexes AS i \
-         WHERE i.object_id = @P1 AND i.index_id > 0 ORDER BY i.name",
-        &oid,
-    )
-    .await?;
-    let parts = query(
-        c,
-        "SELECT ic.index_id, c.name, ic.is_descending_key, ic.is_included_column \
-         FROM sys.index_columns AS ic JOIN sys.columns AS c ON c.object_id = ic.object_id AND \
-         c.column_id = ic.column_id WHERE ic.object_id = @P1 \
-         ORDER BY ic.index_id, ic.key_ordinal, ic.index_column_id",
-        &oid,
-    )
-    .await?;
-    for r in &indexes {
-        let index_id = int(r.first());
-        let mut keys = Vec::new();
-        let mut include = Vec::new();
-        for p in parts.iter().filter(|p| int(p.first()) == index_id) {
-            let name = text(p.get(1)).unwrap_or_default();
-            if yes(p.get(3)) {
-                include.push(serde_json::Value::String(name));
-            } else {
-                let mut k = IndexColumn::column(name);
-                k.descending = yes(p.get(2));
-                keys.push(k);
-            }
-        }
-        let kind = text(r.get(5)).unwrap_or_default().to_lowercase();
-        let clustered = kind == "clustered";
-        let name = text(r.get(1)).unwrap_or_default();
-        if yes(r.get(2)) {
-            t.primary_key = Some(PrimaryKeyDef {
-                name: Some(name),
-                columns: keys.into_iter().map(|k| k.name).collect(),
-            });
-            t.extras.insert(props::CLUSTERED, clustered);
-            continue;
-        }
-        let mut idx = IndexDef {
-            name,
-            columns: keys,
-            unique: yes(r.get(3)),
-            is_constraint: yes(r.get(4)),
-            predicate: text(r.get(6)),
-            extras: Extras::new(),
-        };
-        idx.extras.insert(props::CLUSTERED, clustered);
-        idx.extras.insert(extras::INDEX_KIND, kind);
-        if !include.is_empty() {
-            idx.extras.insert(
-                props::INCLUDE_COLUMNS,
-                Value::Json(serde_json::Value::Array(include)),
-            );
-        }
-        let fill = int(r.get(7));
-        if fill != 0 {
-            idx.extras.insert(props::FILL_FACTOR, Value::Int(fill));
-        }
-        t.indexes.push(idx);
-    }
-
-    let fks = query(
-        c,
-        "SELECT fk.object_id, fk.name, OBJECT_SCHEMA_NAME(fk.referenced_object_id), \
-         OBJECT_NAME(fk.referenced_object_id), fk.delete_referential_action_desc, \
-         fk.update_referential_action_desc, fk.is_not_trusted FROM sys.foreign_keys AS fk \
-         WHERE fk.parent_object_id = @P1 ORDER BY fk.name",
-        &oid,
-    )
-    .await?;
-    let fk_cols = query(
-        c,
-        "SELECT fkc.constraint_object_id, pc.name, rc.name FROM sys.foreign_key_columns AS fkc \
-         JOIN sys.columns AS pc ON pc.object_id = fkc.parent_object_id AND pc.column_id = \
-         fkc.parent_column_id JOIN sys.columns AS rc ON rc.object_id = \
-         fkc.referenced_object_id AND rc.column_id = fkc.referenced_column_id \
-         WHERE fkc.parent_object_id = @P1 ORDER BY fkc.constraint_object_id, \
-         fkc.constraint_column_id",
-        &oid,
-    )
-    .await?;
-    let action = |desc: Option<String>| match desc.as_deref() {
-        Some("CASCADE") => FkAction::Cascade,
-        Some("SET_NULL") => FkAction::SetNull,
-        Some("SET_DEFAULT") => FkAction::SetDefault,
-        _ => FkAction::NoAction,
-    };
-    for r in &fks {
-        let fid = int(r.first());
-        let mine: Vec<&Vec<Option<String>>> =
-            fk_cols.iter().filter(|p| int(p.first()) == fid).collect();
-        let mut fk = ForeignKeyDef {
-            name: text(r.get(1)),
-            columns: mine
-                .iter()
-                .map(|p| text(p.get(1)).unwrap_or_default())
-                .collect(),
-            ref_table: ObjectRef::table(
-                Some(db),
-                text(r.get(2)).as_deref(),
-                text(r.get(3)).unwrap_or_default(),
-            ),
-            ref_columns: mine
-                .iter()
-                .map(|p| text(p.get(2)).unwrap_or_default())
-                .collect(),
-            on_delete: action(text(r.get(4))),
-            on_update: action(text(r.get(5))),
-            extras: Extras::new(),
-        };
-        fk.extras.insert(extras::NOT_TRUSTED, yes(r.get(6)));
-        t.foreign_keys.push(fk);
-    }
-
-    let checks = query(
-        c,
-        "SELECT name, definition, is_not_trusted FROM sys.check_constraints \
-         WHERE parent_object_id = @P1 ORDER BY name",
-        &oid,
-    )
-    .await?;
-    for r in &checks {
-        let mut check = CheckDef {
-            name: text(r.first()),
-            expression: text(r.get(1)).unwrap_or_default(),
-            extras: Extras::new(),
-        };
-        check.extras.insert(extras::NOT_TRUSTED, yes(r.get(2)));
-        t.checks.push(check);
-    }
-
-    let comment = query(
-        c,
-        "SELECT CAST(value AS nvarchar(max)) FROM sys.extended_properties WHERE class = 1 AND \
-         major_id = @P1 AND minor_id = 0 AND name = N'MS_Description'",
-        &oid,
-    )
-    .await?;
-    t.comment = comment.first().and_then(|r| text(r.first()));
-    Ok(Some(t))
 }
 
 // --- the round trip -------------------------------------------------------------------------
