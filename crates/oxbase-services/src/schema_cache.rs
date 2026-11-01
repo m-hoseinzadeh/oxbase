@@ -238,7 +238,7 @@ impl fmt::Debug for SchemaEvents {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SchemaEvents")
             .field("subscribers", &self.tx.receiver_count())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -416,7 +416,7 @@ mod tests {
             database: "app".into(),
         };
         let status = CacheStatus::missing(key.clone());
-        let v = serde_json::to_value(&status).unwrap();
+        let v = serde_json::to_value(status).unwrap();
         assert_eq!(v["state"], "missing");
         assert_eq!(v["key"]["profileId"], Uuid::nil().to_string());
         assert_eq!(v["relationCount"], 0);
@@ -442,7 +442,7 @@ mod tests {
         assert_eq!(status.generation, Some(cache.generation()));
         let mut failed = status;
         failed.last_error = Some(Error::connection("refused"));
-        let v = serde_json::to_value(&failed).unwrap();
+        let v = serde_json::to_value(failed).unwrap();
         assert_eq!(v["lastError"]["category"], "connection");
     }
 

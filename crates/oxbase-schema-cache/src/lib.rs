@@ -189,6 +189,7 @@ fn idx(i: usize) -> u32 {
 impl SchemaCache {
     /// Builds the index over `snapshot` (normalized first). Linear in the number of names plus
     /// one sort.
+    #[allow(clippy::many_single_char_names)] // short loop and closure names
     pub fn new(mut snapshot: CatalogSnapshot) -> Self {
         snapshot.normalize();
         let mut names = Vec::with_capacity(snapshot.column_count() + snapshot.relation_count());
@@ -276,6 +277,7 @@ impl SchemaCache {
     }
 
     /// The name a target points at (empty for a stale target).
+    #[allow(clippy::many_single_char_names)] // short loop and closure names
     pub fn name_of(&self, target: Target) -> &str {
         let snap = &self.inner.snapshot;
         let schema = |s: u32| snap.schemas.get(s as usize);
@@ -316,6 +318,7 @@ impl SchemaCache {
     ///
     /// Prefix scores: 1 000 for an exact (case-insensitive) match, else 900 minus the number of
     /// extra characters (at least 1). Fuzzy scores come from [`fuzzy_score`].
+    #[allow(clippy::many_single_char_names)] // short loop and closure names
     pub fn search(&self, query: &NameQuery<'_>) -> Vec<NameHit> {
         let pattern = query.pattern.to_lowercase();
         let mut hits: Vec<(NameHit, &str)> = Vec::new();
@@ -386,7 +389,11 @@ impl SchemaCache {
     pub fn search_schemas(&self) -> Vec<u32> {
         let snap = self.snapshot();
         let find = |name: &str| snap.schemas.iter().position(|s| s.name == name).map(idx);
-        let path: Vec<u32> = snap.search_path.iter().filter_map(|s| find(s)).collect();
+        let path: Vec<u32> = snap
+            .search_path
+            .iter()
+            .filter_map(|s| find(s.as_str()))
+            .collect();
         if !path.is_empty() {
             return path;
         }
@@ -500,6 +507,7 @@ impl SchemaCache {
     }
 
     /// An estimate of the heap memory of the snapshot and the index, in bytes.
+    #[allow(clippy::many_single_char_names)] // short loop and closure names
     pub fn heap_bytes(&self) -> usize {
         let snap = &self.inner.snapshot;
         let s = |x: &String| x.capacity();
@@ -590,7 +598,7 @@ impl SchemaCache {
             let target = match snap.schemas.iter().position(|s| s.name == schema_name) {
                 Some(i) => &mut snap.schemas[i],
                 None if fresh.is_some() => {
-                    snap.schemas.push(CatalogSchema::new(schema_name.clone()));
+                    snap.schemas.push(CatalogSchema::new(schema_name.as_str()));
                     snap.schemas.last_mut().expect("just pushed")
                 }
                 None => continue,

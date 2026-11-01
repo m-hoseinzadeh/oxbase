@@ -145,6 +145,7 @@ impl Rng {
 }
 
 /// The snapshot for `spec`.
+#[allow(clippy::many_single_char_names)] // short loop and closure names
 pub fn snapshot(spec: &SyntheticSpec) -> CatalogSnapshot {
     let mut rng = Rng(spec.seed | 1);
     let single = matches!(

@@ -327,7 +327,7 @@ mod tests {
         };
         assert!(s.applies_to(Engine::MsSql));
         assert!(!s.applies_to(Engine::Postgres));
-        let json = serde_json::to_value(&s).unwrap();
+        let json = serde_json::to_value(s).unwrap();
         assert_eq!(json["engines"], serde_json::json!(["mssql"]));
         assert_eq!(json["builtin"], serde_json::json!(true));
         let input: SnippetInput = serde_json::from_value(serde_json::json!({

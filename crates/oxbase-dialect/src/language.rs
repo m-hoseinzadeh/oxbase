@@ -122,7 +122,7 @@ fn contains_upper(list: &[&str], word: &str) -> bool {
     list.binary_search_by(|k| cmp_upper(k, word)).is_ok()
 }
 
-fn sorted_ci<'a>(names: impl Iterator<Item = &'a str>) -> Result<(), String> {
+fn sorted_ci(names: impl Iterator<Item = &'static str>) -> Result<(), String> {
     let mut prev: Option<String> = None;
     for name in names {
         let up = name.to_ascii_uppercase();
@@ -191,22 +191,29 @@ impl SqlLanguage {
         };
         let first_ok = first.is_alphabetic() || first == '_' || (extra(first) && first != '$');
         let rest_ok = chars.all(|c| c.is_alphanumeric() || c == '_' || extra(c));
-        !first_ok || !rest_ok || self.is_reserved(name) || !case.case_survives_unquoted(name)
+        let bare =
+            first_ok && rest_ok && !self.is_reserved(name) && case.case_survives_unquoted(name);
+        !bare
     }
 
     /// Problems with the data (module docs); empty when it is well-formed. Engine crates
     /// assert this is empty in a unit test.
+    #[allow(clippy::many_single_char_names)] // short loop and closure names
     pub fn validate(&self) -> Vec<String> {
         let mut problems = Vec::new();
         for (what, list) in [("keywords", self.keywords), ("reserved", self.reserved)] {
             if let Some(w) = list.iter().find(|w| w.to_ascii_uppercase() != **w) {
                 problems.push(format!("{what}: `{w}` is not upper case"));
             }
-            if let Some(pair) = list.windows(2).find(|p| p[0] >= p[1]) {
-                problems.push(format!(
-                    "{what}: `{}` and `{}` are out of order or duplicated",
-                    pair[0], pair[1]
-                ));
+            for pair in list.windows(2) {
+                if let [a, b] = pair
+                    && a >= b
+                {
+                    problems.push(format!(
+                        "{what}: `{a}` and `{b}` are out of order or duplicated"
+                    ));
+                    break;
+                }
             }
         }
         for w in self.reserved {
@@ -228,12 +235,13 @@ impl SqlLanguage {
         if let Err(e) = sorted_ci(self.types.iter().map(|t| t.name)) {
             problems.push(format!("types: {e}"));
         }
-        if let Some(pair) = self
-            .types
-            .windows(2)
-            .find(|p| p[0].name.eq_ignore_ascii_case(p[1].name))
-        {
-            problems.push(format!("types: `{}` is duplicated", pair[0].name));
+        for pair in self.types.windows(2) {
+            if let [a, b] = pair
+                && a.name.eq_ignore_ascii_case(b.name)
+            {
+                problems.push(format!("types: `{}` is duplicated", a.name));
+                break;
+            }
         }
         problems
     }

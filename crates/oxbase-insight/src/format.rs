@@ -54,7 +54,7 @@ impl Default for FormatOptions {
 
 impl FormatOptions {
     /// `Error::InvalidInput` when a value is out of its documented range.
-    pub fn validate(&self) -> Result<()> {
+    pub fn validate(self) -> Result<()> {
         if !(1..=8).contains(&self.indent_width) {
             return Err(Error::invalid_input("indent width must be 1 to 8"));
         }

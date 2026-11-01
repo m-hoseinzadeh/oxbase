@@ -284,7 +284,7 @@ impl SchemaCacheRepository for MemorySchemaCacheRepository {
     async fn delete(&self, profile_id: Uuid, database: Option<&str>) -> Result<u64> {
         let mut map = self.lock()?;
         let before = map.len();
-        map.retain(|(p, d), _| !(*p == profile_id && database.is_none_or(|db| db == d.as_str())));
+        map.retain(|(p, d), _| *p != profile_id || database.is_some_and(|db| db != d.as_str()));
         Ok(u64::try_from(before - map.len()).unwrap_or(0))
     }
 }
@@ -474,7 +474,7 @@ mod tests {
             .await
             .unwrap();
         drop(db);
-        let db = AppDb::open(&path).await.unwrap();
+        let db = AppDb::open(path).await.unwrap();
         let list = SqliteSnippetRepository::new(db).list().await.unwrap();
         assert_eq!(list.len(), 2);
         assert_eq!(list[1], kept);

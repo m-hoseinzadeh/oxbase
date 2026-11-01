@@ -71,6 +71,7 @@ pub struct SchemaChange {
 /// Not detected: `SELECT ... INTO new_table`, DDL run by dynamic SQL or inside functions, and
 /// executable MySQL comments. A false positive only costs a cache refresh; a miss leaves the
 /// cache stale until the next refresh (the editor offers one).
+#[allow(clippy::many_single_char_names)] // short loop and closure names
 pub fn schema_changes(dialect: SqlDialect, statement: &str) -> Vec<SchemaChange> {
     let toks: Vec<SqlToken> = tokenize(dialect, statement)
         .filter(|t| !t.is_trivia() && t.kind != SqlTokenKind::ExecComment)
@@ -165,7 +166,8 @@ pub fn schema_changes(dialect: SqlDialect, statement: &str) -> Vec<SchemaChange>
         loop {
             let after = toks.get(next).map(|t| t.text(statement));
             let renamed_to = verb == DdlVerb::Rename && word(next).as_deref() == Some("TO");
-            if !(renamed_to || (after == Some(",") && verb != DdlVerb::Create)) {
+            let listed = after == Some(",") && verb != DdlVerb::Create;
+            if !renamed_to && !listed {
                 break;
             }
             let (more, after_more) = read_name(statement, &toks, next + 1);

@@ -213,6 +213,7 @@ impl std::error::Error for TokenMismatch {}
 ///    a parameter or variable sigil (`$ @ : ? # &`) followed by a word, and a number with an
 ///    exponent marker followed by its sign (`1e` `-` `5`). Parentheses, commas and `;` may
 ///    gain or lose spaces freely.
+#[allow(clippy::many_single_char_names)] // short loop and closure names
 pub fn tokens_equivalent(
     dialect: SqlDialect,
     before: &str,
