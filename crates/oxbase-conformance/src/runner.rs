@@ -18,7 +18,7 @@ use crate::report::{
 use crate::roundtrip;
 
 /// The milestone this harness build implements.
-pub const MILESTONE: &str = "M3";
+pub const MILESTONE: &str = "M4";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RunOptions {

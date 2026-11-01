@@ -267,7 +267,8 @@ fn failed_all(e: &ResolvedEngine, why: &str) -> Vec<ConnCell> {
 pub(crate) struct Ctx {
     pub(crate) mgr: ConnectionManager,
     secrets: Arc<MemorySecretStore>,
-    fixtures: Fixtures,
+    // Boxed: every check future holds a Ctx, and the fixtures file is large.
+    fixtures: Box<Fixtures>,
 }
 
 type CheckResult = Result<String, String>;
@@ -283,7 +284,7 @@ impl Ctx {
         Self {
             mgr,
             secrets,
-            fixtures: fixtures.clone(),
+            fixtures: Box::new(fixtures.clone()),
         }
     }
 
