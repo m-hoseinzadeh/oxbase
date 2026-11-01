@@ -262,11 +262,12 @@ fn split(
 /// Where the statement starting at `start` ends: its `;`, the next statement's first word
 /// (T-SQL batches), or `hi`.
 fn segment_end(t: &Toks<'_>, feat: &Features, start: usize, hi: usize) -> usize {
-    let mut head = t.upper(start);
-    if update_statistics(t, start) {
-        // `UPDATE STATISTICS t` is maintenance, not DML: a `SET` after it starts a statement.
-        head = "UPDATE STATISTICS".to_owned();
-    }
+    // `UPDATE STATISTICS t` is maintenance, not DML: a `SET` after it starts a statement.
+    let head = if update_statistics(t, start) {
+        "UPDATE STATISTICS".to_owned()
+    } else {
+        t.upper(start)
+    };
     let mut main_seen = false;
     // The first DML word of the statement (`WITH x AS (...) UPDATE ...`).
     let mut main_word = String::new();
