@@ -100,6 +100,12 @@ describe("SQL Server grid values", () => {
     expect(typedProblem(kind, '<a b="1"/>', xml)).toBeNull();
     expect(typedProblem(kind, "<a/><b>text</b>", xml)).toBeNull();
     expect(typedProblem(kind, "<a>", xml)).toBe("not well-formed XML");
+    // A leading XML declaration is valid for SQL Server's xml type.
+    expect(typedProblem(kind, '<?xml version="1.0" encoding="UTF-8"?><a/>', xml)).toBeNull();
+    expect(typedProblem(kind, '  <?xml version="1.0"?>\n<a/><b/>', xml)).toBeNull();
+    expect(typedProblem(kind, '<?xml version="1.0"?><a>', xml)).toBe("not well-formed XML");
+    // Only at the start.
+    expect(typedProblem(kind, '<a/><?xml version="1.0"?>', xml)).toBe("not well-formed XML");
     expect(typedProblem(kind, "<a>", { type: "other", name: "hierarchyid" })).toBeNull();
     const onChange = vi.fn();
     render(<Harness kind={kind} dataType={xml} initial="<a/>" onChange={onChange} />);

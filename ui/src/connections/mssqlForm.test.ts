@@ -100,6 +100,13 @@ describe("SQL Server connection form", () => {
     expect(validateForm({ ...mssql(), instance: "host\\SQLEXPRESS" }, "save").instance).toMatch(
       /only the instance name/,
     );
+    const instanceError = (instance: string) =>
+      validateForm({ ...mssql(), instance }, "save").instance;
+    expect(instanceError("SQLEXPRESS,1433")).toMatch(/Port field/);
+    for (const bad of ["a;b", "o'brien", "a&b", "a@b", "a#b", "SEVENTEEN_CHARS_X"]) {
+      expect(instanceError(bad)).toMatch(/up to 16 letters/);
+    }
+    expect(instanceError("SQL_2025$")).toBeUndefined();
   });
 
   it("does not send client certificates (the driver refuses them)", () => {

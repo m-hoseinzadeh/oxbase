@@ -131,8 +131,11 @@ export function byteLength(text: string): number | null {
 /** A problem with an XML fragment (the server accepts several top-level nodes), or `null`. */
 function xmlProblem(text: string): string | null {
   if (typeof DOMParser === "undefined") return null;
+  // The value is wrapped so a fragment (several top-level elements, as SQL Server's xml type
+  // allows) parses; a leading XML declaration may only start a document, so it is dropped.
+  const body = text.replace(/^﻿?\s*<\?xml(?:\s[^?]*)?\?>/, "");
   const doc = new DOMParser().parseFromString(
-    `<oxbase-root>${text}</oxbase-root>`,
+    `<oxbase-root>${body}</oxbase-root>`,
     "application/xml",
   );
   return doc.getElementsByTagName("parsererror").length > 0 ? "not well-formed XML" : null;

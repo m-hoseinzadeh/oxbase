@@ -281,6 +281,106 @@ export function indexLockReason(index: IndexDef, traits: DesignTraits): string |
   return `A ${kind.replace(/_/g, " ")} index is kept as it is: the designer cannot change it.`;
 }
 
+/** Whether the table's primary key is clustered (an absent `clustered` extra means it is). */
+export function primaryKeyClustered(design: TableDesign): boolean {
+  if (!design.primaryKey || design.primaryKey.columns.length === 0) return false;
+  return boolExtra(design.extras, EXTRA.clustered) ?? true;
+}
+
+/** Whether `index` is clustered (the `clustered` extra, or a clustered index kind). */
+export function indexClustered(index: IndexDef): boolean {
+  const flag = boolExtra(index.extras, EXTRA.clustered);
+  if (flag !== undefined) return flag;
+  return textExtra(index.extras, EXTRA.indexKind)?.startsWith("clustered") ?? false;
+}
+
+/**
+ * What else holds the table's one clustered index, besides `self` (the primary key or the
+ * index at that position): a name to show, or `null` when nothing else is clustered.
+ */
+export function otherClustered(design: TableDesign, self: "primaryKey" | number): string | null {
+  if (self !== "primaryKey" && primaryKeyClustered(design)) return "the primary key";
+  for (const [i, item] of design.indexes.entries()) {
+    if (i !== self && indexClustered(item.def)) {
+      return item.def.name ? `index ${item.def.name}` : `index ${i + 1}`;
+    }
+  }
+  return null;
+}
+
+const WHOLE_NUMBER = /^[+-]?\d+$/;
+
+/** Why `IDENTITY(seed, increment)` text is invalid, or `null`. */
+export function identityProblem(seed: string, increment: string): string | null {
+  if (!WHOLE_NUMBER.test(seed.trim())) return "The identity seed must be a whole number.";
+  if (!WHOLE_NUMBER.test(increment.trim()) || /^[+-]?0+$/.test(increment.trim())) {
+    return "The identity increment must be a whole number other than 0.";
+  }
+  return null;
+}
+
+/**
+ * Why a column of type `native` cannot be an identity column, or `null`. SQL Server allows
+ * tinyint, smallint, int, bigint and decimal/numeric with scale 0; a type the designer does
+ * not know (an alias type) is left to the server.
+ */
+export function identityTypeProblem(native: string, engine: Engine | undefined): string | null {
+  if (!native.trim()) return null;
+  const t = guessDataType(native, engine);
+  if (t.type === "int" || t.type === "other") return null;
+  if (t.type === "decimal" && (t.scale ?? 0) === 0) return null;
+  return "An identity column must be tinyint, smallint, int, bigint, or decimal/numeric with scale 0.";
+}
+
+/**
+ * Problems the designer finds before asking the server: rules of the engine's designer traits
+ * that a preview would only report as a failed apply. Errors block apply like the preview's.
+ */
+export function designProblems(design: TableDesign, engine: Engine | undefined): DesignIssue[] {
+  const traits = designTraits(engine);
+  const issues: DesignIssue[] = [];
+  if (traits.identityStyle === "seedIncrement") {
+    for (const [i, { column }] of design.columns.entries()) {
+      if (!column.identity) continue;
+      const path = `columns[${i}].identity`;
+      const text =
+        identityProblem(column.identity.start ?? "1", column.identity.increment ?? "1") ??
+        identityTypeProblem(column.native_type, engine);
+      if (text) issues.push({ severity: "error", path, message: text });
+    }
+  }
+  if (traits.clusteredIndexes) {
+    for (const [i, { def }] of design.indexes.entries()) {
+      if (!indexClustered(def) || indexLockReason(def, traits)) continue;
+      const path = `indexes[${i}]`;
+      // Report a conflict once, on the later holder (the primary key comes first).
+      const before = otherClustered({ ...design, indexes: design.indexes.slice(0, i + 1) }, i);
+      if (before) {
+        issues.push({
+          severity: "error",
+          path: `${path}.clustered`,
+          message: `A table has at most one clustered index, and ${before} is already clustered.`,
+        });
+      }
+      if (traits.includedColumns && namesExtra(def.extras, EXTRA.includeColumns).length > 0) {
+        issues.push({
+          severity: "error",
+          path: `${path}.include_columns`,
+          message: "A clustered index cannot have included columns.",
+        });
+      }
+      if (def.predicate?.trim()) {
+        issues.push({
+          severity: "error",
+          path: `${path}.predicate`,
+          message: "A filtered index (with a WHERE condition) must be nonclustered.",
+        });
+      }
+    }
+  }
+  return issues;
+}
+
 function args(text: string): number[] {
   const m = /\(([^)]*)\)/.exec(text);
   if (!m?.[1]) return [];
@@ -377,6 +477,9 @@ function guessTSqlType(
     case "varchar":
     case "nvarchar":
       return max ? { type: "text" } : { type: "var_char", length: a ?? 1 };
+    case "sysname":
+      // A built-in alias of nvarchar(128) NOT NULL.
+      return { type: "var_char", length: 128 };
     case "char":
     case "nchar":
       return { type: "char", length: a ?? 1 };

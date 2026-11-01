@@ -101,6 +101,24 @@ export const FIELD_ORDER: FormField[] = [
 ];
 
 /**
+ * Why `name` is not a SQL Server instance name (up to 16 characters, none of
+ * `\ / : , ; ' & @ #` or white space), or `null`; empty is no instance.
+ */
+export function instanceProblem(name: string): string | null {
+  if (name === "") return null;
+  if (/[\\/:]/.test(name)) {
+    return "Enter only the instance name (like SQLEXPRESS), without the host.";
+  }
+  if (name.includes(",")) {
+    return "Enter only the instance name (like SQLEXPRESS); the port goes in the Port field.";
+  }
+  if (/[;'&@#\s]/.test(name) || name.length > 16) {
+    return "Enter only the instance name (like SQLEXPRESS): up to 16 letters, digits, _ or $.";
+  }
+  return null;
+}
+
+/**
  * What the dialog offers per engine beyond the common fields. Engines not listed have none of
  * the extras and accept client certificates.
  */
@@ -301,8 +319,9 @@ export function validateForm(form: ConnectionForm, purpose: ValidationPurpose): 
     if (traits.instance && form.instance.trim() !== "" && form.port.trim() === "") {
       errors.port = "Enter the named instance's port (the SQL Server Browser service is not used).";
     }
-    if (traits.instance && /[\\/:\s]/.test(form.instance.trim())) {
-      errors.instance = "Enter only the instance name (like SQLEXPRESS), without the host.";
+    if (traits.instance) {
+      const problem = instanceProblem(form.instance.trim());
+      if (problem) errors.instance = problem;
     }
     if (
       traits.strictEncryption &&

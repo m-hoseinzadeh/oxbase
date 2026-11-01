@@ -31,6 +31,8 @@ import {
   dropColumnRefs,
   EXTRA,
   guessDataType,
+  identityTypeProblem,
+  indexClustered,
   indexLockReason,
   issuesAt,
   moveItem,
@@ -38,6 +40,7 @@ import {
   newColumn,
   newForeignKey,
   newIndex,
+  otherClustered,
   renameColumn,
   splitNames,
   supportHint,
@@ -392,6 +395,7 @@ export function ColumnsEditor({
                           design.columns.find((c, i) => i !== index && c.column.identity)?.column
                             .name ?? null
                         }
+                        identityTypeHint={identityTypeProblem(col.column.native_type, engine)}
                         existing={existing}
                         disabled={disabled}
                         onChange={(next) => setColumn(index, next)}
@@ -499,6 +503,7 @@ function ColumnDetails({
   caps,
   traits,
   otherIdentity,
+  identityTypeHint,
   existing,
   disabled,
   onChange,
@@ -509,6 +514,8 @@ function ColumnDetails({
   traits: DesignTraits;
   /** Another column of the table that has identity (for engines with one per table). */
   otherIdentity: string | null;
+  /** Why the column's type cannot be an identity column, or `null`. */
+  identityTypeHint: string | null;
   existing: boolean;
   disabled: boolean;
   onChange: (next: DesignColumn) => void;
@@ -542,6 +549,7 @@ function ColumnDetails({
           caps={caps}
           traits={traits}
           otherIdentity={otherIdentity}
+          typeHint={identityTypeHint}
           existing={existing}
           disabled={disabled}
           onChange={onChange}
@@ -646,8 +654,6 @@ function ColumnDetails({
   );
 }
 
-const WHOLE_NUMBER = /^[+-]?\d+$/;
-
 /**
  * `IDENTITY(seed, increment)` of a column (SQL Server): set when the column is created, never
  * added to, removed from or changed on an existing column, and on at most one column.
@@ -658,6 +664,7 @@ function SeedIncrementIdentity({
   caps,
   traits,
   otherIdentity,
+  typeHint,
   existing,
   disabled,
   onChange,
@@ -667,6 +674,7 @@ function SeedIncrementIdentity({
   caps: DesignerCapabilities;
   traits: DesignTraits;
   otherIdentity: string | null;
+  typeHint: string | null;
   existing: boolean;
   disabled: boolean;
   onChange: (next: DesignColumn) => void;
@@ -675,23 +683,21 @@ function SeedIncrementIdentity({
   const identity = def.identity;
   const lockedByExisting = existing && traits.identityOnNewColumnsOnly;
   const lockedByOther = !identity && traits.singleIdentity && otherIdentity !== null;
+  // Turning identity on needs an integer type; an identity column whose type changed keeps
+  // its checkbox (to turn it off) and gets a designer issue (`designProblems`).
+  const lockedByType = !identity && typeHint !== null;
   const hint = !caps.identity
     ? "Identity columns are not supported by this database"
     : lockedByExisting
       ? "IDENTITY cannot be added to, removed from or changed on an existing column: add a new column or recreate the table."
       : lockedByOther
         ? `The table already has an identity column (${otherIdentity || "unnamed"}).`
-        : undefined;
+        : lockedByType
+          ? typeHint
+          : undefined;
   const locked = disabled || !caps.identity || lockedByExisting;
   const seed = identity?.start ?? "1";
   const increment = identity?.increment ?? "1";
-  const problem = !identity
-    ? null
-    : !WHOLE_NUMBER.test(seed.trim())
-      ? "The seed must be a whole number."
-      : !WHOLE_NUMBER.test(increment.trim()) || /^[+-]?0+$/.test(increment.trim())
-        ? "The increment must be a whole number other than 0."
-        : null;
 
   function toggle(on: boolean) {
     if (on) {
@@ -725,7 +731,7 @@ function SeedIncrementIdentity({
           type="checkbox"
           aria-label={`Column ${index + 1} identity`}
           checked={identity !== undefined}
-          disabled={locked || lockedByOther}
+          disabled={locked || lockedByOther || lockedByType}
           onChange={(e) => toggle(e.target.checked)}
         />
         Identity
@@ -760,12 +766,7 @@ function SeedIncrementIdentity({
           </label>
         </>
       ) : null}
-      {problem ? (
-        <span className="designer__issue designer__issue--error" role="alert">
-          {problem}
-        </span>
-      ) : null}
-      {lockedByExisting && caps.identity ? (
+      {(lockedByExisting || lockedByType) && caps.identity ? (
         <span className="field__hint designer__identity-hint">{hint}</span>
       ) : null}
     </span>
@@ -862,8 +863,11 @@ function DraftInput({
   );
 }
 
-/** `index` marked clustered or not (the `index_kind` extra follows when it is a plain kind). */
-function withClustered(index: IndexDef, on: boolean): IndexDef {
+/**
+ * `index` marked clustered or not (the `index_kind` extra follows when it is a plain kind). A
+ * clustered index has no included columns and no filter, so turning it on clears both.
+ */
+export function withClustered(index: IndexDef, on: boolean): IndexDef {
   let extras = withExtra(index.extras, EXTRA.clustered, { type: "bool", value: on });
   const kind = textExtra(index.extras, EXTRA.indexKind);
   if (kind === "clustered" || kind === "nonclustered") {
@@ -872,8 +876,14 @@ function withClustered(index: IndexDef, on: boolean): IndexDef {
       value: on ? "clustered" : "nonclustered",
     });
   }
-  const { extras: _e, ...rest } = index;
-  return { ...rest, extras };
+  if (on && EXTRA.includeColumns in extras) {
+    // Written empty (not removed), so dropping existing ones is a change.
+    extras = withExtra(extras, EXTRA.includeColumns, { type: "json", value: [] });
+  }
+  const { extras: _e, predicate: _p, ...rest } = index;
+  return on || index.predicate === undefined
+    ? { ...rest, extras }
+    : { ...rest, extras, predicate: index.predicate };
 }
 
 export function IndexesEditor({
@@ -917,7 +927,11 @@ export function IndexesEditor({
             const rowIssues = issuesAt(issues, `indexes[${index}]`);
             const kindLock = indexLockReason(item.def, traits);
             const locked = disabled || !canChange(item) || kindLock !== null;
-            const clustered = boolExtra(item.def.extras, EXTRA.clustered) ?? false;
+            const clustered = indexClustered(item.def);
+            // At most one clustered index per table (the primary key's counts).
+            const clusteredElsewhere = traits.clusteredIndexes
+              ? otherClustered(design, index)
+              : null;
             const columnCount =
               4 +
               (caps.uniqueConstraints ? 1 : 0) +
@@ -991,8 +1005,12 @@ export function IndexesEditor({
                         type="checkbox"
                         aria-label={`Index ${index + 1} clustered`}
                         checked={clustered}
-                        disabled={locked}
-                        title="A table has at most one clustered index (the primary key's, when it is clustered)."
+                        disabled={locked || (!clustered && clusteredElsewhere !== null)}
+                        title={
+                          !clustered && clusteredElsewhere !== null
+                            ? `A table has at most one clustered index: ${clusteredElsewhere} is clustered.`
+                            : "A table has at most one clustered index (the primary key's, when it is clustered)."
+                        }
                         onChange={(e) => set(index, withClustered(item.def, e.target.checked))}
                       />
                     </td>
@@ -1032,7 +1050,16 @@ export function IndexesEditor({
                         aria-label={`Index ${index + 1} predicate`}
                         value={item.def.predicate ?? ""}
                         placeholder="partial index condition"
-                        disabled={locked || item.def.is_constraint}
+                        disabled={
+                          locked ||
+                          item.def.is_constraint ||
+                          (traits.clusteredIndexes && clustered && !item.def.predicate)
+                        }
+                        title={
+                          traits.clusteredIndexes && clustered
+                            ? "A filtered index must be nonclustered"
+                            : undefined
+                        }
                         spellCheck={false}
                         onChange={(e) => {
                           const { predicate: _p, ...rest } = item.def;
@@ -1384,6 +1411,12 @@ export function OptionsEditor({
   const canComment = allowed(caps.tableComment);
   const canPk = isNew || allowed(caps.changePrimaryKey);
   const nameIssues = issuesAt(issues, "table");
+  const pkClustered = boolExtra(design.extras, EXTRA.clustered) ?? true;
+  const clusteredIndex = traits.clusteredIndexes ? otherClustered(design, "primaryKey") : null;
+  const pkClusterHint =
+    !pkClustered && clusteredIndex !== null
+      ? `A table has at most one clustered index: ${clusteredIndex} is clustered.`
+      : undefined;
   return (
     <div className="designer__section designer__options">
       <div className="field">
@@ -1442,13 +1475,13 @@ export function OptionsEditor({
           />
           <p className="field__hint">Columns: {design.primaryKey.columns.join(", ")}</p>
           {traits.clusteredIndexes ? (
-            <label className="checkbox">
+            <label className="checkbox" title={pkClusterHint}>
               <input
                 type="checkbox"
                 aria-label="Clustered primary key"
                 // Absent means clustered (the server's default for a primary key).
-                checked={boolExtra(design.extras, EXTRA.clustered) ?? true}
-                disabled={disabled || !canPk}
+                checked={pkClustered}
+                disabled={disabled || !canPk || (!pkClustered && clusteredIndex !== null)}
                 onChange={(e) =>
                   onChange({
                     ...design,

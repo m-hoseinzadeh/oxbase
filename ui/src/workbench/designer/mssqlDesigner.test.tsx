@@ -2,14 +2,18 @@ import { fireEvent, render, screen } from "@testing-library/react";
 import { useState } from "react";
 import { describe, expect, it, vi } from "vitest";
 import type { DesignerCapabilities, ServerVersion, TableDef, TableDesign } from "../../api";
-import { ColumnsEditor, IndexesEditor, OptionsEditor } from "./DesignerTabs";
+import { ColumnsEditor, IndexesEditor, OptionsEditor, withClustered } from "./DesignerTabs";
 import {
   columnLockReason,
+  designProblems,
   designTraits,
   guessDataType,
+  identityTypeProblem,
   indexLockReason,
   NO_DESIGNER,
   newColumn,
+  otherClustered,
+  primaryKeyClustered,
   tableReadOnlyReason,
   typeSuggestions,
 } from "./designModel";
@@ -146,7 +150,8 @@ function Harness({
         onChange(d);
       }}
       caps={MSSQL_DESIGNER}
-      issues={[]}
+      // The panel adds the designer's own checks to the preview's issues.
+      issues={designProblems(design, "mssql")}
       engine="mssql"
       serverVersion={serverVersion}
       isNew={false}
@@ -196,6 +201,7 @@ describe("SQL Server designer model", () => {
     expect(g("rowversion")).toEqual({ type: "binary", length: 8 });
     expect(g("xml")).toEqual({ type: "other", name: "xml" });
     expect(g("json")).toEqual({ type: "json", binary: true });
+    expect(g("sysname")).toEqual({ type: "var_char", length: 128 });
     // Elsewhere `timestamp` stays a timestamp.
     expect(guessDataType("timestamp", "postgres")).toEqual({ type: "timestamp", precision: null });
   });
@@ -223,6 +229,74 @@ describe("SQL Server designer model", () => {
     expect(tableReadOnlyReason(temporal)).toMatch(/system-versioned/);
     temporal.original.extras = { memory_optimized: { type: "bool", value: true } };
     expect(tableReadOnlyReason(temporal)).toMatch(/memory-optimized/);
+  });
+
+  it("allows IDENTITY on integer types and decimal with scale 0 only", () => {
+    for (const t of ["tinyint", "smallint", "int", "bigint", "decimal(18,0)", "numeric(10)"]) {
+      expect(identityTypeProblem(t, "mssql")).toBeNull();
+    }
+    for (const t of ["nvarchar(20)", "datetime2", "decimal(12,2)", "money", "bit", "float"]) {
+      expect(identityTypeProblem(t, "mssql")).toMatch(/tinyint, smallint, int, bigint/);
+    }
+    // An alias type is left to the server.
+    expect(identityTypeProblem("dbo.my_id", "mssql")).toBeNull();
+  });
+
+  it("finds identity and clustered problems before the preview", () => {
+    const design = loaded();
+    expect(designProblems(design, "mssql")).toEqual([]);
+    expect(primaryKeyClustered(design)).toBe(true);
+    expect(otherClustered(design, 0)).toBe("the primary key");
+    expect(otherClustered(design, "primaryKey")).toBeNull();
+
+    design.columns.push({
+      column: {
+        ...newColumn("n").column,
+        native_type: "nvarchar(20)",
+        identity: { always: true, start: "1", increment: "1" },
+      },
+    });
+    design.columns.push({
+      column: {
+        ...newColumn("m").column,
+        native_type: "int",
+        identity: { always: true, start: "x", increment: "0" },
+      },
+    });
+    const ix = design.indexes[0];
+    if (!ix) throw new Error("index");
+    ix.def = { ...ix.def, extras: { ...ix.def.extras, clustered: { type: "bool", value: true } } };
+    const problems = designProblems(design, "mssql");
+    expect(problems.map((p) => [p.severity, p.path])).toEqual([
+      ["error", "columns[3].identity"],
+      ["error", "columns[4].identity"],
+      ["error", "indexes[0].clustered"],
+      ["error", "indexes[0].include_columns"],
+      ["error", "indexes[0].predicate"],
+    ]);
+    expect(problems[1]?.message).toMatch(/seed must be a whole number/);
+    expect(problems[2]?.message).toMatch(/the primary key is already clustered/);
+    // Other engines have none of these rules.
+    expect(designProblems(design, "postgres")).toEqual([]);
+
+    // A nonclustered primary key leaves room for the index.
+    design.extras = { clustered: { type: "bool", value: false } };
+    expect(designProblems(design, "mssql").map((p) => p.path)).not.toContain(
+      "indexes[0].clustered",
+    );
+    expect(otherClustered(design, "primaryKey")).toBe("index ix_code");
+  });
+
+  it("clears included columns and the filter when an index becomes clustered", () => {
+    const ix = ORIGINAL.indexes[0];
+    if (!ix) throw new Error("index");
+    const on = withClustered(ix, true);
+    expect(on.extras.include_columns).toEqual({ type: "json", value: [] });
+    expect(on.predicate).toBeUndefined();
+    expect(on.extras.index_kind).toEqual({ type: "text", value: "clustered" });
+    const off = withClustered(ix, false);
+    expect(off.predicate).toBe(ix.predicate);
+    expect(off.extras.include_columns).toEqual(ix.extras.include_columns);
   });
 });
 
@@ -289,16 +363,54 @@ describe("SQL Server designer editors", () => {
     });
     column = onChange.mock.lastCall?.[0].columns[0].column;
     expect(column.identity).toEqual({ always: true, start: "1000", increment: "0" });
-    expect(screen.getByRole("alert")).toHaveTextContent("other than 0");
+    expect(screen.getByText(/increment must be a whole number other than 0/)).toBeInTheDocument();
     fireEvent.click(screen.getByRole("checkbox", { name: "Column 1 identity" }));
     column = onChange.mock.lastCall?.[0].columns[0].column;
     expect(column.identity).toBeUndefined();
     expect(column.auto_increment).toBe(false);
   });
 
+  it("keeps one clustered index per table", () => {
+    render(<Harness editor={IndexesEditor} initial={loaded()} onChange={vi.fn()} />);
+    // The primary key is clustered (the extra is absent), so no index can be.
+    const box = screen.getByRole("checkbox", { name: "Index 1 clustered" });
+    expect(box).toBeDisabled();
+    expect(box).toHaveAttribute("title", expect.stringMatching(/the primary key is clustered/));
+  });
+
+  it("does not make the primary key clustered while an index is", () => {
+    const design = loaded();
+    design.extras = { clustered: { type: "bool", value: false } };
+    const ix = design.indexes[0];
+    if (!ix) throw new Error("index");
+    ix.def = withClustered(ix.def, true);
+    render(<Harness editor={OptionsEditor} initial={design} onChange={vi.fn()} />);
+    const box = screen.getByRole("checkbox", { name: "Clustered primary key" });
+    expect(box).not.toBeChecked();
+    expect(box).toBeDisabled();
+  });
+
+  it("offers IDENTITY only on integer column types", () => {
+    const design: TableDesign = {
+      table: { kind: "table", schema: "m4", name: "t" },
+      columns: [{ column: { ...newColumn("code").column, native_type: "nvarchar(20)" } }],
+      indexes: [],
+      foreignKeys: [],
+      checks: [],
+      extras: {},
+    };
+    render(<Harness editor={ColumnsEditor} initial={design} onChange={vi.fn()} />);
+    fireEvent.click(screen.getByRole("button", { name: "More options of column 1" }));
+    expect(screen.getByRole("checkbox", { name: "Column 1 identity" })).toBeDisabled();
+    expect(screen.getByText(/must be tinyint, smallint, int, bigint/)).toBeInTheDocument();
+  });
+
   it("edits clustered, included columns and the filter of indexes", () => {
     const onChange = vi.fn();
-    render(<Harness editor={IndexesEditor} initial={loaded()} onChange={onChange} />);
+    const design = loaded();
+    // A nonclustered primary key, so an index may be clustered.
+    design.extras = { clustered: { type: "bool", value: false } };
+    render(<Harness editor={IndexesEditor} initial={design} onChange={onChange} />);
     expect(screen.getByRole("columnheader", { name: "Clustered" })).toBeInTheDocument();
     expect(screen.getByRole("textbox", { name: "Index 1 predicate" })).toHaveValue(
       "([code] IS NOT NULL)",
@@ -320,11 +432,15 @@ describe("SQL Server designer editors", () => {
     });
 
     fireEvent.click(screen.getByRole("checkbox", { name: "Index 1 clustered" }));
-    const extras = onChange.mock.lastCall?.[0].indexes[0].def.extras;
-    expect(extras.clustered).toEqual({ type: "bool", value: true });
-    expect(extras.index_kind).toEqual({ type: "text", value: "clustered" });
-    // A clustered index has no included columns.
+    const def = onChange.mock.lastCall?.[0].indexes[0].def;
+    expect(def.extras.clustered).toEqual({ type: "bool", value: true });
+    expect(def.extras.index_kind).toEqual({ type: "text", value: "clustered" });
+    // A clustered index has no included columns and no filter: both are cleared.
+    expect(def.extras.include_columns).toEqual({ type: "json", value: [] });
+    expect(def.predicate).toBeUndefined();
     expect(screen.getByRole("textbox", { name: "Index 1 included columns" })).toBeDisabled();
+    expect(screen.getByRole("textbox", { name: "Index 1 included columns" })).toHaveValue("");
+    expect(screen.getByRole("textbox", { name: "Index 1 predicate" })).toBeDisabled();
 
     // A columnstore index is kept as it is.
     expect(screen.getByRole("textbox", { name: "Index 2 name" })).toBeDisabled();
