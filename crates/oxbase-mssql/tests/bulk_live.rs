@@ -882,3 +882,97 @@ async fn duplicate_key_fails_the_call() {
     )
     .await;
 }
+
+/// Decimals at the edges of 38 digits (a 38-digit integer next to a fraction, `decimal(38, 38)`)
+/// and the row count of the `INSERT` itself when a trigger's statements report their own.
+#[tokio::test]
+#[ignore = "needs the mssql fixture (scripts/fixtures-up.sh mssql)"]
+async fn wide_decimals_and_row_counts_with_a_trigger() {
+    const BIG: &str = "12345678901234567890123456789012345678";
+    const TINY: &str = "0.1234567890123456789012345678901234567";
+    let fx = fixture();
+    let f = &fx;
+    with_table(
+        f,
+        "wide",
+        "id bigint PRIMARY KEY, w decimal(38, 0), z decimal(38, 38), touched int NOT NULL DEFAULT 0",
+        |name| async move {
+            let c = connect(f).await;
+            let qualified = f.qualified(&name);
+            // Two statements of one row each run inside every INSERT: their DONE counts (1 and
+            // 1) must not be added to the INSERT's.
+            run(
+                c.as_ref(),
+                &format!(
+                    "CREATE TRIGGER {} ON {qualified} AFTER INSERT AS BEGIN \
+                     UPDATE t SET touched = touched + 1 FROM {qualified} AS t \
+                     JOIN inserted AS i ON i.id = t.id WHERE t.id = 1; \
+                     UPDATE t SET touched = touched + 1 FROM {qualified} AS t \
+                     JOIN inserted AS i ON i.id = t.id WHERE t.id = 1; END",
+                    f.qualified(&format!("{name}_tr"))
+                ),
+            )
+            .await;
+            let decimal = |scale| DataType::Decimal {
+                precision: Some(38),
+                scale: Some(scale),
+            };
+            let cols = vec![
+                LoadColumn::new("id", DataType::INT64),
+                LoadColumn::new("w", decimal(0)),
+                LoadColumn::new("z", decimal(38)),
+            ];
+            let table = f.table(&name);
+            let target = LoadTarget {
+                table: &table,
+                columns: &cols,
+                version: c.server_version(),
+            };
+            let arrays: Vec<ArrayRef> = vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec![Some(BIG), Some("1.5"), None])),
+                Arc::new(StringArray::from(vec![Some("0.5"), Some(TINY), Some("-0.25")])),
+            ];
+            let data = RecordBatch::try_new(target.schema(), arrays).expect("batch");
+            let n = loader()
+                .load(
+                    LoadSession::new(c.as_ref(), None),
+                    &target,
+                    &data,
+                    CancellationToken::new(),
+                )
+                .await
+                .expect("load");
+            assert_eq!(n, 3, "the INSERT's own row count");
+
+            let out = run(
+                c.as_ref(),
+                &format!(
+                    "SELECT id, CAST(w AS varchar(60)), CAST(z AS varchar(60)), touched \
+                     FROM {qualified} ORDER BY id"
+                ),
+            )
+            .await;
+            let got = rows(&out);
+            assert_eq!(got.len(), 3);
+            let want: [(i64, Option<&str>, &str, i64); 3] = [
+                (1, Some(BIG), "0.5", 2),
+                // `decimal(38, 0)` rounds 1.5 half away from zero, as the column does.
+                (2, Some("2"), TINY, 0),
+                (3, None, "-0.25", 0),
+            ];
+            for (row, (id, w, z, touched)) in got.iter().zip(want) {
+                assert_eq!(row[0], Value::Int(id));
+                if let Some(w) = w {
+                    assert_eq!(number(&row[1], 0), scaled(w, 0), "w of {id}");
+                } else {
+                    assert_eq!(row[1], Value::Null, "w of {id}");
+                }
+                assert_eq!(number(&row[2], 38), scaled(z, 38), "z of {id}");
+                assert_eq!(row[3], Value::Int(touched), "touched of {id}");
+            }
+            c.close().await.expect("close");
+        },
+    )
+    .await;
+}

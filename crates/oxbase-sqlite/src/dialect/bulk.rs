@@ -9,9 +9,16 @@
 //!   journal once per commit, not per statement; a multi-row statement costs one parse for
 //!   thousands of rows, about what a reused single-row prepared statement saves.
 //! - Values bind as the driver maps them: `bool` as 0 / 1, decimals as their exact text (the
-//!   column's affinity decides what SQLite stores), dates, times and timestamps as ISO text
-//!   (`timestamp_tz` with `+00:00`), UUIDs as hyphenated text, JSON as compact text, binary as
-//!   blobs.
+//!   column's affinity decides what SQLite stores, see below), dates, times and timestamps as
+//!   ISO text (`timestamp_tz` with `+00:00`), UUIDs as hyphenated text, JSON as compact text,
+//!   binary as blobs.
+//! - **Decimals are exact only in `TEXT`-affinity columns** (a deviation from §4.5, recorded in
+//!   §13 of the contracts). SQLite applies `NUMERIC` affinity to a column declared `DECIMAL`,
+//!   `NUMERIC`, `MONEY`, ... and turns bound text that looks like a number into an `INTEGER` or
+//!   a `REAL` (a double): `'1.10'` is stored as `1.1`, and `'-9999999999999999.9999'` keeps
+//!   about 15 significant digits. No error is raised and no bind type avoids it (a blob would be
+//!   kept, but as bytes), so the loader cannot prevent it; the import plan has to target a
+//!   `TEXT` column for exact decimals, or warn when the target column has `NUMERIC` affinity.
 //! - The token is checked before each statement; a running one is interrupted by the driver
 //!   (`sqlite3_interrupt` and its progress handler), also while it waits for a lock held by
 //!   another connection.

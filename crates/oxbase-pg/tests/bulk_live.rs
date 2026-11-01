@@ -804,6 +804,78 @@ async fn cancel_while_the_copy_waits_rolls_back() {
     .await;
 }
 
+/// The caller drops the load future (an aborted import task) while the `COPY` waits for a row
+/// lock: the `COPY` still ends (`CopyFail`, then cancel requests), so the session serves the
+/// next statement while the lock is still held.
+#[tokio::test]
+#[ignore = "needs the postgres fixture (scripts/fixtures-up.sh postgres)"]
+async fn dropping_a_blocked_copy_frees_the_session() {
+    let fx = fixture();
+    let f = &fx;
+    with_table(
+        f,
+        "drop",
+        "id bigint PRIMARY KEY, note text",
+        |name| async move {
+            let a = connect(f).await;
+            let b = connect(f).await;
+            let cols = vec![
+                LoadColumn::new("id", DataType::INT64),
+                LoadColumn::new("note", DataType::Text),
+            ];
+            let table = f.table(&name);
+            let target = LoadTarget {
+                table: &table,
+                columns: &cols,
+                version: a.server_version(),
+            };
+            let blocker: Box<dyn Tx> = b.begin().await.expect("begin b");
+            run_tx(
+                blocker.as_ref(),
+                &format!(
+                    "INSERT INTO {} (id, note) VALUES (5000, 'blocker')",
+                    f.qualified(&name)
+                ),
+            )
+            .await;
+
+            let rows_in = batch(&target, &ids(1..=20_000));
+            let copy_loader = loader();
+            let load = copy_loader.load(
+                LoadSession::new(a.as_ref(), None),
+                &target,
+                &rows_in,
+                CancellationToken::new(),
+            );
+            let dropped = tokio::time::timeout(Duration::from_millis(800), load).await;
+            assert!(dropped.is_err(), "the COPY must wait for the row lock");
+
+            // The lock is still held by B; A must answer anyway.
+            let started = Instant::now();
+            let out =
+                tokio::time::timeout(Duration::from_secs(5), run(a.as_ref(), "SELECT 1::bigint"))
+                    .await
+                    .expect("the session is free again within 5 s");
+            println!(
+                "postgres session free after a dropped COPY in {:?}",
+                started.elapsed()
+            );
+            assert_eq!(rows(&out), vec![vec![Value::Int(1)]]);
+
+            blocker.rollback().await.expect("rollback b");
+            let out = run(
+                a.as_ref(),
+                &format!("SELECT count(*) FROM {}", f.qualified(&name)),
+            )
+            .await;
+            assert_eq!(rows(&out), vec![vec![Value::Int(0)]]);
+            a.close().await.expect("close a");
+            b.close().await.expect("close b");
+        },
+    )
+    .await;
+}
+
 #[tokio::test]
 #[ignore = "needs the postgres fixture (scripts/fixtures-up.sh postgres)"]
 async fn duplicate_key_fails_the_call() {

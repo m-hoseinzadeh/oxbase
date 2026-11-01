@@ -557,6 +557,13 @@ fn checks() -> Vec<(&'static str, usize, i128)> {
         ("COUNT(tod)", 0, count(&|i| tod(i).is_some())),
         ("COUNT(ts)", 0, count(&|i| ts(i).is_some())),
         ("COUNT(tstz)", 0, count(&|i| tstz(i).is_some())),
+        // The stored instants, whatever the session's time zone: `UNIX_TIMESTAMP` of a
+        // `TIMESTAMP` column is its internal UTC value.
+        (
+            "CAST(SUM(UNIX_TIMESTAMP(tstz)) AS CHAR)",
+            6,
+            sum(&|i| i128::from(tstz(i).unwrap_or(0))),
+        ),
         ("COUNT(uid)", 0, count(&|i| uid(i).is_some())),
         ("COUNT(doc)", 0, count(&|i| doc(i).is_some())),
     ]
@@ -661,7 +668,7 @@ fn generated_data_is_consistent() {
     }
     assert_eq!(amount(3).as_deref(), Some("-9999999999999999.9999"));
     assert_eq!(scaled("-12.3400", 4), -123_400);
-    assert_eq!(checks().len(), 19);
+    assert_eq!(checks().len(), 20);
 }
 
 async fn load_100k_rows_of_every_type(key: &'static str) {
@@ -679,6 +686,9 @@ async fn load_100k_rows_of_every_type(key: &'static str) {
             version: c.server_version(),
         };
         let token = CancellationToken::new();
+        // A session zone other than UTC: `prepare` must switch the session to UTC, or the
+        // `TIMESTAMP` column stores instants 5 hours off (checked with `UNIX_TIMESTAMP`).
+        run(c.as_ref(), "SET time_zone = '+05:00'").await;
         loader
             .prepare(LoadSession::new(c.as_ref(), None), &target, token.clone())
             .await

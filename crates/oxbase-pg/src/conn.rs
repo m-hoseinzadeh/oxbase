@@ -1024,19 +1024,24 @@ const COPY_ABORT_GRACE: Duration = Duration::from_millis(200);
 ///
 /// # How a `COPY` runs
 ///
+/// - The `COPY` runs on its own task ([`CopyJob`]), like every statement of this driver, so
+///   its cleanup also happens when the caller's future is dropped (an aborted import task)
+///   instead of awaited to the end.
 /// - It takes the connection's statement lock like any statement (so it queues behind a
 ///   running one and nothing interleaves with it), after a pending rollback of a dropped `Tx`.
+///   An interruption before that rollback is sent leaves it pending for the next statement;
+///   one while it runs lets it finish and starts no `COPY`.
 /// - Rows travel as `CopyData` messages of about [`COPY_CHUNK`] bytes, produced on demand by the
 ///   caller's `fill`, so only one chunk is held in memory. `tokio-postgres` applies the
 ///   socket's backpressure to every send.
-/// - On the caller's token, or [`Connection::cancel_running`], the copy is abandoned at once:
-///   dropping the sink makes `tokio-postgres` send `CopyFail`, so the server aborts the `COPY`
-///   (the transaction is then failed and must be rolled back), and `copy_in` returns
-///   `Err(Cancelled)` immediately. A background task keeps the statement lock until the server
-///   has ended the `COPY` and sends cancel requests (with the statement path's backoff) if
-///   that takes longer than [`COPY_ABORT_GRACE`] (a `COPY` waiting for a lock reads no more
-///   input, so `CopyFail` alone would not reach it). The next statement on the connection (the
-///   caller's `ROLLBACK`) runs after that.
+/// - On the caller's token, [`Connection::cancel_running`], or the caller dropping the
+///   `copy_in` future, the copy is abandoned: `copy_in` returns `Err(Cancelled)` at once, and
+///   the task drops the sink, which makes `tokio-postgres` send `CopyFail`, so the server
+///   aborts the `COPY` (the transaction is then failed and must be rolled back). The task keeps
+///   the statement lock until the server has ended the `COPY` and sends cancel requests (with
+///   the statement path's backoff) if that takes longer than [`COPY_ABORT_GRACE`] (a `COPY`
+///   waiting for a lock reads no more input, so `CopyFail` alone would not reach it). The next
+///   statement on the connection (the caller's `ROLLBACK`) runs after that.
 /// - Notices raised during the `COPY` (triggers) are discarded: no result stream carries them.
 #[derive(Clone)]
 pub(crate) struct CopySession(Arc<Shared>);
@@ -1060,57 +1065,116 @@ impl CopySession {
         cancel: &CancellationToken,
     ) -> Result<u64>
     where
-        F: FnMut(&mut String) -> Result<bool> + Send,
+        F: FnMut(&mut String) -> Result<bool> + Send + 'static,
     {
-        let shared = &self.0;
         if cancel.is_cancelled() {
             return Err(Error::Cancelled);
         }
+        let shared = self.0.clone();
         let client = shared.client()?;
         let stop = lock(&shared.stop_all).child_token();
+        let (out, done) = tokio::sync::oneshot::channel();
+        let job = CopyJob {
+            shared,
+            client,
+            sql: sql.to_owned(),
+            cancel: cancel.clone(),
+            stop: stop.clone(),
+        };
+        tokio::spawn(job.run(fill, out));
+        tokio::select! {
+            biased;
+            result = done => result.unwrap_or_else(|_| {
+                Err(Error::internal("the PostgreSQL COPY task ended without a result"))
+            }),
+            () = cancel.cancelled() => Err(Error::Cancelled),
+            () = stop.cancelled() => Err(Error::Cancelled),
+        }
+    }
+}
+
+/// One `COPY ... FROM STDIN` on its own task (see [`CopySession`]).
+struct CopyJob {
+    shared: Arc<Shared>,
+    client: Arc<Client>,
+    sql: String,
+    /// The caller's token.
+    cancel: CancellationToken,
+    /// Child of `Shared::stop_all`.
+    stop: CancellationToken,
+}
+
+impl CopyJob {
+    fn interrupted(&self, out: &tokio::sync::oneshot::Sender<Result<u64>>) -> bool {
+        self.cancel.is_cancelled() || self.stop.is_cancelled() || out.is_closed()
+    }
+
+    async fn run<F>(self, fill: F, mut out: tokio::sync::oneshot::Sender<Result<u64>>)
+    where
+        F: FnMut(&mut String) -> Result<bool> + Send + 'static,
+    {
+        // Wait for the previous statement on this connection to end. Nothing has been sent for
+        // the `COPY` yet, so an interruption here needs no cancel request.
         let mut notices = tokio::select! {
             biased;
-            () = cancel.cancelled() => return Err(Error::Cancelled),
-            () = stop.cancelled() => return Err(Error::Cancelled),
-            guard = shared.exec.clone().lock_owned() => guard,
+            () = self.cancel.cancelled() => {
+                let _ = out.send(Err(Error::Cancelled));
+                return;
+            }
+            () = self.stop.cancelled() => {
+                let _ = out.send(Err(Error::Cancelled));
+                return;
+            }
+            () = out.closed() => return,
+            guard = self.shared.exec.clone().lock_owned() => guard,
         };
-        if shared.rollback_pending.swap(false, Ordering::AcqRel)
-            && let Err(e) = client.batch_execute("ROLLBACK").await
-        {
-            tracing::debug!(error = %from_pg(&e), "rollback of a dropped transaction failed");
+        if self.shared.rollback_pending.swap(false, Ordering::AcqRel) {
+            if self.interrupted(&out) {
+                // Not sent: the next statement rolls back instead.
+                self.shared.rollback_pending.store(true, Ordering::Release);
+                let _ = out.send(Err(Error::Cancelled));
+                return;
+            }
+            // Short and never blocked by locks; the `COPY` must not start before it ends.
+            if let Err(e) = self.client.batch_execute("ROLLBACK").await {
+                tracing::debug!(error = %from_pg(&e), "rollback of a dropped transaction failed");
+            }
         }
-        let mut work = Box::pin(copy_rows(&client, sql, fill));
+        if self.interrupted(&out) {
+            let _ = out.send(Err(Error::Cancelled));
+            return;
+        }
+        let mut work = Box::pin(copy_rows(&self.client, &self.sql, fill));
         let outcome = tokio::select! {
             biased;
             result = &mut work => Some(result),
-            () = cancel.cancelled() => None,
-            () = stop.cancelled() => None,
+            () = self.cancel.cancelled() => None,
+            () = self.stop.cancelled() => None,
+            () = out.closed() => None,
         };
         if let Some(result) = outcome {
             while notices.try_recv().is_some() {}
-            return result;
+            let _ = out.send(result);
+            return;
         }
+        let _ = out.send(Err(Error::Cancelled));
         // Dropping the sink (inside `work`) sends `CopyFail`.
         drop(work);
-        let shared = shared.clone();
-        tokio::spawn(async move {
-            let mut ended = Box::pin(async {
-                // Answered after the server has processed the end of the `COPY`.
-                let _ = client.batch_execute("").await;
-            });
-            if tokio::time::timeout(COPY_ABORT_GRACE, ended.as_mut())
+        let mut ended = Box::pin(async {
+            // Answered after the server has processed the end of the `COPY`.
+            let _ = self.client.batch_execute("").await;
+        });
+        if tokio::time::timeout(COPY_ABORT_GRACE, ended.as_mut())
+            .await
+            .is_err()
+            && tokio::time::timeout(DRAIN_LIMIT, cancel_until_done(&self.shared, ended.as_mut()))
                 .await
                 .is_err()
-                && tokio::time::timeout(DRAIN_LIMIT, cancel_until_done(&shared, ended.as_mut()))
-                    .await
-                    .is_err()
-            {
-                tracing::warn!("a cancelled PostgreSQL COPY did not end within {DRAIN_LIMIT:?}");
-            }
-            while notices.try_recv().is_some() {}
-            // `notices` (the statement lock) is dropped here.
-        });
-        Err(Error::Cancelled)
+        {
+            tracing::warn!("a cancelled PostgreSQL COPY did not end within {DRAIN_LIMIT:?}");
+        }
+        while notices.try_recv().is_some() {}
+        // `notices` (the statement lock) is dropped here.
     }
 }
 

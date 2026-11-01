@@ -132,10 +132,15 @@ impl BulkLoader for PgBulkLoader {
         if batch.num_rows() == 0 {
             return Ok(0);
         }
-        let columns = CopyColumns::new(batch)?;
+        // Checked here so a bad batch fails before the `COPY` starts.
+        CopyColumns::new(batch)?;
+        // The `COPY` runs on its own task (see `CopySession`), so `fill` owns the batch (its
+        // arrays are shared, not copied).
+        let batch = batch.clone();
         let total = batch.num_rows();
         let mut next = 0_usize;
-        let fill = |out: &mut String| -> Result<bool> {
+        let fill = move |out: &mut String| -> Result<bool> {
+            let columns = CopyColumns::new(&batch)?;
             while next < total && out.len() < COPY_CHUNK {
                 columns.write_row(out, next)?;
                 next += 1;

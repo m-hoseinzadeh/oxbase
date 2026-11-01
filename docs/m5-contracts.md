@@ -570,14 +570,37 @@ Streams record deviations from this file here, with the reason.
   `@params` and SQL Server reuses its plan; with the `Value`-declared parameters of
   `Connection::execute` a NULL is `nvarchar(1)`, the `@params` text changes with every NULL
   pattern and each 2 000-parameter statement is compiled anew (about 1 200 rows/s on the CI
-  fixture). `IDENTITY_INSERT` handling is as specified.
+  fixture). `IDENTITY_INSERT` handling is as specified. Decimal parameters are declared
+  `decimal(38, <the column's scale>)` and each value keeps its own precision and scale, so any
+  value the column can store fits (a 38-digit integer next to `1.5`, `decimal(38, 38)`); values
+  with more decimal places are rounded once to the column's scale, as on PostgreSQL and MySQL.
+  The count a call returns is each statement's `SELECT @@ROWCOUNT` (the `INSERT`'s own rows,
+  with or without `NOCOUNT`, not counting trigger statements). **Throughput**: about 3 900
+  rows/s for the 14-column live test on the CI fixture (100 000 rows in about 26 s), so the
+  10-million-row exit-check file would take about 45 minutes on SQL Server; the perf job
+  (§9) requires only PostgreSQL and MySQL. **Needs Design's sign-off**; a TDS bulk path (with the
+  per-table `InsertLoader` fallback §4.3 already allows) is the follow-up if this rate is not
+  acceptable, and the import plan / report should state the expected rate for SQL Server.
 - **load, SQLite method** (§4.3, one of the two allowed): `multi_row_insert` through
   `InsertLoader` with 32 766 parameters, inside the service's transaction; no worker-side
   prepared statement, so the SQLite driver is unchanged.
+- **load, SQLite decimals** (§4.5): decimals stay exact only in a column of `TEXT` affinity.
+  SQLite gives a column declared `DECIMAL` / `NUMERIC` (and any type name without `INT`,
+  `CHAR` / `CLOB` / `TEXT`, `BLOB` or `REAL` / `FLOA` / `DOUB`) `NUMERIC` affinity and converts
+  bound text that looks like a number to `INTEGER` or `REAL`: `'1.10'` becomes `1.1`,
+  `'-9999999999999999.9999'` keeps about 15 significant digits, without an error. No bind type
+  avoids it, so the loader cannot. Owners to act (not the load stream): the SQLite DDL /
+  import plan (services) should map `decimal` target columns of new tables to `TEXT`, and show a
+  conversion note when an existing target column has `NUMERIC` affinity. The SQLite live test
+  loads its decimal column as `TEXT`.
 - **load, PostgreSQL driver addition** (§2.1): `PgConnection` and its `Tx` return `Some(self)`
   from `as_any`, and `oxbase-pg`'s `conn.rs` has a crate-private `CopySession` (the `COPY ... FROM
-  STDIN` entry point). It takes the connection's statement lock like any statement, streams
-  256 KiB `CopyData` chunks produced on demand, and on cancel drops the sink (`CopyFail`),
-  returns `Cancelled` at once and keeps the lock in a background task, which sends cancel
-  requests if the server has not ended the `COPY` within 200 ms (a `COPY` blocked on a lock reads
-  no input). The next statement (the service's `ROLLBACK`) runs after that.
+  STDIN` entry point). The `COPY` runs on its own task, like every statement of the driver: it
+  takes the connection's statement lock, runs a pending rollback of a dropped `Tx` first (an
+  interruption before it is sent leaves it pending; one while it runs lets it finish and starts
+  no `COPY`), and streams 256 KiB `CopyData` chunks produced on demand. On cancel,
+  `cancel_running`, or the caller dropping the load future (an aborted import task), the caller
+  gets `Cancelled` at once while the task drops the sink (`CopyFail`) and keeps the lock until
+  the server has ended the `COPY`, sending cancel requests if that takes more than 200 ms (a
+  `COPY` blocked on a lock reads no input). The next statement (the service's `ROLLBACK`) runs
+  after that.
