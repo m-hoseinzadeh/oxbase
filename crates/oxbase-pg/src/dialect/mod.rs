@@ -54,7 +54,14 @@
 //!   aliases ([`canonical_type`]) and the server's rewriting of expressions
 //!   ([`normalize_expression`]).
 //! - Grid writes (`dml.rs`): bound `$n` parameters, key-only `WHERE`, `RETURNING` read-back.
+//!
+//! # Bulk load (M5)
+//!
+//! [`PgBulkLoader`] (`bulk.rs`): import batches go through `COPY ... FROM STDIN` in text format
+//! on the import session's client (the connection exposes it to this crate through
+//! `Connection::as_any` / `Tx::as_any`; `docs/m5-contracts.md` §4.3).
 
+mod bulk;
 mod caps;
 mod compare;
 mod ddl;
@@ -72,6 +79,7 @@ use oxbase_dialect::{
 };
 use oxbase_types::{Engine, ObjectKind, PropId, ServerVersion};
 
+pub use bulk::PgBulkLoader;
 pub use compare::{PgComparator, PgRules, canonical_type, normalize_def, normalize_expression};
 
 pub use fetch::{
@@ -119,6 +127,8 @@ pub fn register(reg: &mut DialectRegistry) {
     reg.register_tree_layout(engine, tree_layout());
     reg.register_capabilities(engine, Arc::new(PgCapabilities));
     reg.register_quoting(engine, Arc::new(PgQuoting));
+    // M5: import bulk loads with COPY ... FROM STDIN (bulk.rs).
+    reg.register_bulk_loader(engine, Arc::new(PgBulkLoader));
     reg.mark_not_applicable_except(engine, &APPLICABLE);
 }
 

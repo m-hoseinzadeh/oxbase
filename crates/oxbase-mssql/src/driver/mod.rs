@@ -81,6 +81,14 @@
 //! `Tx` is rolled back before the connection's next statement. DDL is transactional on SQL
 //! Server, so designer scripts run atomically.
 //!
+//! # Typed parameters (M5)
+//!
+//! `Connection::as_any` / `Tx::as_any` return the connection / transaction so the bulk loader
+//! of this crate (`dialect::bulk`) can run statements whose parameters it declares itself
+//! (`conn::ParamSession`: one declaration per column, typed NULLs), which lets SQL Server reuse
+//! the plan of every full-size multi-row `INSERT`. Same session lock, cancel and error handling
+//! as `execute`.
+//!
 //! # Known gaps (tiberius 0.13.0, accepted for M4)
 //!
 //! - `INFO` messages (`PRINT`, `RAISERROR` with severity 0-10, `DBCC` output) are not exposed by
@@ -117,6 +125,8 @@ use async_trait::async_trait;
 use oxbase_driver::{ConnectParams, Connection, Driver, DriverRegistry};
 use oxbase_types::{Engine, Result};
 
+/// M5: typed parameters for the bulk loader (`crate::dialect`), see `conn::ParamSession`.
+pub(crate) use conn::ParamSession;
 pub use conn::{CANCEL_DRAIN, DEFAULT_APPLICATION_NAME, DEFAULT_CONNECT_TIMEOUT, MsSqlConnection};
 
 /// The SQL Server [`Driver`].

@@ -12,6 +12,11 @@
 //! parameters, `LAST_INSERT_ID()` / MariaDB `RETURNING` read-back) and
 //! `Capabilities::designer` (module `caps`), all version-aware through `ServerVersion`.
 //!
+//! # Bulk load (M5)
+//!
+//! [`MySqlBulkLoader`] (module `bulk`): batched multi-row `INSERT`s within the placeholder and
+//! packet limits, on a UTC session; no `LOAD DATA LOCAL INFILE` (see the module docs).
+//!
 //! # Catalog
 //!
 //! Everything is read from `information_schema` with the object names as **bound parameters**;
@@ -48,6 +53,7 @@
 //! System databases (`information_schema`, `mysql`, `performance_schema`, `sys`) and everything
 //! in them are listed with `system = true`.
 
+mod bulk;
 mod caps;
 mod coltype;
 mod compare;
@@ -77,6 +83,8 @@ use oxbase_types::{
 };
 
 use rows::query;
+
+pub use bulk::{MySqlBulkLoader, UTC_SESSION_SQL};
 
 /// Extra: the column's `ON UPDATE` expression (`CURRENT_TIMESTAMP`).
 pub const ON_UPDATE_EXPRESSION: PropId = PropId::from_static("on_update_expression");
@@ -111,6 +119,8 @@ pub fn register(reg: &mut DialectRegistry) {
             );
         }
         reg.register_dml_writer(engine, Arc::new(dml::MySqlDmlWriter { mariadb }));
+        // M5: import bulk loads as batched multi-row INSERTs (bulk.rs).
+        reg.register_bulk_loader(engine, Arc::new(MySqlBulkLoader::new(engine)));
         reg.register_fetcher(
             engine,
             ObjectKind::Database,
