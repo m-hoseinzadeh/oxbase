@@ -297,6 +297,37 @@ login enforced by a logon trigger, the SSH target `mssql:1433` and the `[m2.mssq
 `[m3.mssql]` and `[m4]` names. Six streams (driver, fetch, ddl, sql, fixtures, app) fill the
 skeleton of `crates/oxbase-mssql`.
 
+**M4 as built (notes, 2026-11-01).** The exit check passed in the CI conformance job (Linux,
+Docker fixtures, with `OXBASE_CONFORMANCE_REQUIRE_M4=1`, the 5-engine guard; numbers in the
+README, *Conformance harness*): on PostgreSQL 18.6, MySQL 8.4.13, MariaDB 11.8.9, SQLite 3.54.1
+and SQL Server 2025 (17.0.5035) every M1 connection check passes (27 of 27 applicable; SQL
+Server: plain, TLS `VerifyFull` as the TLS-only login, SSH, TLS over SSH, cancel, 200k-row
+stream), every `fetch_list` cell passes (55; SQL Server 13: database, schema, table, column,
+index, foreign key, check, view, function, procedure, trigger, sequence, type) and `roundtrip`
+and `capabilities` pass for table, column, index, foreign key and check (50 of 50 cells). The
+services live tests run on SQL Server too: a 1 000 000-row query streamed in 3.5-4.4 s (two
+runs) with random 200-row pages at p95 0.20 ms, a cancel after about 200 000 rows ended the run
+in about 1 s and the editor's next `SELECT 1` took under 100 ms (on a new session), and the
+edit and designer cycles pass with SQL Server's own grid writer and DDL cells. On the same code
+(`milestone/m4` at d47cb5d), the full CI lane (Rust tests: 766 passed on Linux and macOS, 765 on
+Windows; OS keychain tests on all three; conformance; webview smoke, IPC plus Arrow decoding p95
+11 ms) and the Bundle workflow (Linux x86_64, macOS aarch64 and x86_64, Windows x86_64) passed in
+manual runs 41298470889 and 41298472236. Where the build differs from the text above or from
+`docs/m4-contracts.md` (its §13 lists every deviation):
+
+- tiberius gaps as planned: no `PRINT` messages (the editor says so for SQL Server), no row
+  counts for plain batches, coarse result metadata. New: `money` is decoded through `f64`, so
+  values above about 9.0e11 lose their last digits (the driver test allows for it).
+- `Tx::commit` fails (error 50000) when the server already ended the transaction, instead of
+  reporting a commit; `begin()` still nests inside an editor's own `BEGIN TRAN`.
+- After a cancel mid-stream SQL Server behaves like MySQL / MariaDB in the query service: the
+  attention drain of a streaming result takes longer than the service's 1 s wait, so the next
+  run gets a new session and the warning about lost `#temp` tables and settings.
+- The SQL Server fixture enforces the TLS-only login with a logon trigger that reads
+  `sys.dm_exec_connections` and runs `sqlservr` as root inside the container.
+- The webview smoke test stays on PostgreSQL; the SQL Server UI (connection dialog, designer
+  types and options, PRINT note) is covered by Vitest only.
+
 Order of work: M0–M3 prove the architecture. M4 and M7 are where the per-database matrix gets tested for real. M8 and M10 reuse the Comparator and DdlGenerator cells and get much cheaper if M3 is done right.
 
 ## 7. Main risks

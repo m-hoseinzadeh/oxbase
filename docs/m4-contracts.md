@@ -801,3 +801,37 @@ Live tests are `#[ignore]`d and run in the conformance CI job against the Docker
 - **app**: Vitest for the SQL Server dialog fields (strict only with verifying modes, instance
   hint), the editor language mapping (`mssql` → `sql`), designer type list and identity
   option, the PRINT note.
+
+## 13. As built (integration, 2026-11-01)
+
+The streams were merged on `milestone/m4`; CI passed with the 5-engine guard on
+(`OXBASE_CONFORMANCE_REQUIRE_M4=1`). Where the build differs from the sections above:
+
+- **§2.4 commit.** `Tx::commit` runs `IF @@TRANCOUNT = 0 RAISERROR(..., 16, 1) ELSE COMMIT
+  TRANSACTION`: a transaction the server already ended (deadlock 1205, `XACT_ABORT`, a
+  trigger's `ROLLBACK`) makes the commit fail with error 50000 instead of reporting a commit
+  that did not happen. `begin()` still nests inside a `BEGIN TRAN` the editor opened on the same
+  session (that commit only decrements `@@TRANCOUNT`).
+- **§2.4 / §11 row counts.** tiberius does not expose the `DONE_COUNT` bit, so the RPC path may
+  still report `RowsAffected(0)` for control-of-flow or failed statements; the zero that directly
+  follows a result set (the `DONEPROC` after `EXEC proc @P1`) is skipped. Plain batches report no
+  counts (gap 2): the services multi-statement test sees `rows_affected = None` for every T-SQL
+  batch.
+- **§5.3 money.** tiberius 0.13 decodes `money` through `f64`, so values above about 9.0e11 lose
+  their last digits: `c_money = 922337203685477.5807` is checked with a tolerance of 2048 units
+  of the fourth decimal (`driver_live`). Exact money needs the follow-up of §11 (a patched or own
+  TDS decoder).
+- **§5.1 / §5.2 fixture.** `CONNECTIONPROPERTY` has no `encrypt_option`, so the logon trigger
+  reads `sys.dm_exec_connections` (`WITH EXECUTE AS N'sa'`; `ORIGINAL_LOGIN()` still names the
+  connecting login). The container runs `sqlservr` as root (compose `user: root`) with a
+  root-owned 0600 copy of the key instead of dropping to uid 10001. `tlsprotocols = 1.2,1.3` is
+  set as specified.
+- **§12 ddl re-fetch.** `tests/m4_live.rs` reads every table back through the registered `Table`
+  fetcher (its stand-in catalog loader is gone), so generator, fetcher and comparator are tested
+  together.
+- **§8.3 services.** `query::live_tests` runs the T-SQL multi-statement script as one statement
+  per `GO` batch with a `#temp` table across batches and a batch of two `SELECT`s (two result
+  sets of one statement); history redacts `ALTER LOGIN ... WITH PASSWORD = N'...'`. The edit and
+  designer live tests use schema `dbo` of `oxbase_test`. After a cancel mid-stream the query
+  service gives the driver 1 s to finish the attention drain of a streaming `GENERATE_SERIES`
+  and then runs the editor's next statement on a new session (as on MySQL / MariaDB).

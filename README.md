@@ -5,9 +5,10 @@ React + TypeScript UI. v1 targets PostgreSQL, MySQL, MariaDB, SQLite, SQL Server
 Redis on Linux, macOS and Windows. The core is headless, so every feature also works from
 `oxbase-cli` and from tests. See [PLAN.md](PLAN.md) for the architecture and milestones.
 
-## What works (M3)
+## What works (M4)
 
-On PostgreSQL, MySQL, MariaDB and SQLite (M1 connections: plain, TLS, SSH, keychain secrets):
+On PostgreSQL, MySQL, MariaDB, SQLite and SQL Server (M1 connections: plain, TLS, SSH,
+keychain secrets; SQL Server since M4):
 
 - **Object tree**: connection, databases, schemas (PostgreSQL), then folders for tables, views,
   materialized views, functions, procedures and sequences; under a table its columns, indexes,
@@ -51,10 +52,21 @@ On PostgreSQL, MySQL, MariaDB and SQLite (M1 connections: plain, TLS, SSH, keych
   keys switched off only for the copy. Apply refuses when the table changed on the server since
   it was loaded. What each engine and version supports comes from its capabilities.
 
-Contracts: [docs/m3-contracts.md](docs/m3-contracts.md). SQL Server follows in M4, in progress:
-the contracts are in [docs/m4-contracts.md](docs/m4-contracts.md) (driver on `tiberius` with
-oxbase's own rustls TLS, the SQL Server tree, designer and grid writer, fixtures); until its
-streams land, SQL Server is "pending (M4)" in the conformance matrix.
+- **SQL Server** (M4, SQL Server 2017 and later; CI runs 2025): the driver is `tiberius` (TDS
+  7.4) with oxbase's own TLS handshake on rustls + ring (TDS 8.0 strict encryption is an
+  option), in-band cancel that also works through an SSH tunnel, SQL authentication. The tree
+  adds a **Types** folder (alias and table types) and indexes and triggers under views. The
+  editor runs one `GO` batch per statement, so `#temp` tables, `SET` and `USE` persist across
+  batches. The designer writes identity, computed (persisted or not), clustered indexes,
+  included columns and filtered indexes, names default constraints and renames through
+  `sp_rename`; DDL runs in one transaction. The grid writer returns exactly one row per edit
+  even with triggers. Known gaps (`docs/m4-contracts.md` §11 and §13): no `PRINT` output (the
+  messages tab says so), no row counts for plain batches, integers arrive as 64-bit and
+  decimals as text, `money` above about 9.0e11 loses its last digits, `GO <n>` runs once, no
+  Windows / Entra authentication, named instances need a port.
+
+Contracts: [docs/m3-contracts.md](docs/m3-contracts.md) and
+[docs/m4-contracts.md](docs/m4-contracts.md) (SQL Server).
 
 ## Layout
 
@@ -75,10 +87,10 @@ crates/
   oxbase-conformance                              cross-engine conformance harness
   app-tauri                                       Tauri 2 shell (no logic)
 ui/                                               React + TS + Vite front end
-tests/fixtures.toml                               test DB connection params and M2/M3 seed object
+tests/fixtures.toml                               test DB connection params and M2-M4 seed object
                                                   names (single source of truth)
-docs/                                             frozen contracts per milestone (m1-contracts.md,
-                                                  m2-contracts.md, m3-contracts.md)
+docs/                                             frozen contracts per milestone (m1-contracts.md
+                                                  to m4-contracts.md)
 ```
 
 ## Prerequisites
@@ -95,8 +107,9 @@ docs/                                             frozen contracts per milestone
 
 ## Checks
 
-These are the checks of `.github/workflows/ci.yml`, plus a few manual ones. For the M2
-integration (2026-10-31) the CI ones passed in GitHub Actions on Linux x86_64 (fmt, clippy,
+These are the checks of `.github/workflows/ci.yml`, plus a few manual ones. For the M4
+integration (2026-11-01) the CI ones passed in GitHub Actions on Linux, macOS and Windows; for
+the M2 integration (2026-10-31) they passed in GitHub Actions on Linux x86_64 (fmt, clippy,
 `cargo test --workspace`, keychain, UI lint/typecheck/test/build, Docker conformance,
 `cargo deny`). `cargo doc`, `cargo build -p app-tauri`, `cargo run -p oxbase-cli` and the
 `cargo tree` checks are not CI jobs; they were last run locally for the M1 integration
@@ -149,15 +162,16 @@ scripts/fixtures-certs.sh [--force]   # (re)generate the test PKI and SSH keys; 
 TLS and SSH (M1):
 
 - **Test PKI** (`[tls]`): `scripts/fixtures-certs.sh` (OpenSSL 1.1.1+/3.x and ssh-keygen) writes a
-  CA, a server certificate for `localhost`, `127.0.0.1`, `postgres`, `mysql` and `mariadb`, and a
-  client certificate (CN `oxbase_tls`) to `target/fixtures/tls`. PostgreSQL, MySQL and MariaDB
-  run with TLS on. Each has a user `oxbase_tls` that the server accepts **only** over TLS
-  (`[engines.<name>.tls_user]`); the normal `oxbase` user works with and without TLS.
+  CA, a server certificate for `localhost`, `127.0.0.1`, `postgres`, `mysql`, `mariadb` and
+  `mssql`, and a client certificate (CN `oxbase_tls`) to `target/fixtures/tls`. PostgreSQL,
+  MySQL, MariaDB and SQL Server run with TLS on. Each has a user `oxbase_tls` that the server
+  accepts **only** over TLS (`[engines.<name>.tls_user]`; on SQL Server a logon trigger enforces
+  it); the normal user (`oxbase`, `sa` on SQL Server) works with and without TLS.
 - **SSH bastion** (`[ssh]`): the `ssh` service, an OpenSSH server on `127.0.0.1:15422` with user
   `oxbase` (password, plain key `id_ed25519` and passphrase key `id_ed25519_enc`, all in
   `target/fixtures/ssh`). Its host key is fixed, so `known_hosts` (Strict) and
   `host_key.fingerprint` (pinning) work. Tunnels reach the engines by their compose service
-  names (`[ssh.targets]`: `postgres:5432`, `mysql:3306`, `mariadb:3306`), so `VerifyFull`
+  names (`[ssh.targets]`: `postgres:5432`, `mysql:3306`, `mariadb:3306`, `mssql:1433`), so `VerifyFull`
   through a tunnel checks the certificate against the service name, not `127.0.0.1`.
 - `fixtures-up.sh` recreates the services that mount this material when it was regenerated.
 
@@ -196,17 +210,18 @@ project.
    renamed to `sel"ect_ü`, and finally drops. `capabilities` checks that what the engine's
    `DesignerCapabilities` claims (native, rebuild, unsupported; transactional DDL and check
    enforcement, both probed) matches what the generator does. Other kinds stay pending;
-   mssql waits for M4, mongodb and redis for M7. The harness also proves each fixture answers
-   its handshake.
+   mongodb and redis wait for M7. The harness also proves each fixture answers its handshake.
+   With `OXBASE_CONFORMANCE_REQUIRE_M4=1` (CI, the M4 exit check) every M1-M3 cell of
+   PostgreSQL, MySQL, MariaDB, SQLite and SQL Server must pass, nothing pending or skipped.
 2. **Connection checks** (M1), through the real drivers, `ConnectionManager` and russh provider:
    `connect` (plain, server version equals `version_prefix`), `tls` (`VerifyFull` with the
    fixture CA as `oxbase_tls`, `tls_in_use`; plaintext and a wrong server name refused), `ssh`
    (bastion, password auth, Strict known_hosts), `tls_over_ssh` (encrypted-key auth plus
    `VerifyFull` against the service name; a wrong name refused), `cancel` (`pg_sleep(30)` /
-   `SLEEP(30)` / an endless recursive CTE ends with `Cancelled` and the session answers
-   `SELECT 1` within 2 s, via the token and via `cancel_running`) and `stream_200k` (200 000
-   generated rows arrive in more than one batch). SQLite has no TLS/SSH columns; mssql, mongodb
-   and redis show `pending (M4)` / `pending (M7)`.
+   `SLEEP(30)` / an endless recursive CTE / `WAITFOR DELAY` ends with `Cancelled` and the
+   session answers `SELECT 1` within 2 s, via the token and via `cancel_running`) and
+   `stream_200k` (200 000 generated rows arrive in more than one batch). SQLite has no TLS/SSH
+   columns; mongodb and redis show `pending (M7)`.
 
 ```sh
 scripts/fixtures-up.sh
@@ -222,8 +237,8 @@ mid-stream, multi-statement scripts, history). The query-run tests print their t
 with a `[m2 query]` prefix:
 
 ```sh
-cargo test -p oxbase-net -p oxbase-pg -p oxbase-mysql -p oxbase-sqlite -p oxbase-services \
-    --locked -- --include-ignored --test-threads 1
+cargo test -p oxbase-net -p oxbase-pg -p oxbase-mysql -p oxbase-sqlite -p oxbase-mssql \
+    -p oxbase-services --locked -- --include-ignored --test-threads 1
 ```
 
 The OS keychain tests (`keychain_smoke` and `keychain_long_values` in `oxbase-store`,
@@ -244,20 +259,25 @@ command can follow the script name, e.g.
 runs the services live tests with the keychain test included. CI runs the script on Linux, macOS
 and Windows (`keychain` job).
 
-Last verified 2026-11-01 in the GitHub Actions conformance job (Linux x86_64, M3 integration,
-run 41254616693) with all 7 fixtures up: every fixture reachable (PostgreSQL 18.6, MySQL
-8.4.13, MariaDB 11.8.9, SQL Server 2025, MongoDB 7.0.45, Redis, SQLite 3.54.1 file).
+Last verified 2026-11-01 in the GitHub Actions conformance job (Linux x86_64, M4 integration,
+full-lane run 41298470889 on `milestone/m4` at d47cb5d; the fast-lane run 41298123652 on the same
+commit gave the same cells) with all 7 fixtures up: every fixture reachable (PostgreSQL 18.6,
+MySQL 8.4.13, MariaDB 11.8.9, SQL Server 2025 17.0.5035, MongoDB 7.0.45, Redis, SQLite 3.54.1
+file). CI sets `OXBASE_CONFORMANCE_REQUIRE_M4=1`: the 5-engine guard reported nothing open.
 
-- Object-kind matrix, 420 cells: **82 pass, 0 fail**, 158 pending, 180 n/a. The 42
+- Object-kind matrix, 420 cells: **105 pass, 0 fail**, 135 pending, 180 n/a. The 55
   `fetch_list` passes are every M2 cell: PostgreSQL 13 (database, schema, table, column,
   index, foreign key, check, view, materialized view, function, procedure, trigger,
   sequence), MySQL 10 and MariaDB 11 (the same without schema and materialized view; sequence
   on MariaDB only), SQLite 8 (database, table, column, index, foreign key, check, view,
-  trigger). The 40 M3 passes are `roundtrip` and `capabilities` for table, column, index,
-  foreign key and check on each of PostgreSQL, MySQL, MariaDB and SQLite (the M3 exit check;
-  CI sets `OXBASE_CONFORMANCE_REQUIRE_M3_ROUNDTRIP=1`, so a pending or failing one fails the
-  job). The only skipped operations are the ones the contract allows: table and column
-  comments on SQLite.
+  trigger) and SQL Server 13 (database, schema, table, column, index, foreign key, check,
+  view, function, procedure, trigger, sequence, type; indexes and triggers also under an
+  indexed view). The 50 M3 passes are `roundtrip` and `capabilities` for table, column,
+  index, foreign key and check on each of the five SQL engines (CI also sets
+  `OXBASE_CONFORMANCE_REQUIRE_M3_ROUNDTRIP=1`). The only skipped operations are the ones the
+  contract allows: table and column comments on SQLite. The pending cells are user, role,
+  grant, event, extension and the `roundtrip` / `capabilities` checks of the non-designer
+  kinds (not in M2-M4), and MongoDB / Redis (M7).
 
   | Engine | table | column | index | foreign key | check |
   |---|---|---|---|---|---|
@@ -265,36 +285,58 @@ run 41254616693) with all 7 fixtures up: every fixture reachable (PostgreSQL 18.
   | MySQL | pass / pass | pass / pass | pass / pass | pass / pass | pass / pass |
   | MariaDB | pass / pass | pass / pass | pass / pass | pass / pass | pass / pass |
   | SQLite | pass / pass | pass / pass | pass / pass | pass / pass | pass / pass |
+  | SQL Server | pass / pass | pass / pass | pass / pass | pass / pass | pass / pass |
 
   (`roundtrip` / `capabilities`.) SQLite does NOT NULL, default, foreign key and check changes
-  as the table rebuild; MySQL and MariaDB DDL is not transactional (probed).
-- Connection checks, 42: 21 pass (postgres, mysql, mariadb, sqlite), 18 pending (mssql M4,
-  mongodb/redis M7), 3 n/a (SQLite TLS/SSH), 0 fail.
-- Query runs (`oxbase-services` live tests, 8 MiB memory budget so the result spills; CI run
-  41229578451. In a second run, 41230261610, the 1M-row stream took 1645 / 1778 / 2247 / 877 ms
-  (same engine order) and every other figure stayed in the same range):
+  as the table rebuild; MySQL and MariaDB DDL is not transactional, SQL Server's is (probed).
+- Connection checks, 42: **27 pass** (postgres, mysql, mariadb, sqlite, mssql), 12 pending
+  (mongodb/redis M7), 3 n/a (SQLite TLS/SSH), 0 fail.
 
-  | Engine | 1M rows streamed | first page | random 200-row page p95 | spill | peak batch memory | cancel after ~230-250k rows: run ended |
+  | Engine | connect | tls | ssh | tls_over_ssh | cancel | stream_200k |
   |---|---|---|---|---|---|---|
-  | PostgreSQL | 1698 ms | 9 ms | 0.17 ms | 28 MiB | 7.6 MiB | 1 ms after cancel |
-  | MySQL | 1885 ms | 52 ms | 0.23 ms | 28 MiB | 7.8 MiB | 1013 ms after cancel |
-  | MariaDB | 1625 ms | 36 ms | 0.28 ms | 28 MiB | 7.8 MiB | 1001 ms after cancel |
-  | SQLite | 885 ms | 3 ms | 0.29 ms | 21 MiB | 6.6 MiB | 0 ms after cancel |
+  | PostgreSQL | pass | pass | pass | pass | pass | pass |
+  | MySQL | pass | pass | pass | pass | pass | pass |
+  | MariaDB | pass | pass | pass | pass | pass | pass |
+  | SQLite | pass | n/a | n/a | n/a | pass | pass |
+  | SQL Server | pass | pass | pass | pass | pass | pass |
 
-  After the cancel, the editor's next `SELECT 1` must finish within 2 s. In CI run
-  41231834815 it took 455 ms (PostgreSQL), 3 ms (MySQL), 3 ms (MariaDB) and 1 ms (SQLite).
-  On MySQL and MariaDB the driver was still stopping the killed stream after 1 s, so that
-  `SELECT 1` ran on a new session. On PostgreSQL and SQLite it ran on the same session.
+  SQL Server details (fast-lane run): TLS as the TLS-only login `oxbase_tls` (plaintext and a
+  wrong name refused), SSH to `mssql:1433`, `VerifyFull` through the tunnel, cancel of
+  `WAITFOR DELAY '00:00:30'` (token: ended in 9 ms, session answered in 12 ms;
+  `cancel_running`: 1 ms / 2 ms), 200 000 rows in 49 batches (1506 ms).
+- Query runs (`oxbase-services` live tests, 8 MiB memory budget so the result spills; full-lane
+  run 41298470889. In the fast-lane run 41298123652 the 1M-row stream took 1376 / 1335 / 1315 /
+  692 / 3520 ms in the same engine order and every other figure stayed in the same range):
+
+  | Engine | 1M rows streamed | first page | random 200-row page p95 | spill | peak batch memory | cancel after ~220-250k rows: run ended | next `SELECT 1` |
+  |---|---|---|---|---|---|---|---|
+  | PostgreSQL | 1791 ms | 10 ms | 0.16 ms | 28 MiB | 7.6 MiB | 188 ms after cancel | 534 ms, same session |
+  | MySQL | 2021 ms | 72 ms | 0.20 ms | 28 MiB | 7.9 MiB | 1001 ms after cancel | 3 ms, new session |
+  | MariaDB | 1827 ms | 42 ms | 0.21 ms | 28 MiB | 7.2 MiB | 1001 ms after cancel | 5 ms, new session |
+  | SQLite | 880 ms | 3 ms | 0.21 ms | 21 MiB | 7.9 MiB | 0 ms after cancel | 1 ms, same session |
+  | SQL Server | 4408 ms | 165 ms | 0.20 ms | 28 MiB | 7.9 MiB | 1001 ms after cancel | 83 ms, new session |
+
+  After the cancel, the editor's next `SELECT 1` must finish within 2 s. On MySQL, MariaDB and
+  SQL Server the driver was still stopping the cancelled stream after 1 s, so that `SELECT 1`
+  ran on a new session. On SQL Server the T-SQL multi-statement script runs one statement per
+  `GO` batch (a `#temp` table across batches, a batch of two `SELECT`s giving two result sets)
+  and reports no row counts for plain batches (a known tiberius gap).
 
 The dialect, driver, tunnel and connection-manager live tests and the keychain tests passed in
-the same CI run, as did the M3 live tests: the DDL / DML cells of each engine
+the same CI run, as did the M3 and M4 live tests: the DDL / DML cells of each engine
 (`oxbase-pg` `m3_live` 10, `oxbase-mysql` `m3_live` 19 for MySQL and MariaDB, `oxbase-sqlite`
-`m3` 16) and the `oxbase-services` edit and designer tests on all four engines (open
-`m3_edit_pk` filtered and sorted; insert / update / delete with read-back; a conflict when
-another session deleted the row; `m3_edit_uq` editable by `code`; `m3_edit_nokey` and
-`m3_edit_view` read-only; designer create / alter / reload, and a conflict when the table
-changed in between). CI runs them with `OXBASE_SERVICES_REQUIRE_M3_CELLS=1`, so a missing
-engine cell or seed table fails instead of reporting "pending".
+`m3` 16, `oxbase-mssql` `m4_live` 5: round trips re-fetched through the `Table` fetcher,
+ALTER COLUMN with its blockers dropped and recreated, unnamed constraint lookups, grid writes
+counting exactly one row per edit with the audit trigger on, datetime keys), the SQL Server
+driver (`driver_live` 11: TLS modes, TDS 8.0 strict, the TLS-only login, every type of
+`m4.m4_types`, parameters, multiple result sets, `#temp` and `USE` across batches, cancel,
+transactions, the marker-password leak check) and fetchers (`fetch_live` 6), and the
+`oxbase-services` edit and designer tests on all five engines (open `m3_edit_pk` filtered and
+sorted; insert / update / delete with read-back; a conflict when another session deleted the
+row; `m3_edit_uq` editable by `code`; `m3_edit_nokey` and `m3_edit_view` read-only; designer
+create / alter / reload, and a conflict when the table changed in between). CI runs them with
+`OXBASE_SERVICES_REQUIRE_M3_CELLS=1`, so a missing engine cell or seed table fails instead of
+reporting "pending".
 
 Disk: the full stack needs about 4-5 GB on top of the images already present (the SQL Server,
 MongoDB and Redis images alone are about 4 GB, and SQL Server keeps writing while it runs).
@@ -308,8 +350,9 @@ run; `OXBASE_CONFORMANCE_ALLOW_MISSING=1` (or `--allow-missing` on the binary) r
 instead. A failed connection check always fails the run. Other knobs:
 `OXBASE_CONFORMANCE_PROBE_TIMEOUT_MS`, `OXBASE_CONFORMANCE_TCP_ONLY=1`,
 `OXBASE_CONFORMANCE_SKIP_CONNECT=1` (or `--skip-connect`: no connection checks),
-`OXBASE_CONFORMANCE_REQUIRE_M2_FETCH=1` and `OXBASE_CONFORMANCE_REQUIRE_M3_ROUNDTRIP=1` (a
-pending M2 / M3 cell fails; CI sets both).
+`OXBASE_CONFORMANCE_REQUIRE_M2_FETCH=1`, `OXBASE_CONFORMANCE_REQUIRE_M3_ROUNDTRIP=1` (a
+pending M2 / M3 cell fails) and `OXBASE_CONFORMANCE_REQUIRE_M4=1` (the 5-engine guard: every
+M1-M3 cell of the five SQL engines must pass and nothing may be skipped); CI sets all three.
 
 ## App data
 
@@ -381,11 +424,12 @@ scripts/e2e-smoke.sh            # results in target/e2e (e2e-perf.json, failure 
 scripts/e2e-fixtures.sh down
 ```
 
-In CI (job **Webview smoke (Linux)**, run 41254616693) page requests through Tauri IPC plus
-Arrow decoding in the webview took p50 2 ms / p95 11 ms / max 11 ms (the grid's own 7 pages,
-`window.__oxbasePerf`; 60 random 200-row probe pages: p50 1 ms, p95 2 ms, max 6 ms; limit
-p95 < 250 ms); Stop ended a streaming query 33 ms after the click; the edit step committed
-and showed the new value after a reload.
+In CI (job **Webview smoke (Linux)**, M4 full-lane run 41298470889; it stays on PostgreSQL)
+page requests through Tauri IPC plus Arrow decoding in the webview took p50 2 ms / p95 11 ms /
+max 11 ms (the grid's own 7 pages, `window.__oxbasePerf`; 60 random 200-row probe pages: p50
+1 ms, p95 2 ms, max 6 ms; limit p95 < 250 ms); the 1 000 000-row query finished in 1.42 s;
+Stop ended a streaming query 65 ms after the click; the edit step committed and showed the new
+value after a reload.
 
 ## CI
 
@@ -394,7 +438,7 @@ and showed the new value after a reload.
   **Full lane**, on pull requests, pushes to main, weekly and manual runs: fmt + clippy on Linux;
   `cargo test --workspace` on Linux, macOS and Windows; the OS keychain tests
   (`scripts/keychain-tests.sh`) on Linux, macOS and Windows; UI lint, typecheck, test and build;
-  the conformance harness and the M1-M3 live tests against the Docker fixtures; the webview
+  the conformance harness and the M1-M4 live tests against the Docker fixtures; the webview
   smoke test (Linux; also on the fast lane of `wip/*-e2e`, `wip/*-app` and `wip/*-integrate`);
   `cargo deny` (advisories, bans, licenses, sources).
 - `.github/workflows/bundle.yml` (push to main, manual): Tauri dev bundles for Linux x86_64,
