@@ -1,0 +1,406 @@
+/* M5: import wizard, export dialog, progress view, and the context menu. */
+
+/* --- dialogs ---------------------------------------------------------------------------- */
+
+.modal--transfer {
+  width: min(960px, calc(100vw - 32px));
+  height: min(680px, calc(100vh - 32px));
+}
+
+.modal--transfer .modal__body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  flex: 1;
+  min-height: 0;
+}
+
+.modal--transfer-narrow {
+  width: min(560px, calc(100vw - 32px));
+}
+
+.modal--transfer-narrow .modal__body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.modal--transfer .banner,
+.modal--transfer-narrow .banner {
+  border: 1px solid var(--color-border);
+  border-radius: 4px;
+  padding: var(--space-2) var(--space-3);
+}
+
+.modal--transfer input[type="number"],
+.modal--transfer-narrow input[type="number"] {
+  font: inherit;
+  padding: var(--space-1) var(--space-2);
+  border: 1px solid var(--color-border);
+  border-radius: 4px;
+  background: var(--color-input-bg);
+  color: var(--color-fg);
+}
+
+/* --- steps ------------------------------------------------------------------------------ */
+
+.transfer-steps {
+  display: flex;
+  gap: var(--space-1);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  counter-reset: step;
+  flex-shrink: 0;
+}
+
+.transfer-steps__item {
+  counter-increment: step;
+  flex: 1;
+  padding: var(--space-1) var(--space-2);
+  border-bottom: 2px solid var(--color-border);
+  color: var(--color-fg-faint);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.transfer-steps__item::before {
+  content: counter(step) ". ";
+}
+
+.transfer-steps__item--done {
+  border-bottom-color: var(--color-fg-faint);
+  color: var(--color-fg-muted);
+}
+
+.transfer-steps__item[aria-current="step"] {
+  border-bottom-color: var(--color-accent);
+  color: var(--color-fg);
+  font-weight: 600;
+}
+
+.transfer-step {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+}
+
+.transfer-step > p {
+  margin: 0;
+}
+
+.transfer-step--split {
+  flex-direction: row;
+  overflow: hidden;
+}
+
+.transfer-step__side {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  flex: 0 0 240px;
+  overflow: auto;
+  padding-right: var(--space-1);
+}
+
+.transfer-step__main {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+}
+
+.transfer-step__status {
+  color: var(--color-fg-muted);
+  font-size: 12px;
+  min-height: 1.4em;
+}
+
+.transfer-file {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+.transfer-file__name {
+  font-family: var(--font-mono);
+  overflow-wrap: anywhere;
+}
+
+.transfer-source {
+  margin: 0;
+  font-weight: 600;
+}
+
+.transfer-label {
+  font-weight: 500;
+}
+
+/* --- option forms ----------------------------------------------------------------------- */
+
+.transfer-form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.transfer-form__inline {
+  display: flex;
+  gap: var(--space-1);
+}
+
+.transfer-form__char {
+  flex: 0 0 48px;
+}
+
+input.transfer-form__char {
+  width: 48px;
+}
+
+.transfer-form__number {
+  width: 110px;
+}
+
+.transfer-form__checks {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.transfer-form__end {
+  align-self: flex-end;
+  padding-bottom: var(--space-1);
+}
+
+.transfer-radio {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: var(--space-1) var(--space-3);
+}
+
+.transfer-radio:has(input:checked) {
+  background: var(--color-accent);
+  color: var(--color-accent-fg);
+}
+
+.transfer-options {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: var(--space-4);
+  flex-shrink: 0;
+}
+
+.transfer-options legend {
+  font-weight: 600;
+  margin-bottom: var(--space-1);
+}
+
+/* --- tables (preview, mapping, plan, error log) ----------------------------------------- */
+
+.transfer-preview,
+.transfer-mapping,
+.transfer-errors {
+  flex: 1;
+  min-height: 120px;
+  overflow: auto;
+  border: 1px solid var(--color-border);
+  border-radius: 4px;
+}
+
+.transfer-errors {
+  flex: 0 1 auto;
+  max-height: 240px;
+}
+
+.transfer-table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 12px;
+}
+
+.transfer-table th,
+.transfer-table td {
+  padding: 3px var(--space-2);
+  border-bottom: 1px solid var(--color-border);
+  text-align: left;
+  vertical-align: top;
+  white-space: nowrap;
+  max-width: 320px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.transfer-table thead th {
+  position: sticky;
+  top: 0;
+  background: var(--color-bg-subtle);
+  font-weight: 600;
+  z-index: 1;
+}
+
+.transfer-table tbody th {
+  font-weight: 500;
+}
+
+.transfer-table__name,
+.transfer-table__type {
+  display: block;
+}
+
+.transfer-table__type {
+  color: var(--color-fg-muted);
+  font-weight: 400;
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+
+.transfer-table__null {
+  color: var(--color-fg-faint);
+  font-style: italic;
+}
+
+.transfer-table__sample {
+  color: var(--color-fg-muted);
+  font-family: var(--font-mono);
+}
+
+.transfer-table__invalid {
+  background: var(--color-danger-bg);
+}
+
+.transfer-table td .field__error {
+  white-space: normal;
+}
+
+.transfer-mapping select,
+.transfer-mapping input[type="text"] {
+  min-width: 160px;
+  padding: 1px var(--space-1);
+}
+
+.transfer-ddl {
+  margin: 0;
+  padding: var(--space-2);
+  max-height: 160px;
+  overflow: auto;
+  border: 1px solid var(--color-border);
+  border-radius: 4px;
+  background: var(--color-bg-subtle);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  white-space: pre-wrap;
+}
+
+.transfer-summary {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: var(--space-2) var(--space-4);
+  margin: 0;
+}
+
+.transfer-summary dt {
+  color: var(--color-fg-muted);
+  font-size: 12px;
+}
+
+.transfer-summary dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+/* --- progress --------------------------------------------------------------------------- */
+
+.transfer-progress {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.transfer-progress__label {
+  margin: 0;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.transfer-progress__bar {
+  width: 100%;
+  height: 10px;
+  accent-color: var(--color-accent);
+}
+
+.transfer-progress__figures {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  gap: var(--space-2) var(--space-4);
+  margin: 0;
+}
+
+.transfer-progress__figure dt {
+  color: var(--color-fg-muted);
+  font-size: 12px;
+}
+
+.transfer-progress__figure dd {
+  margin: 0;
+  font-variant-numeric: tabular-nums;
+}
+
+.transfer-progress__figure--alert dd {
+  color: var(--color-danger);
+  font-weight: 600;
+}
+
+/* --- result status export button -------------------------------------------------------- */
+
+.results__status:has(.results__export) {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+
+.results__export {
+  margin-left: auto;
+}
+
+/* --- context menu ----------------------------------------------------------------------- */
+
+.context-menu {
+  position: fixed;
+  z-index: 1100;
+  display: flex;
+  flex-direction: column;
+  min-width: 180px;
+  padding: var(--space-1) 0;
+  background: var(--color-bg);
+  color: var(--color-fg);
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  box-shadow: 0 8px 24px rgb(0 0 0 / 20%);
+}
+
+.context-menu__item {
+  font: inherit;
+  padding: var(--space-1) var(--space-3);
+  border: none;
+  background: none;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.context-menu__item:hover,
+.context-menu__item:focus-visible {
+  background: var(--color-bg-muted);
+  outline: none;
+}
+
+.context-menu__item[aria-disabled="true"] {
+  opacity: 0.5;
+  cursor: default;
+}

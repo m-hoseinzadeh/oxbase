@@ -8,7 +8,13 @@ import { formatMs } from "../format";
 import { ResultPager } from "./pager";
 import { timedQueryPage } from "./perf";
 import { ResultGrid } from "./ResultGrid";
-import { type ResultInfo, type RunMessage, type RunState, rowCountLabel } from "./runState";
+import {
+  isActive,
+  type ResultInfo,
+  type RunMessage,
+  type RunState,
+  rowCountLabel,
+} from "./runState";
 
 type TabId = "messages" | number;
 
@@ -96,9 +102,11 @@ export interface ResultsAreaProps {
   run: RunState;
   /** A note for the Messages tab about what the engine cannot report (SQL Server PRINT). */
   messagesNote?: string | null | undefined;
+  /** Exports every row of a result (offered once the run has ended). */
+  onExport?: ((result: ResultInfo) => void) | undefined;
 }
 
-export function ResultsArea({ run, messagesNote = null }: ResultsAreaProps) {
+export function ResultsArea({ run, messagesNote = null, onExport }: ResultsAreaProps) {
   // The tab the user picked, for the run it was picked in (a new run starts on its first result).
   const [picked, setPicked] = useState<{ runId: string | null; tab: TabId } | null>(null);
   const pagers = useRef(new Map<number, ResultPager>());
@@ -214,6 +222,21 @@ export function ResultsArea({ run, messagesNote = null }: ResultsAreaProps) {
               {activeResult.columns.length === 0 ? " · no columns" : ""}
               {pager.error ? ` · page failed: ${pager.error}` : ""}
               {shownNotice ? ` · ${shownNotice}` : ""}
+              {onExport ? (
+                <button
+                  type="button"
+                  className="button button--small results__export"
+                  disabled={isActive(run.status) || activeResult.columns.length === 0}
+                  title={
+                    isActive(run.status)
+                      ? "Available once the run has ended"
+                      : "Export every row of this result"
+                  }
+                  onClick={() => onExport(activeResult)}
+                >
+                  Export…
+                </button>
+              ) : null}
             </div>
             <div className="results__grid">
               <ResultGrid

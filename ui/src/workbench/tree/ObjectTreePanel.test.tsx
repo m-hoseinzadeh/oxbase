@@ -5,6 +5,8 @@ import { refreshSessions, resetConnectionsStore } from "../../connections/store"
 import type { SessionSummary } from "../../connections/types";
 import { tauriCore } from "../../test/tauriMock";
 import { setDockviewApi } from "../layout";
+import { resetTransferStore } from "../transfer/store";
+import { TransferHost } from "../transfer/TransferHost";
 import { ObjectTreePanel } from "./ObjectTreePanel";
 
 vi.mock("@tauri-apps/api/core", async () => (await import("../../test/tauriMock")).tauriCore);
@@ -281,5 +283,80 @@ describe("ObjectTreePanel", () => {
     } finally {
       setDockviewApi(null);
     }
+  });
+});
+
+describe("ObjectTreePanel import and export", () => {
+  beforeEach(() => {
+    resetConnectionsStore();
+    resetTransferStore();
+    tauriCore.invoke.mockReset();
+    tauriCore.isTauri.mockReturnValue(true);
+    treeHandler = async (node, showSystem) => childrenOf(node, showSystem);
+    mockCore();
+  });
+  afterEach(() => {
+    resetTransferStore();
+    resetConnectionsStore();
+  });
+
+  async function showTables() {
+    render(<TransferHost />);
+    const tree = await renderTree();
+    fireEvent.doubleClick(item(/Local PG/));
+    fireEvent.doubleClick(await screen.findByRole("treeitem", { name: /app/ }));
+    fireEvent.doubleClick(await screen.findByRole("treeitem", { name: "Tables" }));
+    await screen.findByRole("treeitem", { name: /users/ });
+    return tree;
+  }
+
+  it("offers import and export in a table's context menu", async () => {
+    await showTables();
+    fireEvent.contextMenu(item(/users/), { clientX: 40, clientY: 50 });
+    const menu = screen.getByRole("menu", { name: "users actions" });
+    expect(item(/users/)).toHaveAttribute("aria-selected", "true");
+    expect(
+      within(menu)
+        .getAllByRole("menuitem")
+        .map((m) => m.textContent),
+    ).toEqual([
+      "Open",
+      "Design",
+      "New table",
+      "New query",
+      "Import into this table…",
+      "Export…",
+      "Refresh",
+    ]);
+    expect(within(menu).getByRole("menuitem", { name: "Open" })).toHaveFocus();
+    fireEvent.keyDown(menu, { key: "ArrowDown" });
+    expect(within(menu).getByRole("menuitem", { name: "Design" })).toHaveFocus();
+
+    fireEvent.click(within(menu).getByRole("menuitem", { name: "Export…" }));
+    expect(screen.queryByRole("menu")).toBeNull();
+    const dialog = screen.getByRole("dialog", { name: "Export data" });
+    expect(within(dialog).getByTestId("export-source")).toHaveTextContent("Table app.users");
+    expect(within(dialog).getByLabelText("Filter (SQL condition)")).toBeInTheDocument();
+  });
+
+  it("imports into a database from its menu (keyboard) and from the toolbar", async () => {
+    const tree = await showTables();
+    fireEvent.click(item(/app/));
+    fireEvent.keyDown(tree, { key: "F10", shiftKey: true });
+    const menu = screen.getByRole("menu", { name: "app actions" });
+    expect(within(menu).queryByRole("menuitem", { name: "Export…" })).toBeNull();
+    fireEvent.keyDown(menu, { key: "Escape" });
+    expect(screen.queryByRole("menu")).toBeNull();
+
+    fireEvent.keyDown(tree, { key: "ContextMenu" });
+    fireEvent.click(screen.getByRole("menuitem", { name: "Import data…" }));
+    expect(screen.getByRole("dialog", { name: "Import data" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByRole("dialog")).toBeNull();
+
+    // Columns cannot take an import; tables can, from the toolbar.
+    fireEvent.click(item(/users/));
+    fireEvent.click(screen.getByRole("button", { name: "Import" }));
+    expect(screen.getByRole("dialog", { name: "Import data" })).toBeInTheDocument();
   });
 });

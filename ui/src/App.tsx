@@ -23,6 +23,8 @@ import {
   showHistory,
   type TableDataPanelParams,
 } from "./workbench/layout";
+import { openImport } from "./workbench/transfer/store";
+import { TransferHost } from "./workbench/transfer/TransferHost";
 import { ObjectTreePanel } from "./workbench/tree/ObjectTreePanel";
 
 function QueryPanel({ params }: IDockviewPanelProps<QueryEditorParams>) {
@@ -111,11 +113,15 @@ export function App() {
         <button type="button" className="button" onClick={showHistory}>
           History
         </button>
+        <button type="button" className="button" onClick={() => openImport()}>
+          Import…
+        </button>
       </header>
       <main className="app__workspace">
         <DockviewReact components={components} onReady={onReady} theme={theme} />
       </main>
       <StatusBar />
+      <TransferHost />
     </div>
   );
 }

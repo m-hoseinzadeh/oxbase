@@ -6,9 +6,11 @@
  */
 import { type KeyboardEvent, useCallback, useEffect, useId, useRef, useState } from "react";
 import { type ObjectRef, type TreeNodeRef, treeChildren } from "../../api";
+import { ContextMenu, type MenuItem } from "../../components/ContextMenu";
 import { cancelRequest, newRequestId, toCommandError } from "../../connections/api";
 import { useConnections } from "../../connections/store";
 import { openQueryEditor, openTableData, openTableDesigner } from "../layout";
+import { openExport, openImport } from "../transfer/store";
 import {
   type ChildrenState,
   cachedDescendants,
@@ -54,6 +56,20 @@ export function newTableTarget(row: Row | null): ObjectRef | null {
   return null;
 }
 
+/** Where an import from `row` goes: its database or schema (a new table) or its table. */
+export function importTarget(row: Row | null): ObjectRef | null | undefined {
+  if (row?.type !== "node") return undefined;
+  const ref = row.ref;
+  if (ref.type === "connection") return null;
+  if (ref.type === "folder") {
+    return ref.kind === "table" && (ref.parent.kind === "database" || ref.parent.kind === "schema")
+      ? ref.parent
+      : undefined;
+  }
+  const kind = ref.object.kind;
+  return kind === "database" || kind === "schema" || kind === "table" ? ref.object : undefined;
+}
+
 function isNavigable(row: Row): boolean {
   return row.type === "node" || row.type === "error";
 }
@@ -64,6 +80,7 @@ export function ObjectTreePanel() {
   const [children, setChildren] = useState<ReadonlyMap<string, ChildrenState>>(new Map());
   const [selected, setSelected] = useState<string | null>(null);
   const [showSystem, setShowSystem] = useState(false);
+  const [menu, setMenu] = useState<{ rowId: string; x: number; y: number } | null>(null);
   /** The request in flight per node id, to cancel it and to drop stale answers. */
   const pending = useRef(new Map<string, string>());
   const treeRef = useRef<HTMLDivElement>(null);
@@ -219,6 +236,71 @@ export function ObjectTreePanel() {
     }
   }
 
+  function importInto(row: Row | null = selectedRow) {
+    const target = importTarget(row);
+    if (row?.type !== "node" || target === undefined) return;
+    openImport({ sessionId: row.sessionId, ...(target ? { target } : {}) });
+  }
+
+  function exportRows(row: Row | null = selectedRow) {
+    const object = dataObject(row);
+    if (row?.type !== "node" || !object) return;
+    const engine = sessions.find((s) => s.id === row.sessionId)?.engine;
+    const what = object.kind === "table" ? "Table" : "View";
+    openExport({
+      source: { type: "table", session: row.sessionId, query: { table: object } },
+      ...(engine ? { engine } : {}),
+      label: `${what} ${[object.schema ?? object.catalog, object.name].filter(Boolean).join(".")}`,
+      baseName: object.name,
+      offerFilter: true,
+    });
+  }
+
+  function menuItems(row: Row): MenuItem[] {
+    if (row.type !== "node") return [];
+    const items: MenuItem[] = [];
+    const object = dataObject(row);
+    if (object) {
+      items.push({ label: "Open", onSelect: () => openData(row) });
+      if (object.kind === "table") {
+        items.push({
+          label: "Design",
+          onSelect: () => openTableDesigner({ sessionId: row.sessionId, table: object }),
+        });
+      }
+    }
+    const tableTarget = newTableTarget(row);
+    if (tableTarget) {
+      items.push({
+        label: "New table",
+        onSelect: () =>
+          openTableDesigner({ sessionId: row.sessionId, table: tableTarget, isNew: true }),
+      });
+    }
+    items.push({
+      label: "New query",
+      onSelect: () => {
+        const database = databaseOf(row.ref);
+        openQueryEditor({ sessionId: row.sessionId, ...(database ? { database } : {}) });
+      },
+    });
+    if (importTarget(row) !== undefined) {
+      items.push({
+        label: object ? "Import into this table…" : "Import data…",
+        onSelect: () => importInto(row),
+      });
+    }
+    if (object) items.push({ label: "Export…", onSelect: () => exportRows(row) });
+    items.push({ label: "Refresh", onSelect: refresh });
+    return items;
+  }
+
+  function openMenu(row: Row, x: number, y: number) {
+    if (row.type !== "node") return;
+    setSelected(row.id);
+    setMenu({ rowId: row.id, x, y });
+  }
+
   function select(id: string) {
     setSelected(id);
     document.getElementById(`${domId}-${id}`)?.scrollIntoView?.({ block: "nearest" });
@@ -264,6 +346,14 @@ export function ObjectTreePanel() {
         break;
       case "F5":
         refresh();
+        break;
+      case "ContextMenu":
+      case "F10":
+        if (event.key === "F10" && !event.shiftKey) return;
+        if (row?.type === "node") {
+          const rect = document.getElementById(`${domId}-${row.id}`)?.getBoundingClientRect();
+          openMenu(row, (rect?.left ?? 0) + 24, rect?.bottom ?? 0);
+        }
         break;
       default:
         return;
@@ -316,6 +406,15 @@ export function ObjectTreePanel() {
           disabled={newTableTarget(selectedRow) === null}
         >
           New table
+        </button>
+        <button
+          type="button"
+          className="button"
+          onClick={() => importInto()}
+          disabled={importTarget(selectedRow) === undefined}
+          title="Import a file into the selected database, schema or table"
+        >
+          Import
         </button>
         <label className="checkbox tree__system">
           <input type="checkbox" checked={showSystem} onChange={toggleSystem} />
@@ -397,6 +496,11 @@ export function ObjectTreePanel() {
                   if (dataObject(row)) openData(row);
                   else setOpen(row, !row.expanded);
                 }}
+                onContextMenu={(e) => {
+                  e.preventDefault();
+                  treeRef.current?.focus();
+                  openMenu(row, e.clientX, e.clientY);
+                }}
               >
                 <span
                   className={`tree__twisty${row.expandable ? "" : " tree__twisty--leaf"}${row.expanded ? " tree__twisty--open" : ""}`}
@@ -415,6 +519,20 @@ export function ObjectTreePanel() {
           })}
         </div>
       )}
+      {menu
+        ? (() => {
+            const row = rows.find((r) => r.id === menu.rowId);
+            return row ? (
+              <ContextMenu
+                x={menu.x}
+                y={menu.y}
+                label={`${row.type === "node" ? row.label : ""} actions`}
+                items={menuItems(row)}
+                onClose={() => setMenu(null)}
+              />
+            ) : null;
+          })()
+        : null}
     </section>
   );
 }
