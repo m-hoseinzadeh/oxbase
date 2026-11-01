@@ -326,6 +326,87 @@ jobs:
         if: always()
         run: bash scripts/ci-fixtures.sh down
 
+  # M6 exit check (docs/m6-contracts.md §5): completion p95 at most 50 ms on the 5 000-table x
+  # 20-column synthetic cache over 240 cursor positions (crates/oxbase-insight/tests/
+  # complete_perf.rs prints p50 / p95 / max per scenario), in a release-like build (`--profile
+  # perf`); OXBASE_REQUIRE_M6_PERF=1 turns a budget overrun into a failure. Then the live
+  # 5k-table PostgreSQL variant (crates/oxbase-services/tests/schema_cache_perf.rs, cache
+  # stream) once that test exists. Full lane, plus the fast lane of the perf, complete, cache
+  # and integration branches.
+  insight-perf:
+    name: Insight perf (5k-table completion)
+    if: >-
+      !startsWith(github.ref, 'refs/heads/wip/')
+      || endsWith(github.ref, '-perf')
+      || endsWith(github.ref, '-complete')
+      || endsWith(github.ref, '-cache')
+      || endsWith(github.ref, '-integrate')
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      OXBASE_REQUIRE_M6_PERF: "1"
+      # The budget covers context_at + complete together (§5): on main and the integration
+      # branch the test fails while context_at is still a skeleton instead of timing
+      # complete() alone over hand-built contexts.
+      OXBASE_REQUIRE_M6_CONTEXT: ${{ (github.ref == 'refs/heads/main' || endsWith(github.ref, '-integrate')) && '1' || '0' }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: perf
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build the completion perf test (perf profile)
+        run: cargo test -p oxbase-insight --profile perf --locked --test complete_perf --no-run
+
+      - name: Completion latency on the synthetic 5k-table cache (perf profile)
+        run: cargo test -p oxbase-insight --profile perf --locked --test complete_perf -- --ignored --nocapture
+
+      # The same check in the release profile itself (thin LTO): the perf profile above is
+      # the slower, conservative one the contract names; both must stay within budget.
+      - name: Completion latency on the synthetic 5k-table cache (release)
+        run: cargo test -p oxbase-insight --release --locked --test complete_perf -- --ignored --nocapture
+
+      # The live variant belongs to the cache stream; until it lands there is nothing to run.
+      - name: Look for the live 5k-table test
+        id: live
+        run: |
+          if [ -f crates/oxbase-services/tests/schema_cache_perf.rs ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "schema_cache_perf.rs is not on this branch yet: live variant pending"
+          fi
+
+      - name: Build the live perf test (perf profile)
+        if: steps.live.outputs.present == 'true'
+        run: cargo test -p oxbase-services --profile perf --locked --test schema_cache_perf --no-run
+
+      - name: Generate fixture TLS PKI and SSH keys
+        if: steps.live.outputs.present == 'true'
+        run: bash scripts/fixtures-certs.sh
+
+      - name: Start the PostgreSQL fixture
+        if: steps.live.outputs.present == 'true'
+        run: bash scripts/ci-fixtures.sh up postgres
+
+      - name: Completion latency on a live 5k-table PostgreSQL schema
+        if: steps.live.outputs.present == 'true'
+        run: cargo test -p oxbase-services --profile perf --locked --test schema_cache_perf -- --ignored --nocapture
+
+      - name: Dump fixture logs
+        if: failure() && steps.live.outputs.present == 'true'
+        run: bash scripts/ci-fixtures.sh logs postgres
+
+      - name: Tear down database fixtures
+        if: always() && steps.live.outputs.present == 'true'
+        run: bash scripts/ci-fixtures.sh down
+
   # The built app driven through its real webview (docs/m3-contracts.md §9, ui/e2e/README.md):
   # a debug app serving ui/dist, tauri-driver in front of WebKitWebDriver under Xvfb, the
   # PostgreSQL fixture only. Full lane, plus the fast lane of the e2e, app and integration

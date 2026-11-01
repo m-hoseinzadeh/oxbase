@@ -24,13 +24,17 @@ use std::collections::HashMap;
 use std::fmt;
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use oxbase_dialect::DialectRegistry;
-use oxbase_insight::{CompletionKind, DiagnosticCode, FormatOptions, Severity};
-use oxbase_types::{Engine, Result};
+use oxbase_insight::{
+    Clause, CompletionKind, CursorContext, DiagnosticCode, Dialect, Expected, FormatOptions,
+    Outline, RecentNames, SchemaCache, Severity, StatementClass,
+};
+use oxbase_types::{Engine, Error, Result, ServerVersion};
 use serde::{Deserialize, Serialize};
 
-use crate::schema_cache::{CacheState, SchemaCacheService};
+use crate::schema_cache::{CacheKey, CacheState, SchemaCacheService};
 use crate::snippets::SnippetService;
 use crate::{CancellationToken, SessionId};
 
@@ -315,6 +319,105 @@ pub struct InsightService {
     snippets: Arc<SnippetService>,
     gate: RequestGate,
     config: InsightConfig,
+    /// Recently used names per cache (relations and routines the edited statements name).
+    recent: Mutex<HashMap<CacheKey, Arc<RecentNames>>>,
+}
+
+/// Most caches whose recently used names are kept.
+const MAX_RECENT_CACHES: usize = 64;
+/// Most completion items one request may ask for.
+const MAX_COMPLETION_LIMIT: usize = 2000;
+
+/// What a request works with (see [`InsightService::inputs`]).
+struct Inputs {
+    dialect: Dialect,
+    cache: Option<SchemaCache>,
+    state: CacheState,
+    /// A cache build is pending: the answer may grow.
+    pending: bool,
+    key: Option<CacheKey>,
+}
+
+/// Runs `work` on the blocking pool.
+async fn blocking<T, F>(work: F) -> Result<T>
+where
+    F: FnOnce() -> Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|_| Error::internal("code insight stopped unexpectedly"))?
+}
+
+/// A keywords-only context at byte `offset` (texts too large to parse on every keystroke):
+/// the word before the cursor is the prefix. It reads as a statement start, so `complete`
+/// offers every keyword of the dialect (inside a clause it offers only the context's list).
+fn keyword_context(dialect: &Dialect, text: &str, offset: usize) -> CursorContext {
+    let extra = dialect.language.ident_chars;
+    let is_word = |c: char| c.is_alphanumeric() || c == '_' || extra.contains(c);
+    let start = text[..offset]
+        .char_indices()
+        .rev()
+        .take_while(|(_, c)| is_word(*c))
+        .last()
+        .map_or(offset, |(i, _)| i);
+    let end = text[offset..]
+        .char_indices()
+        .find(|(_, c)| !is_word(*c))
+        .map_or(text.len(), |(i, _)| offset + i);
+    CursorContext {
+        offset,
+        statement: offset..offset,
+        class: StatementClass::Other,
+        clause: Clause::Start,
+        word: start..end,
+        prefix: text[start..offset].to_owned(),
+        quote: None,
+        qualifier: Vec::new(),
+        expected: vec![Expected::Keyword],
+        keywords: Vec::new(),
+        scope: Vec::new(),
+        ctes: Vec::new(),
+        outline: Outline::empty(offset..offset),
+    }
+}
+
+/// Converts many byte ranges of one text to UTF-16 without rescanning the text for each:
+/// conversions continue from the last converted offset when they move forward.
+struct Utf16Ranges<'t> {
+    text: &'t str,
+    byte: usize,
+    units: usize,
+}
+
+impl<'t> Utf16Ranges<'t> {
+    fn new(text: &'t str) -> Self {
+        Self {
+            text,
+            byte: 0,
+            units: 0,
+        }
+    }
+
+    fn offset(&mut self, byte: usize) -> usize {
+        let mut target = byte.min(self.text.len());
+        while !self.text.is_char_boundary(target) {
+            target -= 1;
+        }
+        if target < self.byte {
+            self.byte = 0;
+            self.units = 0;
+        }
+        self.units += self.text[self.byte..target].encode_utf16().count();
+        self.byte = target;
+        self.units
+    }
+
+    fn convert(&mut self, range: &Range<usize>) -> Utf16Range {
+        let start = self.offset(range.start);
+        let end = self.offset(range.end);
+        Utf16Range { start, end }
+    }
 }
 
 impl InsightService {
@@ -330,6 +433,7 @@ impl InsightService {
             snippets,
             gate: RequestGate::new(),
             config,
+            recent: Mutex::new(HashMap::new()),
         }
     }
 
@@ -357,40 +461,299 @@ impl InsightService {
     /// registry with the session's server version, user + built-in snippets for the engine,
     /// `oxbase_insight::context_at` + `complete` on the blocking pool, items converted to
     /// UTF-16. `cancel` (the app's request id) and the gate's token both stop it.
-    #[allow(clippy::unused_async)] // skeleton until the complete stream fills it
+    ///
+    /// A request a newer one of the same editor overtook answers `superseded: true`; one
+    /// cancelled through `cancel` fails with `Cancelled`. The list is `incomplete` while the
+    /// cache is missing or being rebuilt, so the editor asks again.
+    #[allow(clippy::needless_pass_by_value)] // the request's token is handed over (contract)
     pub async fn complete(
         &self,
         request: InsightRequest,
         limit: Option<usize>,
         cancel: CancellationToken,
     ) -> Result<CompletionResponse> {
-        let _ = (self, request, limit, cancel);
-        unimplemented!("m6: complete")
+        let seq = request.seq;
+        let Some(ticket) = self
+            .gate
+            .begin(&request.editor_id, RequestKind::Complete, seq)
+        else {
+            return Ok(CompletionResponse::superseded(seq));
+        };
+        let work = ticket.token.child_token();
+        let result = tokio::select! {
+            biased;
+            () = cancel.cancelled() => Err(Error::Cancelled),
+            r = self.complete_inner(request, limit, &work) => r,
+        };
+        work.cancel();
+        match result {
+            Err(e) if e.is_cancelled() && !cancel.is_cancelled() && ticket.token.is_cancelled() => {
+                Ok(CompletionResponse::superseded(seq))
+            }
+            other => other,
+        }
+    }
+
+    async fn complete_inner(
+        &self,
+        request: InsightRequest,
+        limit: Option<usize>,
+        token: &CancellationToken,
+    ) -> Result<CompletionResponse> {
+        let limit = limit
+            .unwrap_or(self.config.completion_limit)
+            .clamp(1, MAX_COMPLETION_LIMIT);
+        let inputs = self.inputs(&request).await?;
+        let InsightRequest {
+            seq,
+            engine,
+            text,
+            offset,
+            ..
+        } = request;
+        let text: Arc<str> = Arc::from(text);
+        let offset = to_byte_offset(&text, offset);
+        let dialect = Arc::new(inputs.dialect);
+        let started = Instant::now();
+
+        let list = if text.len() > self.config.max_text_bytes {
+            // Too large to parse on every keystroke: keywords only.
+            let ctx = keyword_context(&dialect, &text, offset);
+            let d = Arc::clone(&dialect);
+            let t = token.clone();
+            blocking(move || oxbase_insight::complete(&ctx, &d, None, &[], limit, &t)).await?
+        } else {
+            let (d, body, t) = (Arc::clone(&dialect), Arc::clone(&text), token.clone());
+            let ctx = blocking(move || {
+                if t.is_cancelled() {
+                    return Err(Error::Cancelled);
+                }
+                Ok(oxbase_insight::context_at(&d, &body, offset))
+            })
+            .await?;
+            let recent = self.recent_for(inputs.key.as_ref(), &ctx);
+            let snippets = if ctx.expects(Expected::Snippet) {
+                self.snippets.list(Some(engine)).await.unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            let (d, t, cache) = (Arc::clone(&dialect), token.clone(), inputs.cache.clone());
+            blocking(move || {
+                oxbase_insight::complete_with_recent(
+                    &ctx,
+                    &d,
+                    cache.as_ref(),
+                    &snippets,
+                    &recent,
+                    limit,
+                    &t,
+                )
+            })
+            .await?
+        };
+        let elapsed_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+        let mut ranges = Utf16Ranges::new(&text);
+        let items = list
+            .items
+            .into_iter()
+            .map(|c| CompletionItem {
+                range: ranges.convert(&c.replace),
+                label: c.label,
+                kind: c.kind,
+                insert_text: c.insert_text,
+                is_snippet: c.is_snippet,
+                detail: c.detail,
+                documentation: c.documentation,
+                sort_text: c.sort_key,
+                filter_text: c.filter_text,
+            })
+            .collect();
+        Ok(CompletionResponse {
+            seq,
+            superseded: false,
+            items,
+            incomplete: list.incomplete || inputs.pending,
+            cache: inputs.state,
+            elapsed_us,
+        })
     }
 
     /// Diagnostics of the request's text (same gate and cache rules as `complete`).
-    #[allow(clippy::unused_async)] // skeleton until the complete stream fills it
+    #[allow(clippy::needless_pass_by_value)] // the request's token is handed over (contract)
     pub async fn diagnose(
         &self,
         request: InsightRequest,
         cancel: CancellationToken,
     ) -> Result<DiagnosticsResponse> {
-        let _ = (self, request, cancel);
-        unimplemented!("m6: complete")
+        let seq = request.seq;
+        let Some(ticket) = self
+            .gate
+            .begin(&request.editor_id, RequestKind::Diagnose, seq)
+        else {
+            return Ok(DiagnosticsResponse::superseded(seq));
+        };
+        let work = ticket.token.child_token();
+        let result = tokio::select! {
+            biased;
+            () = cancel.cancelled() => Err(Error::Cancelled),
+            r = self.diagnose_inner(request, &work) => r,
+        };
+        work.cancel();
+        match result {
+            Err(e) if e.is_cancelled() && !cancel.is_cancelled() && ticket.token.is_cancelled() => {
+                Ok(DiagnosticsResponse::superseded(seq))
+            }
+            other => other,
+        }
+    }
+
+    async fn diagnose_inner(
+        &self,
+        request: InsightRequest,
+        token: &CancellationToken,
+    ) -> Result<DiagnosticsResponse> {
+        let inputs = self.inputs(&request).await?;
+        let seq = request.seq;
+        let text: Arc<str> = Arc::from(request.text);
+        // Larger texts get lexical findings only (no names).
+        let cache = inputs
+            .cache
+            .filter(|_| text.len() <= self.config.max_text_bytes);
+        let started = Instant::now();
+        let (body, t, dialect) = (Arc::clone(&text), token.clone(), inputs.dialect);
+        let found =
+            blocking(move || oxbase_insight::diagnose(&dialect, &body, cache.as_ref(), &t)).await?;
+        let elapsed_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+        let mut ranges = Utf16Ranges::new(&text);
+        let diagnostics = found
+            .into_iter()
+            .map(|d| DiagnosticItem {
+                range: ranges.convert(&d.range),
+                severity: d.severity,
+                code: d.code,
+                message: d.message,
+            })
+            .collect();
+        Ok(DiagnosticsResponse {
+            seq,
+            superseded: false,
+            diagnostics,
+            cache: inputs.state,
+            elapsed_us,
+        })
     }
 
     /// Hover at the request's cursor (no gate: the editor asks once per hover).
-    #[allow(clippy::unused_async)] // skeleton until the complete stream fills it
     pub async fn hover(&self, request: InsightRequest) -> Result<Option<HoverResponse>> {
-        let _ = (self, request);
-        unimplemented!("m6: complete")
+        let inputs = self.inputs(&request).await?;
+        let text: Arc<str> = Arc::from(request.text);
+        if text.len() > self.config.max_text_bytes {
+            return Ok(None);
+        }
+        let offset = to_byte_offset(&text, request.offset);
+        let (body, dialect, cache) = (Arc::clone(&text), inputs.dialect, inputs.cache);
+        let found = blocking(move || {
+            Ok(oxbase_insight::hover(
+                &dialect,
+                &body,
+                offset,
+                cache.as_ref(),
+            ))
+        })
+        .await?;
+        Ok(found.map(|h| HoverResponse {
+            range: to_utf16_range(&text, &h.range),
+            markdown: h.markdown,
+        }))
     }
 
     /// Formats the request's text (or the statements in its range) on the blocking pool.
-    #[allow(clippy::unused_async)] // skeleton until the complete stream fills it
     pub async fn format(&self, request: FormatRequest) -> Result<FormatResponse> {
-        let _ = (self, request);
-        unimplemented!("m6: complete")
+        let options = request.options.unwrap_or_default();
+        options.validate()?;
+        let dialect = self.dialect(request.engine, None)?;
+        let text: Arc<str> = Arc::from(request.text);
+        let range = request.range.map(|r| to_byte_range(&text, r));
+        let body = Arc::clone(&text);
+        let edit = blocking(move || match range {
+            Some(range) => oxbase_insight::format_range(&dialect, &body, range, &options),
+            None => oxbase_insight::format(&dialect, &body, &options).map(|formatted| {
+                oxbase_insight::TextEdit {
+                    range: 0..body.len(),
+                    text: formatted,
+                }
+            }),
+        })
+        .await?;
+        Ok(FormatResponse {
+            range: to_utf16_range(&text, &edit.range),
+            text: edit.text,
+        })
+    }
+
+    /// The insight dialect of `engine`: the registry's language data and quoting (the
+    /// standard data and the engine's usual quoting when nothing is registered).
+    fn dialect(&self, engine: Engine, version: Option<ServerVersion>) -> Result<Dialect> {
+        Dialect::from_registry(&self.dialects, engine, version.clone())
+            .or_else(|_| Dialect::builtin(engine).map(|d| Dialect { version, ..d }))
+    }
+
+    /// The dialect, cache and cache state for a request. Never waits for the network: the
+    /// cache comes from memory or the app database, and a missing or stale one is rebuilt in
+    /// the background.
+    async fn inputs(&self, request: &InsightRequest) -> Result<Inputs> {
+        let mut inputs = Inputs {
+            dialect: Dialect::builtin(request.engine)?,
+            cache: None,
+            state: CacheState::Missing,
+            pending: false,
+            key: None,
+        };
+        let mut version = None;
+        if let Some(session) = request.session_id
+            && let Some(handle) = self.caches.manager().get(session)
+        {
+            version = Some(handle.info().server_version.clone());
+            if let Ok(key) = self.caches.key_for(session, request.database.as_deref()) {
+                inputs.cache = self.caches.cache(&key).await;
+                match self.caches.ensure(session, request.database.clone()).await {
+                    Ok(status) => {
+                        inputs.state = status.state;
+                        inputs.pending = status.building || inputs.cache.is_none();
+                    }
+                    Err(_) => {
+                        inputs.state = if inputs.cache.is_some() {
+                            CacheState::Stale
+                        } else {
+                            CacheState::Failed
+                        };
+                    }
+                }
+                inputs.key = Some(key);
+            }
+        }
+        inputs.dialect = self.dialect(request.engine, version)?;
+        if let Some(cache) = &inputs.cache {
+            inputs.dialect.case_rules = cache.case_rules();
+        }
+        Ok(inputs)
+    }
+
+    /// Records the names the statement at the cursor uses and returns the recently used
+    /// names of the request's cache (empty without one).
+    fn recent_for(&self, key: Option<&CacheKey>, ctx: &CursorContext) -> Arc<RecentNames> {
+        let Some(key) = key else {
+            return Arc::new(RecentNames::default());
+        };
+        let Ok(mut all) = self.recent.lock() else {
+            return Arc::new(RecentNames::default());
+        };
+        if !all.contains_key(key) && all.len() >= MAX_RECENT_CACHES {
+            all.clear();
+        }
+        let entry = all.entry(key.clone()).or_default();
+        Arc::make_mut(entry).record(&ctx.outline, ctx.offset);
+        Arc::clone(entry)
     }
 
     /// Forgets an editor's requests (its tab closed).
@@ -514,5 +877,189 @@ mod tests {
         assert!(!other.token.is_cancelled());
         assert!(!gate.is_current("e", RequestKind::Complete, 3));
         assert!(gate.begin("e", RequestKind::Complete, 1).is_some());
+    }
+
+    fn service(config: InsightConfig) -> InsightService {
+        let manager = Arc::new(crate::ConnectionManager::new(
+            oxbase_driver::DriverRegistry::new(),
+            Arc::new(oxbase_store::MemorySecretStore::new()),
+            Arc::new(oxbase_net::ssh::RusshTunnelProvider::new()),
+        ));
+        let dialects = Arc::new(DialectRegistry::new());
+        let caches = Arc::new(SchemaCacheService::new(
+            manager,
+            Arc::clone(&dialects),
+            Arc::new(oxbase_store::MemorySchemaCacheRepository::new()),
+            crate::schema_cache::SchemaEvents::new(),
+            crate::schema_cache::SchemaCacheConfig::default(),
+        ));
+        let snippets = Arc::new(SnippetService::new(Arc::new(
+            oxbase_store::MemorySnippetRepository::new(),
+        )));
+        InsightService::new(dialects, caches, snippets, config)
+    }
+
+    fn request(editor: &str, seq: u64, text: &str) -> InsightRequest {
+        InsightRequest {
+            editor_id: editor.into(),
+            seq,
+            engine: Engine::Postgres,
+            session_id: None,
+            database: None,
+            text: text.into(),
+            offset: text.encode_utf16().count(),
+        }
+    }
+
+    #[tokio::test]
+    async fn overtaken_requests_answer_superseded() {
+        let svc = service(InsightConfig::default());
+        let newer = svc.gate().begin("e", RequestKind::Complete, 5).unwrap();
+        let answer = svc
+            .complete(request("e", 3, "SEL"), None, CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(answer, CompletionResponse::superseded(3));
+        // The newer request is not disturbed by the late one.
+        assert!(!newer.token.is_cancelled());
+        svc.gate().begin("e", RequestKind::Diagnose, 9).unwrap();
+        let answer = svc
+            .diagnose(request("e", 1, "SELECT"), CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(answer, DiagnosticsResponse::superseded(1));
+        svc.close_editor("e");
+        assert!(newer.token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_request_fails_with_cancelled() {
+        let svc = service(InsightConfig::default());
+        let token = CancellationToken::new();
+        token.cancel();
+        let err = svc
+            .complete(request("e", 1, "SEL"), Some(10), token.clone())
+            .await
+            .unwrap_err();
+        assert!(err.is_cancelled());
+        let err = svc
+            .diagnose(request("e", 1, "SELECT"), token)
+            .await
+            .unwrap_err();
+        assert!(err.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn large_texts_get_keywords_only_with_utf16_ranges() {
+        let svc = service(InsightConfig {
+            completion_limit: 50,
+            max_text_bytes: 16,
+        });
+        let text = "SELECT 'é😀' FROM t; SEL";
+        let answer = svc
+            .complete(request("e", 1, text), None, CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(!answer.superseded);
+        assert_eq!(answer.cache, CacheState::Missing);
+        assert!(!answer.incomplete);
+        let first = &answer.items[0];
+        assert_eq!(first.label, "SELECT");
+        assert_eq!(first.kind, CompletionKind::Keyword);
+        let end = text.encode_utf16().count();
+        assert_eq!(
+            first.range,
+            Utf16Range {
+                start: end - 3,
+                end
+            }
+        );
+        assert_eq!(first.sort_text, "000000");
+        // MongoDB has no SQL editor.
+        let mut mongo = request("m", 1, "x");
+        mongo.engine = Engine::MongoDb;
+        let err = svc
+            .complete(mongo, None, CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert_eq!(err.category(), oxbase_types::ErrorCategory::Unsupported);
+    }
+
+    #[tokio::test]
+    async fn format_checks_its_options_first() {
+        let svc = service(InsightConfig::default());
+        let err = svc
+            .format(FormatRequest {
+                engine: Engine::Postgres,
+                text: "select 1".into(),
+                range: None,
+                options: Some(FormatOptions {
+                    indent_width: 0,
+                    ..FormatOptions::default()
+                }),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.category(), oxbase_types::ErrorCategory::InvalidInput);
+    }
+
+    #[test]
+    fn utf16_ranges_match_the_one_off_conversion() {
+        let text = "a😀b é\nc 😀😀 d";
+        let mut ranges = Utf16Ranges::new(text);
+        let probes = [0..1, 1..5, 5..9, 3..4, 7..text.len(), 0..0, 2..999];
+        for r in probes {
+            assert_eq!(ranges.convert(&r), to_utf16_range(text, &r), "{r:?}");
+        }
+    }
+
+    #[test]
+    fn keyword_context_takes_the_word_at_the_cursor() {
+        let d = Dialect::builtin(Engine::Postgres).unwrap();
+        let text = "x; select more";
+        let c = keyword_context(&d, text, 6);
+        assert_eq!(c.word, 3..9);
+        assert_eq!(c.prefix, "sel");
+        assert_eq!(c.expected, [Expected::Keyword]);
+        assert_eq!(c.clause, Clause::Start);
+        let list =
+            oxbase_insight::complete(&c, &d, None, &[], 50, &CancellationToken::new()).unwrap();
+        assert!(list.items.iter().any(|i| i.label == "select"));
+        let c = keyword_context(&d, "", 0);
+        assert_eq!(c.word, 0..0);
+        assert_eq!(c.prefix, "");
+    }
+
+    #[test]
+    fn recent_names_are_kept_per_cache() {
+        let svc = service(InsightConfig::default());
+        let d = Dialect::builtin(Engine::Postgres).unwrap();
+        let mut ctx = keyword_context(&d, "SELECT * FROM orders", 20);
+        ctx.offset = 0;
+        ctx.outline.refs = vec![oxbase_insight::NameRef {
+            parts: vec![oxbase_insight::Ident {
+                text: "orders".into(),
+                quoted: false,
+            }],
+            ranges: std::iter::once(14..20).collect(),
+            role: oxbase_insight::RefRole::Relation,
+            query: Some(0),
+            clause: Clause::From,
+        }];
+        let key = CacheKey {
+            profile_id: uuid::Uuid::nil(),
+            database: "app".into(),
+        };
+        let recent = svc.recent_for(Some(&key), &ctx);
+        assert_eq!(recent.rank("orders"), 0);
+        let other = CacheKey {
+            profile_id: uuid::Uuid::nil(),
+            database: "other".into(),
+        };
+        let mut empty = keyword_context(&d, "", 0);
+        empty.offset = 0;
+        assert_eq!(svc.recent_for(Some(&other), &empty).rank("orders"), 2);
+        assert_eq!(svc.recent_for(Some(&key), &empty).rank("orders"), 0);
+        assert_eq!(svc.recent_for(None, &ctx).len(), 0);
     }
 }

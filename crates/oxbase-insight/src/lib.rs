@@ -54,7 +54,9 @@ mod hover;
 mod outline;
 pub mod snippets;
 
-pub use complete::{Completion, CompletionKind, CompletionList, complete};
+pub use complete::{
+    Completion, CompletionKind, CompletionList, RecentNames, complete, complete_with_recent,
+};
 pub use context::{CursorContext, Expected, context_at};
 pub use diagnose::{Diagnostic, DiagnosticCode, Severity, diagnose};
 pub use format::{FormatOptions, KeywordCase, TextEdit, check_format, format, format_range};
