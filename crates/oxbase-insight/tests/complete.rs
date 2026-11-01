@@ -985,14 +985,14 @@ fn recent_names_come_from_outlines() {
             },
             oxbase_insight::NameRef {
                 parts: vec![ident("total")],
-                ranges: Vec::from([7..12]),
+                ranges: std::iter::once(7..12).collect(),
                 role: oxbase_insight::RefRole::Column,
                 query: Some(0),
                 clause: Clause::SelectList,
             },
             oxbase_insight::NameRef {
                 parts: vec![ident("cust")],
-                ranges: Vec::from([30..34]),
+                ranges: std::iter::once(30..34).collect(),
                 role: oxbase_insight::RefRole::Relation,
                 query: Some(0),
                 clause: Clause::From,
