@@ -172,6 +172,16 @@ ALTER TABLE orders ADD CONSTRAINT fk_orders_customer FOREIGN KEY (customer_id) R
 ALTER TABLE IF EXISTS tmp_cache RENAME TO tmp_cache_old;
 SELECT k, v FROM tmp_cache_old;
 ALTER TABLE products ALTER COLUMN price SET DEFAULT 0;
+UPDATE customers SET phone = '555-0100' WHERE id = 1;
+SELECT c.phone FROM customers c WHERE c.phone IS NOT NULL;
+DROP TABLE IF EXISTS payments;
+CREATE TABLE payments (ref text, settled boolean);
+INSERT INTO payments (ref, settled) VALUES ('x', true);
+SELECT ref FROM payments WHERE settled;
+SELECT (o).id, (o).total FROM orders o WHERE (o).status = 'open';
+SELECT (pg_stat_file('postgresql.conf')).size, (pg_stat_file('postgresql.conf')).modification FROM orders LIMIT 1;
+SELECT (array_agg(o ORDER BY o.id))[1].total FROM orders o;
+SELECT (information_schema._pg_expandarray(ARRAY['a', 'b'])).n FROM orders;
 COMMENT ON TABLE customers IS 'People who buy things';
 GRANT SELECT, INSERT ON customers TO reporting_role;
 REVOKE UPDATE ON orders FROM reporting_role;

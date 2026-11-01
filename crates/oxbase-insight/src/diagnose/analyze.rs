@@ -262,8 +262,15 @@ fn split(
 /// Where the statement starting at `start` ends: its `;`, the next statement's first word
 /// (T-SQL batches), or `hi`.
 fn segment_end(t: &Toks<'_>, feat: &Features, start: usize, hi: usize) -> usize {
-    let head = t.upper(start);
+    let mut head = t.upper(start);
+    if update_statistics(t, start) {
+        // `UPDATE STATISTICS t` is maintenance, not DML: a `SET` after it starts a statement.
+        head = "UPDATE STATISTICS".to_owned();
+    }
     let mut main_seen = false;
+    // The first DML word of the statement (`WITH x AS (...) UPDATE ...`).
+    let mut main_word = String::new();
+    let mut set_seen = false;
     let mut saw_as = false;
     let mut case_depth = 0u32;
     let mut i = start + 1;
@@ -285,11 +292,25 @@ fn segment_end(t: &Toks<'_>, feat: &Features, start: usize, hi: usize) -> usize 
                 } else if w == "AS" {
                     saw_as = true;
                 }
-                if feat.batches
-                    && case_depth == 0
-                    && starts_statement(t, &head, main_seen, saw_as, i, &w)
-                {
-                    return i;
+                if feat.batches && case_depth == 0 {
+                    let dml = if head == "WITH" {
+                        main_word.as_str()
+                    } else {
+                        head.as_str()
+                    };
+                    let state = Batch {
+                        head: &head,
+                        dml,
+                        main_seen,
+                        set_seen,
+                        saw_as,
+                    };
+                    if starts_statement(t, &state, i, &w) {
+                        return i;
+                    }
+                    if w == "SET" && dml == "UPDATE" {
+                        set_seen = true;
+                    }
                 }
                 if matches!(
                     w.as_str(),
@@ -302,6 +323,9 @@ fn segment_end(t: &Toks<'_>, feat: &Features, start: usize, hi: usize) -> usize 
                         | "DELETE"
                         | "MERGE"
                 ) {
+                    if !main_seen {
+                        main_word = w;
+                    }
                     main_seen = true;
                 }
             }
@@ -312,15 +336,31 @@ fn segment_end(t: &Toks<'_>, feat: &Features, start: usize, hi: usize) -> usize 
     hi
 }
 
-/// T-SQL: whether word `w` at `i` starts a new statement of the batch.
-fn starts_statement(
-    t: &Toks<'_>,
-    head: &str,
+/// T-SQL `UPDATE STATISTICS t [...]` at `i` (the `UPDATE` word), not an `UPDATE` of a table
+/// named `statistics`.
+fn update_statistics(t: &Toks<'_>, i: usize) -> bool {
+    t.is_word(i, "UPDATE")
+        && t.is_word(i + 1, "STATISTICS")
+        && t.is_name(i + 2)
+        && !t.word_in(i + 2, &["AS", "FROM", "OUTPUT", "SET", "WITH"])
+}
+
+/// What [`segment_end`] knows of the statement so far.
+struct Batch<'s> {
+    /// The statement's first word, upper case.
+    head: &'s str,
+    /// The DML word the statement runs (`head`, or the word after a `WITH` list).
+    dml: &'s str,
+    /// A `SELECT`, `VALUES`, `EXEC` or DML word was read.
     main_seen: bool,
+    /// An `UPDATE`'s `SET` clause was read.
+    set_seen: bool,
     saw_as: bool,
-    i: usize,
-    w: &str,
-) -> bool {
+}
+
+/// T-SQL: whether word `w` at `i` starts a new statement of the batch.
+fn starts_statement(t: &Toks<'_>, b: &Batch<'_>, i: usize, w: &str) -> bool {
+    let (head, main_seen, saw_as) = (b.head, b.main_seen, b.saw_as);
     let prev = t.upper(i - 1);
     let prev_comma = t.is_punct(i - 1, b',');
     let ddl_head = matches!(head, "CREATE" | "ALTER");
@@ -334,7 +374,8 @@ fn starts_statement(
                 || prev_comma)
         }
         "INSERT" | "UPDATE" | "DELETE" | "MERGE" => {
-            !(has(words::DML_CONT_PREV, &prev)
+            // `SET IDENTITY_INSERT t ON` + `INSERT ...`: `ON` ends the option there.
+            !((has(words::DML_CONT_PREV, &prev) && !(head == "SET" && prev == "ON"))
                 || prev_comma
                 || t.is_punct(i + 1, b'(')
                 || (head == "WITH" && !main_seen)
@@ -344,11 +385,15 @@ fn starts_statement(
             !ddl_head && t.is_name(i + 1) && (t.is_word(i + 2, "AS") || t.is_punct(i + 2, b'('))
         }
         "SET" => {
-            !(matches!(
-                head,
-                "UPDATE" | "MERGE" | "ALTER" | "CREATE" | "INSERT" | "WITH"
-            ) || matches!(prev.as_str(), "UPDATE" | "ON" | "DELETE"))
+            // T-SQL `INSERT` has no `SET` clause and an `UPDATE` only one: a `SET` after them
+            // is the next statement (`SET NOCOUNT OFF`, `SET IDENTITY_INSERT t OFF`).
+            let next_dml = b.dml == "INSERT" || (b.dml == "UPDATE" && b.set_seen);
+            next_dml
+                || !(matches!(head, "UPDATE" | "MERGE" | "ALTER" | "CREATE" | "WITH")
+                    || matches!(prev.as_str(), "UPDATE" | "ON" | "DELETE"))
         }
+        // `OFFSET n ROWS FETCH NEXT ...` continues the query; a cursor `FETCH` starts one.
+        "FETCH" => !(matches!(prev.as_str(), "ROW" | "ROWS") || grant_head),
         "CREATE" | "ALTER" | "DROP" => !(ddl_head || grant_head || prev == "OR"),
         "IF" => {
             !(matches!(head, "DROP" | "CREATE" | "ALTER") && t.word_in(i + 1, &["EXISTS", "NOT"]))
@@ -848,7 +893,7 @@ impl Parser<'_, '_> {
             {
                 self.insert(b, i + 1, hi);
             }
-            "UPDATE" => self.update(b, i, hi),
+            "UPDATE" if !(self.feat.batches && update_statistics(t, i)) => self.update(b, i, hi),
             "DELETE" => self.delete(b, i, hi),
             "MERGE" => self.merge(b, i + 1, hi),
             "CREATE" => self.create(i + 1, hi),
@@ -1708,7 +1753,19 @@ impl Parser<'_, '_> {
                 self.enter(w, Cl::Limit, r, "LIMIT");
                 Some(i + 1)
             }
-            "OFFSET" | "FETCH" if w.cl != Cl::Head => {
+            // A bare `offset` may be a column name (not reserved in MySQL, SQLite, T-SQL): as a
+            // clause it follows a complete operand, as a name it starts one.
+            "OFFSET"
+                if w.cl == Cl::Limit
+                    || (w.cl != Cl::Head
+                        && (matches!(t.kind(i + 1), Some(Kind::Number | Kind::Param))
+                            || next_paren
+                            || (w.ex.after && self.lang.is_reserved("OFFSET")))) =>
+            {
+                self.enter(w, Cl::Limit, r, "OFFSET");
+                Some(i + 1)
+            }
+            "FETCH" if w.cl != Cl::Head && t.word_in(i + 1, &["FIRST", "NEXT"]) => {
                 self.enter(w, Cl::Limit, r, "OFFSET");
                 Some(i + 1)
             }
@@ -2163,6 +2220,9 @@ impl Parser<'_, '_> {
 
     fn name_atom(&mut self, b: usize, i: usize, hi: usize, ex: &mut Ex) -> usize {
         let t = self.t;
+        if i.checked_sub(1).is_some_and(|p| t.is_punct(p, b'.')) {
+            return self.field_selector(b, i, hi, ex);
+        }
         let quoted = t.kind(i) == Some(Kind::Quoted);
         let next_dot = i + 1 < hi && t.is_punct(i + 1, b'.');
         if !quoted && !next_dot {
@@ -2245,6 +2305,26 @@ impl Parser<'_, '_> {
             });
         }
         Self::operand(ex, last);
+        next
+    }
+
+    /// A name right after a `.` that no name path took: a field of a composite value
+    /// (`(addr).city`, `arr[1].f`) or a method (`@x.value(...)`, `(expr).method()`). Neither
+    /// is a column reference nor a function of the catalog.
+    fn field_selector(&mut self, b: usize, i: usize, hi: usize, ex: &mut Ex) -> usize {
+        let t = self.t;
+        let (_, _, mut next) = self.path(i, hi);
+        next = next.max(i + 1);
+        if next < hi && t.is_punct(next, b'(') {
+            let c = t.close_of(next, hi);
+            let g = ex.group();
+            self.group(b, next + 1, c, g);
+            next = c + 1;
+        }
+        ex.chain = None;
+        ex.after = true;
+        ex.item_start = false;
+        ex.after_for = false;
         next
     }
 

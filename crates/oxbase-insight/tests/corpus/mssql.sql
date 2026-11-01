@@ -261,6 +261,58 @@ ALTER TABLE orders ADD CONSTRAINT fk_orders_customer FOREIGN KEY (customer_id) R
 GO
 ALTER TABLE products ALTER COLUMN price decimal(10, 2) NOT NULL;
 GO
+UPDATE customers SET phone = N'555-0100' WHERE id = 1
+SELECT phone FROM customers WHERE phone IS NOT NULL
+GO
+DROP TABLE IF EXISTS payments
+CREATE TABLE payments (ref nvarchar(20), settled bit)
+INSERT INTO payments (ref, settled) VALUES ('x', 1)
+SELECT ref FROM payments WHERE settled = 1
+GO
+DECLARE @id int, @t decimal(12, 2) = 0
+DECLARE c CURSOR LOCAL FAST_FORWARD FOR SELECT id FROM orders WHERE status = 'open'
+OPEN c
+FETCH NEXT FROM c INTO @id
+WHILE @@FETCH_STATUS = 0
+BEGIN
+    SELECT @t = @t + total FROM orders WHERE id = @id
+    UPDATE orders SET status = 'counted' WHERE id = @id
+    FETCH NEXT FROM c INTO @id
+END
+CLOSE c
+DEALLOCATE c
+SELECT @t AS grand_total
+GO
+CREATE PROCEDURE dbo.usp_close_orders
+AS
+BEGIN
+    SET NOCOUNT ON
+    DECLARE @id int
+    DECLARE c CURSOR FOR SELECT id FROM orders WHERE status = 'open'
+    OPEN c
+    FETCH NEXT FROM c INTO @id
+    WHILE @@FETCH_STATUS = 0
+    BEGIN
+        UPDATE orders SET status = 'closed' WHERE id = @id
+        FETCH NEXT FROM c INTO @id
+    END
+    CLOSE c
+    DEALLOCATE c
+    SET NOCOUNT OFF
+END
+GO
+SET IDENTITY_INSERT orders ON
+INSERT INTO orders (id, customer_id, total) VALUES (9001, 1, 0)
+SET IDENTITY_INSERT orders OFF
+UPDATE orders SET status = 'x' WHERE id = 9001
+SET NOCOUNT OFF
+UPDATE STATISTICS dbo.orders
+UPDATE STATISTICS orders WITH FULLSCAN
+SET NOCOUNT ON
+GO
+DECLARE @x xml = '<a/>'
+SELECT @x.value('(/a)[1]', 'int') AS v
+GO
 DROP TABLE IF EXISTS tmp_events;
 GO
 DROP VIEW IF EXISTS v_open_orders;

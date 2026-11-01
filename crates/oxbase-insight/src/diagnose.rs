@@ -169,8 +169,9 @@ impl Diagnostic {
     }
 }
 
-/// Every diagnostic of `text`, sorted by range start. Works without a cache (lexical findings
-/// only). Must finish within 100 ms for a 1 MiB script in a release build; checks `cancel`
+/// Every diagnostic of `text`, sorted by range start. Works without a cache (then without the
+/// catalog findings: lexical errors, syntax, dialect mismatches and dangerous statements
+/// remain). Must finish within 100 ms for a 1 MiB script in a release build; checks `cancel`
 /// between statements and returns `Error::Cancelled` once it is cancelled.
 pub fn diagnose(
     dialect: &Dialect,

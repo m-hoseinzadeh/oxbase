@@ -686,6 +686,136 @@ fn function_calls() {
     assert_eq!(f, vec![(UnknownFunction, Hint, "frobnicate".to_owned())]);
 }
 
+// --- reading without semicolons, scripts that change tables, composite values -----------------
+
+#[test]
+fn tsql_statements_without_semicolons_are_cut_where_the_next_one_starts() {
+    let ms = sample(Engine::MsSql);
+    for sql in [
+        "DECLARE @id int, @t decimal(12, 2) = 0\nDECLARE c CURSOR FOR SELECT id FROM orders\nOPEN c\nFETCH NEXT FROM c INTO @id\nWHILE @@FETCH_STATUS = 0\nBEGIN\n    SELECT @t = @t + total FROM orders WHERE id = @id\n    FETCH NEXT FROM c INTO @id\nEND\nCLOSE c\nDEALLOCATE c",
+        "UPDATE orders SET status = 'x' WHERE id = 1\nFETCH NEXT FROM c INTO @id",
+        "UPDATE orders SET status = 'x' WHERE id = 1\nSET NOCOUNT OFF",
+        "SET IDENTITY_INSERT orders ON\nINSERT INTO orders (id, total) VALUES (1, 0)\nSET IDENTITY_INSERT orders OFF",
+        "WITH x AS (SELECT id FROM orders) UPDATE orders SET status = 'x' WHERE id IN (SELECT id FROM x)\nSET NOCOUNT OFF",
+        "UPDATE STATISTICS dbo.orders\nUPDATE STATISTICS orders WITH FULLSCAN\nSET NOCOUNT ON",
+        "SELECT id FROM orders ORDER BY id OFFSET 5 ROWS FETCH NEXT 5 ROWS ONLY",
+    ] {
+        for cache in [None, Some(&ms)] {
+            assert_eq!(
+                loud(&found(Engine::MsSql, sql, cache)),
+                Found::new(),
+                "{sql}"
+            );
+        }
+    }
+    // Each statement of the batch is still checked.
+    let f = found(
+        Engine::MsSql,
+        "SET NOCOUNT ON\nUPDATE orders SET total = 0\nSET NOCOUNT OFF",
+        None,
+    );
+    assert_has(&f, MissingWhere, Warning, "UPDATE orders");
+    let f = found(
+        Engine::MsSql,
+        "UPDATE orders SET nope = 1 WHERE id = 1\nSET NOCOUNT OFF",
+        Some(&ms),
+    );
+    assert_eq!(f, vec![(UnknownColumn, Warning, "nope".to_owned())]);
+    assert_lacks(
+        &found(Engine::MsSql, "UPDATE STATISTICS dbo.orders", None),
+        MissingWhere,
+    );
+}
+
+#[test]
+fn tables_the_script_alters_or_recreates_have_unknown_columns() {
+    let pg = sample(Engine::Postgres);
+    for sql in [
+        "ALTER TABLE customers ADD COLUMN phone text; UPDATE customers SET phone = '1' WHERE id = 1; SELECT c.phone FROM customers c",
+        "DROP TABLE IF EXISTS orders; CREATE TABLE orders (ref text); INSERT INTO orders (ref) VALUES ('x'); SELECT ref FROM orders",
+    ] {
+        assert_eq!(
+            found(Engine::Postgres, sql, Some(&pg)),
+            Found::new(),
+            "{sql}"
+        );
+    }
+    let lite = sample(Engine::Sqlite);
+    assert_eq!(
+        found(
+            Engine::Sqlite,
+            "ALTER TABLE products RENAME COLUMN sku TO code; SELECT code FROM products",
+            Some(&lite)
+        ),
+        Found::new()
+    );
+    let ms = sample(Engine::MsSql);
+    assert_eq!(
+        found(
+            Engine::MsSql,
+            "ALTER TABLE customers ADD phone nvarchar(30)\nGO\nUPDATE customers SET phone = '1' WHERE id = 1",
+            Some(&ms)
+        ),
+        Found::new()
+    );
+    // Tables the script leaves alone keep their checks; an unknown table stays unknown.
+    let f = found(
+        Engine::Postgres,
+        "ALTER TABLE customers ADD COLUMN phone text; SELECT nope FROM orders",
+        Some(&pg),
+    );
+    assert_eq!(f, vec![(UnknownColumn, Warning, "nope".to_owned())]);
+    let f = found(
+        Engine::Postgres,
+        "ALTER TABLE nope ADD COLUMN phone text",
+        Some(&pg),
+    );
+    assert_eq!(f, vec![(UnknownRelation, Warning, "nope".to_owned())]);
+}
+
+#[test]
+fn composite_fields_and_methods_are_not_columns() {
+    let pg = sample(Engine::Postgres);
+    for sql in [
+        "SELECT (o).id, (o).total FROM orders o WHERE (o).status = 'open'",
+        "SELECT (pg_stat_file('postgresql.conf')).size FROM orders",
+        "SELECT (array_agg(o))[1].total FROM orders o",
+        "SELECT (information_schema._pg_expandarray(ARRAY['a', 'b'])).n FROM orders",
+    ] {
+        assert_eq!(
+            loud(&found(Engine::Postgres, sql, Some(&pg))),
+            Found::new(),
+            "{sql}"
+        );
+    }
+    let ms = sample(Engine::MsSql);
+    let sql = "DECLARE @x xml = '<a/>'\nSELECT @x.value('(/a)[1]', 'int') AS v FROM orders";
+    assert_eq!(loud(&found(Engine::MsSql, sql, Some(&ms))), Found::new());
+    // A plain column next to a field selector is still checked.
+    let f = found(
+        Engine::Postgres,
+        "SELECT (o).id, nope FROM orders o",
+        Some(&pg),
+    );
+    assert_eq!(f, vec![(UnknownColumn, Warning, "nope".to_owned())]);
+}
+
+#[test]
+fn a_column_named_offset_is_no_clause() {
+    let my = sample(Engine::MySql);
+    let sql = "CREATE TABLE pages (id int, offset int); SELECT id FROM pages WHERE offset > 10 ORDER BY id";
+    assert_eq!(loud(&found(Engine::MySql, sql, Some(&my))), Found::new());
+    let sql = "SELECT id, offset FROM pages WHERE offset > 10 ORDER BY id LIMIT 5 OFFSET 10";
+    assert_eq!(loud(&found(Engine::MySql, sql, None)), Found::new());
+    // `OFFSET n` still is a clause, and its place is checked.
+    let f = found(
+        Engine::Postgres,
+        "SELECT id FROM orders ORDER BY id OFFSET 5 WHERE id = 1",
+        None,
+    );
+    assert_has(&f, SyntaxError, Warning, "WHERE");
+}
+
 // --- policy ---------------------------------------------------------------------------------------
 
 #[test]

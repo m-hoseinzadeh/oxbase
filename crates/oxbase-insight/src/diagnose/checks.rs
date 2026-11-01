@@ -21,6 +21,9 @@ pub(crate) struct Env<'c> {
     pub rules: CaseRules,
     /// Lower-case names of relations created or renamed earlier in the script.
     created: HashSet<String>,
+    /// Lower-case names of relations altered earlier in the script (columns added, renamed,
+    /// dropped): their cached columns are out of date.
+    altered: HashSet<String>,
     /// Lower-case names of schemas or databases created or attached in the script.
     schemas: HashSet<String>,
     /// A rename whose target is unknown (`sp_rename`): any name may be new.
@@ -35,6 +38,7 @@ impl<'c> Env<'c> {
             cache,
             rules: cache.map_or(dialect.case_rules, SchemaCache::case_rules),
             created: HashSet::new(),
+            altered: HashSet::new(),
             schemas: HashSet::new(),
             renamed: false,
             elsewhere: false,
@@ -51,23 +55,36 @@ impl<'c> Env<'c> {
     /// uses).
     pub fn apply_changes(&mut self, changes: &[SchemaChange]) {
         for c in changes {
-            if !matches!(c.verb, DdlVerb::Create | DdlVerb::Rename) {
+            if c.verb == DdlVerb::Drop {
                 continue;
             }
             let Some(last) = c.name.last() else {
-                self.renamed = true;
+                if c.verb != DdlVerb::Alter {
+                    self.renamed = true;
+                }
                 continue;
             };
             let key = last.text.to_lowercase();
-            match c.object {
-                DdlObject::Schema | DdlObject::Database => {
+            match (c.verb, c.object) {
+                (DdlVerb::Alter, DdlObject::Schema | DdlObject::Database) => {}
+                (_, DdlObject::Schema | DdlObject::Database) => {
                     self.schemas.insert(key);
+                }
+                (DdlVerb::Alter, _) => {
+                    self.altered.insert(key);
                 }
                 _ => {
                     self.created.insert(key);
                 }
             }
         }
+    }
+
+    /// The script created, re-created or altered a relation named `last`: the cache's columns
+    /// for it cannot be trusted.
+    fn changed(&self, last: &Name) -> bool {
+        let key = last.text.to_lowercase();
+        self.created.contains(&key) || self.altered.contains(&key)
     }
 
     /// Notes what a statement did after its findings (`USE`, `SELECT INTO`, `ATTACH`).
@@ -264,6 +281,7 @@ pub(crate) fn rel_has(
     let names_have = |names: Vec<&Name>| names.iter().any(|n| same(rule, col, n));
     match &rel.source {
         Source::Table(path) => match resolve_table(env, st, Some(owner), path) {
+            Resolved::Catalog(_) if path.last().is_some_and(|l| env.changed(l)) => None,
             Resolved::Catalog(ids) => {
                 let cache = env.cache?;
                 Some(
