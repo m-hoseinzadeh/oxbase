@@ -166,6 +166,16 @@ input.transfer-form__char {
   width: 110px;
 }
 
+.transfer-size {
+  display: flex;
+  gap: var(--space-1);
+  margin-top: var(--space-1);
+}
+
+.transfer-size .transfer-form__number {
+  width: 72px;
+}
+
 .transfer-form__checks {
   display: flex;
   flex-direction: column;

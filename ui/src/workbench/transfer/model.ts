@@ -296,6 +296,7 @@ export const TYPE_CHOICES: readonly DataType[] = [
   { type: "var_char", length: 255 },
   { type: "int", bits: 32, unsigned: false },
   { type: "int", bits: 64, unsigned: false },
+  { type: "decimal", precision: null, scale: null },
   { type: "decimal", precision: 38, scale: 10 },
   { type: "float", bits: 64 },
   { type: "bool" },
@@ -308,10 +309,60 @@ export const TYPE_CHOICES: readonly DataType[] = [
   { type: "var_binary", length: null },
 ];
 
-/** The choices for a column: its inferred type first, then the common ones. */
-export function typeChoices(inferred: DataType): DataType[] {
-  const key = typeKey(inferred);
-  return [inferred, ...TYPE_CHOICES.filter((t) => typeKey(t) !== key)];
+/**
+ * The choices for a column: its inferred type first, then `extra` (the target column's type,
+ * the current choice when it was sized by hand), then the common ones; no type twice.
+ */
+export function typeChoices(inferred: DataType, ...extra: DataType[]): DataType[] {
+  const seen = new Set<string>();
+  const out: DataType[] = [];
+  for (const t of [inferred, ...extra, ...TYPE_CHOICES]) {
+    const key = typeKey(t);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(t);
+  }
+  return out;
+}
+
+/** A size typed by the user: a whole number from `min`, or `null` (blank: unsized). */
+export function parseSize(text: string, min: number): number | null {
+  const t = text.trim();
+  if (t === "") return null;
+  const n = Number(t);
+  return Number.isInteger(n) && n >= min ? n : null;
+}
+
+/** What is wrong with a hand-sized type (the core checks the engine's own limits). */
+export function typeSizeProblem(type: DataType): string | null {
+  if (type.type === "decimal") {
+    if (type.scale !== null && type.precision === null) {
+      return "A decimal scale needs a precision.";
+    }
+    if (type.precision !== null && type.scale !== null && type.scale > type.precision) {
+      return "A decimal scale cannot be larger than its precision.";
+    }
+  }
+  return null;
+}
+
+/**
+ * The type an existing target column is read as. Text-like columns (char, varchar, text, enum,
+ * engine-specific types) take the file's text as it is, so a value that does not look like the
+ * rest of the sample is not lost and nothing is rewritten in a canonical form; other columns
+ * are read as their own logical type.
+ */
+export function readTypeFor(column: ColumnDef): DataType {
+  switch (column.data_type.type) {
+    case "char":
+    case "var_char":
+    case "text":
+    case "enum":
+    case "other":
+      return { type: "text" };
+    default:
+      return column.data_type;
+  }
 }
 
 // --- names ----------------------------------------------------------------------------------
@@ -327,7 +378,8 @@ export function tableNameFromFile(fileName: string): string {
     .replace(/[^a-z0-9_]+/g, "_")
     .replace(/^_+|_+$/g, "");
   if (!name) return "imported";
-  return /^[0-9]/.test(name) ? `t_${name}` : name.slice(0, 63);
+  // A suggestion only: the target engine's own limit is checked by `import_plan`.
+  return (/^[0-9]/.test(name) ? `t_${name}` : name).slice(0, 63);
 }
 
 /** `schema.name` (or `catalog.name`) for messages. */
@@ -352,6 +404,15 @@ export const MODE_LABEL: Record<TargetMode, string> = {
 
 // --- mapping --------------------------------------------------------------------------------
 
+/**
+ * A mapping row pointed at another existing column: the file is read as that column's type
+ * (`readTypeFor`); blank or unknown targets keep the current type.
+ */
+export function retarget(target: string, targetColumns: ColumnDef[]): Partial<MappingRow> {
+  const column = targetColumns.find((c) => c.name === target);
+  return column ? { target, dataType: readTypeFor(column) } : { target };
+}
+
 /** One source column in the mapping table. */
 export interface MappingRow {
   source: number;
@@ -373,19 +434,22 @@ export function initialMapping(
   mode: TargetMode,
   targetColumns: ColumnDef[] = [],
 ): MappingRow[] {
-  const byName = new Map(targetColumns.map((c) => [c.name.toLowerCase(), c.name]));
+  const byName = new Map(targetColumns.map((c) => [c.name.toLowerCase(), c]));
   return columns.map((c) => {
     let target = c.name;
     let skip = false;
+    let dataType = c.dataType;
     if (!createsTable(mode)) {
-      target = byName.get(c.name.toLowerCase()) ?? "";
+      const column = byName.get(c.name.toLowerCase());
+      target = column?.name ?? "";
       skip = target === "";
+      if (column) dataType = readTypeFor(column);
     }
     return {
       source: c.index,
       sourceName: c.name,
       inferred: c.dataType,
-      dataType: c.dataType,
+      dataType,
       target,
       skip,
       primaryKey: false,
@@ -458,8 +522,11 @@ export function mappingProblems(
       }
       const refusal = writeRefusal(column);
       if (refusal) problems.push({ source: row.source, message: refusal });
-    } else if (target.length > 63) {
-      problems.push({ source: row.source, message: `"${target}" is longer than 63 characters.` });
+    }
+    // Name lengths are the target engine's rule: `import_plan` checks them.
+    const sizeProblem = typeSizeProblem(row.dataType);
+    if (sizeProblem) {
+      problems.push({ source: row.source, message: `"${row.sourceName}": ${sizeProblem}` });
     }
   }
   for (const group of seen.values()) {

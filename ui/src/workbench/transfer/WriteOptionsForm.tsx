@@ -127,6 +127,20 @@ function CsvForm({ o, set, disabled }: { o: Csv; set: (n: Csv) => void; disabled
           disabled={disabled}
           onChange={(e) => set({ ...o, nullToken: e.target.value })}
         />
+        {(o.nullToken ?? "") === "" ? (
+          <p className="field__hint" data-testid="null-token-hint">
+            Empty: NULL and empty text look the same in the file.{" "}
+            <button
+              type="button"
+              className="button button--small"
+              disabled={disabled}
+              onClick={() => set({ ...o, nullToken: "\\N" })}
+            >
+              Use \N
+            </button>{" "}
+            to keep them apart.
+          </p>
+        ) : null}
       </div>
       <div className="transfer-form__checks">
         <Check

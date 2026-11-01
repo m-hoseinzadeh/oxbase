@@ -16,6 +16,7 @@ import {
   type ImportEvent,
   type ImportPlan,
   type ImportReport,
+  type ImportRequest,
   type ImportRowError,
   importCancel,
   importPlan,
@@ -51,10 +52,13 @@ import {
   type MappingRow,
   MODE_LABEL,
   mappingProblems,
+  parseSize,
   qualifiedName,
   rates,
   readOptionsFor,
   readOptionsProblem,
+  readTypeFor,
+  retarget,
   tableNameFromFile,
   typeChoices,
   typeKey,
@@ -96,11 +100,18 @@ interface TargetForm {
   suggested: boolean;
 }
 
+/**
+ * The core's plan of the import, with the exact request it was made for: Start sends that
+ * request, and only while the wizard would still build the same one (`key`).
+ */
 type PlanState =
   | { status: "idle" }
   | { status: "loading" }
-  | { status: "ok"; plan: ImportPlan }
+  | { status: "ok"; plan: ImportPlan; request: ImportRequest; key: string }
   | { status: "error"; message: string };
+
+/** The row errors the core sends live (docs/m5-contracts.md §5.3). */
+const LIVE_ERROR_LIMIT = 100;
 
 // --- run state ------------------------------------------------------------------------------
 
@@ -369,6 +380,9 @@ export function ImportWizard({ init, onClose }: { init: ImportInit; onClose: () 
   const [run, dispatch] = useReducer(importRunReducer, IDLE_IMPORT);
   const cancelWanted = useRef(false);
   const alive = useRef(true);
+  /** Plans asked for so far: only the answer to the latest one is kept. */
+  const planSeq = useRef(0);
+  const planRequestId = useRef<string | null>(null);
   const fileRef = useRef<PickedFile | null>(null);
   fileRef.current = file;
 
@@ -389,6 +403,8 @@ export function ImportWizard({ init, onClose }: { init: ImportInit; onClose: () 
     alive.current = true;
     return () => {
       alive.current = false;
+      const requestId = planRequestId.current;
+      if (requestId) void cancelRequest(requestId).catch(() => {});
       const f = fileRef.current;
       if (f) void fileRelease(f.handle).catch(() => {});
     };
@@ -440,7 +456,12 @@ export function ImportWizard({ init, onClose }: { init: ImportInit; onClose: () 
     setPicking(true);
     try {
       const picked = await filePickOpen(importFilters(), "Choose a file to import");
-      if (!alive.current || !picked) return;
+      if (!picked) return;
+      if (!alive.current) {
+        // The wizard was closed while the dialog was up: nobody will use this handle.
+        void fileRelease(picked.handle).catch(() => {});
+        return;
+      }
       const previous = file;
       if (previous) void fileRelease(previous.handle).catch(() => {});
       setFile(picked);
@@ -495,7 +516,7 @@ export function ImportWizard({ init, onClose }: { init: ImportInit; onClose: () 
     const basis = JSON.stringify([
       columns.map((c) => [c.name, typeKey(c.dataType)]),
       create,
-      def?.columns.map((c) => c.name) ?? [],
+      def?.columns.map((c) => [c.name, typeKey(c.data_type)]) ?? [],
     ]);
     if (basis !== rowsBasis) {
       setRows(initialMapping(columns, mode, def?.columns ?? []));
@@ -525,28 +546,57 @@ export function ImportWizard({ init, onClose }: { init: ImportInit; onClose: () 
     });
   }
 
+  /** Forgets the current plan: a late answer to it is ignored, and the core stops working on it. */
+  function dropPlan() {
+    planSeq.current += 1;
+    const requestId = planRequestId.current;
+    planRequestId.current = null;
+    if (requestId) void cancelRequest(requestId).catch(() => {});
+    setPlan({ status: "idle" });
+    setConfirmed(false);
+  }
+
   async function toSummary() {
     setShowProblems(true);
     if (problems.length > 0) return;
+    dropPlan();
     setStep("summary");
-    setConfirmed(false);
-    setPlan({ status: "loading" });
     if (!file) return;
+    const seq = planSeq.current;
+    const requestId = newRequestId();
+    planRequestId.current = requestId;
+    const planned = request();
+    setPlan({ status: "loading" });
     try {
-      const result = await importPlan(file.handle, request());
-      if (alive.current) setPlan({ status: "ok", plan: result });
+      const result = await importPlan(file.handle, planned, requestId);
+      if (!alive.current || seq !== planSeq.current) return;
+      setPlan({ status: "ok", plan: result, request: planned, key: JSON.stringify(planned) });
     } catch (error) {
-      if (alive.current) setPlan({ status: "error", message: toCommandError(error).message });
+      if (!alive.current || seq !== planSeq.current) return;
+      setPlan({ status: "error", message: toCommandError(error).message });
+    } finally {
+      if (planRequestId.current === requestId) planRequestId.current = null;
     }
   }
 
+  function backFromSummary() {
+    dropPlan();
+    setStep("mapping");
+  }
+
+  /** The plan on screen is the one for what the wizard would send now. */
+  const planCurrent = plan.status === "ok" && plan.key === JSON.stringify(request());
+
   async function start() {
-    if (!file || plan.status !== "ok") return;
+    if (!file || plan.status !== "ok" || !planCurrent) return;
+    if (plan.plan.destructive && !confirmed) return;
+    // The exact request the user saw planned (and confirmed, when destructive).
+    const planned = plan.request;
     cancelWanted.current = false;
     setStep("run");
     dispatch({ type: "start" });
     try {
-      const importId = await importRun(file.handle, request(), (event) => {
+      const importId = await importRun(file.handle, planned, (event) => {
         if (!alive.current) return;
         dispatch({ type: "event", event });
         if (isTerminalTransferEvent(event)) setTransferBusy(false);
@@ -771,6 +821,80 @@ export function ImportWizard({ init, onClose }: { init: ImportInit; onClose: () 
     );
   }
 
+  /** A row's type: the select, plus size inputs for a new decimal / char / varchar column. */
+  function typeCell(r: MappingRow, targetColumns: ColumnDef[]): ReactNode {
+    const column = create ? undefined : targetColumns.find((c) => c.name === r.target);
+    const targetType = column ? readTypeFor(column) : null;
+    const inferredKey = typeKey(r.inferred);
+    const targetKey = targetType ? typeKey(targetType) : null;
+    const choices = typeChoices(r.inferred, ...(targetType ? [targetType] : []), r.dataType);
+    // A new column's size; for an existing table the type only says how the file is read.
+    const sized = create && !r.skip;
+    const dt = r.dataType;
+    const setType = (dataType: MappingRow["dataType"]) => updateRow(r.source, { dataType });
+    return (
+      <>
+        <select
+          aria-label={`Type of ${r.sourceName}`}
+          value={typeKey(r.dataType)}
+          disabled={r.skip}
+          onChange={(e) => setType(JSON.parse(e.target.value) as MappingRow["dataType"])}
+        >
+          {choices.map((t) => {
+            const key = typeKey(t);
+            const note =
+              key === inferredKey
+                ? " (inferred)"
+                : key === targetKey
+                  ? " (as the target column)"
+                  : "";
+            return (
+              <option key={key} value={key}>
+                {typeLabel(t)}
+                {note}
+              </option>
+            );
+          })}
+        </select>
+        {sized && dt.type === "decimal" ? (
+          <span className="transfer-size">
+            <input
+              type="number"
+              className="transfer-form__number"
+              aria-label={`Precision of ${r.sourceName}`}
+              placeholder="any"
+              min={1}
+              value={dt.precision ?? ""}
+              onChange={(e) => setType({ ...dt, precision: parseSize(e.target.value, 1) })}
+            />
+            <input
+              type="number"
+              className="transfer-form__number"
+              aria-label={`Scale of ${r.sourceName}`}
+              placeholder="any"
+              min={0}
+              value={dt.scale ?? ""}
+              onChange={(e) => setType({ ...dt, scale: parseSize(e.target.value, 0) })}
+            />
+          </span>
+        ) : null}
+        {sized && (dt.type === "var_char" || dt.type === "char") ? (
+          <span className="transfer-size">
+            <input
+              type="number"
+              className="transfer-form__number"
+              aria-label={`Length of ${r.sourceName}`}
+              placeholder="any"
+              min={1}
+              value={dt.length ?? ""}
+              onChange={(e) => setType({ ...dt, length: parseSize(e.target.value, 1) })}
+            />
+          </span>
+        ) : null}
+      </>
+    );
+  }
+
   function mappingStep(): ReactNode {
     const byRow = new Map<number, string[]>();
     for (const p of problems) {
@@ -819,25 +943,7 @@ export function ImportWizard({ init, onClose }: { init: ImportInit; onClose: () 
                     </td>
                     <th scope="row">{r.sourceName}</th>
                     <td className="transfer-table__sample">{sample(r.source)}</td>
-                    <td>
-                      <select
-                        aria-label={`Type of ${r.sourceName}`}
-                        value={typeKey(r.dataType)}
-                        disabled={r.skip}
-                        onChange={(e) =>
-                          updateRow(r.source, {
-                            dataType: JSON.parse(e.target.value) as MappingRow["dataType"],
-                          })
-                        }
-                      >
-                        {typeChoices(r.inferred).map((t, i) => (
-                          <option key={typeKey(t)} value={typeKey(t)}>
-                            {typeLabel(t)}
-                            {i === 0 ? " (inferred)" : ""}
-                          </option>
-                        ))}
-                      </select>
-                    </td>
+                    <td>{typeCell(r, targetColumns)}</td>
                     <td>
                       {create ? (
                         <input
@@ -854,7 +960,9 @@ export function ImportWizard({ init, onClose }: { init: ImportInit; onClose: () 
                           aria-invalid={rowProblems.length > 0}
                           value={r.target}
                           disabled={r.skip}
-                          onChange={(e) => updateRow(r.source, { target: e.target.value })}
+                          onChange={(e) =>
+                            updateRow(r.source, retarget(e.target.value, targetColumns))
+                          }
                         >
                           <option value="">Choose…</option>
                           {r.target && !targetColumns.some((c) => c.name === r.target) ? (
@@ -1115,6 +1223,9 @@ export function ImportWizard({ init, onClose }: { init: ImportInit; onClose: () 
     const done = run.status === "finished" || run.status === "failed" || run.status === "cancelled";
     const table = plan.status === "ok" ? plan.plan.table : targetRef(target);
     const errorCount = Math.max(p?.rowsSkipped ?? 0, run.rowErrors.length);
+    // Each skipped row has at least one error; the core sends only the first ones live.
+    const liveTruncated =
+      run.rowErrors.length >= LIVE_ERROR_LIMIT || errorCount > run.rowErrors.length;
     if (!done) {
       const r = rates({
         done: p?.bytesRead ?? 0,
@@ -1140,7 +1251,7 @@ export function ImportWizard({ init, onClose }: { init: ImportInit; onClose: () 
               { label: "Errors", value: formatCount(errorCount), alert: errorCount > 0 },
             ]}
           />
-          <ErrorLog errors={run.rowErrors} truncated={false} />
+          <ErrorLog errors={run.rowErrors} truncated={liveTruncated} />
         </div>
       );
     }
@@ -1200,7 +1311,7 @@ export function ImportWizard({ init, onClose }: { init: ImportInit; onClose: () 
             <ErrorLog errors={report.errors} truncated={report.errorsTruncated} />
           </>
         ) : (
-          <ErrorLog errors={run.rowErrors} truncated={false} />
+          <ErrorLog errors={run.rowErrors} truncated={liveTruncated} />
         )}
       </div>
     );
@@ -1287,12 +1398,14 @@ export function ImportWizard({ init, onClose }: { init: ImportInit; onClose: () 
           <button type="button" className="button modal__footer-start" onClick={close}>
             Cancel
           </button>
-          {back("mapping")}
+          <button type="button" className="button" onClick={backFromSummary}>
+            Back
+          </button>
           <button
             type="button"
             className="button button--primary"
             data-testid="start-import"
-            disabled={plan.status !== "ok" || (plan.plan.destructive && !confirmed)}
+            disabled={plan.status !== "ok" || !planCurrent || (plan.plan.destructive && !confirmed)}
             onClick={() => void start()}
           >
             Start import

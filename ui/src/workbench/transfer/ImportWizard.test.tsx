@@ -151,6 +151,8 @@ function report(extra: Partial<ImportReport> = {}): ImportReport {
 interface Calls {
   previews: { options: unknown }[];
   plans: ImportRequest[];
+  planIds: (string | null)[];
+  cancelledRequests: string[];
   runs: ImportRequest[];
   cancels: string[];
   released: string[];
@@ -161,19 +163,35 @@ let calls: Calls;
 let send: (event: ImportEvent) => void;
 let planExtra: Partial<ImportPlan>;
 let previewFails: boolean;
+/** When set, `import_plan` answers only when the test resolves it. */
+let deferPlans: boolean;
+let pendingPlans: { request: ImportRequest; resolve: (extra: Partial<ImportPlan>) => void }[];
+let pickGate: Promise<PickedFile | null> | null;
 
 function mockCore() {
-  calls = { previews: [], plans: [], runs: [], cancels: [], released: [], loads: [] };
+  calls = {
+    previews: [],
+    plans: [],
+    planIds: [],
+    cancelledRequests: [],
+    runs: [],
+    cancels: [],
+    released: [],
+    loads: [],
+  };
   send = () => {};
   planExtra = {};
   previewFails = false;
+  deferPlans = false;
+  pendingPlans = [];
+  pickGate = null;
   tauriCore.invoke.mockImplementation(async (cmd, args) => {
     const a = (args ?? {}) as Record<string, unknown>;
     switch (cmd) {
       case "list_open_connections":
         return [SESSION];
       case "file_pick_open":
-        return PICKED;
+        return pickGate ?? PICKED;
       case "file_release":
         calls.released.push(a.handle as string);
         return true;
@@ -183,13 +201,20 @@ function mockCore() {
           throw { category: "invalid_input", message: "line 3: unterminated quote" };
         return PREVIEW;
       case "cancel_request":
+        calls.cancelledRequests.push(a.requestId as string);
         return true;
       case "object_load":
         calls.loads.push(a.object);
         return ORDERS;
-      case "import_plan":
-        calls.plans.push(a.request as ImportRequest);
-        return plan(a.request as ImportRequest, planExtra);
+      case "import_plan": {
+        const request = a.request as ImportRequest;
+        calls.plans.push(request);
+        calls.planIds.push((a.requestId as string | null) ?? null);
+        if (!deferPlans) return plan(request, planExtra);
+        return new Promise<ImportPlan>((resolve) => {
+          pendingPlans.push({ request, resolve: (extra) => resolve(plan(request, extra)) });
+        });
+      }
       case "import_run": {
         calls.runs.push(a.request as ImportRequest);
         const channel = a.onEvent as { onmessage: (e: ImportEvent) => void };
@@ -227,6 +252,20 @@ async function toMapping() {
   await screen.findByLabelText("Table");
   next();
   await screen.findByRole("table", { name: "Column mapping" });
+}
+
+const MODE_TEXT = { truncate: "Empty the table first (TRUNCATE)" } as const;
+
+/** The default mock, with `object_load` answering `table`. */
+function wrapLoad(table: ObjectDef) {
+  const base = tauriCore.invoke.getMockImplementation();
+  return async (cmd: string, args?: unknown) => {
+    if (cmd === "object_load") {
+      calls.loads.push((args as Record<string, unknown>).object);
+      return table;
+    }
+    return base?.(cmd, args as never);
+  };
 }
 
 describe("ImportWizard", () => {
@@ -468,5 +507,149 @@ describe("ImportWizard", () => {
     );
     unmount();
     expect(calls.released).toEqual(["h-1"]);
+  });
+  it("keeps only the latest plan: a late answer cannot skip the destructive confirmation", async () => {
+    deferPlans = true;
+    await renderWizard({
+      sessionId: "s-1",
+      target: { kind: "table", catalog: "app", schema: "public", name: "orders" },
+    });
+    await pickAndPreview();
+    next();
+    await screen.findByLabelText("Before importing");
+    next();
+    await screen.findByRole("table", { name: "Column mapping" });
+    fireEvent.change(screen.getByLabelText("Target column for note"), {
+      target: { value: "created_at" },
+    });
+    // Plan 1: append (slow, not destructive).
+    next();
+    await waitFor(() => expect(calls.plans).toHaveLength(1));
+    expect(calls.plans[0]?.target.mode).toBe("append");
+    const firstId = calls.planIds[0];
+    expect(firstId).toBeTruthy();
+    // Back twice, TRUNCATE, Next twice: plan 2.
+    fireEvent.click(screen.getByRole("button", { name: "Back" }));
+    expect(calls.cancelledRequests).toContain(firstId);
+    fireEvent.click(screen.getByRole("button", { name: "Back" }));
+    fireEvent.change(screen.getByLabelText("Before importing"), { target: { value: "truncate" } });
+    next();
+    await screen.findByRole("table", { name: "Column mapping" });
+    next();
+    await waitFor(() => expect(calls.plans).toHaveLength(2));
+    expect(calls.plans[1]?.target.mode).toBe("truncate");
+    // Plan 2 answers first, then plan 1.
+    const [first, second] = pendingPlans;
+    await act(async () => second?.resolve({ destructive: true }));
+    await act(async () => first?.resolve({ destructive: false }));
+    expect(screen.getByTestId("destructive-warning")).toBeInTheDocument();
+    expect(screen.getByText(MODE_TEXT.truncate)).toBeInTheDocument();
+    expect(screen.getByTestId("start-import")).toBeDisabled();
+    fireEvent.click(screen.getByLabelText("I understand; import anyway"));
+    fireEvent.click(screen.getByTestId("start-import"));
+    await waitFor(() => expect(calls.runs).toHaveLength(1));
+    // The run sends exactly the request that was planned and confirmed.
+    expect(calls.runs[0]).toEqual(calls.plans[1]);
+  });
+
+  it("reads an existing varchar column as text, following the chosen target column", async () => {
+    tauriCore.invoke.mockImplementation(
+      wrapLoad({
+        ...ORDERS,
+        columns: ORDERS.columns.map((c) =>
+          c.name === "id"
+            ? {
+                ...c,
+                data_type: { type: "var_char" as const, length: 20 },
+                native_type: "varchar(20)",
+              }
+            : c,
+        ),
+      }),
+    );
+    await renderWizard({
+      sessionId: "s-1",
+      target: { kind: "table", catalog: "app", schema: "public", name: "orders" },
+    });
+    await pickAndPreview();
+    next();
+    await screen.findByLabelText("Before importing");
+    next();
+    await screen.findByRole("table", { name: "Column mapping" });
+    expect(screen.getByLabelText("Type of id")).toHaveValue(JSON.stringify({ type: "text" }));
+    fireEvent.change(screen.getByLabelText("Target column for note"), {
+      target: { value: "created_at" },
+    });
+    expect(screen.getByLabelText("Type of note")).toHaveValue(
+      JSON.stringify({ type: "timestamp", precision: 6 }),
+    );
+    next();
+    await waitFor(() => expect(calls.plans).toHaveLength(1));
+    expect(calls.plans[0]?.columns.map((c) => c.dataType)).toEqual([
+      { type: "text" },
+      { type: "decimal", precision: 10, scale: 2 },
+      { type: "timestamp", precision: 6 },
+    ]);
+  });
+
+  it("sizes a new decimal or varchar column", async () => {
+    await renderWizard({ sessionId: "s-1", target: { kind: "schema", name: "public" } });
+    await toMapping();
+    fireEvent.change(screen.getByLabelText("Scale of amount"), { target: { value: "12" } });
+    fireEvent.change(screen.getByLabelText("Precision of amount"), { target: { value: "30" } });
+    fireEvent.change(screen.getByLabelText("Type of note"), {
+      target: { value: JSON.stringify({ type: "var_char", length: 255 }) },
+    });
+    fireEvent.change(screen.getByLabelText("Length of note"), { target: { value: "4000" } });
+    expect(screen.getByLabelText("Type of note")).toHaveValue(
+      JSON.stringify({ type: "var_char", length: 4000 }),
+    );
+    next();
+    await waitFor(() => expect(calls.plans).toHaveLength(1));
+    expect(calls.plans[0]?.mapping.map((m) => m.dataType)).toEqual([
+      { type: "int", bits: 64, unsigned: false },
+      { type: "decimal", precision: 30, scale: 12 },
+      { type: "var_char", length: 4000 },
+    ]);
+  });
+
+  it("says when the live error log stops at the errors the core sends", async () => {
+    await renderWizard({ sessionId: "s-1", target: { kind: "schema", name: "public" } });
+    await toMapping();
+    next();
+    await screen.findByTestId("plan-ddl");
+    fireEvent.click(screen.getByTestId("start-import"));
+    await waitFor(() => expect(calls.runs).toHaveLength(1));
+    send({
+      type: "started",
+      importId: "imp-1",
+      totalBytes: 2_000_000,
+      plan: plan(calls.runs[0] as ImportRequest),
+    });
+    send({ type: "rowError", error: { row: 3, message: "bad" } });
+    expect(screen.queryByText(/Only the first/)).toBeNull();
+    send({
+      type: "progress",
+      bytesRead: 10,
+      totalBytes: 2_000_000,
+      rowsRead: 500,
+      rowsInserted: 0,
+      rowsCommitted: 0,
+      rowsSkipped: 250,
+      elapsedMs: 1000,
+    });
+    expect(screen.getByText("Only the first 1 errors are listed.")).toBeInTheDocument();
+  });
+
+  it("releases a file picked after the wizard was closed", async () => {
+    let answer: (file: PickedFile | null) => void = () => {};
+    pickGate = new Promise((resolve) => {
+      answer = resolve;
+    });
+    const { unmount } = await renderWizard();
+    fireEvent.click(screen.getByRole("button", { name: "Choose file…" }));
+    unmount();
+    await act(async () => answer({ ...PICKED, handle: "h-late" }));
+    await waitFor(() => expect(calls.released).toEqual(["h-late"]));
   });
 });

@@ -7,9 +7,12 @@ import {
   initialMapping,
   type MappingRow,
   mappingProblems,
+  parseSize,
   rates,
   readOptionsFor,
   readOptionsProblem,
+  readTypeFor,
+  retarget,
   tableNameFromFile,
   typeChoices,
   typeKey,
@@ -98,12 +101,31 @@ describe("types and names", () => {
     expect(choices.filter((t) => typeKey(t) === typeKey(TEXT))).toHaveLength(1);
     const odd: DataType = { type: "decimal", precision: 7, scale: 3 };
     expect(typeChoices(odd)[0]).toEqual(odd);
+    // The target column's type and a hand-sized choice are offered too, each once.
+    const sized: DataType = { type: "decimal", precision: 20, scale: 12 };
+    const withExtra = typeChoices(INT, TEXT, sized, INT).map(typeKey);
+    expect(withExtra.slice(0, 3)).toEqual([typeKey(INT), typeKey(TEXT), typeKey(sized)]);
+    expect(new Set(withExtra).size).toBe(withExtra.length);
+    // An unsized decimal is a common choice.
+    expect(typeChoices(TEXT).map(typeKey)).toContain(
+      typeKey({ type: "decimal", precision: null, scale: null }),
+    );
+  });
+
+  it("reads sizes typed by the user", () => {
+    expect(parseSize("12", 1)).toBe(12);
+    expect(parseSize(" ", 1)).toBeNull();
+    expect(parseSize("0", 1)).toBeNull();
+    expect(parseSize("0", 0)).toBe(0);
+    expect(parseSize("2.5", 0)).toBeNull();
   });
 
   it("suggests table names from file names", () => {
     expect(tableNameFromFile("Orders 2026.csv")).toBe("orders_2026");
     expect(tableNameFromFile("café-menu.xlsx")).toBe("cafe_menu");
     expect(tableNameFromFile("2026.csv")).toBe("t_2026");
+    expect(tableNameFromFile(`1${"a".repeat(80)}.csv`)).toHaveLength(63);
+    expect(tableNameFromFile(`${"b".repeat(80)}.csv`)).toHaveLength(63);
     expect(tableNameFromFile("...csv")).toBe("imported");
   });
 
@@ -131,6 +153,62 @@ describe("mapping", () => {
       ["id", false],
       ["note", false],
       ["", true],
+    ]);
+  });
+
+  it("reads an existing column as its own type, text-like columns as text", () => {
+    const table = [
+      column("id", { data_type: { type: "var_char", length: 20 }, native_type: "varchar(20)" }),
+      column("note", {
+        data_type: { type: "decimal", precision: 10, scale: 2 },
+        native_type: "numeric(10,2)",
+      }),
+    ];
+    // "ID" looks like integers in the sample, but goes into a varchar column: read as text.
+    const rows = initialMapping(PREVIEW_COLUMNS, "append", table);
+    expect(rows[0]?.inferred).toEqual(INT);
+    expect(rows[0]?.dataType).toEqual(TEXT);
+    expect(rows[1]?.dataType).toEqual({ type: "decimal", precision: 10, scale: 2 });
+    const request = buildImportRequest({
+      options: { format: "csv" },
+      rows,
+      session: "s-1",
+      table: { kind: "table", name: "t" },
+      mode: "append",
+      conversion: {},
+      errors: { type: "stop" },
+      transaction: { type: "auto" },
+    });
+    expect(request.columns[0]).toEqual({ name: "ID", dataType: TEXT });
+    expect(readTypeFor(column("e", { data_type: { type: "enum", labels: ["a"] } }))).toEqual(TEXT);
+    expect(readTypeFor(column("o", { data_type: { type: "other", name: "citext" } }))).toEqual(
+      TEXT,
+    );
+    expect(readTypeFor(column("d", { data_type: { type: "date" } }))).toEqual({ type: "date" });
+    // Picking another target column follows that column's type.
+    expect(retarget("note", table)).toEqual({
+      target: "note",
+      dataType: { type: "decimal", precision: 10, scale: 2 },
+    });
+    expect(retarget("id", table)).toEqual({ target: "id", dataType: TEXT });
+    expect(retarget("", table)).toEqual({ target: "" });
+  });
+
+  it("leaves name lengths to the engine and checks hand-sized decimals", () => {
+    const rows = initialMapping(PREVIEW_COLUMNS, "create").map((r) =>
+      r.source === 0 ? { ...r, target: "c".repeat(100) } : r,
+    );
+    expect(mappingProblems(rows, "create")).toEqual([]);
+    const scaled = rows.map((r) =>
+      r.source === 1
+        ? { ...r, dataType: { type: "decimal", precision: 4, scale: 6 } as DataType }
+        : r.source === 2
+          ? { ...r, dataType: { type: "decimal", precision: null, scale: 2 } as DataType }
+          : r,
+    );
+    expect(mappingProblems(scaled, "create")).toEqual([
+      { source: 1, message: '"note": A decimal scale cannot be larger than its precision.' },
+      { source: 2, message: '"extra": A decimal scale needs a precision.' },
     ]);
   });
 

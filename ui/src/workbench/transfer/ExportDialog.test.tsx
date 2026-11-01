@@ -86,6 +86,19 @@ describe("ExportDialog", () => {
     resetTransferStore();
   });
 
+  it("warns that an empty NULL token hides empty text, and offers \\N", async () => {
+    render(<ExportDialog init={RESULT} onClose={vi.fn()} />);
+    expect(screen.getByTestId("null-token-hint")).toHaveTextContent(
+      "NULL and empty text look the same",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Use \\N" }));
+    expect(screen.getByLabelText("NULL is written as")).toHaveValue("\\N");
+    expect(screen.queryByTestId("null-token-hint")).toBeNull();
+    fireEvent.click(screen.getByTestId("start-export"));
+    await waitFor(() => expect(calls.runs).toHaveLength(1));
+    expect(calls.runs[0]?.request.options).toMatchObject({ format: "csv", nullToken: "\\N" });
+  });
+
   it("exports a result: save dialog, progress, cancel", async () => {
     const onClose = vi.fn();
     render(<ExportDialog init={RESULT} onClose={onClose} />);
