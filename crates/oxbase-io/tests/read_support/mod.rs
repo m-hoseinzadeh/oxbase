@@ -1,4 +1,4 @@
-//! Helpers shared by the reader tests (`read_*.rs`).
+//! Helpers shared by the reader tests (`read_*.rs`; named apart from other streams' helpers).
 
 #![allow(dead_code)]
 

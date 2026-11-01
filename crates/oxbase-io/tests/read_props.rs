@@ -3,14 +3,14 @@
 //! contents (quotes, delimiters, CR / LF, Unicode, empty strings); and type inference rules
 //! hold for random integers and decimals.
 
-mod common;
+mod read_support;
 
 use std::path::Path;
 
-use common::{Rng, read_all};
 use oxbase_io::infer::TypeInference;
 use oxbase_io::{ColumnSpec, CsvReadOptions, ReadOptions, ValueFormats};
 use oxbase_types::DataType;
+use read_support::{Rng, read_all};
 
 const ALPHABET: [&str; 16] = [
     "a", "b", "Z", " ", ",", ";", "\t", "|", "\"", "\n", "\r", "é", "日", "🚀", "\\", "=",
@@ -88,7 +88,7 @@ fn random_tables_round_trip_through_the_parser() {
 }
 
 fn check_preview(path: &Path, options: &ReadOptions, rows: usize, columns: usize, case: usize) {
-    let p = common::preview(path, options).unwrap();
+    let p = read_support::preview(path, options).unwrap();
     assert_eq!(p.sampled_rows, rows, "case {case}");
     assert_eq!(p.columns.len(), columns, "case {case}");
     assert!(p.complete, "case {case}");

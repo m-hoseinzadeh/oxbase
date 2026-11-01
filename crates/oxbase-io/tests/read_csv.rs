@@ -1,7 +1,7 @@
 //! CSV / TSV reader: values, options, overrides, preview limits, bounded batches, progress,
 //! cancel and a debug-build throughput floor (docs/m5-contracts.md §3.3, §12 read).
 
-mod common;
+mod read_support;
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -10,13 +10,13 @@ use std::time::Instant;
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Int64Type, TimestampMicrosecondType};
 use chrono::NaiveDate;
-use common::{ReadAll, preview, preview_and_read, read_all, sample};
 use futures::StreamExt;
 use oxbase_driver::CancellationToken;
 use oxbase_io::{
     ColumnSpec, CsvReadOptions, LineEnding, PreviewLimits, ReadOptions, TextEncoding, spawn_reader,
 };
 use oxbase_types::{DataType, ErrorCategory};
+use read_support::{ReadAll, preview, preview_and_read, read_all, sample};
 
 fn csv(o: CsvReadOptions) -> ReadOptions {
     ReadOptions::Csv(o)
@@ -343,7 +343,7 @@ fn fifty_thousand_rows_in_bounded_batches() {
     let kinds: Vec<&str> = p
         .columns
         .iter()
-        .map(|c| common::kind(&c.data_type))
+        .map(|c| read_support::kind(&c.data_type))
         .collect();
     assert_eq!(kinds, ["int", "text", "decimal", "bool"]);
     let specs = ColumnSpec::from_preview(&p);

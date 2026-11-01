@@ -2,7 +2,7 @@
 //! `tests/fixtures.toml` (docs/m5-contracts.md §8, §12 read): rows, columns, names, types,
 //! values, NULLs, row issues, encodings, BOM and errors.
 
-mod common;
+mod read_support;
 
 use std::path::Path;
 
@@ -71,17 +71,17 @@ fn strings(expect: &toml::Table, key: &str) -> Option<Vec<String>> {
 
 #[test]
 fn every_sample_reads_as_expected() {
-    let fixtures = common::fixtures();
+    let fixtures = read_support::fixtures();
     let files = fixtures["m5"]["files"].as_table().expect("[m5.files]");
     assert!(files.len() >= 20, "only {} samples listed", files.len());
     for (name, expect) in files {
         let expect = expect.as_table().unwrap();
-        let path = common::sample(name);
+        let path = read_support::sample(name);
         assert!(path.is_file(), "{name} is listed but missing");
         let options = options_for(name);
 
         if let Some(error) = expect.get("error").and_then(Value::as_str) {
-            let err = common::preview_and_read(&path, &options)
+            let err = read_support::preview_and_read(&path, &options)
                 .err()
                 .unwrap_or_else(|| panic!("{name}: expected an error"));
             assert_eq!(err.category().to_string(), error, "{name}: {err}");
@@ -92,8 +92,8 @@ fn every_sample_reads_as_expected() {
             continue;
         }
 
-        let preview =
-            common::preview(&path, &options).unwrap_or_else(|e| panic!("{name}: preview: {e}"));
+        let preview = read_support::preview(&path, &options)
+            .unwrap_or_else(|e| panic!("{name}: preview: {e}"));
         assert!(preview.complete, "{name}: small samples are read whole");
         assert_eq!(
             preview.total_bytes,
@@ -111,7 +111,7 @@ fn every_sample_reads_as_expected() {
             let found: Vec<&str> = preview
                 .columns
                 .iter()
-                .map(|c| common::kind(&c.data_type))
+                .map(|c| read_support::kind(&c.data_type))
                 .collect();
             assert_eq!(found, types, "{name}: types");
         }
@@ -136,7 +136,7 @@ fn every_sample_reads_as_expected() {
             );
             continue;
         }
-        let all = common::read_all(&path, &options, &specs, 2)
+        let all = read_support::read_all(&path, &options, &specs, 2)
             .unwrap_or_else(|e| panic!("{name}: read: {e}"));
         all.assert_progress();
         if let Some(rows) = count(expect, "rows") {

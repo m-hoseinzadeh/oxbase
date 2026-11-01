@@ -1,14 +1,14 @@
 //! JSON / NDJSON reader: exact numbers, nested values as JSON text, keys after the sample,
 //! malformed files and elements (docs/m5-contracts.md §3.3, §12 read).
 
-mod common;
+mod read_support;
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
-use common::{preview, preview_and_read, read_all, sample};
 use oxbase_io::{ColumnSpec, JsonLayout, JsonReadOptions, ReadOptions};
 use oxbase_types::{DataType, ErrorCategory};
+use read_support::{preview, preview_and_read, read_all, sample};
 
 fn json() -> ReadOptions {
     ReadOptions::Json(JsonReadOptions::default())

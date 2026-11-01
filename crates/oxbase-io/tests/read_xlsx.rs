@@ -2,14 +2,14 @@
 //! cached formula values, error cells, formula-looking text, empty rows, sheets, header rows
 //! (docs/m5-contracts.md §3.3, §12 read).
 
-mod common;
+mod read_support;
 
 use std::path::{Path, PathBuf};
 
 use chrono::NaiveDate;
-use common::{preview, preview_and_read};
 use oxbase_io::{ReadOptions, XlsxReadOptions};
 use oxbase_types::{DataType, ErrorCategory};
+use read_support::{preview, preview_and_read};
 use rust_xlsxwriter::{Format, Formula, Workbook};
 
 const HEADER: [&str; 8] = ["id", "price", "flag", "day", "at", "formula", "err", "text"];
@@ -93,7 +93,7 @@ fn typed_cells_formulas_errors_and_empty_rows() {
         let kinds: Vec<&str> = p
             .columns
             .iter()
-            .map(|c| common::kind(&c.data_type))
+            .map(|c| read_support::kind(&c.data_type))
             .collect();
         assert_eq!(
             kinds,
@@ -186,7 +186,7 @@ fn sheets_and_header_rows() {
 fn files_that_are_not_workbooks() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("table.xlsx");
-    std::fs::copy(common::sample("basic.csv"), &path).unwrap();
+    std::fs::copy(read_support::sample("basic.csv"), &path).unwrap();
     let err = preview(&path, &defaults()).unwrap_err();
     assert_eq!(err.category(), ErrorCategory::InvalidInput);
     assert!(err.to_string().contains("not an XLSX workbook"), "{err}");

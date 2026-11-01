@@ -2,7 +2,7 @@
 //! exact decimals, zoned timestamps, lists as JSON, binary, NULLs, row groups and progress,
 //! overrides and nanosecond values (docs/m5-contracts.md §3.3, §12 read).
 
-mod common;
+mod read_support;
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -16,12 +16,12 @@ use arrow_array::{
     TimestampMicrosecondArray, TimestampNanosecondArray,
 };
 use arrow_schema::{DataType as ArrowType, Field, Schema, TimeUnit};
-use common::{preview, preview_and_read, read_all};
 use oxbase_io::{ColumnSpec, ParquetReadOptions, ReadOptions};
 use oxbase_types::{DataType, ErrorCategory};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
+use read_support::{preview, preview_and_read, read_all};
 
 const ROWS: i64 = 3_000;
 
@@ -228,7 +228,7 @@ fn nanoseconds_and_empty_files() {
     all.assert_progress();
 
     let path = dir.path().join("fake.parquet");
-    std::fs::copy(common::sample("basic.csv"), &path).unwrap();
+    std::fs::copy(read_support::sample("basic.csv"), &path).unwrap();
     let err = preview(&path, &parquet()).unwrap_err();
     assert_eq!(err.category(), ErrorCategory::InvalidInput);
     assert!(err.to_string().contains("not a Parquet file"), "{err}");
