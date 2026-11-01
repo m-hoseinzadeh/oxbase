@@ -5,6 +5,10 @@ use std::ops::Range;
 
 use crate::{Dialect, Ident};
 
+// The tolerant parser (private files under `src/parse/`, context stream).
+#[path = "parse/mod.rs"]
+pub(crate) mod parse;
+
 /// What kind of statement it is (from its leading keywords; `Other` when unknown).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum StatementClass {
@@ -261,8 +265,7 @@ impl Outline {
 /// [`Outline`]. Never fails and never panics, whatever the input: unknown or broken parts are
 /// skipped (`docs/m6-contracts.md` §4.1 lists what must be recognised per dialect).
 pub fn outline(dialect: &Dialect, text: &str, range: Range<usize>) -> Outline {
-    let _ = (dialect, text, range);
-    unimplemented!("m6: context")
+    parse::parse(dialect, text, range, None).outline
 }
 
 #[cfg(test)]
