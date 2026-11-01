@@ -474,7 +474,7 @@ impl ExportService {
             database: query.table.catalog.clone(),
             statement,
             engine,
-            table: def,
+            table: def.map(Box::new),
         })
     }
 
@@ -560,7 +560,7 @@ enum Resolved {
         database: Option<String>,
         statement: BoundStatement,
         engine: Engine,
-        table: Option<TableDef>,
+        table: Option<Box<TableDef>>,
     },
     /// The rows a finished run keeps.
     Result {
@@ -630,10 +630,10 @@ impl Job {
             } => {
                 let context = WriteContext {
                     dialects: Some(Arc::clone(&self.dialects)),
-                    table: table.clone(),
+                    table: table.as_deref().cloned(),
                     source_engine: Some(*engine),
                 };
-                self.from_statement(
+                self.export_statement(
                     *session,
                     database.as_deref(),
                     statement,
@@ -655,7 +655,7 @@ impl Job {
                     table: None,
                     source_engine: *engine,
                 };
-                self.from_result(*run_id, *result_index, context, make, &mut output, started)
+                self.export_result(*run_id, *result_index, context, make, &mut output, started)
                     .await
             }
         };
@@ -752,7 +752,7 @@ impl Job {
         clippy::too_many_arguments,
         reason = "the parts of a resolved statement source plus the run's state"
     )]
-    async fn from_statement(
+    async fn export_statement(
         &self,
         session: SessionId,
         database: Option<&str>,
@@ -834,7 +834,7 @@ impl Job {
     }
 
     /// Pages every row the run's result store keeps into the writer.
-    async fn from_result(
+    async fn export_result(
         &self,
         run_id: RunId,
         result_index: usize,

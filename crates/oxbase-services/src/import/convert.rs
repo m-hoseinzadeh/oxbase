@@ -494,11 +494,11 @@ impl Converter {
         match &column.to {
             Kind::Bool => self.to_bool(&column.from, value, to_type),
             Kind::Int { bits, unsigned } => {
-                self.to_int(&column.from, value, *bits, *unsigned, to_type)
+                self.to_int(&column.from, &value, *bits, *unsigned, to_type)
             }
-            Kind::Float { bits } => self.to_float(&column.from, value, *bits, to_type),
+            Kind::Float { bits } => self.to_float(&column.from, &value, *bits, to_type),
             Kind::Decimal { precision, scale } => {
-                self.to_decimal(&column.from, value, *precision, *scale, to_type)
+                self.to_decimal(&column.from, &value, *precision, *scale, to_type)
             }
             Kind::Text { length } => {
                 let text = text_form(value);
@@ -592,12 +592,12 @@ impl Converter {
     fn to_int<'a>(
         &self,
         from: &Kind,
-        value: Val<'a>,
+        value: &Val<'a>,
         bits: u8,
         unsigned: bool,
         to_type: &DataType,
     ) -> std::result::Result<Val<'a>, String> {
-        let n: i128 = match &value {
+        let n: i128 = match value {
             Val::I64(v) => i128::from(*v),
             Val::U64(v) => i128::from(*v),
             Val::Bool(b) => i128::from(*b),
@@ -641,11 +641,11 @@ impl Converter {
     fn to_float<'a>(
         &self,
         from: &Kind,
-        value: Val<'a>,
+        value: &Val<'a>,
         bits: u8,
         to_type: &DataType,
     ) -> std::result::Result<Val<'a>, String> {
-        let v = match &value {
+        let v = match value {
             Val::F64(v) => *v,
             Val::I64(v) => *v as f64,
             Val::U64(v) => *v as f64,
@@ -670,12 +670,12 @@ impl Converter {
     fn to_decimal<'a>(
         &self,
         from: &Kind,
-        value: Val<'a>,
+        value: &Val<'a>,
         precision: Option<u32>,
         scale: Option<u32>,
         to_type: &DataType,
     ) -> std::result::Result<Val<'a>, String> {
-        let number = match &value {
+        let number = match value {
             Val::I64(v) => parse_canonical(&v.to_string()),
             Val::U64(v) => parse_canonical(&v.to_string()),
             Val::F64(v) if v.is_finite() => parse_canonical(&v.to_string()),
@@ -684,7 +684,7 @@ impl Converter {
             Val::Str(text) => parse_canonical(text),
             other => return Err(cannot(other, to_type)),
         };
-        let shown_value = || match &value {
+        let shown_value = || match value {
             Val::Str(text) => shown(text),
             other => text_form(other.clone()).into_owned(),
         };
@@ -997,7 +997,7 @@ fn parse_hex(text: &str) -> Option<Vec<u8>> {
         .or_else(|| t.strip_prefix("0X"))
         .or_else(|| t.strip_prefix("\\x"))
         .unwrap_or(t);
-    if digits.len() % 2 != 0 {
+    if !digits.len().is_multiple_of(2) {
         return None;
     }
     let nibble = |c: u8| match c {
@@ -1078,9 +1078,9 @@ impl Number {
         }
         let split = digits.len() - self.frac.len();
         let (int, frac) = digits.split_at(split);
-        self.int = String::from_utf8_lossy(int)
+        String::from_utf8_lossy(int)
             .trim_start_matches('0')
-            .to_owned();
+            .clone_into(&mut self.int);
         self.frac = String::from_utf8_lossy(frac).into_owned();
     }
 

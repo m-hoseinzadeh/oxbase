@@ -510,7 +510,7 @@ async fn cancel_and_failures_leave_no_file() {
         }
         assert!(!event.is_terminal(), "{event:?}");
     }
-    let asked = std::time::Instant::now();
+    let asked = Instant::now();
     assert!(h.export.cancel(handle.id));
     let rest = drain(events).await;
     assert!(

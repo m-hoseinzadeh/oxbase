@@ -36,8 +36,8 @@ use crate::import::live_tests::{
 };
 use crate::import::testing::{MemoryReader, MemoryWriter, Written};
 use crate::import::{
-    ColumnMapping, ConversionOptions, ErrorPolicy, ImportRequest, ImportSource, ImportTarget,
-    TargetMode, TransactionPolicy,
+    ColumnMapping, ConversionOptions, ErrorPolicy, ImportRequest, ImportService, ImportSource,
+    ImportTarget, TargetMode, TransactionPolicy,
 };
 use crate::query::{EditorId, QueryConfig, RunEvent, RunOptions, RunTarget};
 
@@ -194,8 +194,8 @@ async fn export_cycle(key: &'static str, engine: Engine) {
         )
         .await
         .unwrap_or_else(|e| panic!("{key}: table export: {e}"));
-    let report = finished(key, &drain(handle.events).await);
-    assert_eq!(report.sink.rows, 500, "{key}");
+    let summary = finished(key, &drain(handle.events).await);
+    assert_eq!(summary.sink.rows, 500, "{key}");
     let ids: Vec<String> = (501..=1_000).rev().map(|i: i64| i.to_string()).collect();
     assert_eq!(written_column(&written, 0), ids, "{key}");
     assert!(destination.path.is_file(), "{key}");
@@ -323,9 +323,9 @@ async fn export_cycle(key: &'static str, engine: Engine) {
         "{key}: {:?}",
         events[0]
     );
-    let report = finished(key, &events);
-    assert_eq!(report.sink.rows, 300_000, "{key}");
-    assert!(!report.source_truncated, "{key}");
+    let summary = finished(key, &events);
+    assert_eq!(summary.sink.rows, 300_000, "{key}");
+    assert!(!summary.source_truncated, "{key}");
     let ids = written_column(&written, 0);
     assert!(
         ids.iter()

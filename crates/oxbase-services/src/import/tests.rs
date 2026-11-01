@@ -23,9 +23,9 @@ use oxbase_store::{ConnectionProfile, MemorySecretStore, ProfileAddress};
 use oxbase_types::{GeneratedColumn, IdentityDef, ObjectSummary, PropId, Script, Value};
 use pretty_assertions::assert_eq;
 
-use super::testing::MemoryReader;
 use super::*;
 use crate::ProvidedSecrets;
+use testing::MemoryReader;
 
 type Log = Arc<Mutex<Vec<String>>>;
 
@@ -543,7 +543,7 @@ async fn drain(mut events: mpsc::Receiver<ImportEvent>) -> Vec<ImportEvent> {
     }
 }
 
-fn report(events: &[ImportEvent]) -> &ImportReport {
+fn report_of(events: &[ImportEvent]) -> &ImportReport {
     match events.last() {
         Some(
             ImportEvent::Finished { report }
@@ -827,7 +827,7 @@ async fn create_mode_runs_ddl_in_the_transaction_and_converts() {
         ),
     ];
     let events = h.run(request, batches).await;
-    let report = report(&events);
+    let report = report_of(&events);
     assert!(matches!(events[0], ImportEvent::Started { .. }));
     assert!(
         matches!(events.last(), Some(ImportEvent::Finished { .. })),
@@ -838,7 +838,7 @@ async fn create_mode_runs_ddl_in_the_transaction_and_converts() {
     assert_eq!(report.rows_committed, 5);
     assert!(report.table_created);
     assert!(!report.table_dropped);
-    assert_eq!(report.bytes_read, 5 * super::testing::ROW_BYTES);
+    assert_eq!(report.bytes_read, 5 * testing::ROW_BYTES);
     let log = h.log();
     let begin = log.iter().position(|l| l == "BEGIN").unwrap();
     assert!(
@@ -897,7 +897,7 @@ async fn skip_policy_drops_bad_rows_and_caps_the_log() {
         vec![reader_issue],
     )];
     let events = h.run(request.clone(), batches).await;
-    let report = report(&events);
+    let report = report_of(&events);
     assert!(
         matches!(events.last(), Some(ImportEvent::Finished { .. })),
         "{events:?}"
@@ -929,7 +929,7 @@ async fn skip_policy_drops_bad_rows_and_caps_the_log() {
         "{events:?}"
     );
     assert_eq!(
-        report(&events).left_behind,
+        report_of(&events).left_behind,
         "nothing was inserted: t is as it was"
     );
 
@@ -943,7 +943,7 @@ async fn skip_policy_drops_bad_rows_and_caps_the_log() {
     let events = small
         .run(request, vec![(text_rows(&[bad, codes]), Vec::new())])
         .await;
-    let report = report(&events);
+    let report = report_of(&events);
     assert_eq!(report.errors.len(), 2);
     assert!(report.errors_truncated);
     assert_eq!(report.rows_skipped, 5);
@@ -976,7 +976,7 @@ async fn stop_policy_fails_at_the_first_issue() {
     let error = failure(&events);
     assert_eq!(error.category, ErrorCategory::InvalidInput);
     assert!(error.message.contains("row 6, column 'id'"), "{error:?}");
-    let report = report(&events);
+    let report = report_of(&events);
     assert_eq!(report.rows_committed, 0);
     assert_eq!(report.errors.len(), 1);
     assert!(
@@ -1011,7 +1011,7 @@ async fn batches_commit_and_failures_keep_committed_rows() {
     let error = failure(&events);
     assert_eq!(error.category, ErrorCategory::Sql);
     assert!(error.message.contains("row 5"), "{error:?}");
-    let report = report(&events);
+    let report = report_of(&events);
     assert_eq!(report.rows_committed, 4);
     assert_eq!(report.rows_inserted, 4);
     assert!(
@@ -1046,7 +1046,7 @@ async fn failed_create_drops_the_table_when_ddl_commits() {
         matches!(events.last(), Some(ImportEvent::Failed { .. })),
         "{events:?}"
     );
-    let report = report(&events);
+    let report = report_of(&events);
     assert!(report.table_created);
     assert!(report.table_dropped);
     assert_eq!(
@@ -1080,7 +1080,7 @@ async fn failed_create_drops_the_table_when_ddl_commits() {
     let events = h
         .run(request, vec![(text_batch_of(&["1", "boom"]), Vec::new())])
         .await;
-    let report = report(&events);
+    let report = report_of(&events);
     assert!(!report.table_created);
     assert!(!report.table_dropped);
     assert!(
@@ -1097,7 +1097,7 @@ async fn failed_create_drops_the_table_when_ddl_commits() {
 
 fn text_batch_of(values: &[&str]) -> RecordBatch {
     let values: Vec<Option<&str>> = values.iter().map(|v| Some(*v)).collect();
-    super::testing::text_batch(&values)
+    testing::text_batch(&values)
 }
 
 #[tokio::test]
@@ -1130,7 +1130,7 @@ async fn fallback_loader_binds_values() {
         matches!(events.last(), Some(ImportEvent::Finished { .. })),
         "{events:?}"
     );
-    assert_eq!(report(&events).method, BulkMethod::MultiRowInsert);
+    assert_eq!(report_of(&events).method, BulkMethod::MultiRowInsert);
     let log = h.log();
     let insert = log.iter().find(|l| l.contains("INSERT")).unwrap();
     assert_eq!(
@@ -1192,7 +1192,7 @@ async fn cancel_ends_quickly_and_keeps_committed_batches() {
         "{:?}",
         asked.elapsed()
     );
-    let report = report(&rest);
+    let report = report_of(&rest);
     assert!(
         matches!(rest.last(), Some(ImportEvent::Cancelled { .. })),
         "{rest:?}"
@@ -1249,7 +1249,7 @@ async fn progress_is_monotonic_and_ends_with_every_byte() {
             .windows(2)
             .all(|w| w[0].0 <= w[1].0 && w[0].1 <= w[1].1)
     );
-    assert_eq!(progress.last().unwrap().0, 15 * super::testing::ROW_BYTES);
+    assert_eq!(progress.last().unwrap().0, 15 * testing::ROW_BYTES);
     assert_eq!(progress.last().unwrap().1, 15);
 }
 
