@@ -592,7 +592,7 @@ pub struct GateOptions {
 
 impl GateOptions {
     /// The engines that must have a layout and a seed, and the variable that asked for it.
-    fn required(&self) -> Option<(&'static [Engine], &'static str)> {
+    fn required(self) -> Option<(&'static [Engine], &'static str)> {
         let m4: &'static [Engine] = &M4_ENGINES;
         let m2: &'static [Engine] = &M2_ENGINES;
         if self.require_m4 {
