@@ -13,9 +13,19 @@
 //! # Keywords
 //!
 //! The formatter re-cases a word only where it reads as a keyword (`docs/m6-contracts.md`
-//! §4.6): a reserved word unless it is qualified (`t.order`) or a parameter (`:date`), and a
-//! non-reserved keyword unless its neighbours say it names something (`SELECT date, user FROM
-//! t`, `CREATE TABLE t (data text)`, `x AS year`). Uncertain cases keep the input's spelling.
+//! §4.6), because on MySQL (Linux), SQLite and SQL Server a re-cased name can be a different
+//! table, alias or result column label:
+//!
+//! - a word the engine reserves, unless it is qualified (`t.order`), a parameter (`:date`), or
+//!   a word only the engine (not the SQL standard) reserves standing where a table name goes
+//!   (`FROM groups` on MySQL 5.7 and MariaDB);
+//! - a non-reserved keyword unless its neighbours say it names something: a select-list item
+//!   (`SELECT date, user FROM t`), a column definition (`CREATE TABLE t (data text)`), a name
+//!   after `AS`, `FROM`, `JOIN`, `TABLE`, `TO`, `ADD`, `RENAME`, `TRUNCATE` and the like, or an
+//!   alias written without `AS` (`FROM users user`, `SELECT max(x) total`).
+//!
+//! When in doubt between a name and a keyword the input's spelling is kept: a keyword left as
+//! typed is cosmetic, a re-cased name is not.
 
 use oxbase_sql::{SqlDialect, SqlToken, SqlTokenKind, tokenize};
 
@@ -119,6 +129,144 @@ const AFTER_INTRO_KEYWORDS: &[&str] = &[
     "UNLOGGED",
 ];
 
+/// Non-reserved keywords that read as keywords right after `WITH` unless a CTE body follows.
+const AFTER_WITH_KEYWORDS: &[&str] = &[
+    "CASCADED",
+    "CUBE",
+    "LOCAL",
+    "NO",
+    "NOCHECK",
+    "ORDINALITY",
+    "ROLLUP",
+    "TIES",
+    "TIME",
+];
+
+/// Words after which the next word names a table, column, user or savepoint (`RENAME TABLE a
+/// TO status`, `ALTER TABLE t ADD status int`, `TRUNCATE data`), unless it is one of
+/// [`AFTER_NAME_INTRO_KEYWORDS`]. `ALTER` and `DROP` count only inside a statement (`ALTER
+/// TABLE t DROP status`), `DESC` only as the statement's first word.
+const NAME_INTRO: &[&str] = &[
+    "ADD", "ALTER", "CHANGE", "DESC", "DESCRIBE", "DROP", "MODIFY", "RENAME", "TABLES", "TO",
+    "TRUNCATE",
+];
+
+/// Keywords that still read as keywords right after a [`NAME_INTRO`] word.
+const AFTER_NAME_INTRO_KEYWORDS: &[&str] = &[
+    "ATTRIBUTE",
+    "CHECK",
+    "COLUMN",
+    "CONSTRAINT",
+    "DEFAULT",
+    "EXPRESSION",
+    "FILE",
+    "FILEGROUP",
+    "FOREIGN",
+    "FULLTEXT",
+    "IDENTITY",
+    "IF",
+    "INDEX",
+    "KEY",
+    "LOG",
+    "MASTER",
+    "MEMBER",
+    "NOT",
+    "ONLY",
+    "PARTITION",
+    "PERIOD",
+    "PRIMARY",
+    "REPLICATION",
+    "SAVEPOINT",
+    "SPATIAL",
+    "SYSTEM",
+    "TABLE",
+    "TABLES",
+    "UNIQUE",
+    "VALUE",
+];
+
+/// Keywords after which a word reserved only by the engine (not by the SQL standard core)
+/// names a table: MySQL 8 reserves `GROUPS` and `RANK` that MySQL 5.7 and MariaDB accept as
+/// table names, so `FROM groups` keeps its spelling.
+const RELATION_INTRO: &[&str] = &["FROM", "INTO", "JOIN", "TABLE", "UPDATE"];
+
+/// Engine-reserved words that still read as keywords right after a [`RELATION_INTRO`] word.
+const AFTER_RELATION_INTRO_KEYWORDS: &[&str] = &[
+    "CASCADE",
+    "DELAYED",
+    "DUMPFILE",
+    "HIGH_PRIORITY",
+    "IF",
+    "IGNORE",
+    "LATERAL",
+    "LOW_PRIORITY",
+    "OUTFILE",
+    "RESTRICT",
+    "STATISTICS",
+    "TOP",
+];
+
+/// Words that may follow an alias written without `AS` (`FROM users user WHERE ...`, `SELECT
+/// max(x) total FROM t`): a non-reserved keyword between an operand and one of these (or `,`,
+/// `)`, `;` or the end) is an alias and keeps its spelling.
+const ALIAS_FOLLOWERS: &[&str] = &[
+    "CROSS",
+    "END",
+    "EXCEPT",
+    "FETCH",
+    "FOR",
+    "FORCE",
+    "FROM",
+    "FULL",
+    "GROUP",
+    "HAVING",
+    "IGNORE",
+    "INNER",
+    "INTERSECT",
+    "INTO",
+    "JOIN",
+    "LEFT",
+    "LIMIT",
+    "LOCK",
+    "MINUS",
+    "NATURAL",
+    "OFFSET",
+    "ON",
+    "OPTION",
+    "ORDER",
+    "OUTER",
+    "OUTPUT",
+    "PIVOT",
+    "RETURNING",
+    "RIGHT",
+    "SET",
+    "STRAIGHT_JOIN",
+    "TABLESAMPLE",
+    "UNION",
+    "UNPIVOT",
+    "USE",
+    "USING",
+    "WHERE",
+    "WINDOW",
+    "WITH",
+];
+
+/// Column and table attributes of `CREATE` / `ALTER` statements that read as keywords even
+/// where an alias could stand (`id int AUTO_INCREMENT,`, `) STRICT`).
+const DDL_ATTRIBUTES: &[&str] = &[
+    "AUTOINCREMENT",
+    "AUTO_INCREMENT",
+    "ENFORCED",
+    "IDENTITY",
+    "INVISIBLE",
+    "PERSISTENT",
+    "SPARSE",
+    "STORED",
+    "STRICT",
+    "VIRTUAL",
+    "VISIBLE",
+];
+
 /// Keywords after which an expression (often a bare column name) starts.
 const EXPR_INTRO: &[&str] = &[
     "ALL",
@@ -173,6 +321,11 @@ const BEGIN_TRANSACTION: &[&str] = &[
     "TRAN",
     "TRANSACTION",
     "WORK",
+];
+
+/// Words of a join phrase (`NATURAL LEFT OUTER JOIN`, `CROSS APPLY`).
+const JOIN_WORDS: &[&str] = &[
+    "CROSS", "FULL", "INNER", "LEFT", "NATURAL", "OUTER", "RIGHT",
 ];
 
 /// Values, not operators: a `-` after one of these is binary.
@@ -412,12 +565,152 @@ fn word_class(
     if it.glue_prev && it.touch_prev && prev.is_some_and(|it| it.op) {
         return (false, false);
     }
-    let reserved = lang.is_reserved(word) || standard.is_reserved(word);
-    let lw = reserved || non_reserved_is_keyword(items, i, lang, standard);
+    if lang.is_reserved(word) {
+        // `FROM groups` where only the engine (MySQL 8) reserves the word.
+        if !standard.is_reserved(word) && names_relation(items, i) {
+            return (false, false);
+        }
+        return (true, listed);
+    }
+    // A word the dialect does not list but the standard core reserves: read by the layout,
+    // never re-cased.
+    if !listed && standard.is_reserved(word) {
+        return (true, false);
+    }
+    let lw = non_reserved_is_keyword(items, i, lang, standard);
     (lw, lw && listed)
 }
 
-/// Whether the non-reserved keyword at `i` reads as a keyword (see the module docs).
+/// `true` when `it` is the word `w` (any case). For items after the one being classified,
+/// whose [`Item::lw`] is not known yet.
+fn is_word_text(it: &Item<'_>, w: &str) -> bool {
+    it.kind == SqlTokenKind::Word && it.text.eq_ignore_ascii_case(w)
+}
+
+/// `true` when the item at `p` is the keyword `UPDATE` introducing a table or column (`UPDATE
+/// t`, `INSERT ... ON DUPLICATE KEY UPDATE col`), not `FOR UPDATE`, `ON UPDATE CASCADE`, `DO
+/// UPDATE SET` or `THEN UPDATE SET`.
+fn update_names_table(items: &[Item<'_>], p: usize) -> bool {
+    !p.checked_sub(1)
+        .is_some_and(|q| items[q].is_any_word(&["DO", "FOR", "ON", "THEN"]))
+}
+
+/// Whether the engine-reserved word at `i` stands where a table name goes ([`RELATION_INTRO`]).
+fn names_relation(items: &[Item<'_>], i: usize) -> bool {
+    let Some(p) = i.checked_sub(1) else {
+        return false;
+    };
+    let prev = &items[p];
+    if !prev.is_any_word(RELATION_INTRO) || is_any(items[i].text, AFTER_RELATION_INTRO_KEYWORDS) {
+        return false;
+    }
+    if prev.is_word("UPDATE") && !update_names_table(items, p) {
+        return false;
+    }
+    // `FROM JSON_TABLE(...)`, `JOIN OPENROWSET(...)`: a table function, not a name (a column
+    // list follows a name only after INTO, TABLE and UPDATE).
+    let call = items.get(i + 1).is_some_and(|it| it.is_punct("("));
+    let table_function = call && (prev.is_word("FROM") || prev.is_word("JOIN"));
+    !table_function
+}
+
+/// Whether the item at `p` ends an operand an alias may follow: a name, a quoted name, a
+/// string literal, `)` or the `END` of `CASE`. Numbers and parameters do not count (`ROWS
+/// BETWEEN 1 PRECEDING`).
+fn ends_operand(items: &[Item<'_>], p: usize) -> bool {
+    let it = &items[p];
+    match it.kind {
+        SqlTokenKind::QuotedIdent { .. } | SqlTokenKind::String { .. } => true,
+        SqlTokenKind::Punct => it.is_punct(")"),
+        SqlTokenKind::Word => {
+            if it.lw {
+                return it.is_word("END");
+            }
+            it.text
+                .chars()
+                .next()
+                .is_some_and(|c| c == '_' || c == '#' || c.is_alphabetic())
+        }
+        _ => false,
+    }
+}
+
+/// The parentheses still open before item `i`.
+fn paren_depth(items: &[Item<'_>], i: usize) -> usize {
+    let mut depth = 0usize;
+    for it in &items[..i] {
+        if it.is_punct("(") {
+            depth += 1;
+        } else if it.is_punct(")") {
+            depth = depth.saturating_sub(1);
+        }
+    }
+    depth
+}
+
+/// The `CASE` blocks still open before item `i`.
+fn open_cases(items: &[Item<'_>], i: usize) -> usize {
+    let mut depth = 0usize;
+    for it in &items[..i] {
+        if it.is_word("CASE") {
+            depth += 1;
+        } else if it.is_word("END") {
+            depth = depth.saturating_sub(1);
+        }
+    }
+    depth
+}
+
+/// Whether the non-reserved keyword at `i` stands where a name goes after a [`NAME_INTRO`]
+/// word (`TO status`, `ADD status int`, `CHANGE old new`, multi-table `DELETE status FROM`).
+fn names_object(items: &[Item<'_>], i: usize) -> bool {
+    let word = items[i].text;
+    let prev = &items[i - 1];
+    let next = items.get(i + 1);
+    let first = |at: usize| at == 0 || items[at - 1].is_punct(";");
+    if prev.is_any_word(NAME_INTRO) {
+        if is_any(word, AFTER_NAME_INTRO_KEYWORDS) {
+            return false;
+        }
+        if prev.is_word("ALTER") || prev.is_word("DROP") {
+            return !first(i - 1);
+        }
+        if prev.is_word("DESC") {
+            return first(i - 1);
+        }
+        if prev.is_word("RENAME") && first(i - 1) && word.eq_ignore_ascii_case("USER") {
+            return false; // `RENAME USER a TO b`
+        }
+        return true;
+    }
+    // `DELETE t1, t2 FROM ...` (MySQL multi-table delete)
+    if prev.is_word("DELETE")
+        && !word.eq_ignore_ascii_case("QUICK")
+        && next.is_some_and(|it| it.is_punct(",") || is_word_text(it, "FROM"))
+    {
+        return true;
+    }
+    // `CHANGE [COLUMN] old new type`
+    if i >= 2 && ends_operand(items, i - 1) && !prev.is_punct(")") {
+        let at = if items[i - 2].is_word("COLUMN") {
+            i.checked_sub(3)
+        } else {
+            Some(i - 2)
+        };
+        if at.is_some_and(|at| items[at].is_word("CHANGE")) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether the non-reserved keyword at `i` reads as a keyword (see the module docs). Where a
+/// name or alias could stand the input's spelling is kept: a keyword may be left as typed, but
+/// a name is never re-cased.
+///
+/// `strong` words are reserved by the SQL standard core but not by this engine (PostgreSQL's
+/// `SET`, `VALUES`, `DELETE`, MySQL's `END`, SQLite's `LEFT`): they read as keywords except
+/// where only a name fits.
 fn non_reserved_is_keyword(
     items: &[Item<'_>],
     i: usize,
@@ -429,6 +722,41 @@ fn non_reserved_is_keyword(
         return true;
     };
     let next = items.get(i + 1);
+    let strong = standard.is_reserved(word);
+    let first = &items[0];
+    let ddl = first.is_word("CREATE") || first.is_word("ALTER");
+    // `CASE ... END` where the engine does not reserve `END` (MySQL, SQLite).
+    if word.eq_ignore_ascii_case("END") && open_cases(items, i) > 0 {
+        return true;
+    }
+    // `ALTER TABLE t ADD c int, DROP COLUMN d, ALTER COLUMN e ...`
+    if prev.is_punct(",")
+        && first.is_word("ALTER")
+        && is_any(
+            word,
+            &["ADD", "ALTER", "CHANGE", "DROP", "MODIFY", "RENAME"],
+        )
+    {
+        return true;
+    }
+    // `GRANT SELECT, INSERT ON ...`: privileges (not the columns of `SELECT (a, b)`).
+    if (first.is_word("GRANT") || first.is_word("REVOKE"))
+        && paren_depth(items, i) == 0
+        && !items[..i]
+            .iter()
+            .any(|it| it.is_any_word(&["ON", "TO", "FROM"]))
+    {
+        return true;
+    }
+    // `LEFT JOIN`, `NATURAL FULL OUTER JOIN`, `CROSS APPLY` (SQLite does not reserve them).
+    if is_any(word, JOIN_WORDS)
+        && next.is_some_and(|it| {
+            it.kind == SqlTokenKind::Word
+                && (is_any(it.text, JOIN_WORDS) || is_any(it.text, &["APPLY", "JOIN"]))
+        })
+    {
+        return true;
+    }
     // `IF [NOT] EXISTS name`
     if prev.is_word("EXISTS")
         && i >= 2
@@ -443,33 +771,73 @@ fn non_reserved_is_keyword(
     {
         return true;
     }
-    if prev.is_any_word(OBJECT_INTRO) {
-        return is_any(word, AFTER_INTRO_KEYWORDS);
+    // `INTERVAL '1' DAY`, `INTERVAL 1 DAY`
+    if i >= 2 && items[i - 2].is_word("INTERVAL") {
+        return true;
+    }
+    if prev.is_any_word(OBJECT_INTRO)
+        && (!prev.is_word("UPDATE") || update_names_table(items, i - 1))
+    {
+        // `WITH ROLLUP`, `WITH TIME ZONE`, but not the CTE `WITH time AS (...)`.
+        let after_with = prev.is_word("WITH")
+            && is_any(word, AFTER_WITH_KEYWORDS)
+            && !next.is_some_and(|it| is_word_text(it, "AS") || it.is_punct("("));
+        return after_with || is_any(word, AFTER_INTRO_KEYWORDS);
+    }
+    if names_object(items, i) {
+        return false;
+    }
+    // `PARTITION BY`, `ON DUPLICATE KEY`
+    if next.is_some_and(|it| is_word_text(it, "BY") || is_word_text(it, "KEY")) {
+        return true;
+    }
+    // Column definitions: types and attributes (`id int AUTO_INCREMENT,`, `) STRICT`).
+    if ddl
+        && ends_operand(items, i - 1)
+        && (is_any(word, DDL_ATTRIBUTES) || lang.type_info(word).is_some())
+        && !items[..i].iter().any(|it| it.is_word("SELECT"))
+    {
+        return true;
     }
     let list_start = prev.is_punct(",") || prev.is_punct("(");
-    let prev_intro = list_start || prev.op || prev.is_any_word(EXPR_INTRO);
+    let prev_intro = list_start
+        || prev.op
+        || (prev.is_any_word(EXPR_INTRO) && !(strong && prev.is_any_word(&["DO", "THEN"])));
+    // A strong word ends a name only before a word the engine itself reserves (PostgreSQL's
+    // `ON DELETE SET NULL` is no name).
     let next_ends = next.is_none_or(|it| {
         it.is_punct(",")
             || it.is_punct(")")
             || it.is_punct(";")
             || it.op
             || (it.kind == SqlTokenKind::Word
-                && (lang.is_reserved(it.text) || standard.is_reserved(it.text)))
+                && (lang.is_reserved(it.text) || (!strong && standard.is_reserved(it.text))))
     });
     if prev_intro && next_ends {
         return false;
     }
+    // `(data text, ...)`, `, status int`: a column name followed by its type.
     if list_start
-        && next.is_some_and(|it| {
-            matches!(
-                it.kind,
-                SqlTokenKind::Word | SqlTokenKind::QuotedIdent { .. }
-            ) && !is_any(it.text, &["BY", "KEY"])
+        && next.is_some_and(|it| match it.kind {
+            SqlTokenKind::QuotedIdent { .. } => true,
+            SqlTokenKind::Word if strong => {
+                !lang.is_keyword(it.text) || lang.type_info(it.text).is_some()
+            }
+            SqlTokenKind::Word => !is_any(it.text, &["BY", "KEY"]),
+            _ => false,
         })
     {
         return false;
     }
-    true
+    // An alias without `AS`: `FROM users user WHERE`, `SELECT max(x) total FROM`.
+    let alias_end = next.is_none_or(|it| {
+        it.is_punct(",")
+            || it.is_punct(")")
+            || it.is_punct(";")
+            || (it.kind == SqlTokenKind::Word && is_any(it.text, ALIAS_FOLLOWERS))
+    });
+    let alias = ends_operand(items, i - 1) && alias_end;
+    !alias
 }
 
 /// `true` when the item at `p` is a prefix operator (`-x`, `NOT`-like `!x`, `~x`): an operator

@@ -3,8 +3,9 @@
 //! combination and over fuzzed inputs: every result passes `check_format` (same tokens apart
 //! from whitespace and keyword case) and formatting is idempotent.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
+use oxbase_dialect::DialectRegistry;
 use oxbase_insight::{Dialect, FormatOptions, KeywordCase, check_format, format, format_range};
 use oxbase_types::{Engine, ErrorCategory};
 use pretty_assertions::assert_eq;
@@ -17,8 +18,34 @@ const ENGINES: [Engine; 5] = [
     Engine::MsSql,
 ];
 
+/// The dialect with the SQL-standard core language data (layout tests).
 fn dialect(engine: Engine) -> Dialect {
     Dialect::builtin(engine).unwrap()
+}
+
+/// The dialect with the engine's own language data, as the app uses it.
+fn engine_dialect(engine: Engine) -> Dialect {
+    let mut reg = DialectRegistry::new();
+    oxbase_pg::dialect::register(&mut reg);
+    oxbase_mysql::dialect::register(&mut reg);
+    oxbase_sqlite::dialect::register(&mut reg);
+    oxbase_mssql::dialect::register(&mut reg);
+    let language = *reg.language(engine);
+    assert_eq!(language.engine, Some(engine));
+    Dialect::builtin(engine).unwrap().with_language(language)
+}
+
+/// Both language data sets of `engine`.
+fn dialects(engine: Engine) -> [Dialect; 2] {
+    [dialect(engine), engine_dialect(engine)]
+}
+
+/// `text` formatted with the default options and the engine's language data.
+fn fmt_engine(engine: Engine, text: &str) -> String {
+    let d = engine_dialect(engine);
+    let out = format(&d, text, &FormatOptions::default()).unwrap();
+    check_format(&d, text, &out).unwrap();
+    out
 }
 
 fn fmt_with(engine: Engine, text: &str, options: FormatOptions) -> String {
@@ -165,6 +192,120 @@ fn keyword_case_options() {
     );
 }
 
+/// Names that are also keywords keep their spelling with the engines' own language data: on
+/// MySQL (Linux), SQLite and SQL Server a re-cased alias, table or result label is a different
+/// one.
+#[test]
+fn names_that_are_keywords_keep_their_spelling() {
+    for engine in [Engine::MySql, Engine::MariaDb] {
+        // Implicit table aliases.
+        assert_eq!(
+            fmt_engine(engine, "select user.name from users user"),
+            "SELECT user.name\nFROM users user"
+        );
+        assert_eq!(
+            fmt_engine(
+                engine,
+                "select s.id from t join u status on status.id = t.id where status.x = 1"
+            ),
+            "SELECT s.id\nFROM t\nJOIN u status ON status.id = t.id\nWHERE status.x = 1"
+        );
+        // Column aliases without AS.
+        assert_eq!(
+            fmt_engine(
+                engine,
+                "select DATE(created_at) date, COUNT(*) total from orders group by date"
+            ),
+            "SELECT DATE(created_at) date, COUNT(*) total\nFROM orders\nGROUP BY date"
+        );
+        assert_eq!(
+            fmt_engine(engine, "select start, end from events"),
+            "SELECT start, end\nFROM events"
+        );
+        // Names in DDL and other statements.
+        assert_eq!(
+            fmt_engine(engine, "rename table a to status"),
+            "RENAME TABLE a TO status"
+        );
+        assert_eq!(
+            fmt_engine(engine, "alter table t rename to user"),
+            "ALTER TABLE t RENAME TO user"
+        );
+        assert_eq!(
+            fmt_engine(engine, "alter table t add status int"),
+            "ALTER TABLE t ADD status INT"
+        );
+        assert_eq!(
+            fmt_engine(engine, "alter table t change created date DATETIME"),
+            "ALTER TABLE t CHANGE created date DATETIME"
+        );
+        assert_eq!(fmt_engine(engine, "truncate data"), "TRUNCATE data");
+        assert_eq!(
+            fmt_engine(
+                engine,
+                "delete status from status join u on u.id = status.id"
+            ),
+            "DELETE status\nFROM status\nJOIN u ON u.id = status.id"
+        );
+        // Words MySQL 8 reserves but MySQL 5.7 and MariaDB accept as table names.
+        assert_eq!(
+            fmt_engine(engine, "select * from groups"),
+            "SELECT *\nFROM groups"
+        );
+        // Keywords around them still change case.
+        assert_eq!(
+            fmt_engine(
+                engine,
+                "select case when a > 0 then 1 else 0 end as sign from t"
+            ),
+            "SELECT CASE WHEN a > 0 THEN 1 ELSE 0 END AS sign\nFROM t"
+        );
+    }
+    assert_eq!(
+        fmt_engine(Engine::MariaDb, "select rank from players"),
+        "SELECT rank\nFROM players"
+    );
+    let ms = Engine::MsSql;
+    assert_eq!(
+        fmt_engine(
+            ms,
+            "select o.id, MAX(o.total) name from orders o join kinds type on type.id = o.kind_id group by o.id"
+        ),
+        "SELECT o.id, MAX(o.total) name\nFROM orders o\nJOIN kinds type ON type.id = o.kind_id\nGROUP BY o.id"
+    );
+    assert_eq!(
+        fmt_engine(ms, "alter table t add type int"),
+        "ALTER TABLE t ADD type int"
+    );
+    // SQLite does not reserve the join words; they still read as keywords before JOIN.
+    assert_eq!(
+        fmt_engine(
+            Engine::Sqlite,
+            "select a.x from a left join b on b.id = a.id"
+        ),
+        "SELECT a.x\nFROM a\nLEFT JOIN b ON b.id = a.id"
+    );
+}
+
+#[test]
+fn statement_keywords_split_only_t_sql_batches() {
+    // Outside T-SQL a statement keyword at the start of a line continues the statement.
+    let grant = "grant select on t to bob\nwith grant OPTION";
+    assert_eq!(
+        fmt(Engine::Postgres, grant),
+        "GRANT SELECT ON t TO bob WITH GRANT OPTION"
+    );
+    assert_eq!(
+        fmt(Engine::MsSql, grant),
+        "GRANT SELECT ON t TO bob WITH GRANT OPTION"
+    );
+    // A T-SQL batch still splits at a statement keyword that starts a line.
+    assert_eq!(
+        fmt(Engine::MsSql, "select 1\nselect 2"),
+        "SELECT 1\nSELECT 2"
+    );
+}
+
 #[test]
 fn comments_stay_with_their_tokens() {
     assert_eq!(
@@ -302,8 +443,8 @@ fn format_range_replaces_the_overlapping_statements() {
 
 #[test]
 fn format_range_results_pass_the_check() {
-    for engine in ENGINES {
-        let d = dialect(engine);
+    for d in ENGINES.into_iter().flat_map(dialects) {
+        let engine = d.engine;
         for text in corpus(engine) {
             for at in [0, text.len() / 3, text.len() / 2, text.len()] {
                 let at = floor(text, at);
@@ -400,13 +541,14 @@ fn corpus_with_every_option_combination() {
     let options = option_matrix();
     let mut violations = Violations::default();
     for engine in ENGINES {
-        let d = dialect(engine);
         let all = corpus(engine).join(";\n");
-        for o in &options {
-            for text in corpus(engine) {
-                violations.check(&d, text, *o);
+        for d in dialects(engine) {
+            for o in &options {
+                for text in corpus(engine) {
+                    violations.check(&d, text, *o);
+                }
+                violations.check(&d, &all, *o);
             }
-            violations.check(&d, &all, *o);
         }
     }
     violations.assert_none();
@@ -448,8 +590,8 @@ fn fuzzed_inputs_keep_the_invariants() {
     let wide = FormatOptions::default();
     let narrow = narrow();
     let mut violations = Violations::default();
-    for engine in ENGINES {
-        let sql = dialect(engine);
+    for sql in ENGINES.into_iter().flat_map(dialects) {
+        let engine = sql.engine;
         for text in corpus(engine) {
             // Every prefix (incomplete SQL is the normal case).
             for (at, _) in text.char_indices() {
@@ -476,24 +618,66 @@ fn fuzzed_inputs_keep_the_invariants() {
     violations.assert_none();
 }
 
-#[test]
-fn a_large_script_formats_quickly() {
-    let d = dialect(Engine::Postgres);
+/// A script of at least 100 KiB made of the corpus statements of `engine`.
+fn large_script(engine: Engine) -> String {
     let mut script = String::new();
     while script.len() < 100 * 1024 {
-        for text in corpus(Engine::Postgres) {
+        for text in corpus(engine) {
             script.push_str(text);
             script.push_str(";\n");
         }
     }
+    script
+}
+
+#[test]
+fn a_large_script_formats_quickly() {
+    let d = engine_dialect(Engine::Postgres);
+    let script = large_script(Engine::Postgres);
     let started = Instant::now();
     let out = format(&d, &script, &FormatOptions::default()).unwrap();
     let elapsed = started.elapsed();
-    println!(
+    eprintln!(
         "formatted {} KiB in {elapsed:?} (budget in a perf build: 200 ms)",
         script.len() / 1024
     );
     assert!(out.len() > script.len() / 2);
+}
+
+/// The §5 budget: `format` within 200 ms for a 100 KiB script, in a `--profile perf` build.
+/// Ignored by default (debug builds are slower); run it with
+/// `cargo test -p oxbase-insight --profile perf --test format -- --ignored --nocapture`.
+/// Prints the best of five runs per engine; with `OXBASE_REQUIRE_M6_PERF=1` a run above the
+/// budget fails the test.
+#[test]
+#[ignore = "perf budget; run in a --profile perf build"]
+fn format_perf_budget() {
+    let budget = Duration::from_millis(200);
+    let required = std::env::var("OXBASE_REQUIRE_M6_PERF").is_ok_and(|v| v == "1");
+    let mut over = Vec::new();
+    for engine in ENGINES {
+        let d = engine_dialect(engine);
+        let script = large_script(engine);
+        let mut best = Duration::MAX;
+        for _ in 0..5 {
+            let started = Instant::now();
+            let out = format(&d, &script, &FormatOptions::default()).unwrap();
+            best = best.min(started.elapsed());
+            assert!(!out.is_empty());
+        }
+        eprintln!(
+            "format perf: {engine:?} {} KiB in {best:?} (budget {budget:?})",
+            script.len() / 1024
+        );
+        if best > budget {
+            over.push(format!("{engine:?}: {best:?}"));
+        }
+    }
+    assert!(
+        !required || over.is_empty(),
+        "over the {budget:?} budget: {}",
+        over.join(", ")
+    );
 }
 
 // --- corpus ---------------------------------------------------------------------------------

@@ -16,7 +16,9 @@
 //! - `CASE` stays inline when it fits, else puts each `WHEN` / `ELSE` on its own line.
 //!
 //! A T-SQL batch (or any statement text holding several statements) is laid out statement by
-//! statement: a `;` or a statement keyword at the start of an input line starts a new one.
+//! statement: a `;` starts a new one, and in T-SQL (whose splitter cuts only at `GO`) so does a
+//! statement keyword at the start of an input line (not `WITH (...)`, `WITH GRANT OPTION`,
+//! `DROP COLUMN`, `SET (...)`, which continue the statement).
 //!
 //! Spacing between neighbours never breaks `oxbase_sql::tokens_equivalent`: where touching
 //! matters the input's choice is kept, two string literals stay on one line or on two lines as
@@ -127,7 +129,7 @@ impl Clause {
     }
 }
 
-/// Words that start a statement when they begin an input line (T-SQL batches hold several).
+/// Words that start a statement when they begin an input line in a T-SQL batch.
 const STARTERS: &[&str] = &[
     "ALTER",
     "ANALYZE",
@@ -222,11 +224,13 @@ pub(super) fn build<'a>(
     nodes: &[Node],
     case: KeywordCase,
     leading_commas: bool,
+    batches: bool,
 ) -> Vec<D<'a>> {
     let mut b = Builder {
         items,
         case,
         leading_commas,
+        batches,
         docs: Vec::new(),
         last: None,
         led: None,
@@ -239,6 +243,8 @@ struct Builder<'s, 'a> {
     items: &'s [Item<'a>],
     case: KeywordCase,
     leading_commas: bool,
+    /// A statement keyword at the start of an input line starts a new statement (T-SQL).
+    batches: bool,
     docs: Vec<D<'a>>,
     /// The last item emitted.
     last: Option<usize>,
@@ -1000,13 +1006,39 @@ impl<'a> Builder<'_, 'a> {
             return Some(self.statement_head(nodes, i, st, false));
         }
         // A new statement on its own line (T-SQL batches).
-        if is_any(word, STARTERS)
+        if self.batches
+            && is_any(word, STARTERS)
             && self.items[nodes[i].first()].nl_before
             && !self.no_break(nodes, i)
+            && self.starts_statement(nodes, i)
         {
             return Some(self.statement_head(nodes, i, st, true));
         }
         None
+    }
+
+    /// Whether the statement keyword at `i` (at the start of an input line) starts a statement
+    /// rather than continuing the current one: `WITH` only as a CTE (`WITH c AS (`, `WITH c(x)
+    /// AS`), not `WITH (options)` or `WITH GRANT OPTION`; not `DROP COLUMN` / `CONSTRAINT` of
+    /// `ALTER TABLE`; not `SET (options)`.
+    fn starts_statement(&self, nodes: &[Node], i: usize) -> bool {
+        let paren_at = |at: usize| matches!(nodes.get(at), Some(Node::Paren { .. }));
+        let word = self.word_at(nodes, i).unwrap_or("");
+        if word.eq_ignore_ascii_case("WITH") {
+            let name = matches!(nodes.get(i + 1), Some(Node::Tok(_)));
+            return name && (self.word_is(nodes, i + 2, "AS") || paren_at(i + 2));
+        }
+        if word.eq_ignore_ascii_case("DROP") {
+            let part = matches!(
+                nodes.get(i + 1),
+                Some(Node::Tok(j)) if is_any(self.items[*j].text, &["COLUMN", "CONSTRAINT", "PERIOD", "SYSTEM"])
+            );
+            return !part;
+        }
+        if word.eq_ignore_ascii_case("SET") {
+            return !paren_at(i + 1);
+        }
+        true
     }
 
     /// `true` when the node before `i` binds the statement keyword at `i` to the current

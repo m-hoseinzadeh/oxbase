@@ -9,7 +9,7 @@
 //! first comment line of the gap, which usually belongs to the next statement, else right
 //! before the next statement), without it there are none.
 
-use oxbase_sql::{SqlTokenKind, Statement, tokenize};
+use oxbase_sql::{SqlDialect, SqlTokenKind, Statement, tokenize};
 
 use super::FormatOptions;
 use super::doc::{Layout, render};
@@ -153,7 +153,8 @@ impl Writer<'_> {
             return None;
         }
         let nodes = tree::tree(&items)?;
-        let docs = layout::build(&items, &nodes, o.keyword_case, o.leading_commas);
+        let batches = self.dialect.sql == SqlDialect::TSql;
+        let docs = layout::build(&items, &nodes, o.keyword_case, o.leading_commas, batches);
         let unit = if o.use_tabs {
             "\t".to_owned()
         } else {
