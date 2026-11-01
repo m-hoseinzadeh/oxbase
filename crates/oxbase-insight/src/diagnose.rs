@@ -5,16 +5,36 @@
 //! Anything that depends on the catalog, on the parser's reading of incomplete SQL or on
 //! dialect features the parser may not know is a warning or a hint. [`Diagnostic::new`] caps
 //! the severity at [`DiagnosticCode::max_severity`], so no code path can raise it.
+//!
+//! # How it works
+//!
+//! The text is cut with `oxbase_sql::split`; the lexer's tokens give the unterminated tokens
+//! and, per statement, the parenthesis balance. Each statement is then read by the tolerant
+//! parser of `analyze` (one statement of the splitter may hold several SQL statements: a
+//! T-SQL batch, a routine body), which reports syntax it is sure about (clause order, stray
+//! commas), syntax of another dialect (`LIMIT` on SQL Server, `TOP` elsewhere, `::`,
+//! backticks, `ILIKE`, client commands), `UPDATE` / `DELETE` without `WHERE` and `DROP`
+//! without `IF EXISTS`. With a cache, `checks` resolves relations (through CTEs, aliases,
+//! derived tables and the search path), columns and functions. Names created earlier in the
+//! script, temporary tables, system objects, other databases, routine bodies and anything
+//! the parser is unsure about only ever give hints.
 
 use std::fmt;
 use std::ops::Range;
 
 use oxbase_schema_cache::SchemaCache;
-use oxbase_types::Result;
+use oxbase_types::{Error, Result};
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
 use crate::Dialect;
+
+pub(crate) mod analyze;
+pub(crate) mod checks;
+pub(crate) mod features;
+mod lexical;
+pub(crate) mod scan;
+pub(crate) mod words;
 
 /// How bad a finding is. Ordered: `Hint < Warning < Error`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -53,6 +73,14 @@ pub enum DiagnosticCode {
     WrongArgumentCount,
     /// `UPDATE` / `DELETE` without `WHERE` (affects every row).
     MissingWhere,
+    /// Syntax the parser is sure is wrong in every dialect (clause order, stray commas), or a
+    /// clause left empty while typing (hint).
+    SyntaxError,
+    /// Syntax of another SQL dialect (`LIMIT` on SQL Server, `TOP` on PostgreSQL, `::` on
+    /// MySQL, backtick quotes on PostgreSQL, a `GO` line outside SQL Server tools).
+    DialectMismatch,
+    /// `DROP TABLE` / `DROP VIEW` without `IF EXISTS`.
+    MissingIfExists,
 }
 
 impl DiagnosticCode {
@@ -61,8 +89,8 @@ impl DiagnosticCode {
     /// | Code | Max |
     /// |---|---|
     /// | unterminated string / identifier / comment, unbalanced parenthesis | error |
-    /// | unknown relation, unknown column, unknown schema, ambiguous column, wrong argument count, missing where | warning |
-    /// | unknown function | hint |
+    /// | unknown relation, unknown column, unknown schema, ambiguous column, wrong argument count, missing where, syntax error, dialect mismatch | warning |
+    /// | unknown function, missing if exists | hint |
     ///
     /// Unknown names are warnings only when the cache is complete and fresh and the name is
     /// not created earlier in the script, a temporary table, a CTE or an alias; otherwise
@@ -78,8 +106,10 @@ impl DiagnosticCode {
             | Self::AmbiguousColumn
             | Self::UnknownSchema
             | Self::WrongArgumentCount
-            | Self::MissingWhere => Severity::Warning,
-            Self::UnknownFunction => Severity::Hint,
+            | Self::MissingWhere
+            | Self::SyntaxError
+            | Self::DialectMismatch => Severity::Warning,
+            Self::UnknownFunction | Self::MissingIfExists => Severity::Hint,
         }
     }
 
@@ -97,6 +127,9 @@ impl DiagnosticCode {
             Self::UnknownFunction => "unknown-function",
             Self::WrongArgumentCount => "wrong-argument-count",
             Self::MissingWhere => "missing-where",
+            Self::SyntaxError => "syntax-error",
+            Self::DialectMismatch => "dialect-mismatch",
+            Self::MissingIfExists => "missing-if-exists",
         }
     }
 }
@@ -145,8 +178,35 @@ pub fn diagnose(
     cache: Option<&SchemaCache>,
     cancel: &CancellationToken,
 ) -> Result<Vec<Diagnostic>> {
-    let _ = (dialect, text, cache, cancel);
-    unimplemented!("m6: diagnose")
+    let feat = features::features(dialect.sql);
+    let mut out = Vec::new();
+    let first_bad = lexical::unterminated(dialect, text, &mut out);
+    let mut env = checks::Env::new(dialect, cache);
+    for statement in oxbase_sql::split(dialect.sql, text) {
+        if cancel.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        let toks = scan::Toks::new(dialect, &feat, text, statement.range.clone());
+        // A string or comment that runs to the end swallows the closing parentheses: one
+        // error is enough.
+        if first_bad.is_none_or(|bad| bad >= statement.range.end) {
+            lexical::parens(&toks, &mut out);
+        }
+        lexical::directives(&toks, &feat, dialect, &mut out);
+        if cache.is_some() {
+            env.apply_changes(&oxbase_sql::schema_changes(dialect.sql, &statement.text));
+        }
+        for st in analyze::analyze(&dialect.language, &feat, &toks) {
+            out.extend_from_slice(&st.findings);
+            if cache.is_some() {
+                checks::check(&env, dialect, &st, &mut out);
+            }
+            env.after(&st);
+        }
+    }
+    out.sort_by_key(|d| (d.range.start, d.range.end, d.code.as_str()));
+    out.dedup();
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -184,6 +244,9 @@ mod tests {
             DiagnosticCode::UnknownFunction,
             DiagnosticCode::WrongArgumentCount,
             DiagnosticCode::MissingWhere,
+            DiagnosticCode::SyntaxError,
+            DiagnosticCode::DialectMismatch,
+            DiagnosticCode::MissingIfExists,
         ] {
             assert_eq!(
                 serde_json::to_value(code).unwrap(),
