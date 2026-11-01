@@ -121,6 +121,15 @@ struct JsonSource {
     total_bytes: u64,
     detected: Detected,
     path: PathBuf,
+    /// What [`JsonSource::at_end`] read ahead.
+    ahead: Option<Ahead>,
+}
+
+/// An element read ahead (bytes, line where it starts), the end, or the failure.
+enum Ahead {
+    Element(Vec<u8>, u64),
+    End,
+    Failed(Error),
 }
 
 impl JsonSource {
@@ -157,6 +166,7 @@ impl JsonSource {
                 ..Detected::default()
             },
             path: path.to_path_buf(),
+            ahead: None,
         })
     }
 
@@ -170,6 +180,40 @@ impl JsonSource {
 
     /// Reads the next element into `elem`; `false` at the end.
     fn next_element(&mut self) -> Result<bool> {
+        match self.ahead.take() {
+            Some(Ahead::Element(elem, line)) => {
+                self.elem = elem;
+                self.elem_line = line;
+                self.index += 1;
+                Ok(true)
+            }
+            Some(Ahead::End) => Ok(false),
+            Some(Ahead::Failed(e)) => Err(e),
+            None => self.read_element(),
+        }
+    }
+
+    /// `true` when no element is left. Reads the next one ahead (the current element stays
+    /// in `elem`); a failure is returned by the next [`JsonSource::next_element`].
+    fn at_end(&mut self) -> bool {
+        if self.ahead.is_none() {
+            let saved = (std::mem::take(&mut self.elem), self.elem_line);
+            let result = self.read_element();
+            let read = std::mem::replace(&mut self.elem, saved.0);
+            let line = std::mem::replace(&mut self.elem_line, saved.1);
+            self.ahead = Some(match result {
+                Ok(true) => {
+                    self.index -= 1;
+                    Ahead::Element(read, line)
+                }
+                Ok(false) => Ahead::End,
+                Err(e) => Ahead::Failed(e),
+            });
+        }
+        matches!(self.ahead, Some(Ahead::End))
+    }
+
+    fn read_element(&mut self) -> Result<bool> {
         if self.finished {
             return Ok(false);
         }
@@ -938,6 +982,10 @@ impl SourceReader for JsonReader {
         if rows == 0 {
             self.progress.finish();
             return Ok(None);
+        }
+        // A full batch looks ahead, so the last batch carries the file size (§12).
+        if !self.done && self.src.at_end() {
+            self.done = true;
         }
         let columns = self
             .builders

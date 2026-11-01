@@ -2,10 +2,15 @@
 //!
 //! Row groups are read one at a time (`with_row_groups`), so progress advances by each row
 //! group's compressed size and memory holds one row group's decoded column chunks. Batches
-//! are converted to the load schema of the specs: Arrow casts where they are exact (failures
-//! become row issues), nested values as JSON text, decimals as exact text, nanosecond
-//! timestamps to microseconds (a value with sub-microsecond digits is a row issue), and text
-//! sources parsed per value like CSV when the spec asks for another type.
+//! are converted to the load schema of the specs. Arrow casts only where they cannot change a
+//! value (widening integers and floats, coarser times, other binary / text layouts, any value
+//! to its text); a value such a cast cannot hold (an integer out of range, bytes that are not
+//! UTF-8) is NULL plus a row issue. `Int64` / `UInt64` to `float64`, `Date64` and timestamps
+//! to `date` and nanosecond times and timestamps to microseconds are checked per value (a
+//! value that would change is a row issue). Every other pair (a float or decimal to an
+//! integer, numbers to booleans, a date to a timestamp, ...) goes through the value's text and
+//! the CSV parsing rules, so `1.5` read as an integer is a row issue as it is in the text
+//! formats. Nested values become JSON text and decimals exact text.
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -13,10 +18,13 @@ use std::sync::Arc;
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::{
-    TimestampMicrosecondType, TimestampMillisecondType, TimestampNanosecondType,
-    TimestampSecondType,
+    Date64Type, Int64Type, Time64NanosecondType, TimestampMicrosecondType,
+    TimestampMillisecondType, TimestampNanosecondType, TimestampSecondType, UInt64Type,
 };
-use arrow_array::{Array, ArrayRef, RecordBatch, TimestampMicrosecondArray};
+use arrow_array::{
+    Array, ArrayRef, Date32Array, Float64Array, RecordBatch, Time64MicrosecondArray,
+    TimestampMicrosecondArray,
+};
 use arrow_cast::CastOptions;
 use arrow_cast::cast::{can_cast_types, cast_with_options};
 use arrow_cast::display::{ArrayFormatter, FormatOptions};
@@ -454,7 +462,12 @@ impl SourceReader for ParquetReader {
         self.row += u64::try_from(raw.num_rows()).unwrap_or(0);
         let batch = RecordBatch::try_new(self.schema.clone(), columns)
             .map_err(|e| Error::internal(format!("Parquet batch: {e}")))?;
-        let done = self.current.is_none() && self.group >= self.rows_per_group.len();
+        // Done once the current row group is read and only empty ones are left.
+        let done = self.current.is_none()
+            && self
+                .rows_per_group
+                .get(self.group..)
+                .is_none_or(|rest| rest.iter().all(|&rows| rows == 0));
         let bytes_read = if done {
             self.progress.finish()
         } else {
@@ -514,9 +527,12 @@ fn convert(
             issues: Vec::new(),
         });
     }
-    // Nested values become JSON text; decimals from floats or dates go through their text.
+    // Nested values become JSON text; JSON from scalars and decimals from floats or dates go
+    // through their text (which is checked).
     if target == &ArrowType::Utf8
-        && (is_nested(source) || (decimal_target && !is_exact_decimal_source(source)))
+        && (is_nested(source)
+            || json_target
+            || (decimal_target && !is_exact_decimal_source(source)))
     {
         return per_value(field, array, spec, formats);
     }
@@ -525,7 +541,10 @@ fn convert(
     {
         return Ok(timestamps(array, *unit, zone.clone()));
     }
-    if can_cast_types(source, target) {
+    if let Some(converted) = checked(field, array, spec, target) {
+        return Ok(converted);
+    }
+    if exact_cast(source, target) && can_cast_types(source, target) {
         let cast =
             cast_with_options(array, target, &CastOptions::default()).map_err(|e| e.to_string())?;
         let mut issues = Vec::new();
@@ -547,6 +566,170 @@ fn convert(
         });
     }
     per_value(field, array, spec, formats)
+}
+
+/// Casts that keep every value they can hold unchanged (a value they cannot hold becomes
+/// NULL, reported by the caller): integers to `Int64` / `UInt64` (range-checked by Arrow),
+/// narrower floats and integers to `Float64`, coarser times to microseconds, binary layouts to
+/// `Binary`, and values other than nested ones to their text.
+fn exact_cast(source: &ArrowType, target: &ArrowType) -> bool {
+    match target {
+        ArrowType::Int64 | ArrowType::UInt64 => source.is_integer(),
+        ArrowType::Float64 => matches!(
+            source,
+            ArrowType::Float16
+                | ArrowType::Float32
+                | ArrowType::Int8
+                | ArrowType::Int16
+                | ArrowType::Int32
+                | ArrowType::UInt8
+                | ArrowType::UInt16
+                | ArrowType::UInt32
+        ),
+        ArrowType::Time64(TimeUnit::Microsecond) => {
+            matches!(source, ArrowType::Time32(_))
+        }
+        ArrowType::Binary => matches!(
+            source,
+            ArrowType::LargeBinary | ArrowType::BinaryView | ArrowType::FixedSizeBinary(_)
+        ),
+        ArrowType::Utf8 => !is_nested(source),
+        _ => false,
+    }
+}
+
+/// Conversions checked value by value: `Int64` / `UInt64` to `Float64` (exactly representable
+/// values only), `Date64` and timestamps to `Date32` (whole days only; a zoned timestamp's
+/// UTC day) and `Time64(ns)` to microseconds (no sub-microsecond digits). `None` for other
+/// pairs.
+fn checked(
+    field: &FieldRef,
+    array: &ArrayRef,
+    spec: &ColumnSpec,
+    target: &ArrowType,
+) -> Option<Converted> {
+    let converted = match (array.data_type(), target) {
+        (ArrowType::Int64 | ArrowType::UInt64, ArrowType::Float64) => {
+            let values: Vec<Option<i128>> = match array.as_primitive_opt::<Int64Type>() {
+                Some(ints) => ints.iter().map(|v| v.map(i128::from)).collect(),
+                None => array
+                    .as_primitive::<UInt64Type>()
+                    .iter()
+                    .map(|v| v.map(i128::from))
+                    .collect(),
+            };
+            let why = format!("cannot be read exactly as {}", spec.data_type);
+            let (out, issues) = per_row(field, array, values.into_iter(), exact_f64, &why);
+            Converted {
+                array: Arc::new(Float64Array::from(out)),
+                issues,
+            }
+        }
+        (ArrowType::Date64, ArrowType::Date32) => {
+            const MS_PER_DAY: i64 = 86_400_000;
+            let values = array.as_primitive::<Date64Type>().iter();
+            let (out, issues) = per_row(
+                field,
+                array,
+                values,
+                |ms| {
+                    if ms % MS_PER_DAY == 0 {
+                        i32::try_from(ms / MS_PER_DAY).ok()
+                    } else {
+                        None
+                    }
+                },
+                "has a time of day; it is not a date",
+            );
+            Converted {
+                array: Arc::new(Date32Array::from(out)),
+                issues,
+            }
+        }
+        (ArrowType::Timestamp(unit, _), ArrowType::Date32) => {
+            const MICROS_PER_DAY: i64 = 86_400_000_000;
+            // Sub-microsecond values are issues here already (and NULL below).
+            let Converted {
+                array: micros,
+                issues: mut all,
+            } = timestamps(array, *unit, None);
+            let values = micros.as_primitive::<TimestampMicrosecondType>().iter();
+            let (out, issues) = per_row(
+                field,
+                array,
+                values,
+                |us| {
+                    if us % MICROS_PER_DAY == 0 {
+                        i32::try_from(us / MICROS_PER_DAY).ok()
+                    } else {
+                        None
+                    }
+                },
+                "has a time of day; it is not a date",
+            );
+            all.extend(issues);
+            all.sort_by_key(|issue| issue.0);
+            Converted {
+                array: Arc::new(Date32Array::from(out)),
+                issues: all,
+            }
+        }
+        (ArrowType::Time64(TimeUnit::Nanosecond), ArrowType::Time64(TimeUnit::Microsecond)) => {
+            let values = array.as_primitive::<Time64NanosecondType>().iter();
+            let (out, issues) = per_row(
+                field,
+                array,
+                values,
+                |ns| (ns % 1_000 == 0).then_some(ns / 1_000),
+                "has sub-microsecond digits",
+            );
+            Converted {
+                array: Arc::new(Time64MicrosecondArray::from(out)),
+                issues,
+            }
+        }
+        _ => return None,
+    };
+    Some(converted)
+}
+
+/// `v` as the `f64` of the same value, when there is one.
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+fn exact_f64(v: i128) -> Option<f64> {
+    let f = v as f64;
+    // `f as i128` is exact for every f64 of an i64 / u64 (2^64 included).
+    (f as i128 == v).then_some(f)
+}
+
+/// `values` mapped by `exact`; a value it rejects is NULL plus the issue
+/// `'<value>' <why>`.
+fn per_row<T, U>(
+    field: &FieldRef,
+    array: &ArrayRef,
+    values: impl Iterator<Item = Option<T>>,
+    exact: impl Fn(T) -> Option<U>,
+    why: &str,
+) -> (Vec<Option<U>>, Vec<(usize, String)>) {
+    let mut rejected = Vec::new();
+    let out = values
+        .enumerate()
+        .map(|(i, v)| {
+            let u = exact(v?);
+            if u.is_none() {
+                rejected.push(i);
+            }
+            u
+        })
+        .collect();
+    let mut issues = Vec::with_capacity(rejected.len());
+    if !rejected.is_empty() {
+        let shown = texts(field, array.as_ref()).unwrap_or_default();
+        for i in rejected {
+            let value = shown.get(i).cloned().flatten().unwrap_or_default();
+            issues.push((i, format!("{} {why}", quote(&value))));
+        }
+    }
+    (out, issues)
 }
 
 /// Integer and decimal sources whose text form is an exact decimal.
@@ -654,7 +837,8 @@ fn timestamps(array: &ArrayRef, unit: TimeUnit, zone: Option<Arc<str>>) -> Conve
 
 #[cfg(test)]
 mod tests {
-    use arrow_array::{Int32Array, StringArray, TimestampNanosecondArray};
+    use arrow_array::types::Date32Type;
+    use arrow_array::{Date64Array, Int32Array, StringArray, TimestampNanosecondArray};
     use arrow_schema::Field;
 
     use super::*;
@@ -705,5 +889,43 @@ mod tests {
             out.array.data_type(),
             &ArrowType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into()))
         );
+    }
+
+    #[test]
+    fn whole_days_only() {
+        let ms: ArrayRef = Arc::new(Date64Array::from(vec![
+            Some(981_158_400_000),
+            Some(981_158_400_001),
+            None,
+        ]));
+        let spec = ColumnSpec::new("d", DataType::Date);
+        let out = convert(
+            &field("d", ArrowType::Date64),
+            &ms,
+            &spec,
+            &ArrowType::Date32,
+            &ValueFormats::default(),
+        )
+        .unwrap();
+        let days = out.array.as_primitive::<Date32Type>();
+        assert_eq!(days.value(0), 11_356);
+        assert!(days.is_null(1) && days.is_null(2));
+        assert_eq!(out.issues.len(), 1);
+        assert_eq!(out.issues[0].0, 1);
+        assert!(out.issues[0].1.contains("time of day"), "{:?}", out.issues);
+    }
+
+    #[test]
+    fn exact_floats_only() {
+        let bits = |v: i128| exact_f64(v).map(f64::to_bits);
+        assert_eq!(bits(1 << 53), Some(9_007_199_254_740_992_f64.to_bits()));
+        assert_eq!(bits((1 << 53) + 1), None);
+        assert_eq!(bits(i128::from(i64::MAX)), None);
+        assert_eq!(
+            bits(i128::from(i64::MIN)),
+            Some((-9_223_372_036_854_775_808_f64).to_bits())
+        );
+        assert_eq!(bits(i128::from(u64::MAX)), None);
+        assert_eq!(bits(-7), Some((-7_f64).to_bits()));
     }
 }

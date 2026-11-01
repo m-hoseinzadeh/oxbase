@@ -280,6 +280,8 @@ struct SheetRows {
     names: Vec<String>,
     sheet: String,
     finished: bool,
+    /// The worker's failure, received while looking ahead ([`SheetRows::at_end`]).
+    deferred: Option<Error>,
 }
 
 impl SheetRows {
@@ -308,6 +310,7 @@ impl SheetRows {
             names: Vec::new(),
             sheet: String::new(),
             finished: false,
+            deferred: None,
         };
         match rows.recv() {
             Some(Msg::Sheets { names, sheet }) => {
@@ -336,6 +339,9 @@ impl SheetRows {
                 self.next_index = index.saturating_add(1);
                 return Ok(self.pending.pop_front());
             }
+            if let Some(e) = self.deferred.take() {
+                return Err(e);
+            }
             if self.finished {
                 return Ok(None);
             }
@@ -344,6 +350,28 @@ impl SheetRows {
                 Some(Msg::Failed(e)) => {
                     self.finished = true;
                     return Err(e);
+                }
+                Some(Msg::Sheets { .. }) => {}
+                None => self.finished = true,
+            }
+        }
+    }
+
+    /// `true` when no row is left (waits for the worker's next chunk). A failure received
+    /// here is returned by the next [`SheetRows::next_row`].
+    fn at_end(&mut self) -> bool {
+        loop {
+            if !self.pending.is_empty() || self.deferred.is_some() {
+                return false;
+            }
+            if self.finished {
+                return true;
+            }
+            match self.recv() {
+                Some(Msg::Rows(rows)) => self.pending.extend(rows),
+                Some(Msg::Failed(e)) => {
+                    self.finished = true;
+                    self.deferred = Some(e);
                 }
                 Some(Msg::Sheets { .. }) => {}
                 None => self.finished = true,
@@ -613,6 +641,10 @@ impl SourceReader for XlsxReader {
         if rows == 0 {
             self.progress.finish();
             return Ok(None);
+        }
+        // A full batch looks ahead, so the last batch carries the file size (§12).
+        if !self.done && self.sheet.at_end() {
+            self.done = true;
         }
         let columns = self
             .builders

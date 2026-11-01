@@ -324,6 +324,17 @@ fn days(date: NaiveDate) -> Result<i32, String> {
         .ok_or_else(|| format!("{date} is out of range"))
 }
 
+/// Text with digits below the microsecond (`10:00:00.1234567`) cannot be kept: the load
+/// types hold microseconds. Spreadsheet date-times are not checked (their nanoseconds are
+/// float rounding, not digits of the source).
+fn whole_micros(cell: Cell<'_>, nanosecond: u32) -> Result<(), String> {
+    if matches!(cell, Cell::Text(_)) && nanosecond % 1_000 != 0 {
+        Err(format!("{} has sub-microsecond digits", describe(cell)))
+    } else {
+        Ok(())
+    }
+}
+
 fn to_time(cell: Cell<'_>, formats: &ValueFormats) -> Result<NaiveTime, String> {
     let value = match cell {
         Cell::Text(t) => parse_time(t, formats),
@@ -331,7 +342,9 @@ fn to_time(cell: Cell<'_>, formats: &ValueFormats) -> Result<NaiveTime, String> 
         Cell::DateTime(v) if v.date().year() < 1900 || v.date() == epoch_1904() => Some(v.time()),
         _ => None,
     };
-    value.ok_or_else(|| mismatch(cell, "a time of day"))
+    let time = value.ok_or_else(|| mismatch(cell, "a time of day"))?;
+    whole_micros(cell, time.nanosecond())?;
+    Ok(time)
 }
 
 fn epoch_1904() -> NaiveDate {
@@ -345,15 +358,18 @@ fn micros_of_day(time: NaiveTime) -> i64 {
 
 fn to_timestamp(cell: Cell<'_>, formats: &ValueFormats, with_zone: bool) -> Result<i64, String> {
     let value = match cell {
-        Cell::DateTime(v) => Some(v.and_utc().timestamp_micros()),
+        Cell::DateTime(v) => Some(v.and_utc()),
         Cell::Text(t) if with_zone => parse_timestamp_tz(t, formats)
-            .map(|v| v.timestamp_micros())
+            .map(|v| v.to_utc())
             // Text without an offset is read as UTC.
-            .or_else(|| parse_timestamp(t, formats).map(|v| v.and_utc().timestamp_micros())),
-        Cell::Text(t) => parse_timestamp(t, formats).map(|v| v.and_utc().timestamp_micros()),
+            .or_else(|| parse_timestamp(t, formats).map(|v| v.and_utc())),
+        Cell::Text(t) => parse_timestamp(t, formats).map(|v| v.and_utc()),
         _ => None,
     };
-    value.ok_or_else(|| {
+    if let Some(v) = value {
+        whole_micros(cell, v.nanosecond())?;
+    }
+    value.map(|v| v.timestamp_micros()).ok_or_else(|| {
         mismatch(
             cell,
             if with_zone {

@@ -45,7 +45,7 @@ pub struct ReadAll {
     pub batches: Vec<SourceBatch>,
     pub rows: usize,
     pub issues: Vec<RowIssue>,
-    /// `bytes_read` after each batch, then the reader's final position.
+    /// `bytes_read` of each batch (the reader's final position when there is none).
     pub positions: Vec<u64>,
     pub total_bytes: u64,
 }
@@ -81,7 +81,13 @@ pub fn read_all(
         out.positions.push(batch.bytes_read);
         out.batches.push(batch);
     }
-    out.positions.push(reader.bytes_read());
+    let end = reader.bytes_read();
+    match out.positions.last() {
+        // The last batch already carries the final position (§12: a consumer of
+        // `spawn_reader` sees batches only).
+        Some(&last) => assert_eq!(last, end, "the last batch reports the final position"),
+        None => out.positions.push(end),
+    }
     Ok(out)
 }
 
@@ -125,7 +131,7 @@ impl ReadAll {
             .sum()
     }
 
-    /// `bytes_read` never goes down and ends at the file size.
+    /// `bytes_read` never goes down and the last batch reports the file size.
     pub fn assert_progress(&self) {
         assert!(
             self.positions.windows(2).all(|w| w[0] <= w[1]),

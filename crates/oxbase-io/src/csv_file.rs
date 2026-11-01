@@ -5,10 +5,11 @@
 //! - The file is decoded with [`crate::encoding::DecodingReader`] (encoding from
 //!   [`CsvReadOptions::encoding`], `Auto` resolved with [`crate::encoding::resolve`] on the first
 //!   64 KiB; a BOM is removed) and parsed with the `csv` crate (`flexible(true)`, so ragged rows
-//!   reach the reader, which applies [`CsvReadOptions::allow_ragged`]). `\r\n`, `\n` and a
-//!   lone `\r` end rows whatever [`crate::LineEnding`] says (as built: the `csv` crate's CRLF
-//!   terminator is the only one that keeps a quoted field ending in `\r` intact; a lone `\r`
-//!   inside an *unquoted* field splits the row). Blank lines are skipped.
+//!   reach the reader, which applies [`CsvReadOptions::allow_ragged`]). `\n` and `\r\n` end
+//!   rows; with [`crate::LineEnding::Cr`] a lone `\r` does too, otherwise it is data (as built:
+//!   in a file with `\n` row ends, a quoted last field ending in `\r` loses that `\r`). Blank
+//!   lines are skipped. [`CsvReadOptions::trim`] also trims quoted fields (the parser does not
+//!   report quoting).
 //! - Quoted fields may hold the delimiter, quotes (doubled or escaped) and line ends. A
 //!   multi-line field is one value; row numbers count records, not lines.
 //! - Values matching [`CsvReadOptions::null_tokens`] are NULL. Other text is parsed as its

@@ -131,6 +131,11 @@ fn ragged_rows() {
             .any(|w| w.contains("do not have 3 fields"))
     );
     assert_eq!(all.column(2)[1], None);
+    // Row 2 lacks c, so c is nullable even though every c in the file has a value.
+    assert!(p.complete);
+    assert!(p.columns[2].nullable);
+    // 4 rows in batches of 2: the last batch carries the file size.
+    all.assert_progress();
     assert_eq!(all.issues.len(), 1);
     assert_eq!(all.issues[0].row, 3);
     assert_eq!(all.issues[0].column, None);
@@ -273,6 +278,92 @@ fn reading_options() {
     });
     let (_, all) = preview_and_read(&path, &o).unwrap();
     assert_eq!(all.column(1), some(&["\"a\""]));
+}
+
+#[test]
+fn line_ends_and_trimming() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+
+    // A lone CR in an unquoted field is data unless the line ending is `cr`.
+    let path = write(d, "lone_cr.csv", b"id,v,w\n1,ab\rcd,x\n2,e,f\n");
+    let (p, all) = preview_and_read(&path, &defaults()).unwrap();
+    assert_eq!(p.warnings.len(), 0, "{:?}", p.warnings);
+    assert_eq!(all.rows, 2);
+    assert_eq!(all.issues.len(), 0, "{:?}", all.issues);
+    assert_eq!(all.column(1), some(&["ab\rcd", "e"]));
+    assert_eq!(all.column(2), some(&["x", "f"]));
+
+    // CRLF row ends: the CR is not part of the last field; blank lines are skipped; a quoted
+    // CR (and CRLF) inside a field is kept.
+    let path = write(
+        d,
+        "crlf_blank.csv",
+        b"id,v,w\r\n1,a,\"x\r\"\r\n\r\n2,\"b\r\nc\",y\r\n",
+    );
+    let (p, all) = preview_and_read(&path, &defaults()).unwrap();
+    assert_eq!(p.columns[2].name, "w");
+    assert_eq!(all.rows, 2);
+    assert_eq!(all.column(1), some(&["a", "b\r\nc"]));
+    assert_eq!(all.column(2), some(&["x\r", "y"]));
+
+    // `cr`: a lone CR ends a row. Line numbers are unknown, so messages name rows only.
+    let cr = csv(CsvReadOptions {
+        line_ending: LineEnding::Cr,
+        ..CsvReadOptions::default()
+    });
+    let path = write(d, "cr_issue.csv", b"id,v\r1,a\rx,b\n3,c\r\n");
+    let specs = [
+        ColumnSpec::new("id", DataType::INT64),
+        ColumnSpec::new("v", DataType::Text),
+    ];
+    let all = read_all(&path, &cr, &specs, 10).unwrap();
+    assert_eq!(all.rows, 3);
+    assert_eq!(all.column(1), some(&["a", "b", "c"]));
+    assert_eq!(all.issues.len(), 1);
+    assert_eq!(all.issues[0].row, 2);
+    assert!(
+        !all.issues[0].message.contains("line"),
+        "{:?}",
+        all.issues[0]
+    );
+
+    // `trim` trims quoted fields too (documented: the parser does not report quoting).
+    let path = write(d, "trim_quoted.csv", b"a,b,c\n\"  x  \", y ,\tz\t\n");
+    let o = csv(CsvReadOptions {
+        trim: true,
+        ..CsvReadOptions::default()
+    });
+    let specs = ["a", "b", "c"].map(|n| ColumnSpec::new(n, DataType::Text));
+    let all = read_all(&path, &o, &specs, 10).unwrap();
+    assert_eq!(all.column(0), some(&["x"]));
+    assert_eq!(all.column(1), some(&["y"]));
+    assert_eq!(all.column(2), some(&["z"]));
+}
+
+#[test]
+fn sub_microsecond_text_is_a_row_issue() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write(
+        dir.path(),
+        "nanos.csv",
+        b"t,ts\n10:00:00.123456,2001-02-03 04:05:06.000001\n10:00:00.1234567,2001-02-03 04:05:06.0000001\n",
+    );
+    let specs = [
+        ColumnSpec::new("t", DataType::Time { precision: None }),
+        ColumnSpec::new("ts", DataType::Timestamp { precision: None }),
+    ];
+    let all = read_all(&path, &defaults(), &specs, 10).unwrap();
+    assert_eq!(all.issues.len(), 2, "{:?}", all.issues);
+    assert!(all.issues.iter().all(|i| i.row == 2));
+    assert!(
+        all.issues[0].message.contains("sub-microsecond"),
+        "{:?}",
+        all.issues[0]
+    );
+    assert_eq!(all.column(0)[0].as_deref(), Some("10:00:00.123456"));
+    assert_eq!(all.column(0)[1], None);
+    assert_eq!(all.column(1)[1], None);
 }
 
 #[test]
