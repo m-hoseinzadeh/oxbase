@@ -17,7 +17,13 @@ import type { CommandError } from "../../../connections/types";
 /** How often the status is read while a build runs. */
 export const CACHE_POLL_MS = 2000;
 /** Answers that report another cache state read the status again at most this often. */
-const NOTE_INTERVAL_MS = 2000;
+export const NOTE_INTERVAL_MS = 2000;
+/**
+ * How long after a query run the status is read again: a schema change made by the run
+ * reaches the cache within 2 s (docs/m6-contracts.md §8), and a new generation makes the
+ * editor diagnose again.
+ */
+export const RUN_SETTLE_MS = 2500;
 
 export interface SchemaCacheView {
   /** `null` before the first answer and without a connection. */
@@ -28,8 +34,13 @@ export interface SchemaCacheView {
   refreshing: boolean;
   /** Reads the catalog again (the whole database). */
   refresh(): void;
-  /** An insight answer reported `state`: read the status again if it differs. */
+  /**
+   * An insight answer reported `state`: read the status again if it differs (at once, or once
+   * the rate limit allows; a note is never lost).
+   */
   noteCacheState(state: CacheState): void;
+  /** A query run finished: read the status again once a schema change it made has landed. */
+  noteRunFinished(): void;
 }
 
 export function useSchemaCache(sessionId: string | null, database: string | null): SchemaCacheView {
@@ -42,6 +53,9 @@ export function useSchemaCache(sessionId: string | null, database: string | null
   const lastLoad = useRef(0);
   const known = useRef<CacheState | null>(null);
   known.current = status?.state ?? null;
+  /** Deferred status loads: one for rate-limited notes, one after query runs. */
+  const noteTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const runTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const load = useCallback(() => {
     if (sessionId === null) return;
@@ -68,6 +82,10 @@ export function useSchemaCache(sessionId: string | null, database: string | null
     load();
     return () => {
       generation.current += 1;
+      for (const timer of [noteTimer, runTimer]) {
+        if (timer.current !== null) clearTimeout(timer.current);
+        timer.current = null;
+      }
       const id = refreshId.current;
       refreshId.current = null;
       if (id) void cancelRequest(id).catch(() => {});
@@ -110,11 +128,29 @@ export function useSchemaCache(sessionId: string | null, database: string | null
   const noteCacheState = useCallback(
     (state: CacheState) => {
       if (state === known.current) return;
-      if (Date.now() - lastLoad.current < NOTE_INTERVAL_MS) return;
-      load();
+      const wait = lastLoad.current + NOTE_INTERVAL_MS - Date.now();
+      if (wait <= 0) {
+        load();
+        return;
+      }
+      // Too soon after the last load: load once the window ends (repeated notes coalesce).
+      if (noteTimer.current !== null) return;
+      noteTimer.current = setTimeout(() => {
+        noteTimer.current = null;
+        load();
+      }, wait);
     },
     [load],
   );
 
-  return { status, error, refreshing, refresh, noteCacheState };
+  const noteRunFinished = useCallback(() => {
+    if (sessionId === null) return;
+    if (runTimer.current !== null) clearTimeout(runTimer.current);
+    runTimer.current = setTimeout(() => {
+      runTimer.current = null;
+      load();
+    }, RUN_SETTLE_MS);
+  }, [sessionId, load]);
+
+  return { status, error, refreshing, refresh, noteCacheState, noteRunFinished };
 }

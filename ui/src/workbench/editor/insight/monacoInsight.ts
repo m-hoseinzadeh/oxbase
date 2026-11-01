@@ -22,10 +22,15 @@ const ENUMS: MonacoEnums = {
 const LANGUAGES = ["pgsql", "mysql", "sql"] as const;
 
 /**
- * Characters that open the list without a word typed: `.` (qualified names), the identifier
- * quotes, and a space (names after `FROM `, `JOIN `, `SELECT `; keywords are not offered there).
+ * Characters that open the list without a word typed (Monaco also asks on typing and on
+ * Ctrl+Space): `.` for qualified names, and the opening identifier quotes of each grammar's
+ * engines (`[` only for T-SQL / SQLite, where it never starts an array subscript).
  */
-export const TRIGGER_CHARACTERS = [".", " ", '"', "`", "["];
+export const TRIGGER_CHARACTERS: Readonly<Record<(typeof LANGUAGES)[number], string[]>> = {
+  pgsql: [".", '"'],
+  mysql: [".", "`"],
+  sql: [".", '"', "[", "`"],
+};
 
 const controllers = new Map<string, InsightController>();
 let registered = false;
@@ -39,15 +44,14 @@ function registerProviders() {
   registered = true;
   for (const language of LANGUAGES) {
     monaco.languages.registerCompletionItemProvider(language, {
-      triggerCharacters: TRIGGER_CHARACTERS,
-      provideCompletionItems: (model, position, context, token) => {
+      triggerCharacters: TRIGGER_CHARACTERS[language],
+      provideCompletionItems: (model, position, _context, token) => {
         const controller = controllerOf(model);
         if (!controller) return undefined;
         return controller.complete(
           model,
           position,
           token,
-          context.triggerCharacter,
         ) as unknown as Promise<monaco.languages.CompletionList>;
       },
     });

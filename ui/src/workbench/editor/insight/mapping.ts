@@ -144,26 +144,62 @@ export function toRange(model: ModelLike, range: Utf16Range, length?: number): R
 }
 
 /**
+ * Line / column positions of one text as it was when a request was sent (Monaco reads a
+ * completion's ranges against the text at the request's position, even when the user typed on
+ * meanwhile). Lines end at `\r\n`, `\r` or `\n`, as in Monaco; columns count UTF-16 units.
+ */
+export class TextPositions {
+  private readonly starts: number[] = [0];
+
+  constructor(readonly text: string) {
+    for (let i = 0; i < text.length; i += 1) {
+      const c = text.charCodeAt(i);
+      if (c === 13 && text.charCodeAt(i + 1) === 10) {
+        i += 1;
+        this.starts.push(i + 1);
+      } else if (c === 10 || c === 13) {
+        this.starts.push(i + 1);
+      }
+    }
+  }
+
+  /** The 1-based position of UTF-16 `offset` (clamped to the text). */
+  positionAt(offset: number): PositionLike {
+    const at = clamp(offset, this.text.length);
+    let lo = 0;
+    let hi = this.starts.length - 1;
+    while (lo < hi) {
+      const mid = (lo + hi + 1) >> 1;
+      if ((this.starts[mid] ?? 0) <= at) lo = mid;
+      else hi = mid - 1;
+    }
+    return { lineNumber: lo + 1, column: at - (this.starts[lo] ?? 0) + 1 };
+  }
+}
+
+/**
  * The insert / replace ranges of an item: Monaco needs both on the cursor's line, the insert
  * range ending at the cursor and the replace range containing it. A range from the core that
- * breaks those rules (it never should) falls back to an empty range at the cursor.
+ * breaks those rules (it never should) falls back to an empty range at the cursor. Also
+ * returns the item's start offset after that check.
  */
 function itemRanges(
-  model: ModelLike,
+  positions: TextPositions,
   range: Utf16Range,
   cursor: number,
-  length: number,
-): { insert: RangeLike; replace: RangeLike } {
+): { insert: RangeLike; replace: RangeLike; start: number } {
+  const length = positions.text.length;
   let start = clamp(range.start, length);
   let end = clamp(range.end, length);
   if (start > cursor || end < cursor) {
     start = cursor;
     end = cursor;
   }
-  const at = model.getPositionAt(cursor);
-  const from = model.getPositionAt(start);
-  const to = model.getPositionAt(end);
-  const fromCol = from.lineNumber === at.lineNumber ? from.column : at.column;
+  const at = positions.positionAt(cursor);
+  const from = positions.positionAt(start);
+  const to = positions.positionAt(end);
+  const sameLine = from.lineNumber === at.lineNumber;
+  const fromCol = sameLine ? from.column : at.column;
   const toCol = to.lineNumber === at.lineNumber ? to.column : at.column;
   const line = at.lineNumber;
   return {
@@ -174,30 +210,52 @@ function itemRanges(
       endColumn: at.column,
     },
     replace: { startLineNumber: line, startColumn: fromCol, endLineNumber: line, endColumn: toCol },
+    start: sameLine ? start : cursor,
   };
 }
 
-/** Monaco suggestions for `items`, answered for `cursor` (UTF-16) in `model`'s current text. */
+/** The characters that open a quoted identifier (the core's word then starts with one). */
+const OPENING_QUOTES = ['"', "`", "["];
+
+/**
+ * The text Monaco filters an item by. Monaco matches the text from the item's range start to
+ * the cursor against `filterText` (else the label); when that text starts with an identifier
+ * quote the name lacks (`"cu` against `customers`), nothing would match, so the quote is put
+ * in front of the name.
+ */
+function filterTextOf(item: CompletionItem, typed: string): string | undefined {
+  const name = item.filterText || item.label;
+  const quote = typed.charAt(0);
+  if (OPENING_QUOTES.includes(quote) && !name.startsWith(quote)) return quote + name;
+  return item.filterText || undefined;
+}
+
+/**
+ * Monaco suggestions for `items`, answered for `cursor` (UTF-16) in `text`, the text the
+ * request was sent with (a `string`, or its {@link TextPositions} when already built).
+ */
 export function toSuggestions(
   items: CompletionItem[],
-  model: ModelLike,
+  text: string | TextPositions,
   cursor: number,
   enums: MonacoEnums,
 ): SuggestionLike[] {
-  const length = model.getValue().length;
+  const positions = typeof text === "string" ? new TextPositions(text) : text;
   return items.map((item) => {
+    const { insert, replace, start } = itemRanges(positions, item.range, cursor);
     const suggestion: SuggestionLike = {
       label: item.detail ? { label: item.label, description: item.detail } : item.label,
       kind: completionKind(item.kind, enums),
       insertText: item.insertText,
       sortText: item.sortText,
-      range: itemRanges(model, item.range, cursor, length),
+      range: { insert, replace },
     };
     if (item.isSnippet)
       suggestion.insertTextRules = enums.CompletionItemInsertTextRule.InsertAsSnippet;
     if (item.detail) suggestion.detail = item.detail;
     if (item.documentation) suggestion.documentation = { value: item.documentation };
-    if (item.filterText) suggestion.filterText = item.filterText;
+    const filterText = filterTextOf(item, positions.text.slice(start, cursor));
+    if (filterText) suggestion.filterText = filterText;
     return suggestion;
   });
 }

@@ -5,8 +5,9 @@
  * - **Completion** has no debounce: Monaco asks on typing, on the trigger characters and on
  *   Ctrl+Space. Every request gets the next `seq` of the editor and a request id; when Monaco
  *   cancels its token the request is cancelled in the core (`cancel_request`), and an answer
- *   that is superseded (by the core or by a newer request) or that arrives after the text
- *   changed is dropped.
+ *   that is superseded (by the core or by a newer request) is dropped. An answer that arrives
+ *   after the user typed on is kept: its ranges are mapped against the text the request was
+ *   sent with, which is how Monaco reads them, and Monaco filters it by what was typed since.
  * - **Diagnostics** run {@link DIAGNOSE_DEBOUNCE_MS} after the last edit and when the target
  *   (engine, connection, database, cache generation) changes; markers cover the whole
  *   document and are replaced by each answer, cleared when there is none.
@@ -188,21 +189,16 @@ export class InsightController {
     this.options.onCacheState?.(state);
   }
 
-  /**
-   * Monaco's `provideCompletionItems`. `trigger` is the trigger character: after a space only
-   * names are offered (no keyword or snippet list pops up between words).
-   */
+  /** Monaco's `provideCompletionItems`. */
   async complete(
     model: ModelLike,
     position: PositionLike,
     token: CancellationLike,
-    trigger?: string,
   ): Promise<{ suggestions: SuggestionLike[]; incomplete: boolean }> {
     const target = this.options.target();
     if (!target || this.disposed || token.isCancellationRequested) return EMPTY_LIST;
     const text = model.getValue();
     const offset = model.getOffsetAt(position);
-    const version = model.getVersionId();
     const seq = this.sequencer.next(this.editorId, "complete");
     const requestId = this.api.newRequestId();
     let pending = true;
@@ -221,19 +217,14 @@ export class InsightController {
       if (
         this.disposed ||
         token.isCancellationRequested ||
-        this.sequencer.isStale(this.editorId, "complete", response) ||
-        model.getVersionId() !== version
+        this.sequencer.isStale(this.editorId, "complete", response)
       ) {
         this.stats.droppedCompletions += 1;
         // Monaco asks again as the user goes on typing.
         return { suggestions: [], incomplete: true };
       }
-      const items =
-        trigger === " "
-          ? response.items.filter((i) => i.kind !== "keyword" && i.kind !== "snippet")
-          : response.items;
       return {
-        suggestions: toSuggestions(items, model, offset, this.options.enums),
+        suggestions: toSuggestions(response.items, text, offset, this.options.enums),
         incomplete: response.incomplete,
       };
     } catch {

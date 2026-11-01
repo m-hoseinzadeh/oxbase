@@ -178,7 +178,11 @@ export function QueryEditorPanel({
         (event) => {
           if (seq !== runSeq.current) return;
           dispatch({ type: "event", event });
-          if (isTerminalEvent(event)) notifyHistoryChanged();
+          if (isTerminalEvent(event)) {
+            notifyHistoryChanged();
+            // A schema change the run made bumps the cache generation: read the status again.
+            cache.noteRunFinished();
+          }
         },
         database ? { database } : undefined,
       );

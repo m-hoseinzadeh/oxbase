@@ -194,19 +194,33 @@ describe("completion", () => {
     expect(c.stats.droppedCompletions).toBe(1);
   });
 
-  it("drops answers the core marks superseded or that arrive after the text changed", async () => {
+  it("drops answers the core marks superseded", async () => {
     const c = controller();
     const superseded = c.complete(model, { lineNumber: 1, column: 17 }, new FakeToken());
     await flush();
     answerNext("insight_complete", completion(1, [], { superseded: true }));
     expect(await superseded).toEqual({ suggestions: [], incomplete: true });
+    expect(c.stats.droppedCompletions).toBe(1);
+  });
 
-    const edited = c.complete(model, { lineNumber: 1, column: 17 }, new FakeToken());
+  it("keeps an answer that arrives after the user typed on, ranged in the request's text", async () => {
+    const c = controller();
+    model.setValue("SELECT 1;\nSELECT * FROM cu");
+    const edited = c.complete(model, { lineNumber: 2, column: 17 }, new FakeToken());
     await flush();
-    model.setValue("SELECT * FROM cus");
-    answerNext("insight_complete", completion(2, [item("customers", "table", 14, 16)]));
-    expect(await edited).toEqual({ suggestions: [], incomplete: true });
-    expect(c.stats.droppedCompletions).toBe(2);
+    // Typing goes on while the core answers; Monaco filters the list by what was typed since.
+    model.setValue("SELECT 1;\nSELECT * FROM cust");
+    answerNext("insight_complete", completion(1, [item("customers", "table", 24, 26)]));
+    const list = await edited;
+    expect(list.suggestions.map((s) => s.insertText)).toEqual(["customers"]);
+    // Monaco reads the range against the text at the request's position (column 17).
+    expect(list.suggestions[0]?.range.insert).toEqual({
+      startLineNumber: 2,
+      startColumn: 15,
+      endLineNumber: 2,
+      endColumn: 17,
+    });
+    expect(c.stats.droppedCompletions).toBe(0);
   });
 
   it("cancels the core request when Monaco cancels its token", async () => {
@@ -223,21 +237,31 @@ describe("completion", () => {
     expect((await result).suggestions).toEqual([]);
   });
 
-  it("offers only names after a space and nothing without an engine or on errors", async () => {
+  it("passes every kind and the core's incomplete flag through", async () => {
     const c = controller();
-    model.setValue("SELECT * FROM ");
-    const spaced = c.complete(model, { lineNumber: 1, column: 15 }, new FakeToken(), " ");
+    model.setValue("SELECT * FROM t WHERE a = 1 A");
+    const result = c.complete(model, { lineNumber: 1, column: 30 }, new FakeToken());
     await flush();
     answerNext(
       "insight_complete",
-      completion(1, [
-        item("customers", "table", 14, 14),
-        item("WHERE", "keyword", 14, 14),
-        item("sel", "snippet", 14, 14),
-      ]),
+      completion(
+        1,
+        [
+          item("AND", "keyword", 28, 29),
+          item("ABS", "function", 28, 29),
+          item("amount", "column", 28, 29),
+        ],
+        { incomplete: false },
+      ),
     );
-    expect((await spaced).suggestions.map((s) => s.insertText)).toEqual(["customers"]);
+    const list = await result;
+    expect(list.suggestions.map((s) => s.insertText)).toEqual(["AND", "ABS($0)", "amount"]);
+    expect(list.incomplete).toBe(false);
+  });
 
+  it("offers nothing without an engine or on errors", async () => {
+    const c = controller();
+    model.setValue("SELECT * FROM ");
     const failing = c.complete(model, { lineNumber: 1, column: 15 }, new FakeToken());
     await flush();
     failNext("insight_complete", { category: "internal", message: "boom" });

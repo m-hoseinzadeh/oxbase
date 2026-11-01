@@ -3,7 +3,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { CacheStatus } from "../../../api";
 import { tauriCore } from "../../../test/tauriMock";
 import { SchemaCacheIndicator } from "./SchemaCacheIndicator";
-import { CACHE_POLL_MS, useSchemaCache } from "./useSchemaCache";
+import {
+  CACHE_POLL_MS,
+  NOTE_INTERVAL_MS,
+  RUN_SETTLE_MS,
+  type SchemaCacheView,
+  useSchemaCache,
+} from "./useSchemaCache";
 
 vi.mock("@tauri-apps/api/core", async () => (await import("../../../test/tauriMock")).tauriCore);
 
@@ -27,6 +33,15 @@ function status(extra: Partial<CacheStatus> = {}): CacheStatus {
 
 function Harness({ sessionId }: { sessionId: string | null }) {
   const view = useSchemaCache(sessionId, "shop");
+  return <SchemaCacheIndicator view={view} connected={sessionId !== null} />;
+}
+
+/** Hands the hook's view to the test (to call `noteCacheState` / `noteRunFinished`). */
+let lastView: SchemaCacheView | null = null;
+
+function ViewHarness({ sessionId }: { sessionId: string | null }) {
+  const view = useSchemaCache(sessionId, "shop");
+  lastView = view;
   return <SchemaCacheIndicator view={view} connected={sessionId !== null} />;
 }
 
@@ -127,5 +142,57 @@ describe("schema cache indicator", () => {
     const indicator = screen.getByTestId("schema-cache-status");
     expect(indicator).toHaveTextContent("Schema: failed");
     expect(indicator.getAttribute("title")).toContain("Last error: denied");
+  });
+  it("loads the status after a state note that came too soon after the last load", async () => {
+    vi.useFakeTimers();
+    // Mount: the cache is missing and no build runs yet (no polling).
+    tauriCore.invoke.mockResolvedValueOnce(
+      status({ state: "missing", building: false, relationCount: 0 }),
+    );
+    render(<ViewHarness sessionId="s-1" />);
+    await settle();
+    expect(screen.getByTestId("schema-cache-status")).toHaveTextContent("Schema: not loaded");
+    // A quick build finished: the next answer reports `ready` within the rate-limit window.
+    tauriCore.invoke.mockResolvedValue(status({ relationCount: 4 }));
+    act(() => {
+      lastView?.noteCacheState("ready");
+      lastView?.noteCacheState("ready");
+    });
+    await settle();
+    expect(calls("schema_cache_status")).toHaveLength(1);
+    await act(async () => {
+      vi.advanceTimersByTime(NOTE_INTERVAL_MS);
+    });
+    await settle();
+    // One deferred load for both notes, and the indicator caught up.
+    expect(calls("schema_cache_status")).toHaveLength(2);
+    expect(screen.getByTestId("schema-cache-status")).toHaveTextContent("Schema: 4 tables");
+    // The same state again reads nothing.
+    act(() => lastView?.noteCacheState("ready"));
+    await act(async () => {
+      vi.advanceTimersByTime(NOTE_INTERVAL_MS * 2);
+    });
+    await settle();
+    expect(calls("schema_cache_status")).toHaveLength(2);
+  });
+
+  it("reads the status again after a query run (a new generation after DDL)", async () => {
+    vi.useFakeTimers();
+    tauriCore.invoke.mockResolvedValueOnce(status({ generation: 7 }));
+    render(<ViewHarness sessionId="s-1" />);
+    await settle();
+    expect(lastView?.status?.generation).toBe(7);
+    tauriCore.invoke.mockResolvedValueOnce(status({ generation: 8, relationCount: 1205 }));
+    act(() => lastView?.noteRunFinished());
+    await act(async () => {
+      vi.advanceTimersByTime(RUN_SETTLE_MS - 1);
+    });
+    expect(calls("schema_cache_status")).toHaveLength(1);
+    await act(async () => {
+      vi.advanceTimersByTime(1);
+    });
+    await settle();
+    expect(calls("schema_cache_status")).toHaveLength(2);
+    expect(lastView?.status?.generation).toBe(8);
   });
 });
