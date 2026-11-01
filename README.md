@@ -353,9 +353,10 @@ file). CI sets `OXBASE_CONFORMANCE_REQUIRE_M4=1`: the 5-engine guard reported no
 
 ### Import and export (M5)
 
-Last verified 2026-11-01 in the M5 integration runs (full-lane run 41328475066 on
-`milestone/m5` at 2434d20 for the numbers below; fast-lane run 41327526129 on the same commit
-had the same results).
+Last verified 2026-11-01 in the M5 integration runs: the numbers below are from the full-lane
+CI run 41330355496 on `milestone/m5` at a424690 (green; its Conformance job passed on the second
+attempt after the SQL Server container stopped at startup on the first, see
+`scripts/ci-fixtures.sh`) and Bundle run 41330357469 on the same commit (green).
 
 The exit check, job **Import perf (1 GB CSV)** (`crates/oxbase-services/tests/import_perf.rs`,
 `--profile perf`): a generated CSV of 10 000 000 rows and 9 columns (integers, text with
@@ -365,8 +366,8 @@ commit every 100 000 rows:
 
 | Engine | Method | Time | Rows/s | MB/s | Progress events (max gap) | Peak RSS growth | Checksum | Cancel at ~25% |
 |---|---|---|---|---|---|---|---|---|
-| PostgreSQL 18.6 | `COPY` (text) | 60.7 s | 164 742 | 20.4 | 214 (498 ms / 1.07% of the file) | 22 MiB | equal | `Cancelled` 1 ms after the call; 2 600 000 committed rows in the table, as reported |
-| MySQL 8.4.13 | multi-row `INSERT` | 91.9 s | 108 845 | 13.5 | 404 (295 ms / 0.58%) | 87 MiB | equal | `Cancelled` after 152 ms; 2 500 000 committed rows in the table, as reported |
+| PostgreSQL 18.6 | `COPY` (text) | 66.7 s | 149 992 | 18.6 | 224 (501 ms / 1.07% of the file) | 24 MiB | equal | `Cancelled` 0 ms after the call; 2 600 000 committed rows in the table, as reported |
+| MySQL 8.4.13 | multi-row `INSERT` | 106.0 s | 94 316 | 11.7 | 517 (286 ms / 0.58%) | 94 MiB | equal | `Cancelled` after 169 ms; 2 500 000 committed rows in the table, as reported |
 
 Limits asserted: progress at most 1.5 s or 1% of the file apart (never over 10 s), RSS growth
 under 512 MiB, cancel within 2 s, and a 20 000-row probe import read back column by column
@@ -374,9 +375,10 @@ before the big run. The checksum (count, sums of `id`, `qty`, amount in cents, c
 of the notes) matched on both engines.
 
 Bulk loaders (`bulk_live.rs`, 100 000 rows of every canonical type, read back equal; debug
-build): PostgreSQL `COPY` 0.64 s, MySQL 2.38 s, MariaDB 1.16 s, SQLite 1.20 s, SQL Server
-13.96 s (parameterized multi-row inserts with typed parameters; no TDS bulk load yet, see
-`docs/m5-contracts.md` §13). Each loader also passes cancel mid-call (rolled back, nothing left)
+build): PostgreSQL `COPY` 0.85 s, MySQL 3.29 s, MariaDB 1.57 s, SQLite 1.60 s, SQL Server
+20.44 s (parameterized multi-row inserts with typed parameters; no TDS bulk load yet, see
+`docs/m5-contracts.md` §13; an import plan into SQL Server says to expect about 4 000 to 7 000
+rows per second). Each loader also passes cancel mid-call (rolled back, nothing left)
 and duplicate-key failure.
 
 Round trips (`oxbase-services` import and export live tests, `OXBASE_SERVICES_REQUIRE_M5_IO=1`):

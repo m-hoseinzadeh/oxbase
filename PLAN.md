@@ -357,31 +357,45 @@ streams (read, write, load, services, app, perf) fill the skeletons.
 
 **M5 as built (notes, 2026-11-01).** The exit check passed in the CI job `import-perf` (Linux,
 `--profile perf`, PostgreSQL and MySQL fixtures, `OXBASE_REQUIRE_M5_PERF=1`; full-lane run
-41328475066 on `milestone/m5` at 2434d20): a generated 1 238 093 427-byte CSV of 10 000 000 rows
-was imported into PostgreSQL 18.6 with `COPY` in 60.7 s (164 742 rows/s, 20.4 MB/s, 22 MiB peak
-RSS growth) and into MySQL 8.4.13 with multi-row inserts in 91.9 s (108 845 rows/s, 13.5 MB/s,
-87 MiB), the checksum matched on both, progress events were at most 498 ms apart, and a cancel
-at about 25% ended the import 1 ms / 152 ms after the call with exactly the committed rows (2.6
-/ 2.5 million) left, as the report said. "Export of any result or table": the services live
+41330355496 on `milestone/m5` at a424690, green): a generated 1 238 093 427-byte CSV of
+10 000 000 rows was imported into PostgreSQL 18.6 with `COPY` in 66.7 s (149 992 rows/s,
+18.6 MB/s, 24 MiB peak RSS growth) and into MySQL 8.4.13 with multi-row inserts in 106.0 s
+(94 316 rows/s, 11.7 MB/s, 94 MiB), the checksum matched on both, progress events were at most
+501 ms apart, and a cancel at about 25% ended the import 0 ms / 169 ms after the call with
+exactly the committed rows (2.6 / 2.5 million) left, as the report said. "Export of any result or table": the services live
 tests export a filtered and sorted table, a query and a 300 000-row spilled result, and round-trip
 a table through CSV, JSON, XLSX and Parquet on all five SQL engines (SQL dumps run back on
 PostgreSQL and SQLite, and each engine's own dump on PostgreSQL, MySQL, MariaDB and SQL Server
 in `oxbase-io`'s live test); the webview smoke test imports a CSV and exports a result grid's
 query through the app (debug-only `--e2e-file-dir` hook, required with
 `OXBASE_E2E_REQUIRE_M5=1`). All five SQL engines register a native `BulkLoader` (unit-tested).
-The full CI lane (Rust tests: 949 passed on Linux and macOS, 948 on Windows; OS keychain tests on
-all three; webview smoke; import-perf) and the Bundle workflow (Linux x86_64, macOS aarch64 and
-x86_64, Windows x86_64, run 41328476718) passed; that conformance run failed once on a SQLite
-cancel test that expected its own rollback to succeed after SQLite had already rolled the
-interrupted transaction back (test fixed). Where the build differs from the text above or from
+The full CI lane of that run (Rust tests: 949 passed on Linux and macOS, 948 on Windows; OS
+keychain tests on all three; webview smoke; import-perf; conformance) and the Bundle workflow
+(Linux x86_64, macOS aarch64 and x86_64, Windows x86_64, run 41330357469) passed. Its
+conformance job passed on the second attempt: on the first the SQL Server container stopped at
+startup ("Failed to load LSA: 0xc0070102"), an infrastructure flake that
+`scripts/ci-fixtures.sh` now retries. The run before (41328475066 at 2434d20) had failed on a
+SQLite cancel test that expected its own rollback to succeed after SQLite had already rolled
+the interrupted transaction back (test fixed). Where the build differs from the text above or from
 `docs/m5-contracts.md` (its §13 lists every deviation):
 
 - SQL Server loads with typed, parameterized multi-row `INSERT`s (2 098 parameters, 1 000 rows
-  per statement; about 7 000 rows/s for 100 000 rows of every type in a debug build), not TDS
+  per statement; about 4 900 rows/s for 100 000 rows of every type in a debug build), not TDS
   bulk load: tiberius needs exact per-column wire types and a half-sent bulk stream cannot be
-  cancelled in-band. SQLite also uses multi-row inserts (32 766 parameters).
-- SQLite `decimal` columns of tables the import creates get `NUMERIC` affinity, which keeps
-  about 15 significant digits; mapping them to `TEXT` is still open.
+  cancelled in-band. Accepted for M5 by the integration step (no separate Design review); every
+  SQL Server import plan warns to expect about 4 000 to 7 000 rows per second
+  (`BulkLoader::plan_notes`). SQLite also uses multi-row inserts (32 766 parameters).
+- SQLite decimals: a table the import creates (and a SQL dump's `CREATE`, with
+  `DdlContext::exact_values`) declares a `decimal` column of more than 15 digits, or of unknown
+  precision, `DECIMAL_TEXT(p,s)`, which has `TEXT` affinity and keeps every digit (it compares
+  and sorts as text; the plan says so); SQLite dumps quote decimals. Appending into an existing
+  `DECIMAL` / `NUMERIC` column (about 15 significant digits) gets a plan warning.
+- SQL dumps set their session first (`Quoting::dump_session`): PostgreSQL
+  `SET standard_conforming_strings = on`; MySQL / MariaDB `sql_mode` without
+  `NO_BACKSLASH_ESCAPES` and `SET NAMES utf8mb4`, restored at the end. Date-time spellings and
+  identity inserts are `Quoting` methods too, so the dump writer has no engine special case.
+  Exported files get the usual Unix mode (`0666` less the umask; a replaced file keeps its
+  mode).
 - The import sends a heartbeat `progress` event during a slow load call, commit or read (the
   first PostgreSQL run had 2 s gaps during commits). Text that is a plain number (SQL Server
   decimals and unconstrained PostgreSQL `numeric` arrive as text) never gets the formula guard.

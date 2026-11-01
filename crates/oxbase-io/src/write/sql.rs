@@ -1,21 +1,23 @@
 //! The SQL dump writer (rules: [`crate::sql_dump`] module docs).
 //!
 //! Every identifier goes through the target's `Quoting` and every value through
-//! `Quoting::literal` (the target dialect's escaping); `CREATE` / `DROP` come from the target's
-//! `DdlGenerator`. The only engine knowledge here is what the contract names: SQL Server's
-//! `SET IDENTITY_INSERT` around inserts into an identity column, and PostgreSQL's
-//! `OVERRIDING SYSTEM VALUE` for `GENERATED ALWAYS` identity columns (without it the server
-//! refuses the dump's values).
+//! `Quoting::dump_literal` (the target dialect's escaping, and the date-time forms its server
+//! reads); `CREATE` / `DROP` come from the target's `DdlGenerator` (with
+//! `DdlContext::exact_values`). Session statements around the dump
+//! (`Quoting::dump_session`: PostgreSQL `standard_conforming_strings`, MySQL / MariaDB
+//! `sql_mode`, character set and time zone) and explicit identity values
+//! (`Quoting::dump_identity_insert`: SQL Server `SET IDENTITY_INSERT`, PostgreSQL
+//! `OVERRIDING SYSTEM VALUE`) are the dialect's too, so nothing here depends on the engine.
 
-use std::fmt::Write as _;
 use std::io::{BufWriter, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use arrow_array::{Array, RecordBatch};
 use arrow_schema::{DataType as ArrowType, Schema};
-use chrono::{NaiveDateTime, NaiveTime, Timelike};
-use oxbase_dialect::{BulkLimits, DdlContext, DdlGenerator, DialectRegistry, DmlTarget, Quoting};
+use oxbase_dialect::{
+    BulkLimits, DdlContext, DdlGenerator, DialectRegistry, DmlTarget, DumpLiteral, Quoting,
+};
 use oxbase_types::{
     ColumnDef, ColumnValue, DataType, Engine, Error, ErrorCategory, Extras, KeyKind, ObjectDef,
     ObjectKind, ObjectRef, Result, RowEdit, RowKey, Script, ServerVersion, TableDef, Value,
@@ -26,96 +28,26 @@ use super::{Count, Tally, already_failed, io_error, plural};
 use crate::sql_dump::default_version;
 use crate::{SinkFile, SinkReport, SinkWriter, SqlDumpOptions, WriteContext, logical_type};
 
-/// How date-time literals are spelled for the target.
-///
-/// `Quoting::literal` writes them with chrono's `Display` (up to 9 fractional digits, and an
-/// offset on timestamps with a zone), which not every target reads:
-/// - **SQL Server** refuses more than 3 fractional digits in a string converted to `datetime`
-///   (the driver reads `datetime` ticks as `…00:00.003333`) and more than 7 for any type, and
-///   reads `yyyy-mm-dd` per `DATEFORMAT` for `datetime`. Timestamps without a zone are written
-///   as `CAST(N'yyyy-mm-ddThh:mm:ss.fffffff' AS datetime2(7))`, which every date-time column
-///   type takes (rounded to its own precision); times and timestamps with a zone keep at most
-///   7 fractional digits.
-/// - **MySQL / MariaDB** do not read an offset in a date-time literal (MariaDB never, MySQL
-///   before 8.0.19), and a `TIMESTAMP` column reads the text in the session's time zone.
-///   Timestamps with a zone are written as their UTC wall-clock time without an offset, and the
-///   dump sets `time_zone = '+00:00'` for its statements; at most 6 fractional digits.
-/// - Everything else: `Quoting::literal` as it is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Temporal {
-    Standard,
-    MySql,
-    MsSql,
-}
-
-impl Temporal {
-    fn for_engine(engine: Engine) -> Self {
-        match engine {
-            Engine::MySql | Engine::MariaDb => Self::MySql,
-            Engine::MsSql => Self::MsSql,
-            _ => Self::Standard,
-        }
-    }
-
-    /// Fractional-second digits the target keeps (`None`: no limit applied here).
-    fn digits(self) -> Option<u32> {
-        match self {
-            Self::Standard => None,
-            Self::MySql => Some(6),
-            Self::MsSql => Some(7),
-        }
-    }
-}
-
-/// Appends `.` and the first `digits` fractional digits of `nanos` without trailing zeros
-/// (nothing for a whole second). `true` when non-zero digits were dropped.
-fn push_fraction(nanos: u32, digits: u32, out: &mut String) -> bool {
-    // A leap second carries nanos >= 10^9; it is written as the last instant of the second.
-    let nanos = nanos.min(999_999_999);
-    let scale = 10_u32.pow(9 - digits);
-    let kept = nanos / scale;
-    if kept > 0 {
-        let width = usize::try_from(digits).unwrap_or(9);
-        let mut text = format!("{kept:0width$}");
-        while text.ends_with('0') {
-            text.pop();
-        }
-        out.push('.');
-        out.push_str(&text);
-    }
-    !nanos.is_multiple_of(scale)
-}
-
-/// `yyyy-mm-dd<sep>hh:mm:ss[.f…]` with at most `digits` fractional digits; `true` when digits
-/// were dropped.
-fn push_datetime(t: &NaiveDateTime, sep: char, digits: u32, out: &mut String) -> bool {
-    let _ = write!(out, "{}{sep}{}", t.format("%Y-%m-%d"), t.format("%H:%M:%S"));
-    push_fraction(t.nanosecond(), digits, out)
-}
-
-/// `hh:mm:ss[.f…]` with at most `digits` fractional digits; `true` when digits were dropped.
-fn push_time(t: NaiveTime, digits: u32, out: &mut String) -> bool {
-    let _ = write!(out, "{}", t.format("%H:%M:%S"));
-    push_fraction(t.nanosecond(), digits, out)
-}
-
 struct SqlSink {
     out: BufWriter<Tally>,
     bytes: Arc<AtomicU64>,
     quoting: Arc<dyn Quoting>,
     forms: TextForms,
-    temporal: Temporal,
     /// Date-time values that had more fractional digits than the target keeps.
     cut_fractions: Count,
-    /// Statements written after the inserts (MySQL: the session time zone restored).
+    /// The fractional digits the target kept (from `DumpLiteral::cut_to`).
+    kept_digits: u32,
+    /// Statements written after the inserts (`Quoting::dump_session`).
     epilogue: String,
     /// Batch columns written, in order (generated columns of a same-engine table are left out).
     written: Vec<usize>,
     columns: usize,
-    /// `INSERT INTO <table> (<columns>)[ OVERRIDING SYSTEM VALUE] VALUES`.
+    /// `INSERT INTO <table> (<columns>)[ <overriding>] VALUES`.
     insert: String,
-    /// `SET IDENTITY_INSERT <table>` (SQL Server identity columns), else `None`.
-    identity_insert: Option<String>,
+    /// Statements before the first and after the last `INSERT` when identity values are
+    /// written (`Quoting::dump_identity_insert`).
+    identity_enable: Option<String>,
+    identity_disable: Option<String>,
     identity_on: bool,
     rows_per_insert: usize,
     /// Rows of the open `INSERT` statement.
@@ -413,7 +345,8 @@ pub(crate) fn writer(
         _ => default_version(target)
             .ok_or_else(|| Error::unsupported(format!("{engine} has no SQL dump")))?,
     };
-    let ctx = DdlContext::new(&version);
+    // The dump's table is made for the exported values: declarations that keep them exactly.
+    let ctx = DdlContext::new(&version).with_exact_values();
     let schema = normalized_schema(schema);
 
     let mut notes = Vec::new();
@@ -502,39 +435,36 @@ pub(crate) fn writer(
         insert.push_str(&quoting.quote_ident(schema.field(i).name()));
     }
     insert.push(')');
-    if target == Engine::Postgres
-        && written_defs
-            .iter()
-            .any(|c| c.identity.as_ref().is_some_and(|i| i.always))
-    {
-        insert.push_str(" OVERRIDING SYSTEM VALUE");
+    let identity = quoting.dump_identity_insert(&qualified, &written_defs);
+    if let Some(overriding) = &identity.overriding {
+        insert.push(' ');
+        insert.push_str(overriding);
     }
     insert.push_str(" VALUES\n");
-    let identity_insert = (target == Engine::MsSql
-        && written_defs
-            .iter()
-            .any(|c| c.identity.is_some() || c.auto_increment))
-    .then(|| format!("SET IDENTITY_INSERT {qualified}"));
 
-    let temporal = Temporal::for_engine(target);
     let mut head = comment("Oxbase SQL dump");
     head.push_str(&comment(&format!("Target: {engine} {version}")));
     for note in &notes {
         head.push_str(&comment(note));
     }
     head.push('\n');
-    // MySQL / MariaDB: timestamps with a zone are written as UTC wall-clock times, which a
-    // `TIMESTAMP` column reads in the session's time zone.
+    let zoned = !written.is_empty()
+        && schema
+            .fields()
+            .iter()
+            .any(|f| matches!(f.data_type(), ArrowType::Timestamp(_, Some(_))));
+    let session = quoting.dump_session(zoned);
+    if !session.prologue.is_empty() {
+        for statement in &session.prologue {
+            head.push_str(statement);
+            head.push_str(";\n");
+        }
+        head.push('\n');
+    }
     let mut epilogue = String::new();
-    let zoned = schema
-        .fields()
-        .iter()
-        .any(|f| matches!(f.data_type(), ArrowType::Timestamp(_, Some(_))));
-    if temporal == Temporal::MySql && zoned && !written.is_empty() {
-        head.push_str(
-            "SET @oxbase_time_zone = @@session.time_zone;\nSET time_zone = '+00:00';\n\n",
-        );
-        epilogue.push_str("SET time_zone = @oxbase_time_zone;\n");
+    for statement in &session.epilogue {
+        epilogue.push_str(statement);
+        epilogue.push_str(";\n");
     }
     if !sql.is_empty() {
         head.push_str(&sql);
@@ -554,13 +484,14 @@ pub(crate) fn writer(
         bytes,
         quoting,
         forms: TextForms::default(),
-        temporal,
         cut_fractions: Count::default(),
+        kept_digits: 9,
         epilogue,
         written,
         columns: schema.fields().len(),
         insert,
-        identity_insert,
+        identity_enable: identity.enable,
+        identity_disable: identity.disable,
         identity_on: false,
         rows_per_insert,
         open: 0,
@@ -572,10 +503,9 @@ pub(crate) fn writer(
 }
 
 impl SqlSink {
-    /// The literal of cell `row` of `array`: `Quoting::literal` of `cell_value`, or of the
-    /// value's text for Arrow types `cell_value` does not cover; date-time values as
-    /// [`Temporal`] says. The flag is `true` when fractional digits were dropped.
-    fn literal(&self, array: &dyn Array, row: usize) -> Result<(String, bool)> {
+    /// The literal of cell `row` of `array`: `Quoting::dump_literal` of `cell_value`, or of the
+    /// value's text for Arrow types `cell_value` does not cover.
+    fn literal(&self, array: &dyn Array, row: usize) -> Result<DumpLiteral> {
         let value = match oxbase_driver::cell_value(array, row) {
             Ok(v) => v,
             Err(Error::Unsupported { .. }) => {
@@ -585,42 +515,7 @@ impl SqlSink {
             }
             Err(e) => return Err(e),
         };
-        Ok(self
-            .temporal_literal(&value)
-            .unwrap_or_else(|| (self.quoting.literal(&value), false)))
-    }
-
-    /// The target's spelling of a date-time `value` ([`Temporal`]) and whether fractional
-    /// digits were dropped; `None` when `Quoting::literal` is right.
-    fn temporal_literal(&self, value: &Value) -> Option<(String, bool)> {
-        let digits = self.temporal.digits()?;
-        let mut text = String::new();
-        let (cut, cast) = match (self.temporal, value) {
-            (Temporal::MsSql, Value::Timestamp(t)) => {
-                (push_datetime(t, 'T', digits, &mut text), true)
-            }
-            (Temporal::MsSql, Value::TimestampTz(t)) => {
-                let cut = push_datetime(&t.naive_local(), 'T', digits, &mut text);
-                text.push_str(&t.offset().to_string());
-                (cut, false)
-            }
-            (Temporal::MySql, Value::Timestamp(t)) => {
-                (push_datetime(t, ' ', digits, &mut text), false)
-            }
-            // The UTC wall-clock time; the dump runs with `time_zone = '+00:00'`.
-            (Temporal::MySql, Value::TimestampTz(t)) => {
-                (push_datetime(&t.naive_utc(), ' ', digits, &mut text), false)
-            }
-            (_, Value::Time(t)) => (push_time(*t, digits, &mut text), false),
-            _ => return None,
-        };
-        let quoted = self.quoting.quote_str(&text);
-        let literal = if cast {
-            format!("CAST({quoted} AS datetime2(7))")
-        } else {
-            quoted
-        };
-        Some((literal, cut))
+        Ok(self.quoting.dump_literal(&value))
     }
 
     fn write_batch(&mut self, batch: &RecordBatch) -> Result<()> {
@@ -640,11 +535,11 @@ impl SqlSink {
             let mut line = std::mem::take(&mut self.line);
             line.clear();
             if self.open == 0 {
-                if let Some(set) = &self.identity_insert
+                if let Some(enable) = &self.identity_enable
                     && !self.identity_on
                 {
-                    line.push_str(set);
-                    line.push_str(" ON;\n");
+                    line.push_str(enable);
+                    line.push_str(";\n");
                     self.identity_on = true;
                 }
                 line.push_str(&self.insert);
@@ -660,11 +555,12 @@ impl SqlSink {
                 if null_at(column.as_ref(), row) {
                     line.push_str("NULL");
                 } else {
-                    let (literal, cut) = self.literal(column.as_ref(), row)?;
-                    if cut {
+                    let literal = self.literal(column.as_ref(), row)?;
+                    if let Some(digits) = literal.cut_to {
                         self.cut_fractions.add();
+                        self.kept_digits = digits;
                     }
-                    line.push_str(&literal);
+                    line.push_str(&literal.sql);
                 }
             }
             line.push(')');
@@ -710,11 +606,11 @@ impl SinkWriter for SqlSink {
         if this.open > 0 {
             tail.push_str(";\n");
         }
-        if let Some(set) = &this.identity_insert
+        if let Some(disable) = &this.identity_disable
             && this.identity_on
         {
-            tail.push_str(set);
-            tail.push_str(" OFF;\n");
+            tail.push_str(disable);
+            tail.push_str(";\n");
         }
         tail.push_str(&this.epilogue);
         this.out
@@ -722,7 +618,7 @@ impl SinkWriter for SqlSink {
             .map_err(|e| io_error(&e))?;
         let tally = this.out.into_inner().map_err(|e| io_error(e.error()))?;
         let bytes = tally.into_file().commit()?;
-        let digits = this.temporal.digits().unwrap_or(9);
+        let digits = this.kept_digits;
         this.cut_fractions.note(&mut this.notes, |n| {
             format!(
                 "{n} date-time value{} had more than {digits} fractional second digits; the \

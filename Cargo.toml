@@ -163,6 +163,9 @@ csv = "1.4.0"
 encoding_rs = "0.8.44"
 calamine = { version = "0.37.0", features = ["dates"] }
 rust_xlsxwriter = { version = "0.102.0", features = ["constant_memory", "chrono"] }
+# XLSX zip entries are inspected before calamine opens them (decompressed-size caps). Same
+# version and features as calamine's own dependency, so the lockfile gains no crate.
+zip = { version = "9.2.1", default-features = false, features = ["deflate"] }
 
 # --- observability ---
 tracing = "0.1.44"

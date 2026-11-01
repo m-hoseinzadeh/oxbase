@@ -9,8 +9,10 @@
 //! rows before and after. The table is dropped afterwards whatever happened.
 //!
 //! What each engine covers: values with quotes, backslashes, Unicode, NULL and binary;
-//! PostgreSQL a `GENERATED ALWAYS` identity and a generated column; MySQL / MariaDB a
-//! `TIMESTAMP` column dumped from a session whose time zone is not UTC, and a generated column;
+//! PostgreSQL a `GENERATED ALWAYS` identity, a generated column and a dump run with
+//! `standard_conforming_strings` off (a backslash before a quote); MySQL / MariaDB a
+//! `TIMESTAMP` column dumped from a session whose time zone is not UTC and whose `sql_mode`
+//! has `NO_BACKSLASH_ESCAPES`, and a generated column;
 //! SQL Server `datetime` ticks, `smalldatetime`, `datetime2(7)`, an identity and a `rowversion`
 //! column.
 
@@ -298,7 +300,13 @@ async fn postgres_dump_runs_on_postgres() {
              '2024-01-02 10:00:00.123456', '2024-01-02 10:00:00.5+03:00', '\\x00ff'::bytea)"
         ),
         format!("INSERT INTO \"{name}\" (name, t, tz, bin) VALUES (NULL, NULL, NULL, NULL)"),
+        // A backslash before a quote: with standard_conforming_strings off, `'\''...` would end
+        // the string early and run the rest as SQL.
+        format!("INSERT INTO \"{name}\" (name) VALUES ('\\''); DROP TABLE \"{name}\"; --')"),
+        format!("INSERT INTO \"{name}\" (name) VALUES ('ends with \\')"),
     ];
+    // The dump runs in a session where standard_conforming_strings is off (a role or database
+    // setting): its own `SET standard_conforming_strings = on` makes the literals read back.
     let result = round_trip(
         c.as_ref(),
         Case {
@@ -307,7 +315,7 @@ async fn postgres_dump_runs_on_postgres() {
             inserts: &inserts,
             export: format!("SELECT * FROM \"{name}\" ORDER BY id"),
             compare: format!("SELECT * FROM \"{name}\" ORDER BY id"),
-            before_dump: &[],
+            before_dump: &["SET standard_conforming_strings = off"],
             before_read: &[],
         },
     )
@@ -315,6 +323,10 @@ async fn postgres_dump_runs_on_postgres() {
     let _ = run(c.as_ref(), &format!("DROP TABLE IF EXISTS \"{name}\"")).await;
     let text = result.unwrap();
     assert!(text.contains("OVERRIDING SYSTEM VALUE"), "{text}");
+    assert!(
+        text.contains("SET standard_conforming_strings = on;"),
+        "{text}"
+    );
 }
 
 async fn mysql_family(key: &str) {
@@ -363,8 +375,9 @@ async fn mysql_family(key: &str) {
         ),
         format!("INSERT INTO `{name}` (id, name, ts, dt, bin) VALUES (2, NULL, NULL, NULL, NULL)"),
     ];
-    // The dump runs in a session at +05:00: its own `SET time_zone` makes the TIMESTAMP values
-    // land on the same instants, and the session's zone is restored afterwards.
+    // The dump runs in a session at +05:00 with sql_mode NO_BACKSLASH_ESCAPES: its own
+    // `SET time_zone` makes the TIMESTAMP values land on the same instants, its `sql_mode`
+    // reads the escaped backslashes as one, and both settings are restored afterwards.
     let result = round_trip(
         c.as_ref(),
         Case {
@@ -373,10 +386,16 @@ async fn mysql_family(key: &str) {
             inserts: &inserts,
             export: format!("SELECT * FROM `{name}` ORDER BY id"),
             compare: format!("SELECT * FROM `{name}` ORDER BY id"),
-            before_dump: &["SET time_zone = '+05:00'"],
-            // The zone the dump left behind, then UTC again for the driver's TIMESTAMP reads.
+            before_dump: &[
+                "SET time_zone = '+05:00'",
+                "SET sql_mode = CONCAT_WS(',', NULLIF(@@session.sql_mode, ''), \
+                 'NO_BACKSLASH_ESCAPES')",
+            ],
+            // The settings the dump left behind, then UTC again for the driver's TIMESTAMP
+            // reads.
             before_read: &[
                 "SET @oxbase_zone_after = @@session.time_zone",
+                "SET @oxbase_mode_after = @@session.sql_mode",
                 "SET time_zone = '+00:00'",
             ],
         },
@@ -384,7 +403,8 @@ async fn mysql_family(key: &str) {
     .await;
     let restored = select(
         c.as_ref(),
-        "SELECT IF(@oxbase_zone_after = '+05:00', 1, 0) AS restored",
+        "SELECT IF(@oxbase_zone_after = '+05:00' \
+         AND FIND_IN_SET('NO_BACKSLASH_ESCAPES', @oxbase_mode_after) > 0, 1, 0) AS restored",
     )
     .await;
     let _ = run(c.as_ref(), &format!("DROP TABLE IF EXISTS `{name}`")).await;
@@ -398,7 +418,11 @@ async fn mysql_family(key: &str) {
     let flag = flag
         .as_ref()
         .map(|a| a.as_primitive::<arrow_array::types::Int64Type>().value(0));
-    assert_eq!(flag, Some(1), "the session time zone is restored");
+    assert_eq!(
+        flag,
+        Some(1),
+        "the session time zone and sql_mode are restored"
+    );
 }
 
 #[tokio::test]

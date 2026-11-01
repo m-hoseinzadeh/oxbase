@@ -132,12 +132,18 @@ next ☃ 🚀', X'', '1970-01-01 00:00:00', 'ffffffff-ffff-ffff-ffff-fffffffffff
 INSERT INTO `export` (`flag`, `n`, `dec`, `txt`, `bin`, `at_tz`, `id`) VALUES
 (NULL, NULL, NULL, NULL, NULL, NULL, NULL);
 SET time_zone = @oxbase_time_zone;
+SET character_set_client = @oxbase_character_set_client;
+SET character_set_results = @oxbase_character_set_results;
+SET collation_connection = @oxbase_collation_connection;
+SET sql_mode = @oxbase_sql_mode;
 "
         }
+        // Decimals quoted: an unquoted number is a double to SQLite before the column's
+        // affinity applies (a `DECIMAL_TEXT` column would lose digits past about 15).
         Engine::Sqlite => {
             "INSERT INTO \"export\" (\"flag\", \"n\", \"dec\", \"txt\", \"bin\", \"at_tz\", \"id\") VALUES
-(TRUE, 1, 12.50, 'it''s \\ back', X'00ff', '2023-11-14T22:13:20.123456+00:00', '12345678-9abc-def0-1234-56789abcdef0'),
-(FALSE, 9007199254740993, -0.05, 'line
+(TRUE, 1, '12.50', 'it''s \\ back', X'00ff', '2023-11-14T22:13:20.123456+00:00', '12345678-9abc-def0-1234-56789abcdef0'),
+(FALSE, 9007199254740993, '-0.05', 'line
 next ☃ 🚀', X'', '1970-01-01T00:00:00+00:00', 'ffffffff-ffff-ffff-ffff-ffffffffffff');
 INSERT INTO \"export\" (\"flag\", \"n\", \"dec\", \"txt\", \"bin\", \"at_tz\", \"id\") VALUES
 (NULL, NULL, NULL, NULL, NULL, NULL, NULL);
@@ -155,6 +161,23 @@ INSERT INTO [export] ([flag], [n], [dec], [txt], [bin], [at_tz], [id]) VALUES
         Engine::MongoDb | Engine::Redis => unreachable!(),
     }
 }
+
+/// What a MySQL / MariaDB dump starts with: `sql_mode` without `NO_BACKSLASH_ESCAPES` and
+/// `SET NAMES utf8mb4`, both saved first.
+const MYSQL_PROLOGUE: &str = "SET @oxbase_sql_mode = @@session.sql_mode;
+SET sql_mode = TRIM(BOTH ',' FROM REPLACE(CONCAT(',', @@session.sql_mode, ','), ',NO_BACKSLASH_ESCAPES,', ','));
+SET @oxbase_character_set_client = @@session.character_set_client;
+SET @oxbase_character_set_results = @@session.character_set_results;
+SET @oxbase_collation_connection = @@session.collation_connection;
+SET NAMES utf8mb4;
+";
+
+/// What a MySQL / MariaDB dump ends with (after the time zone, when it set one).
+const MYSQL_EPILOGUE: &str = "SET character_set_client = @oxbase_character_set_client;
+SET character_set_results = @oxbase_character_set_results;
+SET collation_connection = @oxbase_collation_connection;
+SET sql_mode = @oxbase_sql_mode;
+";
 
 #[test]
 fn golden_inserts_per_engine() {
@@ -194,8 +217,18 @@ fn golden_inserts_per_engine() {
                 session_zone.is_some_and(|at| at < drop),
                 "{engine}: the session time zone is set first:\n{text}"
             );
+            assert!(
+                text.find(MYSQL_PROLOGUE).is_some_and(|at| at < drop),
+                "{engine}: sql_mode and character set first:\n{text}"
+            );
         } else {
             assert!(session_zone.is_none(), "{engine}:\n{text}");
+        }
+        let conforming = text.find("SET standard_conforming_strings = on;\n");
+        if engine == Engine::Postgres {
+            assert!(conforming.is_some_and(|at| at < drop), "{engine}:\n{text}");
+        } else {
+            assert!(conforming.is_none(), "{engine}:\n{text}");
         }
         // Every statement ends with `;` and the file uses `\n` only.
         assert!(!text.contains('\r'), "{engine}");
@@ -241,12 +274,15 @@ fn every_type_dumps_for_every_engine() {
             &[sample(), sample()],
         );
         assert_eq!(text.matches("INSERT INTO").count(), 1, "{engine}");
-        // MySQL / MariaDB restore the session time zone after the inserts (`at_tz`).
+        // MySQL / MariaDB restore the session time zone after the inserts (`at_tz`), then the
+        // character set and sql_mode.
         let end = match engine {
-            Engine::MySql | Engine::MariaDb => ");\nSET time_zone = @oxbase_time_zone;\n",
-            _ => ");\n",
+            Engine::MySql | Engine::MariaDb => {
+                format!(");\nSET time_zone = @oxbase_time_zone;\n{MYSQL_EPILOGUE}")
+            }
+            _ => ");\n".to_owned(),
         };
-        assert!(text.ends_with(end), "{engine}:\n{text}");
+        assert!(text.ends_with(&end), "{engine}:\n{text}");
     }
 }
 
@@ -606,12 +642,12 @@ fn date_time_literals_suit_the_target() {
             .expect("time zone set");
         assert!(set < text.find("INSERT").unwrap(), "{text}");
         assert!(
-            text.ends_with(
+            text.ends_with(&format!(
                 "INSERT INTO `export` (`at`, `at_ns`, `at_tz`, `clock`) VALUES\n\
                  ('2024-01-02 10:00:00.003333', '2024-01-02 10:00:00.123456', \
                  '2024-01-02 10:00:00.5', '10:00:00.123456');\n\
-                 SET time_zone = @oxbase_time_zone;\n"
-            ),
+                 SET time_zone = @oxbase_time_zone;\n{MYSQL_EPILOGUE}"
+            )),
             "{engine}:\n{text}"
         );
         let warnings = report.warnings.join("\n");
@@ -732,5 +768,120 @@ fn null_typed_columns_dump_null() {
             "INSERT INTO \"export\" (\"n\", \"nothing\") VALUES\n(1, NULL),\n(2, NULL);\n"
         ),
         "{text}"
+    );
+}
+
+/// One text column holding `values`.
+fn texts(values: &[Option<&str>]) -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![Field::new("txt", ArrowType::Utf8, true)]));
+    RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(values.to_vec()))]).unwrap()
+}
+
+/// A text that ends a standard string early when a backslash escapes the quote after it.
+const BREAKOUT: &str = "\\'); DROP TABLE t; --";
+
+#[test]
+fn postgres_dumps_read_backslashes_as_text() {
+    // `standard_conforming_strings = off` (a role or database setting) would read `\'` as an
+    // escaped quote and run the rest as SQL: the dump turns it on before anything else.
+    let text = dump(
+        Engine::Postgres,
+        SqlDumpOptions {
+            include_drop: true,
+            ..SqlDumpOptions::new(Engine::Postgres)
+        },
+        &context(),
+        &[texts(&[Some(BREAKOUT), Some("a\\b\\")])],
+    );
+    let set = text
+        .find("SET standard_conforming_strings = on;\n")
+        .expect("the setting");
+    assert!(set < text.find("DROP TABLE").unwrap(), "{text}");
+    assert!(
+        text.ends_with(
+            "INSERT INTO \"export\" (\"txt\") VALUES\n('\\''); DROP TABLE t; --'),\n('a\\b\\');\n"
+        ),
+        "{text}"
+    );
+}
+
+#[test]
+fn mysql_dumps_reset_backslash_mode_and_character_set() {
+    for engine in [Engine::MySql, Engine::MariaDb] {
+        let text = dump(
+            engine,
+            SqlDumpOptions::new(engine),
+            &context(),
+            &[texts(&[Some(BREAKOUT), Some("nul \0 end")])],
+        );
+        let prologue = text.find(MYSQL_PROLOGUE).expect("the prologue");
+        assert!(prologue < text.find("CREATE TABLE").unwrap(), "{text}");
+        // Backslashes and NULs escaped, as the reset sql_mode reads them; no time zone without
+        // a zoned timestamp.
+        assert!(
+            text.ends_with(&format!(
+                "INSERT INTO `export` (`txt`) VALUES\n('\\\\''); DROP TABLE t; --'),\n\
+                 ('nul \\0 end');\n{MYSQL_EPILOGUE}"
+            )),
+            "{engine}:\n{text}"
+        );
+        assert!(!text.contains("time_zone"), "{engine}:\n{text}");
+    }
+}
+
+#[test]
+fn sqlite_dumps_keep_long_decimals_exact() {
+    // decimal(38,10): more digits than a double keeps.
+    let values = Decimal128Array::from(vec![
+        Some(12_345_678_901_234_567_890_123_456_780_123_456_789_i128),
+        Some(-1_000_000_000_i128),
+        None,
+    ])
+    .with_precision_and_scale(38, 10)
+    .unwrap();
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "amount",
+        values.data_type().clone(),
+        true,
+    )]));
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(values)]).unwrap();
+    let (text, report) = dump_report(
+        Engine::Sqlite,
+        SqlDumpOptions::new(Engine::Sqlite),
+        &context(),
+        &[batch],
+    );
+    assert!(text.contains("\"amount\" DECIMAL_TEXT(38,10)"), "{text}");
+    assert!(
+        text.contains("-- column amount: declared DECIMAL_TEXT(38,10)"),
+        "{text}"
+    );
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|w| w.contains("DECIMAL_TEXT(38,10)")),
+        "{report:?}"
+    );
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    conn.execute_batch(&text).unwrap();
+    let mut stmt = conn
+        .prepare("SELECT \"amount\", typeof(\"amount\") FROM \"export\" ORDER BY rowid")
+        .unwrap();
+    let rows: Vec<(Option<String>, String)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            (
+                Some("1234567890123456789012345678.0123456789".to_owned()),
+                "text".to_owned()
+            ),
+            (Some("-0.1000000000".to_owned()), "text".to_owned()),
+            (None, "null".to_owned()),
+        ]
     );
 }

@@ -18,15 +18,21 @@
 //!   columns, no keys. The table name is [`SqlDumpOptions::table`], else the source table's,
 //!   else `export`.
 //! - **Statements.** A header comment (`-- Oxbase SQL dump`, target engine and version, no
-//!   connection details); `DROP TABLE` (`include_drop`) via `DdlGenerator::drop_object`; the
-//!   `CREATE` script (`include_create`) via `DdlGenerator::create` with `DdlContext::new(version)`
-//!   and `Script::to_sql(";")`; then `INSERT INTO <qualified> (<quoted columns>) VALUES
-//!   (...), (...);` with [`SqlDumpOptions::rows_per_insert`] rows each (SQL Server: at most
-//!   1000), every value rendered with `Quoting::literal` of
-//!   [`oxbase_driver::cell_value`] (strings and binary escaped by the target dialect: PostgreSQL
-//!   `E'...'` / `'\x..'::bytea`, MySQL backslashes, SQL Server `N'...'` / `0x..`). Statements
-//!   end with `;` (no `GO` lines). SQL Server: `SET IDENTITY_INSERT <table> ON` / `OFF` around
-//!   the inserts when the table has an identity column whose values are written.
+//!   connection details); the target's session statements (`Quoting::dump_session`:
+//!   PostgreSQL `SET standard_conforming_strings = on`; MySQL / MariaDB `sql_mode` without
+//!   `NO_BACKSLASH_ESCAPES`, `SET NAMES utf8mb4` and, with timestamps with a zone, `time_zone =
+//!   '+00:00'`, each saved first and restored at the end); `DROP TABLE` (`include_drop`) via
+//!   `DdlGenerator::drop_object`; the `CREATE` script (`include_create`) via
+//!   `DdlGenerator::create` with `DdlContext::new(version).with_exact_values()` (SQLite declares
+//!   decimals of more than 15 digits `DECIMAL_TEXT(p,s)`) and `Script::to_sql(";")`; then
+//!   `INSERT INTO <qualified> (<quoted columns>) VALUES (...), (...);` with
+//!   [`SqlDumpOptions::rows_per_insert`] rows each (SQL Server: at most 1000), every value
+//!   rendered with `Quoting::dump_literal` of [`oxbase_driver::cell_value`] (strings and
+//!   binary escaped by the target dialect: PostgreSQL standard strings / `'\x..'::bytea`,
+//!   MySQL backslashes, SQL Server `N'...'` / `0x..`; date-times in a form the target reads;
+//!   SQLite decimals quoted). Statements end with `;` (no `GO` lines). Explicit identity values
+//!   follow `Quoting::dump_identity_insert`: SQL Server `SET IDENTITY_INSERT <table> ON` /
+//!   `OFF` around the inserts, PostgreSQL `OVERRIDING SYSTEM VALUE` for `GENERATED ALWAYS`.
 //! - Line ends `\n`, UTF-8 without BOM. Progress in bytes written.
 
 use arrow_schema::SchemaRef;

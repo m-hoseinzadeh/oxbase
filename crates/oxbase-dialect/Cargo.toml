@@ -22,6 +22,8 @@ serde_json.workspace = true
 arrow-array.workspace = true
 arrow-schema.workspace = true
 futures.workspace = true
+# M5 integration: SQL dump date-time literals (`dump`).
+chrono.workspace = true
 
 [dev-dependencies]
 oxbase-driver = { workspace = true, features = ["mock"] }

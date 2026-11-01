@@ -106,6 +106,39 @@ fn existing_files_are_kept_unless_overwrite_and_never_damaged() {
     }
 }
 
+/// Unix: an exported file gets the mode any new file gets (0666 less the umask, compared with
+/// a file `std::fs::File::create` makes next to it), not a temporary file's 0600; a replaced
+/// file keeps its own mode.
+#[cfg(unix)]
+#[test]
+fn exported_files_get_the_usual_permissions() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let mode =
+        |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o7777;
+    let dir = tempfile::tempdir().unwrap();
+    let reference = dir.path().join("reference");
+    std::fs::File::create(&reference).unwrap();
+    let usual = mode(&reference);
+    std::fs::remove_file(&reference).unwrap();
+
+    for (name, options) in every_format() {
+        let path = dir.path().join(name);
+        let mut writer =
+            create_writer(&path, false, sample_schema(), &options, &context()).unwrap();
+        writer.write(&sample()).unwrap();
+        writer.finish().unwrap();
+        assert_eq!(mode(&path), usual, "{name}: a new file");
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let mut writer = create_writer(&path, true, sample_schema(), &options, &context()).unwrap();
+        writer.write(&sample()).unwrap();
+        writer.finish().unwrap();
+        assert_eq!(mode(&path), 0o640, "{name}: a replaced file");
+        std::fs::remove_file(&path).unwrap();
+    }
+}
+
 #[test]
 fn a_failed_export_keeps_the_old_file() {
     let dir = tempfile::tempdir().unwrap();

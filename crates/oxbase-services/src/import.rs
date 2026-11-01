@@ -92,7 +92,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use oxbase_dialect::{BulkMethod, DatabaseScope, DdlContext, DialectRegistry, LoadColumn};
+use oxbase_dialect::{
+    BulkMethod, DatabaseScope, DdlContext, DialectRegistry, LoadColumn, LoadTarget,
+};
 use oxbase_io::{ColumnSpec, PreviewLimits, ReadOptions, SourcePreview, ValueFormats};
 use oxbase_types::{
     ColumnDef, DataType, Engine, Error, ErrorCategory, ObjectDef, ObjectKind, ObjectRef,
@@ -693,7 +695,18 @@ impl ImportService {
             .steps
             .iter()
             .all(|s| s.transactional && s.phase == StepPhase::Main);
-        let method = self.dialects.bulk_loader(engine)?.method(&version);
+        let loader = self.dialects.bulk_loader(engine)?;
+        let method = loader.method(&version);
+        let load_columns: Vec<LoadColumn> = columns.iter().map(|(_, _, c)| c.clone()).collect();
+        let sources: Vec<DataType> = columns.iter().map(|(_, t, _)| t.clone()).collect();
+        warnings.extend(loader.plan_notes(
+            &LoadTarget {
+                table,
+                columns: &load_columns,
+                version: &version,
+            },
+            &sources,
+        ));
         let commit_every = match request.transaction {
             TransactionPolicy::Single => None,
             TransactionPolicy::Batches { rows } => Some(rows.max(1)),
@@ -777,7 +790,9 @@ impl ImportService {
         def: &TableDef,
         exists: bool,
     ) -> Result<TargetDdl> {
-        let ctx = DdlContext::new(version);
+        // A table made for the file's values: declarations that keep them exactly (SQLite
+        // long decimals, `DdlContext::exact_values`).
+        let ctx = DdlContext::new(version).with_exact_values();
         let mut out = TargetDdl::default();
         match mode {
             TargetMode::Append => {}

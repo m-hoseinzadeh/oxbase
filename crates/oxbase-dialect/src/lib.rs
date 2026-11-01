@@ -28,7 +28,9 @@
 //! M5 adds bulk loading for import: the per-engine [`BulkLoader`] role (module [`bulk`]: load
 //! batches in a fixed Arrow schema, batch-size rules per engine, the generic multi-row
 //! [`InsertLoader`] every SQL engine falls back to), registered with
-//! [`DialectRegistry::register_bulk_loader`].
+//! [`DialectRegistry::register_bulk_loader`]. The SQL dump rules are [`Quoting`] methods
+//! (module [`dump`]: session statements, literals the target reads back, identity inserts), and
+//! [`DdlContext::exact_values`] asks for column types that keep imported values exactly.
 //!
 //! How engine crates register their cells: see [`DialectRegistry`] (*Registration*). The
 //! contracts are in `docs/m2-contracts.md`, `docs/m3-contracts.md`, `docs/m4-contracts.md` and
@@ -39,6 +41,7 @@ mod capability;
 pub mod compare;
 mod ddl;
 mod dml;
+pub mod dump;
 mod quoting;
 mod registry;
 pub mod sql;
@@ -57,6 +60,7 @@ pub use bulk::{
 pub use capability::{DesignerCapabilities, Support};
 pub use ddl::DdlContext;
 pub use dml::{DmlPlan, DmlTarget, write_column_list, write_key_predicate};
+pub use dump::{DumpLiteral, DumpSession, IdentityInsert};
 pub use quoting::{AnsiQuoting, BacktickQuoting, BracketQuoting, LexRules, PgQuoting, Quoting};
 pub use registry::{
     CellRole, CellStatus, CoverageMatrix, DESIGNER_KINDS, DialectRegistry, EngineRole, MissingCell,

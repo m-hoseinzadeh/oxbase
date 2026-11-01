@@ -148,9 +148,17 @@ impl SinkFile {
             Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
             _ => PathBuf::from("."),
         };
-        let temp = tempfile::Builder::new()
-            .prefix(".oxbase-")
-            .suffix(".part")
+        let mut builder = tempfile::Builder::new();
+        builder.prefix(".oxbase-").suffix(".part");
+        // Unix: a new file gets the permissions any program's new file gets (0666 less the
+        // umask), not the owner-only 0600 of a temporary file; `commit` copies those of a file
+        // it replaces.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            builder.permissions(std::fs::Permissions::from_mode(0o666));
+        }
+        let temp = builder
             .tempfile_in(&dir)
             .map_err(|e| io_error(destination, &e))?;
         Ok(Self {
@@ -173,7 +181,8 @@ impl SinkFile {
 
     /// Flushes, syncs and renames the file over the destination; returns its size. With
     /// `overwrite` false, fails (and deletes the temporary file) when the destination appeared
-    /// meanwhile.
+    /// meanwhile. On Unix a new file has mode `0666` less the umask, and a replaced file's
+    /// permissions carry over.
     pub fn commit(mut self) -> Result<u64> {
         let destination = self.destination.clone();
         self.temp
@@ -187,6 +196,9 @@ impl SinkFile {
             .metadata()
             .map_err(|e| io_error(&destination, &e))?
             .len();
+        if self.overwrite {
+            keep_permissions(self.temp.as_file(), &destination)?;
+        }
         let persisted = if self.overwrite {
             self.temp.persist(&destination)
         } else {
@@ -206,6 +218,25 @@ impl SinkFile {
     pub fn file_mut(&mut self) -> &mut File {
         self.temp.as_file_mut()
     }
+}
+
+/// Unix: gives `file` the permissions of the file at `destination` it is about to replace (a
+/// rename would bring the new file's). Nothing when there is no such file, and on other
+/// systems.
+#[cfg(unix)]
+fn keep_permissions(file: &File, destination: &Path) -> Result<()> {
+    match std::fs::metadata(destination) {
+        Ok(existing) if existing.is_file() => file
+            .set_permissions(existing.permissions())
+            .map_err(|e| io_error(destination, &e)),
+        _ => Ok(()),
+    }
+}
+
+#[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps, reason = "the Unix version can fail")]
+fn keep_permissions(_file: &File, _destination: &Path) -> Result<()> {
+    Ok(())
 }
 
 impl Write for SinkFile {

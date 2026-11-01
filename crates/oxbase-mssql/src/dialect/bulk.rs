@@ -596,6 +596,15 @@ impl BulkLoader for MsSqlBulkLoader {
         self.limits
     }
 
+    /// The expected rate: parameterized multi-row `INSERT`s, not TDS bulk load (contracts §13).
+    fn plan_notes(&self, _target: &LoadTarget<'_>, _sources: &[DataType]) -> Vec<String> {
+        vec![
+            "SQL Server rows go in as parameterized multi-row INSERTs, not a bulk copy: expect \
+             about 4 000 to 7 000 rows per second (2.5 to 4.5 minutes per million rows)"
+                .to_owned(),
+        ]
+    }
+
     async fn prepare(
         &self,
         session: LoadSession<'_>,

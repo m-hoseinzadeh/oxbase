@@ -4020,6 +4020,7 @@ dependencies = [
  "arrow-array",
  "arrow-schema",
  "async-trait",
+ "chrono",
  "futures",
  "oxbase-driver",
  "oxbase-types",

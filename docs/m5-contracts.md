@@ -179,7 +179,8 @@ Export only (to import a dump, open it in the query editor and run it). `CREATE 
 **target** engine's `DdlGenerator::create` (`DdlContext::new(version)`), `DROP` from
 `drop_object` when asked, then multi-row `INSERT`s whose values are `Quoting::literal` of
 `cell_value` (escaping is the target dialect's: PostgreSQL `E'...'` and `'\x..'::bytea`, MySQL
-backslashes, SQL Server `N'...'` and `0x..`). Version: `targetVersion` parsed, else
+backslashes, SQL Server `N'...'` and `0x..`; *as built*: `Quoting::dump_literal`, PostgreSQL
+standard strings under `SET standard_conforming_strings = on`, §13). Version: `targetVersion` parsed, else
 `default_version(engine)` (PostgreSQL 18, MySQL 8.4, MariaDB 11.8, SQLite 3.45, SQL Server 17).
 A table export uses its `TableDef` (keys, indexes, checks, comments); across engines the
 engine-specific parts (native types, defaults, collations, generated expressions, extras) are
@@ -573,8 +574,10 @@ Streams record deviations from this file here, with the reason.
   then comments are dropped if the target refuses them (SQLite); each with a note.
 - **SQL dump names** are unqualified unless `SqlDumpOptions::table` says otherwise (the source
   table's database / schema are dropped, so a dump loads into the current one).
-- **PostgreSQL literals** are standard strings from `PgQuoting` (`'a\b'`, relying on
-  `standard_conforming_strings = on`, the default since 9.1), not `E'...'`. PostgreSQL inserts
+- **PostgreSQL literals** are standard strings from `PgQuoting` (`'a\b'`), not `E'...'`; every
+  PostgreSQL dump starts with `SET standard_conforming_strings = on;` (as `pg_dump` does;
+  *integration*: before, a session with the setting off read `\'` as an escaped quote, so text
+  such as `\'); DROP TABLE t; --` ended the string early). PostgreSQL inserts
   into a `GENERATED ALWAYS` identity column carry `OVERRIDING SYSTEM VALUE` (the server refuses
   the values otherwise); generated columns are left out of same-engine `INSERT`s.
 - **SQL dump date-time literals** are spelled by the writer (`write/sql.rs`, `Temporal`) where
@@ -586,8 +589,10 @@ Streams record deviations from this file here, with the reason.
   with a zone are their UTC wall-clock time without an offset (MariaDB and MySQL before 8.0.19
   read no offset), the dump wraps its statements in `SET time_zone = '+00:00'` (saved in
   `@oxbase_time_zone` and restored at the end) when it has such a column, at most 6 digits.
-  Dropped digits are a report warning. This belongs in the dialects' `Quoting` (Design) once
-  they grow a dump-literal rule; the writer would then only call it.
+  Dropped digits are a report warning. *Integration*: these spellings, the session statements
+  and the identity handling are now `Quoting` methods (`dump_literal`, `dump_session`,
+  `dump_identity_insert`, types in `oxbase_dialect::dump`), so the writer has no engine
+  special case (§10.10).
 - **Server-maintained columns** of a same-engine table are left out of the `INSERT`s (with a
   `--` note and a warning): generated columns, and every column the target's `DmlWriter`
   refuses to write (`plan` of a one-column insert into a probe table returns `InvalidInput`):
@@ -622,12 +627,13 @@ Streams record deviations from this file here, with the reason.
   value the column can store fits (a 38-digit integer next to `1.5`, `decimal(38, 38)`); values
   with more decimal places are rounded once to the column's scale, as on PostgreSQL and MySQL.
   The count a call returns is each statement's `SELECT @@ROWCOUNT` (the `INSERT`'s own rows,
-  with or without `NOCOUNT`, not counting trigger statements). **Throughput**: about 3 900
-  rows/s for the 14-column live test on the CI fixture (100 000 rows in about 26 s), so the
-  10-million-row exit-check file would take about 45 minutes on SQL Server; the perf job
-  (§9) requires only PostgreSQL and MySQL. **Needs Design's sign-off**; a TDS bulk path (with the
-  per-table `InsertLoader` fallback §4.3 already allows) is the follow-up if this rate is not
-  acceptable, and the import plan / report should state the expected rate for SQL Server.
+  with or without `NOCOUNT`, not counting trigger statements). **Throughput**: about 3 900 to
+  7 000 rows/s on the CI fixture (the 14-column live test: 100 000 rows in 14 to 26 s), so the
+  10-million-row exit-check file would take 25 to 45 minutes on SQL Server; the perf job (§9)
+  requires only PostgreSQL and MySQL. *Integration*: accepted for M5 (not signed off by a
+  separate Design review); every SQL Server import plan carries the warning "expect about
+  4 000 to 7 000 rows per second" (`BulkLoader::plan_notes`). A TDS bulk path (with the
+  per-table `InsertLoader` fallback §4.3 already allows) stays the follow-up.
 - **load, SQLite method** (§4.3, one of the two allowed): `multi_row_insert` through
   `InsertLoader` with 32 766 parameters, inside the service's transaction; no worker-side
   prepared statement, so the SQLite driver is unchanged.
@@ -639,7 +645,7 @@ Streams record deviations from this file here, with the reason.
   avoids it, so the loader cannot. Owners to act (not the load stream): the SQLite DDL /
   import plan (services) should map `decimal` target columns of new tables to `TEXT`, and show a
   conversion note when an existing target column has `NUMERIC` affinity. The SQLite live test
-  loads its decimal column as `TEXT`.
+  loads its decimal column as `TEXT`. *Integration*: done, see the integration notes below.
 - **load, PostgreSQL driver addition** (§2.1): `PgConnection` and its `Tx` return `Some(self)`
   from `as_any`, and `oxbase-pg`'s `conn.rs` has a crate-private `CopySession` (the `COPY ... FROM
   STDIN` entry point). The `COPY` runs on its own task, like every statement of the driver: it
@@ -708,7 +714,28 @@ Streams record deviations from this file here, with the reason.
   engine), the five loaders and the services with `OXBASE_SERVICES_REQUIRE_M5_IO=1`;
   `import-perf` sets `OXBASE_REQUIRE_M5_PERF=1` on every lane. A unit test of
   `oxbase-services` requires a registered native bulk loader for all five SQL engines.
-- **Still open**: SQLite `decimal` columns of tables the import creates get `NUMERIC` affinity,
-  which keeps about 15 significant digits (load stream note above). Mapping them to `TEXT` is a
-  SQLite DDL decision that was not made in M5. The SQL Server loader stays on parameterized
-  multi-row inserts (about 3 900 rows/s), which still needs Design's sign-off.
+- **SQLite exact decimals** (§10.7; audit fix): `DdlContext` has `exact_values`
+  (`with_exact_values()`), set by the import for the tables it creates and by the SQL dump for
+  its `CREATE`. With it the SQLite `DdlGenerator` declares a `decimal` column without a native
+  type whose precision is unknown or above 15 as `DECIMAL_TEXT(p,s)`: `TEXT` affinity (the name
+  contains `TEXT`), read back as `decimal(p,s)` by the SQLite type mapping, with a script
+  warning (shown in the plan / dump header) that the values compare and sort as text. Columns
+  of at most 15 digits stay `DECIMAL(p,s)` (a double keeps 15 significant digits). SQLite dump
+  literals quote decimals (`AnsiQuoting::dump_literal`), since SQLite reads an unquoted number
+  as a double before affinity applies. Into an existing `NUMERIC`-affinity column the plan
+  warns when the values may have more than 15 digits (`BulkLoader::plan_notes`, SQLite
+  loader). Live test: a `decimal(38,10)` import read back exactly on all five engines.
+- **SQL dump session statements** (audit fix): PostgreSQL dumps start with
+  `SET standard_conforming_strings = on;`; MySQL / MariaDB dumps save `sql_mode` and the
+  connection character set, set `sql_mode` without `NO_BACKSLASH_ESCAPES` and
+  `SET NAMES utf8mb4`, and restore both at the end (next to the existing `time_zone`). The live
+  dump tests run the PostgreSQL dump with the setting off and the MySQL / MariaDB dumps with
+  `NO_BACKSLASH_ESCAPES` on.
+- **Export file mode** (audit fix): on Unix the temporary file is created with `0666` less the
+  umask (not `tempfile`'s `0600`), and a replaced file's permissions are copied to it before
+  the rename.
+- **Fixtures**: `scripts/ci-fixtures.sh up` starts a container that exited during startup again
+  (three attempts in all; SQL Server sometimes stops with "Failed to load LSA: 0xc0070102" on
+  a fresh runner).
+- **Dependencies**: `zip` 9.2.1 (`deflate` only) is in `[workspace.dependencies]`;
+  `oxbase-dialect` uses the workspace's `chrono` for the dump date-time literals.

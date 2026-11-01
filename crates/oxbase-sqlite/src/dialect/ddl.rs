@@ -769,6 +769,14 @@ fn drop_index_step(schema: &str, name: &str) -> ScriptStep {
 // --- create --------------------------------------------------------------------------------
 
 fn create_table(t: &TableDef, ctx: &DdlContext<'_>) -> Result<Script> {
+    let mut warnings = Vec::new();
+    let exact;
+    let t = if ctx.exact_values {
+        exact = exact_columns(t, &mut warnings);
+        &exact
+    } else {
+        t
+    };
     check_table(t, ctx.version)?;
     let schema = schema_of(&t.obj);
     let name = &t.obj.name;
@@ -780,7 +788,49 @@ fn create_table(t: &TableDef, ctx: &DdlContext<'_>) -> Result<Script> {
     for idx in t.indexes.iter().filter(|i| !i.is_constraint) {
         script.push_step(create_index_step(schema, name, idx)?);
     }
+    script.warnings.extend(warnings);
     Ok(script)
+}
+
+/// Significant digits a `NUMERIC`-affinity column keeps: SQLite stores a decimal there as an
+/// integer or a double, and a double round-trips 15 decimal digits.
+pub(crate) const NUMERIC_EXACT_DIGITS: u32 = 15;
+
+/// The declared type of a decimal column that keeps every digit: `DECIMAL_TEXT(p,s)` has `TEXT`
+/// affinity (its name contains `TEXT`), so bound decimal text is stored as it is, and
+/// [`super::types::data_type`] reads it back as `decimal(p,s)`.
+pub(crate) fn exact_decimal_type(precision: Option<u32>, scale: Option<u32>) -> String {
+    match (precision, scale) {
+        (Some(p), Some(s)) => format!("{EXACT_DECIMAL}({p},{s})"),
+        (Some(p), None) => format!("{EXACT_DECIMAL}({p})"),
+        _ => EXACT_DECIMAL.to_owned(),
+    }
+}
+
+/// The base name of [`exact_decimal_type`].
+pub(crate) const EXACT_DECIMAL: &str = "DECIMAL_TEXT";
+
+/// `t` with the columns `DdlContext::exact_values` changes: a decimal column without a native
+/// type whose precision is unknown or above [`NUMERIC_EXACT_DIGITS`] is declared with
+/// [`exact_decimal_type`], with a warning each (it compares and sorts as text).
+fn exact_columns(t: &TableDef, warnings: &mut Vec<String>) -> TableDef {
+    let mut out = t.clone();
+    for c in &mut out.columns {
+        let DataType::Decimal { precision, scale } = c.data_type else {
+            continue;
+        };
+        if !c.native_type.trim().is_empty() || precision.is_some_and(|p| p <= NUMERIC_EXACT_DIGITS)
+        {
+            continue;
+        }
+        c.native_type = exact_decimal_type(precision, scale);
+        warnings.push(format!(
+            "column {}: declared {} so SQLite keeps every digit (a DECIMAL column keeps about \
+             {NUMERIC_EXACT_DIGITS}); its values are stored, compared and sorted as text",
+            c.name, c.native_type
+        ));
+    }
+    out
 }
 
 // --- renames -------------------------------------------------------------------------------
@@ -2709,5 +2759,40 @@ mod tests {
                 .drop_object(&ObjectRef::new(ObjectKind::View, "v"), &ctx)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn exact_values_declare_long_decimals_as_text() {
+        let version = v("3.51.0");
+        let mut t = TableDef::new(ObjectRef::table(Some("main"), None, "imported"));
+        let decimal = |name: &str, precision, scale| {
+            ColumnDef::new(name, DataType::Decimal { precision, scale })
+        };
+        t.columns = vec![
+            decimal("big", Some(38), Some(10)),
+            decimal("small", Some(15), Some(2)),
+            decimal("open", None, None),
+            col("given", "NUMERIC(20,2)"),
+        ];
+        let plain = SqliteDdl
+            .create(&ObjectDef::Table(t.clone()), &DdlContext::new(&version))
+            .unwrap();
+        assert!(plain.warnings.is_empty(), "{:?}", plain.warnings);
+        assert!(sqls(&plain)[0].contains("\"big\" DECIMAL(38,10)"));
+
+        let exact = SqliteDdl
+            .create(
+                &ObjectDef::Table(t),
+                &DdlContext::new(&version).with_exact_values(),
+            )
+            .unwrap();
+        let sql = sqls(&exact)[0];
+        assert!(sql.contains("\"big\" DECIMAL_TEXT(38,10)"), "{sql}");
+        assert!(sql.contains("\"small\" DECIMAL(15,2)"), "{sql}");
+        assert!(sql.contains("\"open\" DECIMAL_TEXT"), "{sql}");
+        // A column that names its own type keeps it.
+        assert!(sql.contains("\"given\" NUMERIC(20,2)"), "{sql}");
+        assert_eq!(exact.warnings.len(), 2, "{:?}", exact.warnings);
+        assert!(exact.warnings[0].contains("column big: declared DECIMAL_TEXT(38,10)"));
     }
 }

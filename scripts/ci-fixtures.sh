@@ -11,7 +11,9 @@
 # ssh). The import-perf job starts only `postgres mysql` (docs/m5-contracts.md §9.3).
 #
 # Env: OXBASE_COMPOSE_FILE (default tests/docker/compose.yml),
-#      OXBASE_FIXTURES_WAIT_SECS (default 600; SQL Server is slow on cold runners).
+#      OXBASE_FIXTURES_WAIT_SECS (default 600; SQL Server is slow on cold runners),
+#      OXBASE_FIXTURES_UP_ATTEMPTS (default 3; containers that exit during startup are
+#      started again).
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -46,7 +48,24 @@ done
 case "$action" in
   up)
     compose pull --quiet "$@"
-    compose up --detach --wait --wait-timeout "$wait_secs" "$@"
+    # A container that exits during startup is started again, up to `attempts` times in all:
+    # the SQL Server image sometimes stops at once on a fresh runner ("Failed to load LSA:
+    # 0xc0070102") and starts fine the next time. A health-check timeout is not retried.
+    attempts="${OXBASE_FIXTURES_UP_ATTEMPTS:-3}"
+    attempt=1
+    until compose up --detach --wait --wait-timeout "$wait_secs" "$@"; do
+      mapfile -t exited < <(compose ps --all --status exited --services "$@" || true)
+      if (( attempt >= attempts || ${#exited[@]} == 0 )); then
+        echo "ci-fixtures: the fixtures did not start (attempt $attempt of $attempts)" >&2
+        exit 1
+      fi
+      echo "ci-fixtures: attempt $attempt of $attempts: exited during startup: ${exited[*]}" >&2
+      for service in "${exited[@]}"; do
+        compose logs --no-color --timestamps --tail 30 "$service" >&2 || true
+      done
+      compose rm --force --stop "${exited[@]}"
+      attempt=$((attempt + 1))
+    done
     compose ps
     ;;
   logs)

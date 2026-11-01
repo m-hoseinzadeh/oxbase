@@ -612,6 +612,7 @@ async fn import_cycle(key: &'static str, engine: Engine) {
     }
 
     text_fidelity(&live, &import, &file, &fid).await;
+    exact_decimals(&live, &import, &file, &fid).await;
 
     // Skip policy: conversion errors are skipped and listed.
     let columns = vec![
@@ -803,6 +804,94 @@ async fn import_cycle(key: &'static str, engine: Engine) {
     for t in [&main, &fresh, &skip, &req, &slow, &fid] {
         live.drop_table(t).await;
     }
+}
+
+/// A `decimal(38,10)` column the import creates keeps every digit (SQLite: `DECIMAL_TEXT`,
+/// `TEXT` affinity; a `DECIMAL` column would keep about 15 significant digits, without an
+/// error). Uses (and drops) `table`.
+async fn exact_decimals(live: &Live, import: &ImportService, file: &Path, table: &ObjectRef) {
+    let key = live.key;
+    live.drop_table(table).await;
+    let decimal = DataType::Decimal {
+        precision: Some(38),
+        scale: Some(10),
+    };
+    let columns = vec![
+        ColumnSpec::new("id", DataType::INT64),
+        ColumnSpec::new("amount", decimal.clone()),
+    ];
+    let request = ImportRequest {
+        options: ReadOptions::Csv(CsvReadOptions::default()),
+        columns: columns.clone(),
+        mapping: vec![
+            ColumnMapping {
+                source: 0,
+                target: Some("id".into()),
+                data_type: None,
+            },
+            ColumnMapping {
+                source: 1,
+                target: Some("amount".into()),
+                data_type: None,
+            },
+        ],
+        target: ImportTarget {
+            session: live.session,
+            table: table.clone(),
+            mode: TargetMode::Create,
+        },
+        primary_key: vec!["id".into()],
+        conversion: ConversionOptions::default(),
+        errors: ErrorPolicy::Stop,
+        transaction: TransactionPolicy::Single,
+    };
+    let source = ImportSource {
+        path: file.to_path_buf(),
+        options: request.options.clone(),
+    };
+    let plan = import
+        .plan(&source, &request, CancellationToken::new())
+        .await
+        .unwrap_or_else(|e| panic!("{key}: exact decimals: plan: {e}"));
+    if live.engine == Engine::Sqlite {
+        assert!(
+            plan.ddl.iter().any(|d| d.contains("DECIMAL_TEXT(38,10)")),
+            "{key}: {:?}",
+            plan.ddl
+        );
+        assert!(
+            plan.warnings.iter().any(|w| w.contains("DECIMAL_TEXT")),
+            "{key}: {:?}",
+            plan.warnings
+        );
+    }
+    let values = [
+        Some("1234567890123456789012345678.0123456789"),
+        Some("-9999999999999999999999999999.9999999999"),
+        Some("0.0000000001"),
+        None,
+    ];
+    let batch = RecordBatch::try_new(
+        ColumnSpec::schema(&columns),
+        vec![
+            Arc::new(arrow_array::Int64Array::from(vec![1, 2, 3, 4])),
+            Arc::new(arrow_array::StringArray::from(values.to_vec())),
+        ],
+    )
+    .unwrap();
+    let reader = MemoryReader::new(&columns, vec![(batch, Vec::new())]);
+    assert_finished(key, &run_import(import, file, request, reader).await);
+    assert_eq!(
+        table_rows(live, table, &["id", "amount"]).await,
+        [
+            ["1", "1234567890123456789012345678.0123456789"],
+            ["2", "-9999999999999999999999999999.9999999999"],
+            ["3", "0.0000000001"],
+            ["4", "NULL"],
+        ],
+        "{key}: decimal(38,10) read back"
+    );
+    live.drop_table(table).await;
 }
 
 /// NULL versus empty text, astral characters, CR / LF / tab, backslashes (`\N` is NULL in

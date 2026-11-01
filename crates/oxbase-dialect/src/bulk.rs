@@ -331,6 +331,15 @@ pub trait BulkLoader: Send + Sync {
     /// The batch-size rules on server version `version`.
     fn limits(&self, version: &ServerVersion) -> BulkLimits;
 
+    /// Warnings the import plan shows about this load (M5 integration): target columns whose
+    /// storage would not keep the loaded values exactly, an expected rate when the method is
+    /// slow. `sources[i]` is the logical type of the source column loaded into
+    /// `target.columns[i]`. Default: none.
+    fn plan_notes(&self, target: &LoadTarget<'_>, sources: &[DataType]) -> Vec<String> {
+        let _ = (target, sources);
+        Vec::new()
+    }
+
     /// Called once by the import service on its dedicated session before the first
     /// [`BulkLoader::load`], outside any transaction. For session settings the loads need
     /// (MySQL `SET time_zone = '+00:00'` so `TIMESTAMP` columns take UTC instants; SQL Server
