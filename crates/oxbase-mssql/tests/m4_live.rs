@@ -22,6 +22,7 @@
     reason = "rows, columns and connections read best with short names in catalog code"
 )]
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -40,7 +41,10 @@ use oxbase_types::{
     Value, props,
 };
 
-type Step<T> = std::result::Result<T, String>;
+type Step<T> = Result<T, String>;
+
+/// One change of the column cell, applied to the column as fetched.
+type ColumnChange = fn(&mut ColumnDef);
 
 // --- fixtures -------------------------------------------------------------------------------
 
@@ -173,12 +177,13 @@ fn cell(batch: &RecordBatch, col: usize, row: usize) -> Option<String> {
         ArrowType::Boolean => if a.as_boolean().value(row) { "1" } else { "0" }.to_owned(),
         ArrowType::Utf8 => a.as_string::<i32>().value(row).to_owned(),
         ArrowType::LargeUtf8 => a.as_string::<i64>().value(row).to_owned(),
-        ArrowType::Binary => a
-            .as_binary::<i32>()
-            .value(row)
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect(),
+        ArrowType::Binary => {
+            let mut hex = String::new();
+            for b in a.as_binary::<i32>().value(row) {
+                let _ = write!(hex, "{b:02x}");
+            }
+            hex
+        }
         other => format!("<{other}>"),
     })
 }
@@ -345,7 +350,7 @@ async fn load_table(
             int(r.get(4)),
         );
         let mut col = ColumnDef::new(text(r.first()).unwrap_or_default(), data_type_of(&native));
-        col.native_type = native.clone();
+        col.native_type.clone_from(&native);
         col.nullable = yes(r.get(5));
         if yes(r.get(16)) {
             col.auto_increment = true;
@@ -777,7 +782,7 @@ async fn round_trips(rt: &Rt, names: &[String]) -> Step<()> {
         &[Value::Text("kept \u{ef}".into())],
     )
     .await?;
-    let steps: [(&str, fn(&mut ColumnDef)); 4] = [
+    let steps: [(&str, ColumnChange); 4] = [
         ("set column NOT NULL", |c| c.nullable = false),
         ("set column default", |c| {
             c.default = Some("N'it''s \u{fc}'".into());
