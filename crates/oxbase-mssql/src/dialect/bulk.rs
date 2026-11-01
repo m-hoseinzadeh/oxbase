@@ -787,8 +787,8 @@ mod tests {
         let version = ServerVersion::new(17, 0, 1000);
         let big = "12345678901234567890123456789012345678";
         let tiny = "0.1234567890123456789012345678901234567";
-        let cases: [(Option<(u32, u32)>, [&str; 2], &str); 4] = [
-            (Some((38, 0)), [big, "1.5"], "decimal(38, 0)"),
+        let cases = [
+            (Some((38_u32, 0_u32)), [big, "1.5"], "decimal(38, 0)"),
             (None, [big, "1.5"], "decimal(38, 0)"),
             (Some((38, 38)), ["0.5", tiny], "decimal(38, 38)"),
             (None, ["-7", tiny], "decimal(38, 37)"),
