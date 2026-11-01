@@ -95,40 +95,38 @@ fn targets(
         }
         _ => return false,
     };
-    let schemas: Vec<String> = match schema {
-        Some(part) => match cache.resolve_schema(part) {
-            Some(index) => vec![
+    let schemas: Vec<String> = if let Some(part) = schema {
+        if let Some(index) = cache.resolve_schema(part) {
+            vec![
                 cache
                     .schema(index)
                     .map(|s| s.name.clone())
                     .unwrap_or_default(),
-            ],
-            None => {
-                if let Some(other) = other_database(snap, part) {
-                    others.push(other);
-                    return true;
-                }
-                vec![stored(part, rules.schemas)]
+            ]
+        } else {
+            if let Some(other) = other_database(snap, part) {
+                others.push(other);
+                return true;
             }
-        },
-        None => {
-            let mut schemas: Vec<String> = cache
-                .resolve_relation(std::slice::from_ref(last))
-                .into_iter()
-                .filter_map(|id| cache.schema(id.schema).map(|s| s.name.clone()))
-                .collect();
-            let default = snap
-                .default_schema
-                .clone()
-                .or_else(|| snap.search_path.first().cloned())
-                .or_else(|| snap.schemas.first().map(|s| s.name.clone()));
-            if let Some(default) = default
-                && !schemas.contains(&default)
-            {
-                schemas.push(default);
-            }
-            schemas
+            vec![stored(part, rules.schemas)]
         }
+    } else {
+        let mut schemas: Vec<String> = cache
+            .resolve_relation(std::slice::from_ref(last))
+            .into_iter()
+            .filter_map(|id| cache.schema(id.schema).map(|s| s.name.clone()))
+            .collect();
+        let default = snap
+            .default_schema
+            .clone()
+            .or_else(|| snap.search_path.first().cloned())
+            .or_else(|| snap.schemas.first().map(|s| s.name.clone()));
+        if let Some(default) = default
+            && !schemas.contains(&default)
+        {
+            schemas.push(default);
+        }
+        schemas
     };
     for schema in &schemas {
         let qualified = [

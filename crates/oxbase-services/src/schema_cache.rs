@@ -75,7 +75,7 @@ impl Default for SchemaCacheConfig {
             stale_after: Duration::from_secs(15 * 60),
             max_caches: 16,
             persist: true,
-            max_columns: oxbase_dialect::CatalogScope::DEFAULT_MAX_COLUMNS,
+            max_columns: CatalogScope::DEFAULT_MAX_COLUMNS,
         }
     }
 }
@@ -704,22 +704,18 @@ impl Core {
         status.last_build_ms = entry.last_build_ms;
         status.last_error.clone_from(&entry.last_error);
         status.source = entry.source;
-        match &entry.cache {
-            Some(cache) => {
-                status.state = if entry.dirty || self.is_old(cache) {
-                    CacheState::Stale
-                } else {
-                    CacheState::Ready
-                };
-                status.with_cache(cache)
-            }
-            None => {
-                if entry.last_error.is_some() {
-                    status.state = CacheState::Failed;
-                }
-                status
-            }
+        if let Some(cache) = &entry.cache {
+            status.state = if entry.dirty || self.is_old(cache) {
+                CacheState::Stale
+            } else {
+                CacheState::Ready
+            };
+            return status.with_cache(cache);
         }
+        if entry.last_error.is_some() {
+            status.state = CacheState::Failed;
+        }
+        status
     }
 
     /// Builds (`scope` full) or refreshes (partial) the cache of `key` on a child of `base`,
@@ -884,7 +880,7 @@ impl Core {
                 Ok(()) => {}
                 Err(e) if e.category() == ErrorCategory::NotFound => {}
                 Err(e) => {
-                    tracing::debug!(category = %e.category(), "closing the cache session failed")
+                    tracing::debug!(category = %e.category(), "closing the cache session failed");
                 }
             }
         }
@@ -995,28 +991,25 @@ impl Core {
                 entry.disk_checked = false;
                 return;
             }
-            match &mut entry.pending {
-                Some(pending) => {
-                    pending.session = base;
-                    match (&mut pending.relations, relations) {
-                        (Some(have), Some(more)) => {
-                            for r in more {
-                                if !have.contains(&r) {
-                                    have.push(r);
-                                }
+            if let Some(pending) = &mut entry.pending {
+                pending.session = base;
+                match (&mut pending.relations, relations) {
+                    (Some(have), Some(more)) => {
+                        for r in more {
+                            if !have.contains(&r) {
+                                have.push(r);
                             }
                         }
-                        (have, _) => *have = None,
                     }
-                    false
+                    (have, _) => *have = None,
                 }
-                None => {
-                    entry.pending = Some(Pending {
-                        session: base,
-                        relations,
-                    });
-                    true
-                }
+                false
+            } else {
+                entry.pending = Some(Pending {
+                    session: base,
+                    relations,
+                });
+                true
             }
         };
         if !spawn {
