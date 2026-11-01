@@ -376,10 +376,9 @@ impl Parser<'_> {
             self.leave();
             return;
         }
-        let field_first = words::contains(words::FIELD_FIRST, name);
+        let mut field_first = words::contains(words::FIELD_FIRST, name);
         let convert =
             name.eq_ignore_ascii_case("CONVERT") || name.eq_ignore_ascii_case("TRY_CONVERT");
-        let mut arg = 0_usize;
         loop {
             self.mark(self.pos, SlotKind::Expr(words::EXPR_START), clause);
             let Some(t) = self.peek() else {
@@ -393,10 +392,11 @@ impl Parser<'_> {
                 Tk::Punct(b';') => break,
                 Tk::Punct(b',') => {
                     self.pos += 1;
-                    arg += 1;
+                    field_first = false;
                 }
-                Tk::Word if arg == 0 && field_first && !self.is_punct(self.pos + 1, b'(') => {
+                Tk::Word if field_first && !self.is_punct(self.pos + 1, b'(') => {
                     self.pos += 1;
+                    field_first = false;
                 }
                 Tk::Word if convert && self.lang.type_info(self.tok_text(t)).is_some() => {
                     let before = self.pos;
@@ -406,6 +406,7 @@ impl Parser<'_> {
                     }
                 }
                 _ => {
+                    field_first = false;
                     let before = self.pos;
                     self.expr(clause, ExprMode::Plain);
                     if self.pos == before {

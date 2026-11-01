@@ -190,7 +190,7 @@ impl Parser<'_> {
             self.select_tail(b);
         } else if self.at_word("TABLE") {
             self.pos += 1;
-            self.in_clause(Clause::From, |p| p.from_item(b, Clause::From, false));
+            self.in_clause(Clause::From, |p| p.relation_item(b, Clause::From, false));
         } else if self.at_punct(b'(') && self.enter() {
             self.pos += 1;
             if self.at_word("WITH") {
@@ -222,7 +222,7 @@ impl Parser<'_> {
         if self.at_word("FROM") {
             self.in_clause(Clause::From, |p| {
                 p.pos += 1;
-                p.from_list(b, Clause::From);
+                p.relation_list(b, Clause::From);
             });
         }
         self.select_tail(b);
@@ -341,9 +341,9 @@ impl Parser<'_> {
 
     /// The relations of a `FROM` list (also the targets of `UPDATE` / `DELETE` and the `USING`
     /// of `DELETE`), with their joins, into block `b`.
-    pub(super) fn from_list(&mut self, b: usize, clause: Clause) {
+    pub(super) fn relation_list(&mut self, b: usize, clause: Clause) {
         loop {
-            self.from_item(b, clause, false);
+            self.relation_item(b, clause, false);
             self.joins(b);
             self.mark(self.pos, SlotKind::Keywords(words::FROM_TAIL), clause);
             if !self.eat_punct(b',') {
@@ -356,7 +356,7 @@ impl Parser<'_> {
     /// USING (...)`, `CROSS JOIN`, `CROSS / OUTER APPLY`, `STRAIGHT_JOIN`.
     pub(super) fn joins(&mut self, b: usize) {
         while let Some(lateral) = self.join_keyword() {
-            self.in_clause(Clause::Join, |p| p.from_item(b, Clause::Join, lateral));
+            self.in_clause(Clause::Join, |p| p.relation_item(b, Clause::Join, lateral));
             self.mark(self.pos, SlotKind::Keywords(words::JOIN_TAIL), Clause::Join);
             if self.at_word("ON") {
                 self.in_clause(Clause::JoinOn, |p| {
@@ -392,7 +392,7 @@ impl Parser<'_> {
 
     /// One relation: a (schema-qualified) table or CTE, a table function, a derived table or
     /// `VALUES` list, or a parenthesised join; with hints and an alias. Pushed to block `b`.
-    pub(super) fn from_item(&mut self, b: usize, clause: Clause, lateral: bool) {
+    pub(super) fn relation_item(&mut self, b: usize, clause: Clause, lateral: bool) {
         self.mark(self.pos, SlotKind::Relation, clause);
         let mut lateral = lateral;
         loop {
@@ -409,7 +409,7 @@ impl Parser<'_> {
                 // A parenthesised join: its relations belong to `b`.
                 if self.enter() {
                     self.pos += 1;
-                    self.from_list(b, clause);
+                    self.relation_list(b, clause);
                     self.close_paren();
                     self.leave();
                 }

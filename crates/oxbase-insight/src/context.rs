@@ -282,7 +282,8 @@ fn lexical(sql: SqlDialect, text: &str, from: usize, offset: usize) -> Lexical {
         }
         SqlTokenKind::Word => {
             word_index -= 1;
-            lex.prefix = slice.get(last.start..rel).unwrap_or("").to_owned();
+            lex.prefix
+                .push_str(slice.get(last.start..rel).unwrap_or(""));
             lex.literal = last
                 .text(slice)
                 .starts_with(|c: char| c.is_ascii_digit() || c == '@' || c == '$')

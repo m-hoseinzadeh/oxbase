@@ -713,9 +713,10 @@ impl<'a> Parser<'a> {
         let t = self.peek()?;
         let part = self.ident_at(self.pos)?;
         self.pos += 1;
+        let range = t.start..t.end;
         Some(Path {
             parts: vec![part],
-            ranges: vec![t.start..t.end],
+            ranges: vec![range],
             complete: true,
             star: false,
         })

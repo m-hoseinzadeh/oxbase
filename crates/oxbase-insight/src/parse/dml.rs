@@ -155,10 +155,10 @@ impl Parser<'_> {
         self.pos += 1;
         self.dml_modifiers();
         self.in_clause(Clause::UpdateTarget, |p| {
-            p.from_item(b, Clause::UpdateTarget, false);
+            p.relation_item(b, Clause::UpdateTarget, false);
             p.joins(b);
             while p.eat_punct(b',') {
-                p.from_item(b, Clause::UpdateTarget, false);
+                p.relation_item(b, Clause::UpdateTarget, false);
                 p.joins(b);
             }
         });
@@ -174,7 +174,7 @@ impl Parser<'_> {
         if self.at_word("FROM") {
             self.in_clause(Clause::From, |p| {
                 p.pos += 1;
-                p.from_list(b, Clause::From);
+                p.relation_list(b, Clause::From);
             });
             self.target_alias(b);
         }
@@ -189,16 +189,16 @@ impl Parser<'_> {
         self.mark(self.pos, SlotKind::Keywords(&["FROM"]), Clause::Target);
         self.eat_word("FROM");
         self.in_clause(Clause::Target, |p| {
-            p.from_item(b, Clause::Target, false);
+            p.relation_item(b, Clause::Target, false);
             while p.eat_punct(b',') {
-                p.from_item(b, Clause::Target, false);
+                p.relation_item(b, Clause::Target, false);
             }
         });
         self.output_clause(b);
         if self.at_word("USING") || self.at_word("FROM") {
             self.in_clause(Clause::From, |p| {
                 p.pos += 1;
-                p.from_list(b, Clause::From);
+                p.relation_list(b, Clause::From);
             });
             self.target_alias(b);
         }
@@ -220,13 +220,13 @@ impl Parser<'_> {
         );
         self.eat_word("INTO");
         self.in_clause(Clause::InsertTarget, |p| {
-            p.from_item(b, Clause::InsertTarget, false);
+            p.relation_item(b, Clause::InsertTarget, false);
         });
         let target = self.queries[b].relations.first().cloned();
         if self.at_word("USING") {
             self.in_clause(Clause::From, |p| {
                 p.pos += 1;
-                p.from_item(b, Clause::From, false);
+                p.relation_item(b, Clause::From, false);
             });
         }
         self.mark(self.pos, SlotKind::Keywords(&["ON"]), Clause::From);

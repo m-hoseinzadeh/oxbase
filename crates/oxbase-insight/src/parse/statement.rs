@@ -532,11 +532,7 @@ impl Parser<'_> {
                         "DEFAULT" => {
                             self.expr(Clause::ColumnDefinitions, ExprMode::Plain);
                         }
-                        "COLLATE" => {
-                            if !self.at_end() {
-                                self.pos += 1;
-                            }
-                        }
+                        "COLLATE" if !self.at_end() => self.pos += 1,
                         _ => {}
                     }
                 }
@@ -908,7 +904,8 @@ impl Parser<'_> {
                 SlotKind::Keywords(words::ALTER_TABLE_ACTIONS),
                 Clause::Other,
             );
-            if self.at_end() || self.at_punct(b';') || self.strong_stop() {
+            let action = words::ALTER_TABLE_ACTIONS.contains(&self.upper(self.pos).as_str());
+            if self.at_end() || self.at_punct(b';') || (!action && self.strong_stop()) {
                 break;
             }
             self.alter_action(target.as_ref());
@@ -1135,10 +1132,7 @@ impl Parser<'_> {
     /// MySQL `DECLARE x INT DEFAULT 0`.
     fn declare(&mut self) {
         self.pos += 1;
-        loop {
-            let Some(t) = self.peek() else {
-                break;
-            };
+        while let Some(t) = self.peek() {
             if !matches!(t.kind, Tk::Param | Tk::Word | Tk::Quoted) {
                 break;
             }
