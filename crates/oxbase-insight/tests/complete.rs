@@ -665,6 +665,8 @@ fn ctes_and_derived_tables_give_their_columns() {
     let body = QueryBlock {
         range: 11..43,
         parent: Some(0),
+        isolated: true,
+        cte_parent: Some(0),
         ctes: vec![],
         relations: vec![named("orders", None)],
         output: vec![ident("id"), ident("created_at")],
@@ -674,6 +676,8 @@ fn ctes_and_derived_tables_give_their_columns() {
     let top = QueryBlock {
         range: 0..60,
         parent: None,
+        isolated: false,
+        cte_parent: None,
         ctes: vec![Cte {
             name: ident("x"),
             columns: vec![ident("id"), ident("created_at")],
@@ -1175,6 +1179,8 @@ fn with_cte(
     let top = QueryBlock {
         range: 0..c.statement.end,
         parent: None,
+        isolated: false,
+        cte_parent: None,
         ctes: vec![cte.clone()],
         relations: c.scope.clone(),
         output: vec![],
@@ -1184,6 +1190,8 @@ fn with_cte(
     let body = QueryBlock {
         range: 6..7,
         parent: Some(0),
+        isolated: true,
+        cte_parent: Some(0),
         ctes: vec![],
         relations: from,
         output: output.iter().copied().map(ident).collect(),
@@ -1307,6 +1315,8 @@ fn star_expands_with_named_outputs_and_through_ctes() {
     d.outline.queries.push(QueryBlock {
         range: 40..60,
         parent: Some(0),
+        isolated: true,
+        cte_parent: Some(0),
         ctes: vec![],
         relations: vec![named("x", None)],
         output: vec![],
