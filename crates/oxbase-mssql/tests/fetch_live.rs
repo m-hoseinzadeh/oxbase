@@ -285,7 +285,10 @@ async fn lists_databases_schemas_and_every_seeded_object() {
     assert_eq!(names(&procedures), vec![f.m2("procedure")]);
     let sequences = list(c, ObjectKind::Sequence, &schema).await;
     assert_eq!(names(&sequences), vec![f.m2("sequence")]);
-    assert!(list(c, ObjectKind::Type, &schema).await.is_empty());
+    assert_eq!(
+        names(&list(c, ObjectKind::Type, &schema).await),
+        Vec::<String>::new()
+    );
 
     // Every [m2.mssql] object is listed under its parent.
     let objects: Vec<String> = get(&f.doc, &["m2", "mssql", "objects"])
@@ -336,8 +339,14 @@ async fn lists_databases_schemas_and_every_seeded_object() {
     let view_cols = list(c, ObjectKind::Column, &view).await;
     assert_eq!(names(&view_cols), vec!["id", "qty", "code"]);
     assert_eq!(view_cols[0].obj.parent_kind, Some(ObjectKind::View));
-    assert!(list(c, ObjectKind::Trigger, &view).await.is_empty());
-    assert!(list(c, ObjectKind::Index, &view).await.is_empty());
+    assert_eq!(
+        names(&list(c, ObjectKind::Trigger, &view).await),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        names(&list(c, ObjectKind::Index, &view).await),
+        Vec::<String>::new()
+    );
 }
 
 #[tokio::test]
@@ -518,7 +527,7 @@ async fn loads_every_seeded_object() {
         "{}",
         view.definition
     );
-    assert!(view.columns.is_empty());
+    assert_eq!(view.columns, Vec::<String>::new());
     assert_eq!(
         view.extras.get(&x::SCHEMA_BINDING),
         Some(&Value::Bool(false))

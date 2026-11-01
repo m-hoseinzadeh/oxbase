@@ -179,7 +179,7 @@ mod tests {
     fn plain_view() {
         let (cols, q) =
             split("CREATE VIEW m2.m2_view AS\nSELECT c.id, c.qty, p.code\nFROM m2.m2_child c;\n");
-        assert!(cols.is_empty());
+        assert_eq!(cols, Vec::<String>::new());
         assert_eq!(q, "SELECT c.id, c.qty, p.code\nFROM m2.m2_child c");
     }
 
@@ -195,7 +195,7 @@ mod tests {
     #[test]
     fn quoted_names_and_unicode() {
         let (cols, q) = split("CREATE VIEW \"s\".\"vüe\" AS SELECT N'é' AS a");
-        assert!(cols.is_empty());
+        assert_eq!(cols, Vec::<String>::new());
         assert_eq!(q, "SELECT N'é' AS a");
     }
 
