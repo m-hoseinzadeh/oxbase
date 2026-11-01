@@ -13,7 +13,8 @@
 //! - default, check, computed-column and filter text as the server stores it
 //!   ([`canonical_expression`]): redundant parentheses (`((0))` = `0`, `('x')` = `'x'`,
 //!   `([qty]>=(0))` = `qty >= 0`), bracketed identifiers, whitespace, case of keywords, names
-//!   and built-in functions (`getdate()` / `GETDATE()`), and the `N` prefix of string literals;
+//!   and built-in functions (`getdate()` / `GETDATE()`), the `N` prefix of string literals,
+//!   `!=` (stored as `<>`) and `CURRENT_TIMESTAMP` (stored as `getdate()`);
 //! - extras compared only when both sides have them ([`crate::extras::DEFAULT_CONSTRAINT`]
 //!   names the server generated), except the facts [`MsSqlComparator`] fills in first: the
 //!   primary key's `clustered` (absent = clustered unless another index is), an index's
@@ -21,6 +22,13 @@
 //!   identity columns are always `always = true` and auto-increment, and computed columns are
 //!   compared without their type and nullability (the server derives both from the
 //!   expression).
+//!
+//! **Known limitation (M4).** The server rewrites more than that when it stores check, default,
+//! computed and filter text, and those rewrites are not folded: `x IN ('A', 'B')` is stored as
+//! `([x]='B' OR [x]='A')`, `x BETWEEN 1 AND 5` as `([x]>=(1) AND [x]<=(5))`, and
+//! `CAST(x AS int)` as `CONVERT([int],[x])`. A designer expression written in one of those
+//! forms looks changed after a save (the next save drops and re-adds it, which is harmless but
+//! noisy). PostgreSQL has the same accepted limitation; writing the stored form avoids it.
 
 use std::sync::Arc;
 
@@ -375,8 +383,21 @@ fn tokenize(text: &str) -> Option<Vec<Tok>> {
             {
                 i += 1;
             }
-            let word: String = chars[start..i].iter().collect();
-            out.push(Tok::Name(word.to_lowercase()));
+            let word = chars[start..i].iter().collect::<String>().to_lowercase();
+            if word == "current_timestamp" {
+                // Stored as `(getdate())`.
+                out.extend([
+                    Tok::Name("getdate".to_owned()),
+                    Tok::Punct('('),
+                    Tok::Punct(')'),
+                ]);
+            } else {
+                out.push(Tok::Name(word));
+            }
+        } else if c == '!' && chars.get(i + 1) == Some(&'=') {
+            // Stored as `<>`.
+            out.extend([Tok::Punct('<'), Tok::Punct('>')]);
+            i += 2;
         } else {
             out.push(Tok::Punct(c));
             i += 1;
@@ -513,7 +534,12 @@ mod tests {
         assert!(same("([a]>(0) AND [b]<(5))", "a > 0 and b < 5"));
         assert!(same("(NEXT VALUE FOR [dbo].[s])", "NEXT VALUE FOR dbo.s"));
         assert!(same("(CONVERT([bit],(0)))", "CONVERT(bit, 0)"));
-        assert!(same("([a] IN ((1), (2)))", "a IN (1, 2)"));
+        assert!(same("([a]<>(1))", "a != 1"));
+        assert!(same("(getdate())", "CURRENT_TIMESTAMP"));
+        assert!(!same("([current_timestamp]>(0))", "getdate() > 0"));
+        // Not folded (module docs): the server stores `a IN (1, 2)` as an OR chain.
+        assert!(!same("([a]=(2) OR [a]=(1))", "a IN (1, 2)"));
+        assert!(same("([a]=(2) OR [a]=(1))", "a = 2 OR a = 1"));
         // Real differences stay visible.
         assert!(!same("([qty]>=(0))", "qty >= 1"));
         assert!(!same("((0))", "1"));

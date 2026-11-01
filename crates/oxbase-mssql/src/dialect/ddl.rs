@@ -101,7 +101,7 @@ impl DdlGenerator for MsSqlDdl {
                     ScriptStep::new(format!(
                         "ALTER TABLE {} ADD {}",
                         table_sql(table),
-                        column_sql(v, table, column)?
+                        added_column_sql(v, table, column)?
                     ))
                     .described(format!("Add column {}", column.name)),
                 );
@@ -596,8 +596,10 @@ fn identity_of(c: &ColumnDef) -> Option<IdentityDef> {
 }
 
 /// `true` when every value of type `old` fits type `new` (both canonical): the same type,
-/// longer strings, more digits, more fractional-second digits, integer widening, `real` →
-/// `float`, non-Unicode → Unicode, `text` / `ntext` / `image` → their `(max)` successors.
+/// longer strings, more digits, more fractional-second digits, integer widening (`bit` to any
+/// integer type), `real` → `float`, non-Unicode → Unicode, `text` / `ntext` / `image` → their
+/// `(max)` successors, `date` → `datetime2` / `datetimeoffset` (not `datetime`, which starts
+/// in 1753), `datetime` → `datetime2(7)`.
 pub(crate) fn is_widening(old: &str, new: &str) -> bool {
     if old == new {
         return true;
@@ -659,9 +661,12 @@ pub(crate) fn is_widening(old: &str, new: &str) -> bool {
         ("text", "varchar(max)" | "nvarchar(max)")
         | ("ntext", "nvarchar(max)")
         | ("image", "varbinary(max)") => true,
-        ("date", _) => nb == "datetime2" || nb == "datetime" || nb == "datetimeoffset",
+        // Not `date` -> `datetime`: dates before 1753 do not fit.
+        ("date", _) => nb == "datetime2" || nb == "datetimeoffset",
         ("smalldatetime", _) => nb == "datetime" || nb == "datetime2",
-        ("datetime", _) => nb == "datetime2" && num(&na, 0).is_some_and(|n| n >= 3),
+        // 1/300 s ticks need all 7 digits; fewer digits round them.
+        ("datetime", _) => nb == "datetime2" && num(&na, 0).is_some_and(|n| n >= 7),
+        ("bit", _) => int_rank(nb).is_some(),
         _ => false,
     }
 }
@@ -766,6 +771,17 @@ fn column_sql(v: &ServerVersion, table: &ObjectRef, c: &ColumnDef) -> Result<Str
     if let Some(id) = identity_of(c) {
         s.push(' ');
         s.push_str(&identity_clause(&id, c));
+    }
+    Ok(s)
+}
+
+/// A column added to an existing table. A nullable column with a default gets `WITH VALUES`,
+/// so existing rows take the default as on the other engines (SQL Server leaves them NULL
+/// otherwise).
+fn added_column_sql(v: &ServerVersion, table: &ObjectRef, c: &ColumnDef) -> Result<String> {
+    let mut s = column_sql(v, table, c)?;
+    if c.nullable && c.default.is_some() && c.generated.is_none() {
+        s.push_str(" WITH VALUES");
     }
     Ok(s)
 }
@@ -1020,6 +1036,18 @@ fn drop_constraint_step(table: &ObjectRef, kind: ObjectKind, name: &str, gone: b
     if gone { step.destructive() } else { step }
 }
 
+/// `IF <var> IS NOT NULL BEGIN SET @sql = ...; EXEC sys.sp_executesql @sql; END`: drops the
+/// constraint of the table `qualified` whose name is in the `sysname` variable `var`.
+/// `EXEC (...)` only accepts literals and variables, so the statement is built in `@sql`
+/// (declared by the caller) with `QUOTENAME` and run through `sp_executesql`.
+fn exec_drop_named(qualified: &str, var: &str) -> String {
+    format!(
+        "IF {var} IS NOT NULL BEGIN SET @sql = {} + QUOTENAME({var}); EXEC sys.sp_executesql \
+         @sql; END",
+        lit(&format!("ALTER TABLE {qualified} DROP CONSTRAINT "))
+    )
+}
+
 /// Drops the primary key: by name, else looked up in `sys.key_constraints`.
 fn drop_pk_step(table: &ObjectRef, name: Option<&str>, gone: bool) -> ScriptStep {
     if let Some(name) = name.filter(|n| !n.is_empty()) {
@@ -1028,10 +1056,9 @@ fn drop_pk_step(table: &ObjectRef, name: Option<&str>, gone: bool) -> ScriptStep
     let t = table_sql(table);
     let step = ScriptStep::new(format!(
         "DECLARE @pk sysname = (SELECT name FROM sys.key_constraints WHERE parent_object_id = \
-         OBJECT_ID({}) AND type = 'PK'); IF @pk IS NOT NULL EXEC (N'ALTER TABLE ' + {} + N' \
-         DROP CONSTRAINT ' + QUOTENAME(@pk))",
+         OBJECT_ID({}) AND type = 'PK'), @sql nvarchar(max); {}",
         lit(&t),
-        lit(&t)
+        exec_drop_named(&t, "@pk")
     ))
     .described("Drop the primary key");
     if gone { step.destructive() } else { step }
@@ -1052,11 +1079,10 @@ fn drop_default_step(table: &ObjectRef, column: &str, name: Option<&str>) -> Scr
     ScriptStep::new(format!(
         "DECLARE @df sysname = (SELECT d.name FROM sys.default_constraints AS d JOIN sys.columns \
          AS c ON c.object_id = d.parent_object_id AND c.column_id = d.parent_column_id WHERE \
-         d.parent_object_id = OBJECT_ID({}) AND c.name = {}); IF @df IS NOT NULL EXEC (N'ALTER \
-         TABLE ' + {} + N' DROP CONSTRAINT ' + QUOTENAME(@df))",
+         d.parent_object_id = OBJECT_ID({}) AND c.name = {}), @sql nvarchar(max); {}",
         lit(&t),
         lit(column),
-        lit(&t)
+        exec_drop_named(&t, "@df")
     ))
     .described(format!("Drop the default of column {column}"))
 }
@@ -2304,7 +2330,7 @@ fn alter_table(
             ScriptStep::new(format!(
                 "ALTER TABLE {} ADD {}",
                 table_sql(table),
-                column_sql(v, table, col)?
+                added_column_sql(v, table, col)?
             ))
             .described(format!("Add column {}", col.name)),
         );

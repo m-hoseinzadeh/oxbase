@@ -24,6 +24,10 @@
 //! - Never written: identity columns (`IdentityDef::always`), computed columns,
 //!   [`crate::extras::ROW_VERSION`] and [`crate::extras::PERIOD`] columns (`InvalidInput`
 //!   naming the column).
+//! - Date-time values for `datetime` / `smalldatetime` columns are written
+//!   `CAST(@Pn AS datetime)`: the driver binds them as `datetime2(7)`, and comparing a
+//!   `datetime` column with that converts the column to its exact 1/300 s value, so keys whose
+//!   milliseconds end in 3 or 7 would never match.
 //! - `Value::Null` is written as the keyword `NULL`, not a parameter (an `nvarchar` NULL
 //!   parameter does not convert to `varbinary`, `image` or CLR types). Text for a column whose
 //!   type has no neutral equivalent (`xml`, `hierarchyid`, `geometry`, `geography`,
@@ -115,8 +119,35 @@ fn needs_cast(col: &ColumnDef) -> bool {
     matches!(col.data_type, DataType::Other { .. })
 }
 
+/// `datetime` / `smalldatetime` when that is the type of `col`.
+///
+/// The driver binds date-time values as `datetime2(7)`, which has the higher type precedence,
+/// so `[d] = @Pn` converts the column instead of the parameter; from compatibility level 130
+/// on, that conversion keeps the exact 1/300 s value (`.997` is `.9966667`), which never
+/// equals the parameter. Such values are converted to the column's type in SQL instead.
+fn legacy_datetime(col: &ColumnDef, v: &ServerVersion) -> Option<&'static str> {
+    let ty = type_text(col, v).ok()?;
+    match split_type(&canonical_type(&ty)).0 {
+        "datetime" => Some("datetime"),
+        "smalldatetime" => Some("smalldatetime"),
+        _ => None,
+    }
+}
+
 /// Appends `NULL`, a placeholder, or `CAST(@Pn AS <type>)` for `value` in column `col`.
 fn bind(w: &mut SqlWriter<'_>, col: &ColumnDef, value: &Value, v: &ServerVersion) -> Result<()> {
+    let date_time = matches!(
+        value,
+        Value::Date(_) | Value::Timestamp(_) | Value::TimestampTz(_)
+    );
+    if let Some(ty) = legacy_datetime(col, v).filter(|_| date_time) {
+        w.push("CAST(")
+            .param(value.clone())
+            .push(" AS ")
+            .push(ty)
+            .push(")");
+        return Ok(());
+    }
     match value {
         Value::Null => {
             w.push("NULL");
@@ -553,6 +584,56 @@ mod tests {
         assert_eq!(
             p.write.params,
             [Value::Int(3), Value::Text("x".into()), Value::Int(2)]
+        );
+    }
+
+    #[test]
+    fn datetime_keys_and_values_are_converted_to_the_column_type() {
+        let mut t = TableDef::new(ObjectRef::table(None, Some("m3"), "dt"));
+        let d = col("d", "datetime", DataType::Timestamp { precision: Some(3) }).not_null();
+        let small = col(
+            "s",
+            "smalldatetime",
+            DataType::Timestamp { precision: Some(0) },
+        );
+        let d2 = col(
+            "d2",
+            "datetime2(7)",
+            DataType::Timestamp { precision: Some(7) },
+        );
+        t.columns = vec![d, small, d2];
+        let k = RowKey::new(t.obj.clone(), KeyKind::Primary, names(&["d"]));
+        let at = chrono::NaiveDate::from_ymd_opt(2026, 1, 15)
+            .unwrap()
+            .and_hms_milli_opt(10, 20, 30, 997)
+            .unwrap();
+        let edit = RowEdit::Update {
+            key: vec![Value::Timestamp(at)],
+            changes: vec![
+                ColumnValue::new("s", Value::Timestamp(at)),
+                ColumnValue::new("d2", Value::Timestamp(at)),
+            ],
+        };
+        let p = plan(&edit, &t, &k, &[]).unwrap();
+        assert_eq!(
+            p.write.sql,
+            "SET NOCOUNT ON;\nDECLARE @k TABLE ([d] datetime);\nUPDATE [m3].[dt] SET [s] = \
+             CAST(@P1 AS smalldatetime), [d2] = @P2 OUTPUT INSERTED.[d] INTO @k WHERE [d] = \
+             CAST(@P3 AS datetime);\nSELECT k.* FROM @k AS k;\nSET NOCOUNT OFF;"
+        );
+        // Still bound: the value never appears in the SQL text.
+        let ts = Value::Timestamp(at);
+        assert_eq!(p.write.params, [ts.clone(), ts.clone(), ts]);
+        // NULL stays the keyword; text keeps the server's own conversion.
+        let edit = RowEdit::Update {
+            key: vec![Value::Text("2026-01-15T10:20:30.997".into())],
+            changes: vec![ColumnValue::new("s", Value::Null)],
+        };
+        let p = plan(&edit, &t, &k, &[]).unwrap();
+        assert!(
+            p.write.sql.contains("SET [s] = NULL OUTPUT") && p.write.sql.contains("[d] = @P1;"),
+            "{}",
+            p.write.sql
         );
     }
 

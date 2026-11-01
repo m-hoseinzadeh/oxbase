@@ -424,10 +424,51 @@ fn defaults_are_named_constraints() {
     );
     assert!(text.contains("OBJECT_ID(N'[m3].[t]')"), "{text}");
     assert!(text.contains("c.name = N'qty'"), "{text}");
-    assert!(text.contains("QUOTENAME(@df)"), "{text}");
+    assert!(
+        text.ends_with(
+            "), @sql nvarchar(max); IF @df IS NOT NULL BEGIN SET @sql = N'ALTER TABLE [m3].[t] \
+             DROP CONSTRAINT ' + QUOTENAME(@df); EXEC sys.sp_executesql @sql; END"
+        ),
+        "{text}"
+    );
+    // `EXEC (...)` takes no function calls: the statement is built in a variable.
+    assert!(!text.contains("EXEC ("), "{text}");
     // Generated names are cut to 128 characters.
     let long = "y".repeat(140);
     assert_eq!(generated_name("DF", &[&long, "c"]).chars().count(), 128);
+}
+
+#[test]
+fn a_primary_key_whose_name_is_not_known_is_looked_up() {
+    let mut old = base();
+    old.primary_key.as_mut().unwrap().name = None;
+    let mut new = old.clone();
+    new.primary_key.as_mut().unwrap().columns = vec!["id".into(), "code".into()];
+    let s = alter(&old, &new, &[]).unwrap();
+    let text = s
+        .steps
+        .iter()
+        .map(|step| step.sql.as_str())
+        .find(|sql| sql.contains("@pk"))
+        .unwrap();
+    assert!(
+        text.starts_with(
+            "DECLARE @pk sysname = (SELECT name FROM sys.key_constraints WHERE parent_object_id \
+             = OBJECT_ID(N'[m3].[t]') AND type = 'PK'), @sql nvarchar(max); IF @pk IS NOT NULL \
+             BEGIN SET @sql = N'ALTER TABLE [m3].[t] DROP CONSTRAINT ' + QUOTENAME(@pk); EXEC \
+             sys.sp_executesql @sql; END"
+        ),
+        "{text}"
+    );
+    // Names with `]` and `'` stay quoted inside the built statement.
+    let odd = ObjectRef::table(None, Some("s]x"), "it's");
+    let step = drop_pk_step(&odd, None, false);
+    assert!(
+        step.sql
+            .contains("SET @sql = N'ALTER TABLE [s]]x].[it''s] DROP CONSTRAINT ' + QUOTENAME"),
+        "{}",
+        step.sql
+    );
 }
 
 #[test]
@@ -450,6 +491,11 @@ fn dropping_a_column_drops_its_default_and_checks_first() {
     let s = MsSqlDdl.drop_object(&qty, &DdlContext::new(&v)).unwrap();
     assert_eq!(s.len(), 2);
     assert!(s.steps[0].sql.starts_with("DECLARE @df sysname"));
+    assert!(
+        s.steps[0].sql.contains("EXEC sys.sp_executesql @sql"),
+        "{}",
+        s.steps[0].sql
+    );
     assert_eq!(s.steps[1].sql, "ALTER TABLE [m3].[t] DROP COLUMN [qty]");
     // Other kinds.
     let s = MsSqlDdl.drop_object(&old.obj, &ctx).unwrap();
@@ -829,6 +875,19 @@ fn column_cell_steps() {
         sql(&s),
         ["ALTER TABLE [m3].[c] ADD [c_new] nvarchar(40) NULL"]
     );
+    // A nullable column with a default fills existing rows (WITH VALUES).
+    let mut filled = added.clone();
+    filled.default = Some("N'n/a'".into());
+    let s = MsSqlDdl
+        .create(&child(&filled), &DdlContext::new(&v).with_table(&t))
+        .unwrap();
+    assert_eq!(
+        sql(&s),
+        [
+            "ALTER TABLE [m3].[c] ADD [c_new] nvarchar(40) NULL CONSTRAINT [DF_c_c_new] DEFAULT \
+          (N'n/a') WITH VALUES"
+        ]
+    );
     // NOT NULL.
     let c = t.columns[1].clone();
     let mut n = c.clone();
@@ -991,6 +1050,12 @@ fn widening_and_narrowing() {
         ("float(53)", "real", false),
         ("varbinary(10)", "varbinary(max)", true),
         ("date", "datetime2(7)", true),
+        ("date", "datetime", false),
+        ("datetime", "datetime2(7)", true),
+        ("datetime", "datetime2(3)", false),
+        ("bit", "tinyint", true),
+        ("bit", "bigint", true),
+        ("int", "bit", false),
     ] {
         assert_eq!(is_widening(old, new), wide, "{old} -> {new}");
     }

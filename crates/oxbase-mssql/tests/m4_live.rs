@@ -290,7 +290,7 @@ fn data_type_of(native: &str) -> DataType {
         "varchar" | "nvarchar" => DataType::Text,
         "varbinary" => DataType::VarBinary { length: arg },
         "date" => DataType::Date,
-        "datetime2" => DataType::Timestamp { precision: None },
+        "datetime2" | "datetime" | "smalldatetime" => DataType::Timestamp { precision: None },
         "json" => DataType::Json { binary: true },
         "rowversion" => DataType::Binary { length: Some(8) },
         other => DataType::Other {
@@ -1315,6 +1315,126 @@ async fn alter_column_drops_and_recreates_its_blockers() {
     }
 }
 
+/// The lookups used when a constraint's name is not known: a default without its
+/// `default_constraint` extra, a primary key without a name, and dropping columns (with and
+/// without a default) without the table in the context.
+async fn unnamed_lookups(rt: &Rt, name: &str) -> Step<()> {
+    let cur = rt
+        .create(&base_table(rt.table_ref(name)), "create table")
+        .await?;
+    exec(
+        &rt.conn,
+        &format!("INSERT INTO [m3].[{name}] ([id], [code]) VALUES (@P1, @P2)"),
+        &[Value::Int(1), Value::Text("a".into())],
+    )
+    .await?;
+    // Forget the names the catalog reported.
+    let mut nameless = cur.clone();
+    if let Some(pk) = nameless.primary_key.as_mut() {
+        pk.name = None;
+    }
+    let qty = nameless
+        .columns
+        .iter_mut()
+        .find(|c| c.name == "qty")
+        .ok_or("no qty")?;
+    if qty.extras.get(&extras::DEFAULT_CONSTRAINT).is_none() {
+        return Err("the loader reported no default_constraint for qty".into());
+    }
+    qty.extras = Extras::new();
+    // Change the default and the primary key: both are dropped through a lookup.
+    let mut new = nameless.clone();
+    if let Some(c) = new.columns.iter_mut().find(|c| c.name == "qty") {
+        c.default = Some("1".into());
+    }
+    if let Some(pk) = new.primary_key.as_mut() {
+        pk.columns = vec!["id".into(), "code".into()];
+    }
+    let ctx = DdlContext::new(&rt.version).with_table(&nameless);
+    let script = rt
+        .ddl()
+        .alter(
+            &ObjectDef::Table(nameless.clone()),
+            &ObjectDef::Table(new.clone()),
+            &ctx,
+        )
+        .map_err(|e| format!("unnamed default and key: {e}"))?;
+    if !script.steps.iter().any(|st| st.sql.contains("@df"))
+        || !script.steps.iter().any(|st| st.sql.contains("@pk"))
+    {
+        return Err(format!("the lookups were not used:\n{script}"));
+    }
+    run_script(&rt.conn, &script, "unnamed default and key").await?;
+    let after = rt.same(&new, "unnamed default and key").await?;
+    let pk = after.primary_key.as_ref().ok_or("no primary key")?;
+    if pk.columns != ["id", "code"] {
+        return Err(format!("primary key is on {:?}", pk.columns));
+    }
+    // Drop columns without the table in the context: one with a default, one without.
+    let column_ddl = rt
+        .reg
+        .ddl(Engine::MsSql, ObjectKind::Column)
+        .map_err(|e| e.to_string())?;
+    for column in ["qty", "order"] {
+        let op = format!("drop column {column} without the table");
+        let script = column_ddl
+            .drop_object(
+                &after.obj.child(ObjectKind::Column, column),
+                &DdlContext::new(&rt.version),
+            )
+            .map_err(|e| format!("{op}: {e}"))?;
+        run_script(&rt.conn, &script, &op).await?;
+    }
+    let left = rt.load(name, "after the column drops").await?;
+    let names: Vec<&str> = left.columns.iter().map(|c| c.name.as_str()).collect();
+    if names != ["id", "code"] {
+        return Err(format!("columns left: {names:?}"));
+    }
+    if rt.count(name).await? != 1 {
+        return Err("the row was lost".into());
+    }
+    // A nullable column with a default: the existing row takes the default (WITH VALUES).
+    let mut note = col("note", DataType::VarChar { length: Some(10) });
+    note.default = Some("N'n/a'".into());
+    let script = column_ddl
+        .create(
+            &ObjectDef::Column {
+                table: left.obj.clone(),
+                column: note,
+            },
+            &DdlContext::new(&rt.version).with_table(&left),
+        )
+        .map_err(|e| format!("add note: {e}"))?;
+    run_script(&rt.conn, &script, "add note").await?;
+    let notes = query(&rt.conn, &format!("SELECT [note] FROM [m3].[{name}]"), &[]).await?;
+    if text(notes.first().and_then(|r| r.first())).as_deref() != Some("n/a") {
+        return Err(format!(
+            "the existing row did not take the default: {notes:?}"
+        ));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "needs the mssql fixture (scripts/fixtures-up.sh mssql)"]
+async fn unnamed_defaults_and_keys_are_looked_up() {
+    let conn = connect().await;
+    let f = fixtures();
+    let rt = Rt {
+        version: conn.server_version().clone(),
+        conn,
+        reg: registry(),
+        db: s(&f, &["m3", "mssql", "database"]),
+        schema: s(&f, &["m3", "mssql", "schema"]),
+    };
+    let name = format!("m3_rt_ddlnn_{}", token());
+    let result = unnamed_lookups(&rt, &name).await;
+    rt.drop_if_exists(&name).await;
+    if let Err(e) = result {
+        panic!("{e}");
+    }
+}
+
 // --- grid writer --------------------------------------------------------------------------
 
 async fn run_plan(
@@ -1532,6 +1652,85 @@ async fn grid_writes(c: &dyn Connection, other: &dyn Connection, tok: &str) -> S
         return Err("SET NOCOUNT was left ON".into());
     }
     Ok(())
+}
+
+/// A `datetime` key whose milliseconds end in 7 (stored as 1/300 s ticks) is matched.
+async fn datetime_key_edits(c: &dyn Connection, name: &str) -> Step<()> {
+    let f = fixtures();
+    let db = s(&f, &["m3", "mssql", "database"]);
+    let schema = s(&f, &["m3", "mssql", "schema"]);
+    exec(
+        c,
+        &format!(
+            "CREATE TABLE [m3].[{name}] ([d] datetime NOT NULL PRIMARY KEY, [s] smalldatetime \
+             NULL, [v] int NULL); INSERT INTO [m3].[{name}] ([d], [v]) VALUES \
+             ('2026-01-15T10:20:30.997', 1)"
+        ),
+        &[],
+    )
+    .await?;
+    let table = load_table(c, &db, &schema, name)
+        .await?
+        .ok_or("the datetime table is missing")?;
+    let key = RowKey::new(table.obj.clone(), KeyKind::Primary, vec!["d".into()]);
+    let reg = registry();
+    let v = c.server_version().clone();
+    let at = chrono::NaiveDate::from_ymd_opt(2026, 1, 15)
+        .and_then(|d| d.and_hms_milli_opt(10, 20, 30, 997))
+        .ok_or("bad date")?;
+    let update = RowEdit::Update {
+        key: vec![Value::Timestamp(at)],
+        changes: vec![
+            ColumnValue::new("v", Value::Int(2)),
+            ColumnValue::new("s", Value::Timestamp(at)),
+        ],
+    };
+    let out = run_plan(c, &reg, &update, &table, &key, &["v".into()], &v).await?;
+    if row_count(&out) != 1 || returned(&out, "v").as_deref() != Some("2") {
+        return Err(format!(
+            "update by a datetime key returned {} rows",
+            row_count(&out)
+        ));
+    }
+    let out = run_plan(
+        c,
+        &reg,
+        &RowEdit::Delete {
+            key: vec![Value::Timestamp(at)],
+        },
+        &table,
+        &key,
+        &[],
+        &v,
+    )
+    .await?;
+    if row_count(&out) != 1 {
+        return Err(format!(
+            "delete by a datetime key returned {} rows",
+            row_count(&out)
+        ));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "needs the mssql fixture (scripts/fixtures-up.sh mssql)"]
+async fn grid_writer_matches_datetime_keys() {
+    let conn = connect().await;
+    let f = fixtures();
+    let rt = Rt {
+        version: conn.server_version().clone(),
+        conn,
+        reg: registry(),
+        db: s(&f, &["m3", "mssql", "database"]),
+        schema: s(&f, &["m3", "mssql", "schema"]),
+    };
+    let name = format!("m3_rt_ddldt_{}", token());
+    let result = datetime_key_edits(&rt.conn, &name).await;
+    rt.drop_if_exists(&name).await;
+    if let Err(e) = result {
+        panic!("{e}");
+    }
 }
 
 #[tokio::test]
