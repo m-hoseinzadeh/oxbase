@@ -16,6 +16,13 @@
 //!   appears after the pick is never overwritten (the export fails with "already exists").
 //! - The webview chooses only the filter list, the dialog title and the suggested *base name*
 //!   of a save dialog (no directories: [`validate_default_name`]).
+//! - **Debug builds only** (`#[cfg(debug_assertions)]`): the process argument
+//!   `--e2e-file-dir=<absolute dir>` replaces both dialogs for the webview smoke test, which
+//!   cannot drive a native dialog (`ui/e2e/README.md`, "The M5 file hook"). `file_pick_open`
+//!   then returns a read handle for the single regular file in `<dir>/open/` and
+//!   `file_pick_save` a write handle for `<dir>/save/<defaultName>`. The folder comes from the
+//!   command line, which only the test runner sets; the webview still never sends a path.
+//!   Release builds contain neither the code nor the flag.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -270,6 +277,48 @@ fn local_path(picked: FilePath) -> CommandResult<PathBuf> {
     })
 }
 
+/// The debug-only webview smoke test hook (module docs).
+#[cfg(debug_assertions)]
+mod e2e {
+    use std::path::{Path, PathBuf};
+
+    use oxbase_types::{Error, Result};
+
+    /// The command-line argument, with its `=`.
+    const ARG: &str = "--e2e-file-dir=";
+
+    /// The folder of `--e2e-file-dir=<dir>` when the app was started with it (an absolute
+    /// path only).
+    pub fn dir() -> Option<PathBuf> {
+        std::env::args_os().find_map(|arg| {
+            let dir = PathBuf::from(arg.to_str()?.strip_prefix(ARG)?);
+            dir.is_absolute().then_some(dir)
+        })
+    }
+
+    /// The single regular file in `<dir>/open/`.
+    pub fn open_file(dir: &Path) -> Result<PathBuf> {
+        let mut found = Vec::new();
+        for entry in std::fs::read_dir(dir.join("open"))? {
+            let entry = entry?;
+            if entry.file_type()?.is_file() {
+                found.push(entry.path());
+            }
+        }
+        match found.pop() {
+            Some(path) if found.is_empty() => Ok(path),
+            _ => Err(Error::invalid_input(
+                "the e2e file folder must hold exactly one file in open/",
+            )),
+        }
+    }
+
+    /// `<dir>/save/<default_name>` (the name is validated by the caller).
+    pub fn save_file(dir: &Path, default_name: &str) -> PathBuf {
+        dir.join("save").join(default_name)
+    }
+}
+
 /// Shows the native open dialog. `None` when the user cancelled.
 #[tauri::command]
 pub async fn file_pick_open(
@@ -279,6 +328,11 @@ pub async fn file_pick_open(
     title: Option<String>,
 ) -> CommandResult<Option<PickedFile>> {
     validate_filters(&filters)?;
+    #[cfg(debug_assertions)]
+    if let Some(dir) = e2e::dir() {
+        let path = e2e::open_file(&dir)?;
+        return Ok(Some(files.register(path, FileAccess::Read)));
+    }
     let (tx, rx) = tokio::sync::oneshot::channel();
     dialog(&app, &filters, title).pick_file(move |picked| {
         let _ = tx.send(picked);
@@ -301,6 +355,11 @@ pub async fn file_pick_save(
 ) -> CommandResult<Option<PickedFile>> {
     validate_filters(&filters)?;
     validate_default_name(&default_name)?;
+    #[cfg(debug_assertions)]
+    if let Some(dir) = e2e::dir() {
+        let path = e2e::save_file(&dir, &default_name);
+        return Ok(Some(files.register(path, FileAccess::Write)));
+    }
     let (tx, rx) = tokio::sync::oneshot::channel();
     dialog(&app, &filters, title)
         .set_file_name(default_name)
@@ -390,6 +449,27 @@ mod tests {
         assert!(json.contains("\"name\":\"orders.csv\""), "{json}");
         assert!(!json.contains("private"), "{json}");
         assert!(json.contains("\"access\":\"read\""), "{json}");
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn e2e_hook_finds_the_single_open_file_and_the_save_target() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("open")).unwrap();
+        std::fs::create_dir(dir.path().join("save")).unwrap();
+        assert!(e2e::open_file(dir.path()).is_err());
+        let sample = dir.path().join("open").join("basic.csv");
+        std::fs::write(&sample, b"id\n1\n").unwrap();
+        std::fs::create_dir(dir.path().join("open").join("sub")).unwrap();
+        assert_eq!(e2e::open_file(dir.path()).unwrap(), sample);
+        std::fs::write(dir.path().join("open").join("other.csv"), b"x").unwrap();
+        assert!(e2e::open_file(dir.path()).is_err());
+        assert_eq!(
+            e2e::save_file(dir.path(), "out.csv"),
+            dir.path().join("save").join("out.csv")
+        );
+        // The test binary is not started with the argument.
+        assert_eq!(e2e::dir(), None);
     }
 
     #[test]

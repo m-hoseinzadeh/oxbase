@@ -198,8 +198,8 @@ jobs:
 
       # Compile before the containers start so their startup overlaps nothing slow
       # and a compile error does not leave a stack running.
-      - name: Build conformance harness and M1-M4 live tests
-        run: cargo test -p oxbase-conformance -p oxbase-net -p oxbase-pg -p oxbase-mysql -p oxbase-sqlite -p oxbase-mssql -p oxbase-services --locked --no-run
+      - name: Build conformance harness and M1-M5 live tests
+        run: cargo test -p oxbase-conformance -p oxbase-net -p oxbase-pg -p oxbase-mysql -p oxbase-sqlite -p oxbase-mssql -p oxbase-services -p oxbase-io --locked --no-run
 
       # Test CA, server/client certificates and SSH keys for the TLS/SSH fixtures (openssl and
       # ssh-keygen ship with the runner image). Compose bind-mounts these files and refuses to
@@ -240,10 +240,16 @@ jobs:
       # every M3 engine; a missing engine cell or seed table fails instead of being pending.
       # M4: the SQL Server driver, fetch and DDL / grid-writer live tests, and the services
       # query (1M rows, cancel, scripts, history), edit and designer live tests on SQL Server.
-      - name: Run M1-M4 live tests
+      # M5: the bulk loader live tests of every engine (bulk_live.rs), the import / export
+      # service live tests on all five engines with the real file readers and writers
+      # (OXBASE_SERVICES_REQUIRE_M5_IO=1: a missing reader or writer fails instead of being
+      # pending), and oxbase-io's SQL dump live test (each engine's dump run on its fixture).
+      # The import_perf test is a skip here (no OXBASE_PERF_DIR); it runs in import-perf.
+      - name: Run M1-M5 live tests
         env:
           OXBASE_SERVICES_REQUIRE_M3_CELLS: "1"
-        run: cargo test -p oxbase-net -p oxbase-pg -p oxbase-mysql -p oxbase-sqlite -p oxbase-mssql -p oxbase-services --locked -- --include-ignored --test-threads 1
+          OXBASE_SERVICES_REQUIRE_M5_IO: "1"
+        run: cargo test -p oxbase-net -p oxbase-pg -p oxbase-mysql -p oxbase-sqlite -p oxbase-mssql -p oxbase-services -p oxbase-io --locked -- --include-ignored --test-threads 1 --nocapture
 
       - name: Dump fixture logs
         if: failure()
@@ -259,7 +265,7 @@ jobs:
   # perf`) and only the two fixtures it needs. Full lane, plus the fast lane of the perf and
   # integration branches (wip/*-perf, wip/*-integrate). Until the read / services / load streams
   # are merged the test reports "pending" and passes; OXBASE_REQUIRE_M5_PERF=1 makes that a
-  # failure. It is set on the "1 GB CSV import" step only (full lane and wip/*-integrate), never
+  # failure. It is set on the "1 GB CSV import" step only (every lane since the integration), never
   # at workflow or job level: the conformance job runs this test too (--include-ignored, no
   # OXBASE_PERF_DIR, where it is a skip).
   import-perf:
@@ -299,9 +305,9 @@ jobs:
       - name: 1 GB CSV import (PostgreSQL, MySQL)
         env:
           OXBASE_PERF_DIR: ${{ runner.temp }}/m5-perf
-          # Mandatory on the full lane and the integration branch (a skeleton left in the
-          # reader, services or loader fails the exit check); "pending" passes on wip/*-perf.
-          OXBASE_REQUIRE_M5_PERF: ${{ (!startsWith(github.ref, 'refs/heads/wip/') || endsWith(github.ref, '-integrate')) && '1' || '0' }}
+          # Mandatory since the M5 integration: a skeleton left in the reader, services or
+          # loader fails the exit check instead of reporting "pending".
+          OXBASE_REQUIRE_M5_PERF: "1"
         run: cargo test -p oxbase-services --profile perf --locked --test import_perf -- --include-ignored --test-threads 1 --nocapture
 
       - name: Delete the generated CSV
@@ -390,11 +396,13 @@ jobs:
       - name: Start the PostgreSQL fixture
         run: bash scripts/e2e-fixtures.sh up
 
-      # M3: the table-data edit step is mandatory (a skip fails the job).
+      # M3: the table-data edit step is mandatory (a skip fails the job). M5: so is the
+      # import / export step (the debug app's --e2e-file-dir hook, ui/e2e/README.md).
       - name: Webview smoke test
         env:
           OXBASE_E2E_OUT: ${{ runner.temp }}/e2e
           OXBASE_E2E_REQUIRE_EDIT: "1"
+          OXBASE_E2E_REQUIRE_M5: "1"
         run: bash scripts/e2e-smoke.sh
 
       - name: Upload e2e results

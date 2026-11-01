@@ -162,7 +162,8 @@ pub struct CsvReadOptions {
     /// `csv` crate does not report whether a field was quoted, so `""` and an empty unquoted
     /// field are the same.
     pub null_tokens: Vec<String>,
-    /// Trim spaces around unquoted values.
+    /// Trim spaces around values. Quoted values are trimmed too: the `csv` parser does not
+    /// report which fields were quoted (as built, `docs/m5-contracts.md` §13).
     pub trim: bool,
     /// Rows with more or fewer fields than the header: `true` pads missing fields with NULL
     /// and reports extra fields as a row issue; `false` makes every ragged row an issue.
