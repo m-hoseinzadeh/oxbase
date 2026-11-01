@@ -32,6 +32,7 @@ mod text;
 mod types;
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 
 use async_trait::async_trait;
 use oxbase_dialect::{BracketQuoting, Fetcher, Quoting};
@@ -556,15 +557,14 @@ async fn load_view(cx: &Cx<'_>, obj: &ObjectRef) -> Result<ObjectDef> {
         extras.insert(props::CHECK_OPTION, "cascaded");
     }
     extras.insert(x::SCHEMA_BINDING, row.flag("is_schema_bound")?);
-    let (definition, columns) = match row.opt_str("definition")? {
-        Some(text) => match text::split_view(text) {
-            Some(v) => (v.query, v.columns),
-            None => (text.trim().to_owned(), Vec::new()),
-        },
-        None => {
-            extras.insert(x::ENCRYPTED, true);
-            (String::new(), Vec::new())
-        }
+    let (definition, columns) = if let Some(text) = row.opt_str("definition")? {
+        text::split_view(text).map_or_else(
+            || (text.trim().to_owned(), Vec::new()),
+            |v| (v.query, v.columns),
+        )
+    } else {
+        extras.insert(x::ENCRYPTED, true);
+        (String::new(), Vec::new())
     };
     let name = row.string("name")?;
     let comment = row.opt_string("comment")?;
@@ -752,11 +752,12 @@ async fn table_type_definition(cx: &Cx<'_>, qualified: &str, table_id: i64) -> R
                 s.push_str(coll);
             }
             if let Some(id) = &c.identity {
-                s.push_str(&format!(
+                let _ = write!(
+                    s,
                     " IDENTITY({}, {})",
                     id.start.unwrap_or(1),
                     id.increment.unwrap_or(1)
-                ));
+                );
             }
             s.push_str(if c.nullable { " NULL" } else { " NOT NULL" });
             if let Some(d) = &c.default {
