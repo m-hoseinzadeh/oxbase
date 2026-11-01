@@ -241,7 +241,12 @@ fn every_type_dumps_for_every_engine() {
             &[sample(), sample()],
         );
         assert_eq!(text.matches("INSERT INTO").count(), 1, "{engine}");
-        assert!(text.ends_with(");\n"), "{engine}");
+        // MySQL / MariaDB restore the session time zone after the inserts (`at_tz`).
+        let end = match engine {
+            Engine::MySql | Engine::MariaDb => ");\nSET time_zone = @oxbase_time_zone;\n",
+            _ => ");\n",
+        };
+        assert!(text.ends_with(end), "{engine}:\n{text}");
     }
 }
 
