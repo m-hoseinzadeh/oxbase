@@ -351,36 +351,64 @@ fn option_matrix() -> Vec<FormatOptions> {
     all
 }
 
-/// Formats `text`, checks the invariants and returns the result. Panics with the input on a
-/// violation.
-fn check_properties(d: &Dialect, text: &str, o: &FormatOptions) -> String {
-    let once = match format(d, text, o) {
-        Ok(out) => out,
-        Err(e) => panic!("{:?}: format failed ({e}) on {text:?}", d.engine),
-    };
-    check_format(d, text, &once).unwrap_or_else(|e| panic!("{e} on {text:?}"));
-    let twice = format(d, &once, o).unwrap_or_else(|e| panic!("{e} on {once:?}"));
-    assert_eq!(
-        twice, once,
-        "{:?} not idempotent on {text:?} with {o:?}",
-        d.engine
-    );
-    once
+/// Formats `text` and checks the invariants: the result passes `check_format` and formatting
+/// it again changes nothing. The violation, described, otherwise.
+fn properties(d: &Dialect, text: &str, o: &FormatOptions) -> Result<(), String> {
+    let once = format(d, text, o)
+        .map_err(|e| format!("{:?}: format failed ({e}) on {text:?}", d.engine))?;
+    check_format(d, text, &once).map_err(|e| format!("{e} on {text:?}"))?;
+    let twice = format(d, &once, o).map_err(|e| format!("{e} on the output {once:?}"))?;
+    if twice != once {
+        return Err(format!(
+            "{:?} not idempotent on {text:?} with {o:?}:\n first: {once:?}\nsecond: {twice:?}",
+            d.engine
+        ));
+    }
+    Ok(())
+}
+
+/// Collects violations (the first 25 are reported, all are counted).
+#[derive(Default)]
+struct Violations {
+    seen: Vec<String>,
+    count: usize,
+}
+
+impl Violations {
+    fn check(&mut self, d: &Dialect, text: &str, o: &FormatOptions) {
+        if let Err(e) = properties(d, text, o) {
+            self.count += 1;
+            if self.seen.len() < 25 && !self.seen.contains(&e) {
+                self.seen.push(e);
+            }
+        }
+    }
+
+    fn assert_none(&self) {
+        assert!(
+            self.count == 0,
+            "{} violations, first ones:\n{}",
+            self.count,
+            self.seen.join("\n---\n")
+        );
+    }
 }
 
 #[test]
 fn corpus_with_every_option_combination() {
     let options = option_matrix();
+    let mut violations = Violations::default();
     for engine in ENGINES {
         let d = dialect(engine);
         let all = corpus(engine).join(";\n");
         for o in &options {
             for text in corpus(engine) {
-                check_properties(&d, text, o);
+                violations.check(&d, text, o);
             }
-            check_properties(&d, &all, o);
+            violations.check(&d, &all, o);
         }
     }
+    violations.assert_none();
 }
 
 /// A tiny deterministic random generator (xorshift) for the fuzz test.
@@ -418,18 +446,19 @@ fn fuzzed_inputs_keep_the_invariants() {
     let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
     let wide = FormatOptions::default();
     let narrow = narrow();
+    let mut violations = Violations::default();
     for engine in ENGINES {
         let sql = dialect(engine);
         for text in corpus(engine) {
             // Every prefix (incomplete SQL is the normal case).
             for (at, _) in text.char_indices() {
-                check_properties(&sql, &text[..at], &wide);
+                violations.check(&sql, &text[..at], &wide);
             }
             // Every single-token deletion.
             let tokens: Vec<_> = oxbase_sql::tokenize(sql.sql, text).collect();
             for token in &tokens {
                 let cut = [&text[..token.start], &text[token.end..]].concat();
-                check_properties(&sql, &cut, &narrow);
+                violations.check(&sql, &cut, &narrow);
             }
             // Random insertions.
             for _ in 0..40 {
@@ -439,10 +468,11 @@ fn fuzzed_inputs_keep_the_invariants() {
                     mutated.insert_str(at, JUNK[rng.below(JUNK.len())]);
                 }
                 let options = if rng.below(2) == 0 { &wide } else { &narrow };
-                check_properties(&sql, &mutated, options);
+                violations.check(&sql, &mutated, options);
             }
         }
     }
+    violations.assert_none();
 }
 
 #[test]

@@ -85,6 +85,23 @@ fn gap<'a>(dialect: &Dialect, text: &'a str) -> Gap<'a> {
     g
 }
 
+/// `true` when characters `a` then `b`, touching in the input, must keep touching (a `.`, or
+/// two operator characters: the rule of `oxbase_sql::tokens_equivalent`).
+fn glued(a: Option<char>, b: Option<char>) -> bool {
+    let (Some(a), Some(b)) = (a, b) else {
+        return false;
+    };
+    let op = |c: char| c.is_ascii_punctuation() && !"(),;'\"`[]".contains(c);
+    a == '.' || b == '.' || (op(a) && op(b))
+}
+
+/// `true` when the gap `text` ends without whitespace right before `next`, and touching matters
+/// there.
+fn touches_next(text: &str, next: &str) -> bool {
+    !text.ends_with(|c: char| c.is_ascii_whitespace())
+        && glued(text.chars().last(), next.chars().next())
+}
+
 /// Columns of `text` with tabs counted as `tab` columns.
 pub(super) fn columns(text: &str, tab: usize) -> usize {
     text.chars().map(|c| if c == '\t' { tab } else { 1 }).sum()
@@ -164,7 +181,10 @@ impl Writer<'_> {
             return &g.lines;
         };
         let terminator = first.text.starts_with(';');
-        if first.same_line || (terminator && !self.ends_with_line_comment(statement)) {
+        let movable = terminator
+            && !self.ends_with_line_comment(statement)
+            && !glued(statement.chars().last(), Some(';'));
+        if first.same_line || movable {
             if first.same_line && g.space_first && !terminator {
                 self.out.push(' ');
             }
@@ -176,7 +196,7 @@ impl Writer<'_> {
 
     /// The gap `text` between `statement` (just written) and the next statement; ends on a new
     /// line, ready for the next statement.
-    pub fn between(&mut self, text: &str, statement: &str) {
+    pub fn between(&mut self, text: &str, statement: &str, next: &str) {
         let g = gap(self.dialect, text);
         let lines = self.attach(&g, statement);
         let blank = self.blank();
@@ -195,6 +215,9 @@ impl Writer<'_> {
             }
             self.line(l.text);
         }
+        if touches_next(text, next) {
+            return;
+        }
         if blank && (g.blank_end || insert_at == lines.len()) {
             self.out.push_str(self.eol);
         }
@@ -202,8 +225,8 @@ impl Writer<'_> {
         self.out.push_str(&self.prefix);
     }
 
-    /// The gap before the first statement (`before_statement`) or a text without statements.
-    pub fn leading(&mut self, text: &str, before_statement: bool) {
+    /// The gap before the first statement (`statement`) or a text without statements.
+    pub fn leading(&mut self, text: &str, statement: Option<&str>) {
         let g = gap(self.dialect, text);
         let blank = self.blank();
         for (k, l) in g.lines.iter().enumerate() {
@@ -216,7 +239,10 @@ impl Writer<'_> {
             }
             self.line(l.text);
         }
-        if before_statement && !g.lines.is_empty() {
+        if let Some(statement) = statement
+            && !g.lines.is_empty()
+            && !touches_next(text, statement)
+        {
             if blank && g.blank_end {
                 self.out.push_str(self.eol);
             }
@@ -241,17 +267,17 @@ impl Writer<'_> {
 /// The whole of `text` formatted (statements from `statements`, the split of `text`).
 pub(super) fn whole(w: &mut Writer<'_>, text: &str, statements: &[Statement]) {
     let Some(first) = statements.first() else {
-        w.leading(text, false);
+        w.leading(text, None);
         if !w.out.is_empty() && text.ends_with('\n') {
             w.out.push_str(w.eol);
         }
         return;
     };
-    w.leading(&text[..first.range.start], true);
+    w.leading(&text[..first.range.start], Some(&first.text));
     for (k, s) in statements.iter().enumerate() {
         w.statement(&s.text, 0);
         match statements.get(k + 1) {
-            Some(next) => w.between(&text[s.range.end..next.range.start], &s.text),
+            Some(next) => w.between(&text[s.range.end..next.range.start], &s.text, &next.text),
             None => w.trailing(&text[s.range.end..], &s.text),
         }
     }
@@ -272,7 +298,7 @@ pub(super) fn span(w: &mut Writer<'_>, text: &str, statements: &[Statement], sta
         };
         w.statement(&s.text, col);
         if let Some(next) = statements.get(k + 1) {
-            w.between(&text[s.range.end..next.range.start], &s.text);
+            w.between(&text[s.range.end..next.range.start], &s.text, &next.text);
         }
     }
 }

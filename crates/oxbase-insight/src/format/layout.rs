@@ -816,8 +816,8 @@ impl<'a> Builder<'_, 'a> {
         st.stmt = stmt;
         st.in_query = stmt == Stmt::Query;
         Clause {
-            new_stmt,
             defs,
+            new_stmt,
             ..Clause::new(head, body)
         }
     }
@@ -855,8 +855,11 @@ impl<'a> Builder<'_, 'a> {
         cur: Option<&Clause>,
     ) -> Option<Clause> {
         let word = self.word_at(nodes, i)?;
-        // After an operator a keyword is an operand (`a = VALUES(a)`), never a clause.
-        if i > 0 && matches!(&nodes[i - 1], Node::Tok(prev) if self.items[*prev].op) {
+        // After an operator a keyword is an operand (`a = VALUES(a)`), never a clause (`*` is
+        // an operand itself in `SELECT * FROM`).
+        if i > 0
+            && matches!(&nodes[i - 1], Node::Tok(prev) if self.items[*prev].op && self.items[*prev].text != "*")
+        {
             return None;
         }
         let is = |other: &str| word.eq_ignore_ascii_case(other);
