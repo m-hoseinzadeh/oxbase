@@ -68,6 +68,8 @@ mod compare;
 mod ddl;
 mod dml;
 mod fetch;
+// M6: keywords, functions and types for code insight.
+mod language;
 mod rows;
 mod sql;
 mod types;
@@ -133,6 +135,8 @@ pub fn register(reg: &mut DialectRegistry) {
     reg.register_bulk_loader(engine, Arc::new(PgBulkLoader));
     // M6: the schema cache reads the whole catalog in a fixed number of queries.
     reg.register_catalog_reader(engine, Arc::new(PgCatalogReader));
+    // M6: language data for code insight (language.rs).
+    reg.register_language(engine, language::LANGUAGE);
     reg.mark_not_applicable_except(engine, &APPLICABLE);
 }
 

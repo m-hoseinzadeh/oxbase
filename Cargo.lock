@@ -4055,8 +4055,12 @@ name = "oxbase-insight"
 version = "0.0.1"
 dependencies = [
  "oxbase-dialect",
+ "oxbase-mssql",
+ "oxbase-mysql",
+ "oxbase-pg",
  "oxbase-schema-cache",
  "oxbase-sql",
+ "oxbase-sqlite",
  "oxbase-types",
  "pretty_assertions",
  "serde",

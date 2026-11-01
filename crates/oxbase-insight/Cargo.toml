@@ -28,3 +28,8 @@ pretty_assertions.workspace = true
 serde_json.workspace = true
 # The completion perf test reads `[m6.perf]` from tests/fixtures.toml.
 toml.workspace = true
+# The engines' own language data (`SqlLanguage`), so the formatter tests see what the app sees.
+oxbase-pg.workspace = true
+oxbase-mysql.workspace = true
+oxbase-sqlite.workspace = true
+oxbase-mssql.workspace = true

@@ -64,6 +64,8 @@ mod ddl_text;
 mod dml;
 mod event;
 mod expr;
+// M6: keywords, functions and types for code insight.
+mod language;
 mod native;
 mod routine;
 mod rows;
@@ -125,6 +127,13 @@ pub fn register(reg: &mut DialectRegistry) {
         reg.register_bulk_loader(engine, Arc::new(MySqlBulkLoader::new(engine)));
         // M6: the schema cache reads the whole catalog in a fixed number of queries.
         reg.register_catalog_reader(engine, Arc::new(MySqlCatalogReader));
+        // M6: language data for code insight (language.rs).
+        let language = if mariadb {
+            language::MARIADB_LANGUAGE
+        } else {
+            language::LANGUAGE
+        };
+        reg.register_language(engine, language);
         reg.register_fetcher(
             engine,
             ObjectKind::Database,

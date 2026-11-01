@@ -4,6 +4,31 @@
 //! The formatter only changes whitespace and the case of keywords. Every result passes
 //! [`check_format`] before it is returned; when it would not (a formatter bug, or text the
 //! formatter cannot handle), the call fails and the editor keeps the original text.
+//!
+//! # How it works
+//!
+//! 1. The script is cut with `oxbase_sql::split`; the gaps between statements (terminators,
+//!    comments, `GO` and `DELIMITER` lines) keep their lines as typed (`script`).
+//! 2. Each statement's tokens become items with their comments attached and keywords told
+//!    apart from identifiers (`prep`), then a tree of parentheses and `CASE` blocks (`tree`).
+//! 3. The layout turns the tree into pretty-printer commands: clauses on their own lines,
+//!    lists and conditions broken only when too long (`layout`), rendered with the options'
+//!    indent and line length (`doc`).
+//! 4. A statement is kept exactly as typed when it cannot be laid out safely: an unterminated
+//!    string, identifier or comment, unbalanced parentheses or `CASE` / `END`, a routine
+//!    definition or procedural block (`CREATE FUNCTION` / `PROCEDURE` / `TRIGGER` / `EVENT`,
+//!    `BEGIN ... END`, `IF`, `WHILE`; their bodies are kept verbatim, like PostgreSQL's
+//!    dollar-quoted bodies which are single string tokens anyway), or a layout that would not
+//!    pass [`check_format`] on its own.
+//!
+//! Formatting is idempotent: line breaks around comments and between string literals are kept
+//! as typed, and every other layout decision depends only on the tokens.
+
+mod doc;
+mod layout;
+mod prep;
+mod script;
+mod tree;
 
 use std::ops::Range;
 
@@ -90,8 +115,32 @@ pub fn check_format(dialect: &Dialect, before: &str, after: &str) -> Result<()> 
 /// own. Fails with `Error::InvalidInput` for invalid options, and with `Error::Internal` when
 /// the result would not pass [`check_format`].
 pub fn format(dialect: &Dialect, text: &str, options: &FormatOptions) -> Result<String> {
-    let _ = (dialect, text, options);
-    unimplemented!("m6: format")
+    options.validate()?;
+    let statements = oxbase_sql::split(dialect.sql, text);
+    let mut w = script::Writer {
+        dialect,
+        options,
+        eol: eol_of(text),
+        prefix: String::new(),
+        out: String::with_capacity(text.len() + text.len() / 4),
+    };
+    script::whole(&mut w, text, &statements);
+    check_format(dialect, text, &w.out)?;
+    Ok(w.out)
+}
+
+/// The line ending the output uses: the text's own (`\r\n` when it has one).
+fn eol_of(text: &str) -> &'static str {
+    if text.contains("\r\n") { "\r\n" } else { "\n" }
+}
+
+/// The largest char boundary of `text` at or below `at` (clamped to the text).
+fn floor_boundary(text: &str, at: usize) -> usize {
+    let mut at = at.min(text.len());
+    while !text.is_char_boundary(at) {
+        at -= 1;
+    }
+    at
 }
 
 /// Formats the statements that overlap `range` (bytes, clamped to the text) and returns one
@@ -103,8 +152,51 @@ pub fn format_range(
     range: Range<usize>,
     options: &FormatOptions,
 ) -> Result<TextEdit> {
-    let _ = (dialect, text, range, options);
-    unimplemented!("m6: format")
+    options.validate()?;
+    let lo = floor_boundary(text, range.start.min(range.end));
+    let hi = floor_boundary(text, range.start.max(range.end));
+    let statements = oxbase_sql::split(dialect.sql, text);
+    let hit = |st: &oxbase_sql::Statement| {
+        if lo == hi {
+            st.range.start <= lo && lo <= st.range.end
+        } else {
+            st.range.start < hi && lo < st.range.end
+        }
+    };
+    let Some(first) = statements.iter().position(hit) else {
+        return Ok(TextEdit {
+            range: lo..lo,
+            text: String::new(),
+        });
+    };
+    let last = statements.iter().rposition(hit).unwrap_or(first);
+    let selected = &statements[first..=last];
+    let start = statements[first].range.start;
+    let end = statements[last].range.end;
+    // The first statement keeps its column; the lines after it are indented to it.
+    let line_start = text[..start].rfind('\n').map_or(0, |nl| nl + 1);
+    let lead = &text[line_start..start];
+    let tab = usize::from(options.indent_width);
+    let start_col = script::columns(lead, tab);
+    let prefix = if lead.chars().all(|ch| ch == ' ' || ch == '\t') {
+        lead.to_owned()
+    } else {
+        " ".repeat(start_col)
+    };
+    let mut writer = script::Writer {
+        dialect,
+        options,
+        eol: eol_of(text),
+        prefix,
+        out: String::new(),
+    };
+    script::span(&mut writer, text, selected, start_col);
+    let replaced = [&text[..start], writer.out.as_str(), &text[end..]].concat();
+    check_format(dialect, text, &replaced)?;
+    Ok(TextEdit {
+        range: start..end,
+        text: writer.out,
+    })
 }
 
 #[cfg(test)]
