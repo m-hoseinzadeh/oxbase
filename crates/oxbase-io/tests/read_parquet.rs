@@ -43,9 +43,13 @@ fn write(path: &Path, batch: &RecordBatch, group_rows: usize) {
 /// `types.parquet`: id, price, at, day, tags, payload, note; 3 row groups of 1000 rows.
 fn types_file(dir: &Path) -> PathBuf {
     let ids: Vec<i64> = (1..=ROWS).collect();
-    let price = Decimal128Array::from(ids.iter().map(|i| i * 125 - 1_000).collect::<Vec<i128>>())
-        .with_precision_and_scale(12, 2)
-        .unwrap();
+    let price = Decimal128Array::from(
+        ids.iter()
+            .map(|&i| i128::from(i) * 125 - 1_000)
+            .collect::<Vec<i128>>(),
+    )
+    .with_precision_and_scale(12, 2)
+    .unwrap();
     let at = TimestampMicrosecondArray::from(
         ids.iter()
             .map(|i| 981_165_906_000_000 + i * 1_000_001)

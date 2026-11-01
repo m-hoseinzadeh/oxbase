@@ -53,7 +53,14 @@ fn micros(all: &ReadAll, column: usize) -> Vec<Option<i64>> {
 fn generated(dir: &Path, name: &str, rows: u64) -> PathBuf {
     let mut text = String::from("id,code,amount,flag\n");
     for i in 1..=rows {
-        writeln!(text, "{i},C{i:08},{}.{:02},{}", i / 3, i % 100, i % 2 == 0).unwrap();
+        writeln!(
+            text,
+            "{i},C{i:08},{}.{:02},{}",
+            i / 3,
+            i % 100,
+            i.is_multiple_of(2)
+        )
+        .unwrap();
     }
     write(dir, name, text.as_bytes())
 }

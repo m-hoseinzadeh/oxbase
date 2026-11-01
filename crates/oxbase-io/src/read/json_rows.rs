@@ -643,19 +643,17 @@ fn sample(
             Parsed::NotObject(_) => s.not_objects += 1,
             Parsed::Object(members) => {
                 for (key, value) in &members {
-                    let column = match index.get(key) {
-                        Some(&c) => c,
-                        None => {
-                            let c = s.keys.len();
-                            index.insert(key.clone(), c);
-                            s.keys.push(key.clone());
-                            seen.push(false);
-                            // Earlier rows lacked the key.
-                            s.inference
-                                .observe_nulls(c, u64::try_from(s.sampled - 1).unwrap_or(0));
-                            c
-                        }
-                    };
+                    let known = index.get(key).copied();
+                    let column = known.unwrap_or_else(|| {
+                        let c = s.keys.len();
+                        index.insert(key.clone(), c);
+                        s.keys.push(key.clone());
+                        seen.push(false);
+                        // Earlier rows lacked the key.
+                        s.inference
+                            .observe_nulls(c, u64::try_from(s.sampled - 1).unwrap_or(0));
+                        c
+                    });
                     if seen[column] {
                         continue;
                     }

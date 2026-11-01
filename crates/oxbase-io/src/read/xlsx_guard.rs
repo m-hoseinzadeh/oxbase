@@ -430,15 +430,12 @@ fn unescape(text: &str) -> String {
                 )
                 .and_then(char::from_u32),
         };
-        match c {
-            Some(c) => {
-                out.push(c);
-                rest = &rest[end + 1..];
-            }
-            None => {
-                out.push('&');
-                rest = &rest[1..];
-            }
+        if let Some(c) = c {
+            out.push(c);
+            rest = &rest[end + 1..];
+        } else {
+            out.push('&');
+            rest = &rest[1..];
         }
     }
     out.push_str(rest);

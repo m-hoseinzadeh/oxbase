@@ -374,13 +374,13 @@ fn hex_value(b: u8) -> Option<u8> {
 }
 
 fn decode_hex(hex: &str) -> Option<Vec<u8>> {
-    let bytes = hex.as_bytes();
-    if bytes.len() % 2 != 0 {
+    let (pairs, rest) = hex.as_bytes().as_chunks::<2>();
+    if !rest.is_empty() {
         return None;
     }
-    bytes
-        .chunks_exact(2)
-        .map(|pair| Some((hex_value(pair[0])? << 4) | hex_value(pair[1])?))
+    pairs
+        .iter()
+        .map(|&[high, low]| Some((hex_value(high)? << 4) | hex_value(low)?))
         .collect()
 }
 
@@ -397,14 +397,13 @@ fn base64_value(b: u8) -> Option<u32> {
 }
 
 fn decode_base64(text: &str) -> Option<Vec<u8>> {
-    let bytes = text.as_bytes();
-    if bytes.len() % 4 != 0 {
+    let (quads, rest) = text.as_bytes().as_chunks::<4>();
+    if !rest.is_empty() {
         return None;
     }
-    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
-    let chunks = bytes.len() / 4;
-    for (index, chunk) in bytes.chunks_exact(4).enumerate() {
-        let last = index + 1 == chunks;
+    let mut out = Vec::with_capacity(quads.len() * 3);
+    for (index, chunk) in quads.iter().enumerate() {
+        let last = index + 1 == quads.len();
         let pad = chunk.iter().rev().take_while(|&&byte| byte == b'=').count();
         if pad > 2 || (pad > 0 && !last) {
             return None;
