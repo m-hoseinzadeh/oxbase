@@ -177,7 +177,7 @@ mod tests {
             states.transfer.export().query(),
             states.data.service().query()
         ));
-        assert!(states.files.is_empty());
+        assert_eq!(states.files.handle_count(), 0);
     }
 
     #[test]

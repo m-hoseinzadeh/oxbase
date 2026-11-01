@@ -350,8 +350,10 @@ mod tests {
 
     #[test]
     fn open_rejects_bad_options_before_touching_the_file() {
-        let mut csv = crate::CsvReadOptions::default();
-        csv.delimiter = '"';
+        let csv = crate::CsvReadOptions {
+            delimiter: '"',
+            ..crate::CsvReadOptions::default()
+        };
         let err = open(
             Path::new("missing.csv"),
             &ReadOptions::Csv(csv),

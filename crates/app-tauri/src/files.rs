@@ -110,7 +110,7 @@ impl FilesState {
         let metadata = std::fs::metadata(&path).ok();
         let exists = metadata.is_some();
         let size = match access {
-            FileAccess::Read => metadata.map(|m| m.len()),
+            FileAccess::Read => metadata.as_ref().map(std::fs::Metadata::len),
             FileAccess::Write => None,
         };
         let name = base_name(&path);
@@ -187,14 +187,8 @@ impl FilesState {
 
     /// Number of live handles.
     #[cfg(test)]
-    pub fn len(&self) -> usize {
+    pub fn handle_count(&self) -> usize {
         self.lock().entries.len()
-    }
-
-    /// `true` when no handle is live.
-    #[cfg(test)]
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
     }
 }
 
@@ -371,7 +365,7 @@ mod tests {
 
         assert!(state.release(read.handle));
         assert!(!state.release(read.handle));
-        assert!(state.is_empty());
+        assert_eq!(state.handle_count(), 0);
     }
 
     #[test]
@@ -381,7 +375,7 @@ mod tests {
         for i in 0..MAX_HANDLES {
             state.register(PathBuf::from(format!("{i}.csv")), FileAccess::Read);
         }
-        assert_eq!(state.len(), MAX_HANDLES);
+        assert_eq!(state.handle_count(), MAX_HANDLES);
         assert!(state.read_path(first.handle).is_err());
     }
 

@@ -399,7 +399,11 @@ mod tests {
         std::fs::read_dir(dir)
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-            .filter(|n| n.ends_with(".part"))
+            .filter(|n| {
+                Path::new(n)
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("part"))
+            })
             .collect()
     }
 
@@ -414,7 +418,7 @@ mod tests {
         assert_eq!(parts(dir.path()).len(), 1);
         assert_eq!(file.commit().unwrap(), 4);
         assert_eq!(std::fs::read(&dest).unwrap(), b"a,b\n");
-        assert!(parts(dir.path()).is_empty());
+        assert_eq!(parts(dir.path()).len(), 0);
 
         // Exists and no overwrite: refused before anything is created.
         let err = SinkFile::create(&dest, false).unwrap_err();
@@ -426,7 +430,7 @@ mod tests {
         file.write_all(b"new").unwrap();
         file.abort();
         assert_eq!(std::fs::read(&dest).unwrap(), b"a,b\n");
-        assert!(parts(dir.path()).is_empty());
+        assert_eq!(parts(dir.path()).len(), 0);
         let mut file = SinkFile::create(&dest, true).unwrap();
         file.write_all(b"new").unwrap();
         file.commit().unwrap();
@@ -462,7 +466,7 @@ mod tests {
         handle.write(batch(2)).await.unwrap();
         handle.abort().await;
         assert!(!other.exists());
-        assert!(parts(dir.path()).is_empty());
+        assert_eq!(parts(dir.path()).len(), 0);
 
         let writer = Lines {
             file: SinkFile::create(&other, false).unwrap(),
@@ -483,6 +487,6 @@ mod tests {
         };
         assert_eq!(err.category(), oxbase_types::ErrorCategory::InvalidInput);
         assert!(!other.exists());
-        assert!(parts(dir.path()).is_empty());
+        assert_eq!(parts(dir.path()).len(), 0);
     }
 }

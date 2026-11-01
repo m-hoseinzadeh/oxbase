@@ -379,7 +379,7 @@ mod tests {
             (TextEncoding::Latin1, 0)
         );
         assert_eq!(bom_bytes(TextEncoding::Utf16Le), b"\xFF\xFE");
-        assert!(bom_bytes(TextEncoding::Windows1252).is_empty());
+        assert_eq!(bom_bytes(TextEncoding::Windows1252).len(), 0);
     }
 
     #[test]
