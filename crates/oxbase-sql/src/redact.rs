@@ -16,6 +16,15 @@
 //! SQLCipher `PRAGMA key|rekey|hexkey|hexrekey = ...` (string, double-quoted or bare-word
 //! value), `ATTACH ... KEY '...'` and `key=` / `hexkey=` values inside literals (URIs).
 //!
+//! T-SQL (`docs/m4-contracts.md` §6): `PASSWORD =` and `SECRET =` cover `CREATE` / `ALTER
+//! LOGIN`, `CREATE USER ... WITH PASSWORD`, `ENCRYPTION` / `DECRYPTION BY PASSWORD`,
+//! credentials (`IDENTITY = '...', SECRET = '...'`) and application roles; `OLD_PASSWORD =`
+//! too. An `N'...'` secret keeps its `N` (`N'***'`). Also masked: a hashed password
+//! `PASSWORD = 0x... HASHED`, `MEDIAPASSWORD = '...'`, `KEY_SOURCE = '...'`, and the
+//! arguments and variables `@password`, `@passwd`, `@rmtpassword`, `@secret`, ... `= '...'`
+//! (`sp_addlinkedsrvlogin`, `SET @password = N'...'`). Dynamic SQL in `EXEC ('...')` /
+//! `sp_executesql N'...'` literals is redacted like any nested SQL.
+//!
 //! Deliberate narrowings:
 //!
 //! - `KEY` (and `REKEY`, `HEXKEY`, `HEXREKEY`) arms only in the SQLite dialect and only in a
@@ -91,15 +100,23 @@ enum Word {
 }
 
 impl Word {
-    fn of(word: &[u8]) -> Self {
+    fn of(dialect: SqlDialect, word: &[u8]) -> Self {
+        let tsql = dialect == SqlDialect::TSql;
+        // T-SQL: `@password = '...'` (procedure arguments, variables) arms like `PASSWORD`.
+        let bare = match word {
+            [b'@', rest @ ..] if tsql => rest,
+            _ => word,
+        };
+        let secret = |k: &str| bare.eq_ignore_ascii_case(k.as_bytes());
         let is = |k: &str| word.eq_ignore_ascii_case(k.as_bytes());
-        if is("PASSWORD") {
+        if secret("PASSWORD") {
             Self::Secret { password: true }
-        } else if is("IDENTIFIED")
-            || is("MASTER_PASSWORD")
-            || is("SOURCE_PASSWORD")
-            || is("OLD_PASSWORD")
-            || is("SECRET")
+        } else if secret("IDENTIFIED")
+            || secret("MASTER_PASSWORD")
+            || secret("SOURCE_PASSWORD")
+            || secret("OLD_PASSWORD")
+            || secret("SECRET")
+            || (tsql && TSQL_SECRET_WORDS.iter().any(|k| secret(k)))
         {
             Self::Secret { password: false }
         } else if is("KEY") || is("REKEY") || is("HEXKEY") || is("HEXREKEY") {
@@ -117,6 +134,11 @@ impl Word {
         }
     }
 }
+
+/// T-SQL words that arm besides the common ones: `BACKUP ... MEDIAPASSWORD = '...'`,
+/// `CREATE SYMMETRIC KEY ... KEY_SOURCE = '...'`, and the arguments `@rmtpassword` /
+/// `@passwd` of `sp_addlinkedsrvlogin` / `sp_addlogin` (the `@` is stripped before matching).
+const TSQL_SECRET_WORDS: &[&str] = &["MEDIAPASSWORD", "KEY_SOURCE", "RMTPASSWORD", "PASSWD"];
 
 /// One replacement: `start..end` of the text becomes `text`.
 type Edit = (usize, usize, Cow<'static, str>);
@@ -248,7 +270,7 @@ impl Redactor<'_> {
                 };
         }
         let keyed = self.sqlite() && self.head == Head::Keyed;
-        let kind = match Word::of(word) {
+        let kind = match Word::of(self.rules.dialect, word) {
             Word::Key if keyed => Word::Secret { password: false },
             Word::Key => Word::Other,
             kind => kind,
@@ -274,6 +296,15 @@ impl Redactor<'_> {
             }
             // SQLCipher `PRAGMA key = passphrase`: a bare word is the key.
             (State::Armed { paren: false, .. }, _) if keyed && prev_eq => self.mask(start, end),
+            // T-SQL `PASSWORD = 0x0200... HASHED`: the password hash.
+            (State::Armed { paren: false, .. }, _)
+                if prev_eq
+                    && self.rules.dialect == SqlDialect::TSql
+                    && word.len() > 2
+                    && word[..2].eq_ignore_ascii_case(b"0x") =>
+            {
+                self.mask(start, end)
+            }
             (State::AfterSecret, Word::Replace) => State::Armed {
                 paren: false,
                 password: false,
