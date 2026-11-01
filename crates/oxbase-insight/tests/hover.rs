@@ -241,7 +241,7 @@ fn every_offset_hovers_without_panicking() {
                 let h = hover(&dialect, text, offset, Some(&c));
                 if let Some(h) = h {
                     assert!(h.range.start <= h.range.end && h.range.end <= text.len());
-                    assert!(!h.markdown.is_empty());
+                    assert_ne!(h.markdown, "");
                 }
                 let _ = hover(&dialect, text, offset, None);
             }
