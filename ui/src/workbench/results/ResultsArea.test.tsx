@@ -137,6 +137,21 @@ describe("ResultsArea", () => {
     expect(messages).toHaveTextContent("4 ms");
   });
 
+  it("shows the engine's messages note once something ran (SQL Server PRINT)", () => {
+    const note = "PRINT output is not shown yet";
+    const { rerender } = render(<ResultsArea run={IDLE_RUN} messagesNote={note} />);
+    expect(screen.queryByTestId("messages-note")).not.toBeInTheDocument();
+    const run = apply(runReducer(IDLE_RUN, { type: "start", script: "PRINT 'x'" }), [
+      { type: "started", runId: "run-3", statements: [{ ...SPAN, returnsRows: false }] },
+      { type: "statementDone", statementIndex: 0, elapsedMs: 2 },
+      { type: "finished", elapsedMs: 3 },
+    ]);
+    rerender(<ResultsArea run={run} messagesNote={note} />);
+    expect(screen.getByTestId("messages-note")).toHaveTextContent(note);
+    rerender(<ResultsArea run={run} />);
+    expect(screen.queryByTestId("messages-note")).not.toBeInTheDocument();
+  });
+
   it("shows the messages tab before anything ran", () => {
     render(<ResultsArea run={IDLE_RUN} />);
     expect(screen.getByRole("tab", { name: "Messages" })).toHaveAttribute("aria-selected", "true");

@@ -20,6 +20,7 @@ import {
 import {
   type ConnectionForm,
   emptyForm,
+  engineTraits,
   FIELD_TAB,
   type FormErrors,
   type FormField,
@@ -30,6 +31,7 @@ import {
   isNetworked,
   profileFromForm,
   type SshAuthMethod,
+  STRICT_TLS_MODES,
   secretsFromForm,
   type ValidationPurpose,
   validateForm,
@@ -231,6 +233,7 @@ export function ConnectionDialog({ profile, onClose, onSaved }: ConnectionDialog
   const hostKeyHelpId = useId();
 
   const networked = isNetworked(form.engine);
+  const traits = engineTraits(form.engine);
   const hasSavedPassword = profile?.password?.source === "keychain";
   const sshAuthPrev = profile?.ssh?.auth;
   const hasSavedSshSecret =
@@ -261,7 +264,9 @@ export function ConnectionDialog({ profile, onClose, onSaved }: ConnectionDialog
     return (event: ChangeEvent<HTMLInputElement>) => set(key, event.target.value as never);
   }
 
-  function check(key: "savePassword" | "sshEnabled" | "saveSshSecret") {
+  function check(
+    key: "savePassword" | "sshEnabled" | "saveSshSecret" | "strictEncryption" | "readOnlyIntent",
+  ) {
     return (event: ChangeEvent<HTMLInputElement>) => set(key, event.target.checked);
   }
 
@@ -336,7 +341,9 @@ export function ConnectionDialog({ profile, onClose, onSaved }: ConnectionDialog
     }
   }
 
-  const tlsHelp = TLS_MODES.find((m) => m.value === form.tlsMode)?.help;
+  const tlsHelp =
+    traits.tlsHelp?.[form.tlsMode] ?? TLS_MODES.find((m) => m.value === form.tlsMode)?.help;
+  const strictAllowed = STRICT_TLS_MODES.includes(form.tlsMode);
   const hostKeyHelp = HOST_KEY_POLICIES.find((p) => p.value === form.hostKeyPolicy)?.help;
   const testing = test.status === "running";
 
@@ -470,9 +477,39 @@ export function ConnectionDialog({ profile, onClose, onSaved }: ConnectionDialog
                   )}
                 </Field>
               </div>
-              <Field field="database" label="Database (optional)" errors={errors}>
+              {traits.instance ? (
+                <Field
+                  field="instance"
+                  label="Instance name (optional)"
+                  errors={errors}
+                  hint="For a named instance (like SQLEXPRESS), also enter the port it listens on above: the SQL Server Browser service is not asked for it."
+                >
+                  {(p) => (
+                    <input
+                      {...p}
+                      type="text"
+                      autoComplete="off"
+                      spellCheck={false}
+                      value={form.instance}
+                      onChange={text("instance")}
+                    />
+                  )}
+                </Field>
+              ) : null}
+              <Field
+                field="database"
+                label="Database (optional)"
+                errors={errors}
+                hint={traits.databaseHint}
+              >
                 {(p) => (
-                  <input {...p} type="text" value={form.database} onChange={text("database")} />
+                  <input
+                    {...p}
+                    type="text"
+                    placeholder={traits.databasePlaceholder}
+                    value={form.database}
+                    onChange={text("database")}
+                  />
                 )}
               </Field>
               <Field field="user" label="User name" errors={errors}>
@@ -517,6 +554,16 @@ export function ConnectionDialog({ profile, onClose, onSaved }: ConnectionDialog
                 />
                 Save password
               </label>
+              {traits.readOnlyIntent ? (
+                <label className="checkbox">
+                  <input
+                    type="checkbox"
+                    checked={form.readOnlyIntent}
+                    onChange={check("readOnlyIntent")}
+                  />
+                  Read-only intent (route to a readable secondary replica)
+                </label>
+              ) : null}
             </>
           ) : (
             <Field
@@ -569,6 +616,36 @@ export function ConnectionDialog({ profile, onClose, onSaved }: ConnectionDialog
               {tlsHelp}
             </p>
           </div>
+          {traits.strictEncryption ? (
+            <div className={`field ${errors.strictEncryption ? "field--invalid" : ""}`}>
+              <label className="checkbox">
+                <input
+                  id={fieldId("strictEncryption")}
+                  type="checkbox"
+                  checked={form.strictEncryption}
+                  disabled={!strictAllowed && !form.strictEncryption}
+                  aria-invalid={Boolean(errors.strictEncryption)}
+                  aria-describedby={
+                    errors.strictEncryption
+                      ? `${fieldId("strictEncryption")}-error`
+                      : `${fieldId("strictEncryption")}-hint`
+                  }
+                  onChange={check("strictEncryption")}
+                />
+                TDS 8.0 strict encryption
+              </label>
+              <p id={`${fieldId("strictEncryption")}-hint`} className="field__hint">
+                {strictAllowed
+                  ? "Encrypt before anything else is sent, as SQL Server 2022 and later and Azure SQL allow. Off: encryption is negotiated first (every version)."
+                  : "Needs the mode Require, Verify certificate authority or Verify certificate and host name."}
+              </p>
+              {errors.strictEncryption ? (
+                <p id={`${fieldId("strictEncryption")}-error`} className="field__error">
+                  {errors.strictEncryption}
+                </p>
+              ) : null}
+            </div>
+          ) : null}
           <FileField
             field="caCert"
             label="CA certificate (optional)"
@@ -579,25 +656,35 @@ export function ConnectionDialog({ profile, onClose, onSaved }: ConnectionDialog
             onBrowse={() => void browse("caCert", "Choose a CA certificate", PEM_FILTERS)}
             hint="The authority that signed the server's certificate. Without it, your system's trusted list is used."
           />
-          <FileField
-            field="clientCert"
-            label="Client certificate (optional)"
-            browseLabel="Browse for the client certificate"
-            errors={errors}
-            value={form.clientCert}
-            onChange={text("clientCert")}
-            onBrowse={() => void browse("clientCert", "Choose a client certificate", PEM_FILTERS)}
-          />
-          <FileField
-            field="clientKey"
-            label="Client key (optional)"
-            browseLabel="Browse for the client key"
-            errors={errors}
-            value={form.clientKey}
-            onChange={text("clientKey")}
-            onBrowse={() => void browse("clientKey", "Choose the client key", PEM_FILTERS)}
-            hint="Needed together with the client certificate. Must not be password-protected."
-          />
+          {traits.clientCertificates ? (
+            <>
+              <FileField
+                field="clientCert"
+                label="Client certificate (optional)"
+                browseLabel="Browse for the client certificate"
+                errors={errors}
+                value={form.clientCert}
+                onChange={text("clientCert")}
+                onBrowse={() =>
+                  void browse("clientCert", "Choose a client certificate", PEM_FILTERS)
+                }
+              />
+              <FileField
+                field="clientKey"
+                label="Client key (optional)"
+                browseLabel="Browse for the client key"
+                errors={errors}
+                value={form.clientKey}
+                onChange={text("clientKey")}
+                onBrowse={() => void browse("clientKey", "Choose the client key", PEM_FILTERS)}
+                hint="Needed together with the client certificate. Must not be password-protected."
+              />
+            </>
+          ) : (
+            <p className="field__hint" data-testid="no-client-cert">
+              {ENGINE_INFO[form.engine].label} connections do not use client certificates.
+            </p>
+          )}
           <Field
             field="serverName"
             label="Certificate host name (optional)"

@@ -237,3 +237,94 @@ describe("ConnectionDialog save", () => {
     expect(onClose).toHaveBeenCalled();
   });
 });
+
+describe("ConnectionDialog for SQL Server", () => {
+  beforeEach(() => {
+    tauriCore.invoke.mockReset();
+    tauriCore.isTauri.mockReset().mockReturnValue(true);
+  });
+
+  function chooseSqlServer() {
+    renderDialog();
+    fireEvent.change(field("Database type"), { target: { value: "mssql" } });
+  }
+
+  it("shows the SQL Server fields with port 1433 and the instance hint", () => {
+    chooseSqlServer();
+    expect(field("Port")).toHaveValue("1433");
+    expect(field("Instance name (optional)")).toHaveAccessibleDescription(
+      /port it listens on above/,
+    );
+    expect(field("Database (optional)")).toHaveAttribute("placeholder", "login default");
+    expect(field("Database (optional)")).toHaveAccessibleDescription(/login's default database/);
+    expect(screen.getByLabelText(/Read-only intent/)).not.toBeChecked();
+  });
+
+  it("offers strict encryption only with Require or a verifying mode", () => {
+    chooseSqlServer();
+    fireEvent.click(screen.getByRole("tab", { name: "SSL/TLS" }));
+    const strict = screen.getByLabelText("TDS 8.0 strict encryption");
+    expect(field("Encryption mode")).toHaveValue("prefer");
+    expect(screen.getByTestId("tls-help")).toHaveTextContent(/TrustServerCertificate/);
+    expect(strict).toBeDisabled();
+    fireEvent.change(field("Encryption mode"), { target: { value: "verify_full" } });
+    expect(strict).toBeEnabled();
+    fireEvent.click(strict);
+    expect(strict).toBeChecked();
+    // Client certificates are not used by SQL Server connections.
+    expect(screen.queryByLabelText("Client certificate (optional)")).toBeNull();
+    expect(screen.getByTestId("no-client-cert")).toHaveTextContent("SQL Server");
+  });
+
+  it("refuses strict encryption with a weaker mode and jumps to it", async () => {
+    chooseSqlServer();
+    type("Connection name", "sql");
+    fireEvent.click(screen.getByRole("tab", { name: "SSL/TLS" }));
+    fireEvent.change(field("Encryption mode"), { target: { value: "require" } });
+    fireEvent.click(screen.getByLabelText("TDS 8.0 strict encryption"));
+    fireEvent.change(field("Encryption mode"), { target: { value: "prefer" } });
+    fireEvent.click(screen.getByRole("tab", { name: "General" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    const strict = screen.getByLabelText("TDS 8.0 strict encryption");
+    await waitFor(() => expect(strict).toHaveFocus());
+    expect(strict).toHaveAttribute("aria-invalid", "true");
+    expect(strict).toHaveAccessibleDescription(/needs the encryption mode Require/);
+    expect(tauriCore.invoke).not.toHaveBeenCalled();
+  });
+
+  it("asks for the port of a named instance", () => {
+    chooseSqlServer();
+    type("Connection name", "sql");
+    type("Instance name (optional)", "SQLEXPRESS");
+    type("Port", "");
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    expect(field("Port")).toHaveAccessibleDescription(/named instance's port/);
+    expect(tauriCore.invoke).not.toHaveBeenCalled();
+  });
+
+  it("saves the SQL Server options with the profile", async () => {
+    const saved = { id: "0190f000-0000-7000-8000-000000000002" };
+    mockCommands({ save_profile: () => saved });
+    const { onSaved } = renderDialog();
+    fireEvent.change(field("Database type"), { target: { value: "mssql" } });
+    type("Connection name", "sql");
+    type("Instance name (optional)", "SQLEXPRESS");
+    type("Port", "14330");
+    fireEvent.click(screen.getByLabelText(/Read-only intent/));
+    fireEvent.click(screen.getByRole("tab", { name: "SSL/TLS" }));
+    fireEvent.change(field("Encryption mode"), { target: { value: "verify_ca" } });
+    fireEvent.click(screen.getByLabelText("TDS 8.0 strict encryption"));
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onSaved).toHaveBeenCalledWith(saved));
+    const [, args] = tauriCore.invoke.mock.calls[0] ?? [];
+    const { profile } = args as { profile: ConnectionProfile };
+    expect(profile.engine).toBe("mssql");
+    expect(profile.address).toEqual({ kind: "network", host: "localhost", port: 14330 });
+    expect(profile.tls.mode).toBe("verify_ca");
+    expect(profile.options).toEqual({
+      instance: "SQLEXPRESS",
+      encrypt: "strict",
+      application_intent: "read_only",
+    });
+  });
+});

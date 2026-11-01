@@ -21,7 +21,7 @@ import type { QueryEditorParams } from "../layout";
 import { spanOffsets } from "../positions";
 import { ResultsArea } from "../results/ResultsArea";
 import { IDLE_RUN, isActive, runReducer } from "../results/runState";
-import { languageFor, type SqlLanguage } from "./language";
+import { languageFor, messagesNoteFor, type SqlLanguage } from "./language";
 import { Splitter } from "./Splitter";
 import { type EditorCommand, SqlEditor, type SqlEditorHandle } from "./SqlEditor";
 
@@ -338,7 +338,7 @@ export function QueryEditorPanel({
         </div>
         <Splitter value={split} onChange={setSplit} label="Resize editor and results" />
         <div className="query-editor__results">
-          <ResultsArea run={run} />
+          <ResultsArea run={run} messagesNote={messagesNoteFor(engine)} />
         </div>
       </div>
     </section>

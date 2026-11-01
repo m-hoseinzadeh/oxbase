@@ -23,20 +23,32 @@ function Messages({
   messages,
   dropped,
   status,
+  note,
 }: {
   messages: RunMessage[];
   dropped: number;
   status: RunState["status"];
+  note: string | null;
 }) {
+  const noteLine =
+    note && status !== "idle" ? (
+      <p className="messages__note" role="note" data-testid="messages-note">
+        {note}
+      </p>
+    ) : null;
   if (messages.length === 0) {
     return (
-      <p className="results__empty">
-        {status === "idle" ? "Run a query to see its results here." : "No messages yet."}
-      </p>
+      <>
+        <p className="results__empty">
+          {status === "idle" ? "Run a query to see its results here." : "No messages yet."}
+        </p>
+        {noteLine}
+      </>
     );
   }
   return (
     <>
+      {noteLine}
       {dropped > 0 ? (
         <p className="messages__dropped" data-testid="messages-dropped">
           {dropped.toLocaleString("en-US")} earlier {dropped === 1 ? "message" : "messages"} not
@@ -82,9 +94,11 @@ function usePagerUpdates(pager: ResultPager | null): void {
 
 export interface ResultsAreaProps {
   run: RunState;
+  /** A note for the Messages tab about what the engine cannot report (SQL Server PRINT). */
+  messagesNote?: string | null | undefined;
 }
 
-export function ResultsArea({ run }: ResultsAreaProps) {
+export function ResultsArea({ run, messagesNote = null }: ResultsAreaProps) {
   // The tab the user picked, for the run it was picked in (a new run starts on its first result).
   const [picked, setPicked] = useState<{ runId: string | null; tab: TabId } | null>(null);
   const pagers = useRef(new Map<number, ResultPager>());
@@ -212,7 +226,12 @@ export function ResultsArea({ run }: ResultsAreaProps) {
             </div>
           </>
         ) : (
-          <Messages messages={run.messages} dropped={run.droppedMessages} status={run.status} />
+          <Messages
+            messages={run.messages}
+            dropped={run.droppedMessages}
+            status={run.status}
+            note={messagesNote}
+          />
         )}
       </div>
     </section>

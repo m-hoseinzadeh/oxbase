@@ -40,7 +40,7 @@ import {
   IndexesEditor,
   OptionsEditor,
 } from "./DesignerTabs";
-import { NO_DESIGNER } from "./designModel";
+import { NO_DESIGNER, tableReadOnlyReason } from "./designModel";
 
 export interface TableDesignerProps {
   sessionId: string;
@@ -295,7 +295,8 @@ export function TableDesignerPanel({
 
   const designerCaps = caps?.designer ?? NO_DESIGNER;
   const engine = caps?.engine;
-  const readOnly = caps !== null && (creating ? !designerCaps.createTable : false);
+  const tableLock = creating ? null : tableReadOnlyReason(loaded);
+  const readOnly = caps !== null && (creating ? !designerCaps.createTable : tableLock !== null);
   const editorProps: EditorProps | null = design
     ? {
         design,
@@ -303,6 +304,7 @@ export function TableDesignerPanel({
         caps: designerCaps,
         issues: current?.issues ?? shown?.issues ?? [],
         engine,
+        serverVersion: caps?.serverVersion,
         isNew: creating,
         disabled: !caps || applying || readOnly,
       }
@@ -372,8 +374,8 @@ export function TableDesignerPanel({
         </div>
       ) : null}
       {readOnly ? (
-        <div className="banner banner--info" role="status">
-          The designer cannot create tables on this database.
+        <div className="banner banner--info" role="status" data-testid="designer-read-only">
+          {tableLock ?? "The designer cannot create tables on this database."}
         </div>
       ) : null}
       {loadError ? (

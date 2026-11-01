@@ -269,10 +269,13 @@ export function cellDisplayText(text: string): string {
   return short.replace(/\r?\n/g, "↵ ").replace(/\t/g, " ");
 }
 
-/** The column's native type when the driver reported one (`oxbase.<engine>.type`), else Arrow's. */
+/**
+ * The column's native type when the driver reported one (`oxbase.<engine>.type` or
+ * `oxbase.native_type`, the MySQL and SQL Server key), else Arrow's.
+ */
 export function columnTypeLabel(column: ColumnInfo): string {
   for (const [key, value] of Object.entries(column.metadata ?? {})) {
-    if (/^oxbase\.[a-z0-9_]+\.type$/.test(key)) return value;
+    if (/^oxbase\.([a-z0-9_]+\.type|native_type)$/.test(key)) return value;
   }
   return column.dataType;
 }

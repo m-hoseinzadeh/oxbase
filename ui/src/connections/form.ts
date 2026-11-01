@@ -4,6 +4,7 @@
  */
 import {
   type ConnectionProfile,
+  DIALOG_ENGINES,
   type DialogEngine,
   ENGINE_INFO,
   type KeyRef,
@@ -50,6 +51,13 @@ export interface ConnectionForm {
   hostKeyPolicy: HostKeyPolicy;
   knownHostsPath: string;
   fingerprint: string;
+
+  /** SQL Server: named instance (`options.instance`). */
+  instance: string;
+  /** SQL Server: TDS 8.0 strict encryption (`options.encrypt = strict`). */
+  strictEncryption: boolean;
+  /** SQL Server: read-only application intent (`options.application_intent = read_only`). */
+  readOnlyIntent: boolean;
 }
 
 export type FormField = keyof ConnectionForm;
@@ -62,6 +70,8 @@ export const FIELD_TAB: Partial<Record<FormField, FormTab>> = {
   host: "general",
   port: "general",
   filePath: "general",
+  instance: "general",
+  strictEncryption: "tls",
   caCert: "tls",
   clientCert: "tls",
   clientKey: "tls",
@@ -77,7 +87,9 @@ export const FIELD_ORDER: FormField[] = [
   "name",
   "host",
   "port",
+  "instance",
   "filePath",
+  "strictEncryption",
   "caCert",
   "clientCert",
   "clientKey",
@@ -87,6 +99,74 @@ export const FIELD_ORDER: FormField[] = [
   "sshKeyFile",
   "fingerprint",
 ];
+
+/**
+ * What the dialog offers per engine beyond the common fields. Engines not listed have none of
+ * the extras and accept client certificates.
+ */
+export interface EngineFormTraits {
+  /** A named instance field (`options.instance`); the instance needs an explicit port. */
+  instance: boolean;
+  /** The "strict encryption" switch (`options.encrypt = strict`, TDS 8.0). */
+  strictEncryption: boolean;
+  /** The "read-only intent" switch (`options.application_intent = read_only`). */
+  readOnlyIntent: boolean;
+  /** TLS client certificates are supported. */
+  clientCertificates: boolean;
+  /** Hint under the database field. */
+  databaseHint?: string;
+  /** Placeholder of the database field. */
+  databasePlaceholder?: string;
+  /** Engine wording of each TLS mode's help (the common help otherwise). */
+  tlsHelp?: Partial<Record<TlsMode, string>>;
+}
+
+const COMMON_TRAITS: EngineFormTraits = {
+  instance: false,
+  strictEncryption: false,
+  readOnlyIntent: false,
+  clientCertificates: true,
+};
+
+/** The SQL Server option keys the dialog manages (`oxbase_mssql::options`). */
+export const MSSQL_OPTION = {
+  instance: "instance",
+  encrypt: "encrypt",
+  encryptStrict: "strict",
+  applicationIntent: "application_intent",
+  readOnly: "read_only",
+} as const;
+
+/** TLS modes that check (or at least require) encryption; strict encryption needs one. */
+export const STRICT_TLS_MODES: readonly TlsMode[] = ["require", "verify_ca", "verify_full"];
+
+const ENGINE_FORM: Partial<Record<DialogEngine, Partial<EngineFormTraits>>> = {
+  mssql: {
+    instance: true,
+    strictEncryption: true,
+    readOnlyIntent: true,
+    clientCertificates: false,
+    databaseHint: "Leave blank to use the login's default database.",
+    databasePlaceholder: "login default",
+    tlsHelp: {
+      disable:
+        "Never encrypt (the client tells the server it cannot encrypt). The login and all data cross the network in plain text; a server that requires encryption refuses the connection.",
+      prefer:
+        "Encrypt when the server offers it, otherwise connect unencrypted. The server's certificate is trusted without any check (like TrustServerCertificate), so this does not protect against a fake server.",
+      require:
+        "Always encrypt and trust the server's certificate without checking it (like Encrypt with TrustServerCertificate). Stops eavesdropping, not a fake server.",
+      verify_ca:
+        "Always encrypt and check that the server's certificate was issued by a trusted authority (the CA file below, or your system's trusted list). The host name in the certificate is not checked.",
+      verify_full:
+        "Always encrypt, check the certificate authority and that the certificate belongs to this server's host name (TrustServerCertificate off). The safest choice for remote servers.",
+    },
+  },
+};
+
+/** The dialog extras of `engine`. */
+export function engineTraits(engine: DialogEngine): EngineFormTraits {
+  return { ...COMMON_TRAITS, ...ENGINE_FORM[engine] };
+}
 
 export function defaultPort(engine: DialogEngine): string {
   const port = ENGINE_INFO[engine].port;
@@ -125,6 +205,9 @@ export function emptyForm(engine: DialogEngine = "postgres"): ConnectionForm {
     hostKeyPolicy: "strict",
     knownHostsPath: "",
     fingerprint: "",
+    instance: "",
+    strictEncryption: false,
+    readOnlyIntent: false,
   };
 }
 
@@ -139,7 +222,7 @@ function filePath(ref: PemRef | KeyRef | undefined): string {
 }
 
 function isDialogEngine(engine: string): engine is DialogEngine {
-  return engine === "postgres" || engine === "mysql" || engine === "mariadb" || engine === "sqlite";
+  return (DIALOG_ENGINES as readonly string[]).includes(engine);
 }
 
 /** The form for editing `profile`. Secret fields start empty (the stored values stay put). */
@@ -162,6 +245,15 @@ export function formFromProfile(profile: ConnectionProfile): ConnectionForm {
   form.clientCert = filePath(profile.tls.client_cert);
   form.clientKey = filePath(profile.tls.client_key);
   form.serverName = profile.tls.server_name ?? "";
+  const options = profile.options ?? {};
+  const traits = engineTraits(engine);
+  if (traits.instance) form.instance = options[MSSQL_OPTION.instance] ?? "";
+  if (traits.strictEncryption) {
+    form.strictEncryption = options[MSSQL_OPTION.encrypt] === MSSQL_OPTION.encryptStrict;
+  }
+  if (traits.readOnlyIntent) {
+    form.readOnlyIntent = options[MSSQL_OPTION.applicationIntent] === MSSQL_OPTION.readOnly;
+  }
   const ssh = profile.ssh;
   if (ssh) {
     form.sshEnabled = true;
@@ -205,10 +297,30 @@ export function validateForm(form: ConnectionForm, purpose: ValidationPurpose): 
     if (form.host.trim() === "") errors.host = "Enter the server's host name or IP address.";
     if (!validPort(form.port, false)) errors.port = "Port must be a number from 1 to 65535.";
 
-    const cert = form.clientCert.trim();
-    const key = form.clientKey.trim();
-    if (cert !== "" && key === "") errors.clientKey = "Choose the key for the client certificate.";
-    if (key !== "" && cert === "") errors.clientCert = "Choose the certificate for this key.";
+    const traits = engineTraits(form.engine);
+    if (traits.instance && form.instance.trim() !== "" && form.port.trim() === "") {
+      errors.port = "Enter the named instance's port (the SQL Server Browser service is not used).";
+    }
+    if (traits.instance && /[\\/:\s]/.test(form.instance.trim())) {
+      errors.instance = "Enter only the instance name (like SQLEXPRESS), without the host.";
+    }
+    if (
+      traits.strictEncryption &&
+      form.strictEncryption &&
+      !STRICT_TLS_MODES.includes(form.tlsMode)
+    ) {
+      errors.strictEncryption =
+        "Strict encryption needs the encryption mode Require, Verify certificate authority or Verify certificate and host name.";
+    }
+
+    if (traits.clientCertificates) {
+      const cert = form.clientCert.trim();
+      const key = form.clientKey.trim();
+      if (cert !== "" && key === "") {
+        errors.clientKey = "Choose the key for the client certificate.";
+      }
+      if (key !== "" && cert === "") errors.clientCert = "Choose the certificate for this key.";
+    }
 
     if (form.sshEnabled) {
       if (form.sshHost.trim() === "") errors.sshHost = "Enter the SSH server's host name.";
@@ -340,17 +452,19 @@ export function profileFromForm(
   // SQLite has no login; an "ask every time" password would only get in the way.
   setOptional(profile, "password", networked || form.password !== "" ? password : undefined);
 
+  const traits = engineTraits(form.engine);
+  const clientCerts = networked && traits.clientCertificates;
   const tls = profile.tls;
   setOptional(tls, "ca_cert", networked ? pemRef(form.caCert, base?.tls.ca_cert) : undefined);
   setOptional(
     tls,
     "client_cert",
-    networked ? pemRef(form.clientCert, base?.tls.client_cert) : undefined,
+    clientCerts ? pemRef(form.clientCert, base?.tls.client_cert) : undefined,
   );
   setOptional(
     tls,
     "client_key",
-    networked ? keyRef(form.clientKey, base?.tls.client_key) : undefined,
+    clientCerts ? keyRef(form.clientKey, base?.tls.client_key) : undefined,
   );
   setOptional(tls, "server_name", networked ? optionalText(form.serverName) : undefined);
 
@@ -367,6 +481,23 @@ export function profileFromForm(
   } else {
     delete profile.ssh;
   }
+
+  // Engine options: the keys the dialog manages are rewritten, any others are kept while the
+  // engine stays the same (they are engine-specific: a driver refuses keys it does not know).
+  const options: Record<string, string> =
+    base?.engine === form.engine ? { ...(base.options ?? {}) } : {};
+  for (const key of [MSSQL_OPTION.instance, MSSQL_OPTION.encrypt, MSSQL_OPTION.applicationIntent]) {
+    delete options[key];
+  }
+  const instance = traits.instance ? optionalText(form.instance) : undefined;
+  if (instance !== undefined) options[MSSQL_OPTION.instance] = instance;
+  if (traits.strictEncryption && form.strictEncryption) {
+    options[MSSQL_OPTION.encrypt] = MSSQL_OPTION.encryptStrict;
+  }
+  if (traits.readOnlyIntent && form.readOnlyIntent) {
+    options[MSSQL_OPTION.applicationIntent] = MSSQL_OPTION.readOnly;
+  }
+  setOptional(profile, "options", Object.keys(options).length > 0 ? options : undefined);
   return profile;
 }
 

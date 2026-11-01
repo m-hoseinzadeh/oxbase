@@ -210,6 +210,10 @@ input[type="search"] {
   background: var(--engine-sqlite);
 }
 
+.tree-icon--mssql::before {
+  background: var(--engine-mssql);
+}
+
 .tree-icon--connection::after {
   left: 4px;
   right: 4px;
@@ -655,6 +659,15 @@ input[type="search"] {
   margin: 0;
   padding: var(--space-1) var(--space-2);
   border-bottom: 1px solid var(--color-border);
+  color: var(--color-fg-muted);
+  font-size: 12px;
+}
+
+.messages__note {
+  margin: 0;
+  padding: var(--space-1) var(--space-2);
+  border-bottom: 1px solid var(--color-border);
+  background: var(--color-bg-subtle);
   color: var(--color-fg-muted);
   font-size: 12px;
 }

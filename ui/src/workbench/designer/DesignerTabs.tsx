@@ -16,25 +16,35 @@ import type {
   ForeignKeyDef,
   IndexColumn,
   IndexDef,
+  ServerVersion,
   TableDesign,
 } from "../../api";
 import {
   allowed,
+  boolExtra,
+  columnLockReason,
   type DefaultMode,
+  type DesignTraits,
   defaultMode,
   dependentsOfColumn,
+  designTraits,
   dropColumnRefs,
+  EXTRA,
   guessDataType,
+  indexLockReason,
   issuesAt,
   moveItem,
+  namesExtra,
   newColumn,
   newForeignKey,
   newIndex,
   renameColumn,
   splitNames,
   supportHint,
-  TYPE_SUGGESTIONS,
+  textExtra,
+  typeSuggestions,
   withDefault,
+  withExtra,
 } from "./designModel";
 
 export interface EditorProps {
@@ -43,6 +53,8 @@ export interface EditorProps {
   caps: DesignerCapabilities;
   issues: readonly DesignIssue[];
   engine: Engine | undefined;
+  /** The server's version (some types depend on it). */
+  serverVersion?: ServerVersion | undefined;
   /** Designing a new table (everything is allowed that `createTable` allows). */
   isNew: boolean;
   disabled: boolean;
@@ -86,10 +98,12 @@ export function ColumnsEditor({
   caps,
   issues,
   engine,
+  serverVersion,
   isNew,
   disabled,
 }: EditorProps) {
   const listId = useId();
+  const traits = designTraits(engine);
   const [details, setDetails] = useState<number | null>(null);
   const [removedNote, setRemovedNote] = useState<string | null>(null);
   const pk = new Set(design.primaryKey?.columns ?? []);
@@ -151,7 +165,7 @@ export function ColumnsEditor({
   return (
     <div className="designer__section">
       <datalist id={listId}>
-        {(engine ? (TYPE_SUGGESTIONS[engine] ?? []) : []).map((t) => (
+        {typeSuggestions(engine, serverVersion).map((t) => (
           <option key={t} value={t} />
         ))}
       </datalist>
@@ -178,8 +192,9 @@ export function ColumnsEditor({
             const nameHint = existing
               ? supportHint(caps.renameColumn, "Renaming a column")
               : undefined;
+            const lockReason = existing ? columnLockReason(col.column) : null;
             const typeHint = existing
-              ? supportHint(caps.alterColumnType, "Changing the type")
+              ? (lockReason ?? supportHint(caps.alterColumnType, "Changing the type"))
               : undefined;
             const nullHint = existing
               ? supportHint(caps.alterColumnNullability, "Changing NOT NULL")
@@ -244,7 +259,7 @@ export function ColumnsEditor({
                       list={listId}
                       aria-label={`Column ${index + 1} type`}
                       value={col.column.native_type}
-                      disabled={disabled || !can(caps.alterColumnType)}
+                      disabled={disabled || !can(caps.alterColumnType) || lockReason !== null}
                       title={typeHint}
                       spellCheck={false}
                       onChange={(e) =>
@@ -372,6 +387,11 @@ export function ColumnsEditor({
                         col={col}
                         index={index}
                         caps={caps}
+                        traits={traits}
+                        otherIdentity={
+                          design.columns.find((c, i) => i !== index && c.column.identity)?.column
+                            .name ?? null
+                        }
                         existing={existing}
                         disabled={disabled}
                         onChange={(next) => setColumn(index, next)}
@@ -477,6 +497,8 @@ function ColumnDetails({
   col,
   index,
   caps,
+  traits,
+  otherIdentity,
   existing,
   disabled,
   onChange,
@@ -484,6 +506,9 @@ function ColumnDetails({
   col: DesignColumn;
   index: number;
   caps: DesignerCapabilities;
+  traits: DesignTraits;
+  /** Another column of the table that has identity (for engines with one per table). */
+  otherIdentity: string | null;
   existing: boolean;
   disabled: boolean;
   onChange: (next: DesignColumn) => void;
@@ -507,9 +532,22 @@ function ColumnDetails({
       ? supportHint(caps.alterColumnType, "Changing identity")
       : undefined;
   const canIdentity = caps.identity && (!existing || allowed(caps.alterColumnType));
+  const seedIncrement = traits.identityStyle === "seedIncrement";
   return (
     <div className="designer__details">
-      {caps.autoIncrement || def.auto_increment ? (
+      {seedIncrement && (caps.identity || def.identity) ? (
+        <SeedIncrementIdentity
+          col={col}
+          index={index}
+          caps={caps}
+          traits={traits}
+          otherIdentity={otherIdentity}
+          existing={existing}
+          disabled={disabled}
+          onChange={onChange}
+        />
+      ) : null}
+      {!seedIncrement && (caps.autoIncrement || def.auto_increment) ? (
         <label className="checkbox" title={autoHint}>
           <input
             type="checkbox"
@@ -521,7 +559,7 @@ function ColumnDetails({
           Auto increment
         </label>
       ) : null}
-      {caps.identity || def.identity ? (
+      {!seedIncrement && (caps.identity || def.identity) ? (
         <label className="designer__inline" title={identityHint}>
           Identity
           <select
@@ -599,12 +637,138 @@ function ColumnDetails({
                   set({ generated: { ...def.generated, stored: e.target.checked } })
                 }
               />
-              Stored
+              {traits.storedLabel}
             </label>
           ) : null}
         </label>
       ) : null}
     </div>
+  );
+}
+
+const WHOLE_NUMBER = /^[+-]?\d+$/;
+
+/**
+ * `IDENTITY(seed, increment)` of a column (SQL Server): set when the column is created, never
+ * added to, removed from or changed on an existing column, and on at most one column.
+ */
+function SeedIncrementIdentity({
+  col,
+  index,
+  caps,
+  traits,
+  otherIdentity,
+  existing,
+  disabled,
+  onChange,
+}: {
+  col: DesignColumn;
+  index: number;
+  caps: DesignerCapabilities;
+  traits: DesignTraits;
+  otherIdentity: string | null;
+  existing: boolean;
+  disabled: boolean;
+  onChange: (next: DesignColumn) => void;
+}) {
+  const def = col.column;
+  const identity = def.identity;
+  const lockedByExisting = existing && traits.identityOnNewColumnsOnly;
+  const lockedByOther = !identity && traits.singleIdentity && otherIdentity !== null;
+  const hint = !caps.identity
+    ? "Identity columns are not supported by this database"
+    : lockedByExisting
+      ? "IDENTITY cannot be added to, removed from or changed on an existing column: add a new column or recreate the table."
+      : lockedByOther
+        ? `The table already has an identity column (${otherIdentity || "unnamed"}).`
+        : undefined;
+  const locked = disabled || !caps.identity || lockedByExisting;
+  const seed = identity?.start ?? "1";
+  const increment = identity?.increment ?? "1";
+  const problem = !identity
+    ? null
+    : !WHOLE_NUMBER.test(seed.trim())
+      ? "The seed must be a whole number."
+      : !WHOLE_NUMBER.test(increment.trim()) || /^[+-]?0+$/.test(increment.trim())
+        ? "The increment must be a whole number other than 0."
+        : null;
+
+  function toggle(on: boolean) {
+    if (on) {
+      // Identity columns are NOT NULL and have no default.
+      const { identity: _i, default: _d, ...rest } = def;
+      const { defaultLiteral: _l, ...colRest } = col;
+      onChange({
+        ...colRest,
+        column: {
+          ...rest,
+          nullable: false,
+          auto_increment: true,
+          identity: { always: true, start: "1", increment: "1" },
+        },
+      });
+    } else {
+      const { identity: _i, ...rest } = def;
+      onChange({ ...col, column: { ...rest, auto_increment: false } });
+    }
+  }
+
+  function setPart(part: "start" | "increment", text: string) {
+    if (!identity) return;
+    onChange({ ...col, column: { ...def, identity: { ...identity, [part]: text } } });
+  }
+
+  return (
+    <span className="designer__inline designer__identity" title={hint}>
+      <label className="checkbox">
+        <input
+          type="checkbox"
+          aria-label={`Column ${index + 1} identity`}
+          checked={identity !== undefined}
+          disabled={locked || lockedByOther}
+          onChange={(e) => toggle(e.target.checked)}
+        />
+        Identity
+      </label>
+      {identity ? (
+        <>
+          <label className="designer__inline">
+            Seed
+            <input
+              type="text"
+              inputMode="numeric"
+              className="designer__short"
+              aria-label={`Column ${index + 1} identity seed`}
+              value={seed}
+              disabled={locked}
+              spellCheck={false}
+              onChange={(e) => setPart("start", e.target.value)}
+            />
+          </label>
+          <label className="designer__inline">
+            Increment
+            <input
+              type="text"
+              inputMode="numeric"
+              className="designer__short"
+              aria-label={`Column ${index + 1} identity increment`}
+              value={increment}
+              disabled={locked}
+              spellCheck={false}
+              onChange={(e) => setPart("increment", e.target.value)}
+            />
+          </label>
+        </>
+      ) : null}
+      {problem ? (
+        <span className="designer__issue designer__issue--error" role="alert">
+          {problem}
+        </span>
+      ) : null}
+      {lockedByExisting && caps.identity ? (
+        <span className="field__hint designer__identity-hint">{hint}</span>
+      ) : null}
+    </span>
   );
 }
 
@@ -698,7 +862,30 @@ function DraftInput({
   );
 }
 
-export function IndexesEditor({ design, onChange, caps, issues, isNew, disabled }: EditorProps) {
+/** `index` marked clustered or not (the `index_kind` extra follows when it is a plain kind). */
+function withClustered(index: IndexDef, on: boolean): IndexDef {
+  let extras = withExtra(index.extras, EXTRA.clustered, { type: "bool", value: on });
+  const kind = textExtra(index.extras, EXTRA.indexKind);
+  if (kind === "clustered" || kind === "nonclustered") {
+    extras = withExtra(extras, EXTRA.indexKind, {
+      type: "text",
+      value: on ? "clustered" : "nonclustered",
+    });
+  }
+  const { extras: _e, ...rest } = index;
+  return { ...rest, extras };
+}
+
+export function IndexesEditor({
+  design,
+  onChange,
+  caps,
+  issues,
+  engine,
+  isNew,
+  disabled,
+}: EditorProps) {
+  const traits = designTraits(engine);
   const canAdd = isNew || allowed(caps.addIndex);
   const canChange = (item: DesignItem<IndexDef>) =>
     isNew || item.origin === undefined || (allowed(caps.addIndex) && allowed(caps.dropIndex));
@@ -718,6 +905,8 @@ export function IndexesEditor({ design, onChange, caps, issues, isNew, disabled 
               <th>Columns</th>
               <th>Unique</th>
               {caps.uniqueConstraints ? <th>Constraint</th> : null}
+              {traits.clusteredIndexes ? <th>Clustered</th> : null}
+              {traits.includedColumns ? <th>Include</th> : null}
               {caps.partialIndexes ? <th>Where</th> : null}
               <th aria-label="Actions" />
             </tr>
@@ -726,7 +915,15 @@ export function IndexesEditor({ design, onChange, caps, issues, isNew, disabled 
         <tbody>
           {design.indexes.map((item, index) => {
             const rowIssues = issuesAt(issues, `indexes[${index}]`);
-            const locked = disabled || !canChange(item);
+            const kindLock = indexLockReason(item.def, traits);
+            const locked = disabled || !canChange(item) || kindLock !== null;
+            const clustered = boolExtra(item.def.extras, EXTRA.clustered) ?? false;
+            const columnCount =
+              4 +
+              (caps.uniqueConstraints ? 1 : 0) +
+              (traits.clusteredIndexes ? 1 : 0) +
+              (traits.includedColumns ? 1 : 0) +
+              (caps.partialIndexes ? 1 : 0);
             const key = item.origin === undefined ? `new-${index}` : `o${item.origin}`;
             const hasDesc = item.def.columns.some((c) => c.descending);
             const hasExpr = item.def.columns.some((c) => c.is_expression);
@@ -788,6 +985,45 @@ export function IndexesEditor({ design, onChange, caps, issues, isNew, disabled 
                       />
                     </td>
                   ) : null}
+                  {traits.clusteredIndexes ? (
+                    <td className="designer__center">
+                      <input
+                        type="checkbox"
+                        aria-label={`Index ${index + 1} clustered`}
+                        checked={clustered}
+                        disabled={locked}
+                        title="A table has at most one clustered index (the primary key's, when it is clustered)."
+                        onChange={(e) => set(index, withClustered(item.def, e.target.checked))}
+                      />
+                    </td>
+                  ) : null}
+                  {traits.includedColumns ? (
+                    <td>
+                      <DraftInput
+                        label={`Index ${index + 1} included columns`}
+                        value={namesExtra(item.def.extras, EXTRA.includeColumns).join(", ")}
+                        disabled={locked || item.def.is_constraint || clustered}
+                        title={
+                          item.def.is_constraint
+                            ? "A unique constraint has no included columns"
+                            : clustered
+                              ? "A clustered index already holds every column"
+                              : undefined
+                        }
+                        placeholder="c, d"
+                        onCommit={(text) =>
+                          set(index, {
+                            ...item.def,
+                            // Always written (also empty), so removing them is a change.
+                            extras: withExtra(item.def.extras, EXTRA.includeColumns, {
+                              type: "json",
+                              value: splitNames(text),
+                            }),
+                          })
+                        }
+                      />
+                    </td>
+                  ) : null}
                   {caps.partialIndexes ? (
                     <td>
                       <input
@@ -833,9 +1069,12 @@ export function IndexesEditor({ design, onChange, caps, issues, isNew, disabled 
                     </button>
                   </td>
                 </tr>
-                {rowIssues.length > 0 || unsupportedParts.length > 0 ? (
+                {rowIssues.length > 0 || unsupportedParts.length > 0 || kindLock ? (
                   <tr className="designer__issues-row">
-                    <td colSpan={6}>
+                    <td colSpan={columnCount}>
+                      {kindLock ? (
+                        <span className="designer__issue designer__issue--warning">{kindLock}</span>
+                      ) : null}
                       <IssueText issues={rowIssues} />
                       {unsupportedParts.length > 0 ? (
                         <span className="designer__issue designer__issue--warning">
@@ -1131,7 +1370,16 @@ export function ChecksEditor({ design, onChange, caps, issues, isNew, disabled }
 
 // --- options ----------------------------------------------------------------------------
 
-export function OptionsEditor({ design, onChange, caps, issues, isNew, disabled }: EditorProps) {
+export function OptionsEditor({
+  design,
+  onChange,
+  caps,
+  issues,
+  engine,
+  isNew,
+  disabled,
+}: EditorProps) {
+  const traits = designTraits(engine);
   const canRename = isNew || allowed(caps.renameTable);
   const canComment = allowed(caps.tableComment);
   const canPk = isNew || allowed(caps.changePrimaryKey);
@@ -1193,6 +1441,27 @@ export function OptionsEditor({ design, onChange, caps, issues, isNew, disabled 
             }}
           />
           <p className="field__hint">Columns: {design.primaryKey.columns.join(", ")}</p>
+          {traits.clusteredIndexes ? (
+            <label className="checkbox">
+              <input
+                type="checkbox"
+                aria-label="Clustered primary key"
+                // Absent means clustered (the server's default for a primary key).
+                checked={boolExtra(design.extras, EXTRA.clustered) ?? true}
+                disabled={disabled || !canPk}
+                onChange={(e) =>
+                  onChange({
+                    ...design,
+                    extras: withExtra(design.extras, EXTRA.clustered, {
+                      type: "bool",
+                      value: e.target.checked,
+                    }),
+                  })
+                }
+              />
+              Clustered (the table's rows are stored in primary key order)
+            </label>
+          ) : null}
         </div>
       ) : null}
       {caps.notes.length > 0 ? (
