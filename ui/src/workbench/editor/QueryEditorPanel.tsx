@@ -20,7 +20,8 @@ import { formatMs } from "../format";
 import type { QueryEditorParams } from "../layout";
 import { spanOffsets } from "../positions";
 import { ResultsArea } from "../results/ResultsArea";
-import { IDLE_RUN, isActive, runReducer } from "../results/runState";
+import { IDLE_RUN, isActive, type ResultInfo, runReducer } from "../results/runState";
+import { openExport } from "../transfer/store";
 import { languageFor, messagesNoteFor, type SqlLanguage } from "./language";
 import { Splitter } from "./Splitter";
 import { type EditorCommand, SqlEditor, type SqlEditorHandle } from "./SqlEditor";
@@ -217,6 +218,49 @@ export function QueryEditorPanel({
     else void runCurrent();
   }
 
+  /** Exports the query at hand: the selection, else the statement at the cursor, else all. */
+  async function exportQuery() {
+    const editor = editorRef.current;
+    if (!editor || !session) return;
+    const text = editor.getText();
+    let sql = editor.getSelection()?.text ?? "";
+    if (!sql.trim()) {
+      try {
+        const span = await statementAt(session.engine, text, editor.getCursorOffset());
+        if (span) {
+          const [start, end] = spanOffsets(text, span);
+          sql = text.slice(start, end);
+        }
+      } catch {
+        // The whole text is exported; the core refuses more than one statement.
+      }
+    }
+    if (!sql.trim()) sql = text;
+    if (!sql.trim()) {
+      setHint("Nothing to export.");
+      return;
+    }
+    setHint(null);
+    const db = database ?? databases.current;
+    openExport({
+      source: { type: "query", session: session.id, sql, ...(db ? { database: db } : {}) },
+      engine: session.engine,
+      label: "the query's rows",
+      baseName: "query",
+    });
+  }
+
+  function exportResult(result: ResultInfo) {
+    if (!run.runId) return;
+    openExport({
+      source: { type: "result", runId: run.runId, resultIndex: result.resultIndex },
+      ...(session ? { engine: session.engine } : {}),
+      label: `Result ${result.resultIndex + 1}`,
+      baseName: `result-${result.resultIndex + 1}`,
+      totalRows: result.rowCount,
+    });
+  }
+
   function cancel() {
     const id = runId.current;
     if (id) void queryCancel(id).catch(() => {});
@@ -316,6 +360,16 @@ export function QueryEditorPanel({
         >
           Stop
         </button>
+        <span className="toolbar__divider" aria-hidden="true" />
+        <button
+          type="button"
+          className="button"
+          disabled={!session}
+          onClick={() => void exportQuery()}
+          title="Export every row of the query at the cursor (or the selection)"
+        >
+          Export…
+        </button>
         <span
           className="query-editor__status"
           role="status"
@@ -338,7 +392,7 @@ export function QueryEditorPanel({
         </div>
         <Splitter value={split} onChange={setSplit} label="Resize editor and results" />
         <div className="query-editor__results">
-          <ResultsArea run={run} messagesNote={messagesNoteFor(engine)} />
+          <ResultsArea run={run} messagesNote={messagesNoteFor(engine)} onExport={exportResult} />
         </div>
       </div>
     </section>
