@@ -65,7 +65,12 @@ const CLOSE_GRACE: Duration = Duration::from_secs(1);
 const SESSION_QUERY: &str = "SET TEXTSIZE 2147483647; SELECT DB_NAME(), @@SPID, \
      CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(128)), @@VERSION";
 const BEGIN_SQL: &str = "BEGIN TRANSACTION";
-const COMMIT_SQL: &str = "IF @@TRANCOUNT > 0 COMMIT TRANSACTION";
+/// A transaction the server already ended (deadlock victim 1205, `XACT_ABORT`, a trigger's
+/// `ROLLBACK`) fails the commit with error 50000 instead of reporting a commit that did not
+/// happen (stricter than contract §2.4's `IF @@TRANCOUNT > 0 COMMIT`).
+const COMMIT_SQL: &str = "IF @@TRANCOUNT = 0 RAISERROR(N'the transaction was already ended by \
+     the server (rolled back after an error); nothing was committed', 16, 1) \
+     ELSE COMMIT TRANSACTION";
 const ROLLBACK_SQL: &str = "IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION";
 const CLOSED_AFTER_CANCEL: &str = "the connection was closed after a cancel";
 
@@ -773,8 +778,10 @@ async fn run_rpc(
     let mut request = pin!(cmd.exec(client));
     let mut results = ctl.wait(&mut request).await.map_err(map_error)?;
     let mut set = None;
+    let mut just_closed = false;
     loop {
         let item = ctl.wait(&mut results.next()).await;
+        let closed_before = std::mem::take(&mut just_closed);
         match item {
             None => break,
             Some(Err(e)) => {
@@ -789,7 +796,12 @@ async fn run_rpc(
                 if set.is_some() {
                     // The DONE that closes a result set counts its rows: not a write.
                     ctl.flush(&mut set).await?;
-                } else {
+                    just_closed = true;
+                } else if n != 0 || !closed_before {
+                    // tiberius does not expose the DONE_COUNT bit (a DONE without a count
+                    // reads as 0). A 0 right after a closed result set is the DONEPROC /
+                    // DONEINPROC of the statement that produced it (`EXEC proc @P1`), not a
+                    // write, so it is skipped.
                     ctl.emit(ResultItem::RowsAffected(n)).await;
                 }
             }

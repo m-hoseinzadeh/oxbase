@@ -498,11 +498,12 @@ fn time_100ns(increments: u64, scale: u8) -> u64 {
     increments.saturating_mul(10u64.pow(7 - scale))
 }
 
-/// `datetime`: days since 1900-01-01 and 1/300 s ticks, as microseconds since the epoch
-/// (rounded to the nearest microsecond, as SQL Server converts to `datetime2(6)`).
+/// `datetime`: days since 1900-01-01 and 1/300 s ticks, as microseconds since the epoch.
+/// The ticks are rounded to the nearest millisecond (contract §5.3), which is the value SQL
+/// Server itself shows: 299 ticks (996.67 ms) reads as `.997`.
 pub(crate) fn datetime_micros(days: i32, ticks: u32) -> i64 {
-    let ticks = i64::from(ticks);
-    (i64::from(days) - DAYS_1900_TO_EPOCH) * MICROS_PER_DAY + (ticks * 10_000 + 1) / 3
+    let millis = (i64::from(ticks) * 10 + 1) / 3;
+    (i64::from(days) - DAYS_1900_TO_EPOCH) * MICROS_PER_DAY + millis * 1_000
 }
 
 /// `smalldatetime`: days since 1900-01-01 and minutes since midnight.
@@ -752,11 +753,23 @@ pub(crate) fn parse_decimal(text: &str) -> Result<(i128, u8)> {
     if significant > 38 || scale > 38 {
         return Err(bad());
     }
-    let magnitude: i128 = if significant == 0 {
+    let mut magnitude: i128 = if significant == 0 {
         0
     } else {
         digits.trim_start_matches('0').parse().map_err(|_| bad())?
     };
+    // tiberius declares the parameter's precision as (integer digits, at least 1) + scale,
+    // so `0.` followed by 38 digits would be sent as precision 39, which the server rejects.
+    // Trailing fractional zeros are dropped to fit; a value that still needs 39 is refused.
+    let mut scale = scale;
+    let int_digits = int.trim_start_matches('0').len().max(1);
+    while int_digits + usize::from(scale) > 38 {
+        if scale == 0 || magnitude % 10 != 0 {
+            return Err(bad());
+        }
+        magnitude /= 10;
+        scale -= 1;
+    }
     Ok((if negative { -magnitude } else { magnitude }, scale))
 }
 
@@ -964,7 +977,7 @@ mod tests {
                 .as_primitive::<TimestampMicrosecondType>()
                 .value(0)
         };
-        assert_eq!(ts(11), micros("2026-01-15 10:20:30.996667"));
+        assert_eq!(ts(11), micros("2026-01-15 10:20:30.997"));
         assert_eq!(ts(12), micros("9999-12-31 23:59:59.999999"));
         assert_eq!(ts(13), micros("2026-01-15 10:21:00.0"));
         assert_eq!(text(14), "2026-01-15T10:20:30.1234567+03:30");
@@ -1026,8 +1039,9 @@ mod tests {
     fn date_and_time_math() {
         assert_eq!(date32(719_162), 0);
         assert_eq!(datetime_micros(25_567, 0), 0);
-        assert_eq!(datetime_micros(25_567, 1), 3_333);
-        assert_eq!(datetime_micros(25_567, 2), 6_667);
+        assert_eq!(datetime_micros(25_567, 1), 3_000);
+        assert_eq!(datetime_micros(25_567, 2), 7_000);
+        assert_eq!(datetime_micros(25_567, 299), 997_000);
         assert_eq!(datetime_micros(25_567, 300), 1_000_000);
         assert_eq!(smalldatetime_micros(25_567, 1), 60_000_000);
         assert_eq!(time_micros(5, 0), 5_000_000);
@@ -1155,6 +1169,20 @@ mod tests {
         assert_eq!(parse_decimal(&max).unwrap().0, max.parse::<i128>().unwrap());
         assert!(parse_decimal(&"9".repeat(39)).is_err());
         assert!(parse_decimal(&format!("0.{}", "1".repeat(39))).is_err());
+        // decimal(38, 38) values: tiberius would declare precision 39 for a zero integer part.
+        assert!(parse_decimal(&format!("0.{}", "1".repeat(38))).is_err());
+        assert_eq!(
+            parse_decimal(&format!("0.{}0", "1".repeat(37))).unwrap(),
+            ("1".repeat(37).parse::<i128>().unwrap(), 37)
+        );
+        assert_eq!(
+            parse_decimal(&format!("0.{}", "0".repeat(38))).unwrap(),
+            (0, 37)
+        );
+        assert_eq!(
+            parse_decimal(&format!("0.{}", "1".repeat(37))).unwrap(),
+            ("1".repeat(37).parse::<i128>().unwrap(), 37)
+        );
         for bad in ["", "-", ".", "1e5", "1.2.3", "abc", "1,5", " - 1"] {
             assert!(parse_decimal(bad).is_err(), "{bad}");
         }

@@ -76,7 +76,8 @@
 //! # Transactions
 //!
 //! [`Connection::begin`]: `BEGIN TRANSACTION`; [`oxbase_driver::Tx::commit`] /
-//! [`oxbase_driver::Tx::rollback`]: `COMMIT` / `ROLLBACK` (`IF @@TRANCOUNT > 0`). A dropped
+//! [`oxbase_driver::Tx::rollback`]: `COMMIT` / `ROLLBACK` (`ROLLBACK` only `IF @@TRANCOUNT > 0`;
+//! `COMMIT` fails when the server already ended the transaction, see below). A dropped
 //! `Tx` is rolled back before the connection's next statement. DDL is transactional on SQL
 //! Server, so designer scripts run atomically.
 //!
@@ -88,6 +89,16 @@
 //!   do.
 //! - Result metadata carries only the column name and a coarse type (no length, precision,
 //!   scale or nullability), which shapes the Arrow mapping ([`types`]).
+//! - `money` is decoded through `f64`: amounts above about ±900 719 925 474.0991 lose their
+//!   last digits (the largest `money` value comes back within 2048 units of the 4th decimal).
+//! - The `DONE_COUNT` bit is not exposed, so on the RPC path a DONE without a count reads as
+//!   `RowsAffected(0)` (control-of-flow statements, a statement that failed). The 0 that
+//!   directly follows a result set is skipped; others can still appear (sums stay correct).
+//!
+//! `Tx::commit` fails (error 50000) when the server already ended the transaction, instead of
+//! the contract's silent `IF @@TRANCOUNT > 0 COMMIT`. `begin()` inside a transaction the
+//! editor opened with `BEGIN TRAN` nests (`@@TRANCOUNT` 2), so its commit only decrements the
+//! count: the work becomes durable when the outer transaction commits.
 //!
 //! # Secrets
 //!

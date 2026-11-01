@@ -342,8 +342,10 @@ async fn m4_types_decode_exactly() {
         text(b, "c_numeric"),
         "1234567890123456789012345678.0123456789"
     );
-    // tiberius 0.13 decodes money through f64 (known gap): the largest money value comes back
-    // within the f64 spacing at that magnitude.
+    // tiberius 0.13 decodes money through f64 (known gap, crate docs "Known gaps"): the
+    // largest money value comes back within the f64 spacing at that magnitude. Contract §5.3
+    // lists the exact value; the tolerance stays until Design records the gap in §11 or
+    // tiberius' money decoding is patched (reported to the orchestrator).
     let money = col(b, "c_money").as_primitive::<Decimal128Type>().value(0);
     assert!(
         (money - 9_223_372_036_854_775_807).abs() <= 2048,
@@ -374,7 +376,7 @@ async fn m4_types_decode_exactly() {
             .as_primitive::<TimestampMicrosecondType>()
             .value(0)
     };
-    assert_eq!(ts("c_datetime"), micros("2026-01-15 10:20:30.996667"));
+    assert_eq!(ts("c_datetime"), micros("2026-01-15 10:20:30.997"));
     assert_eq!(ts("c_datetime2"), micros("9999-12-31 23:59:59.999999"));
     assert_eq!(ts("c_smalldatetime"), micros("2026-01-15 10:21:00.0"));
     assert_eq!(text(b, "c_dto"), "2026-01-15T10:20:30.1234567+03:30");
@@ -774,5 +776,35 @@ async fn transactions_commit_roll_back_and_roll_back_when_dropped() {
             .as_primitive::<Int64Type>()
             .value(0),
         0
+    );
+
+    // A transaction the server already ended (here an explicit ROLLBACK, as after a deadlock
+    // or XACT_ABORT) makes commit fail instead of reporting a commit that did not happen.
+    let tx = c.begin().await.unwrap();
+    collect(
+        tx.execute(
+            "INSERT INTO #tx VALUES (4); ROLLBACK TRANSACTION",
+            &[],
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    let err = tx.commit().await.unwrap_err();
+    assert!(
+        matches!(&err, Error::Sql { code: Some(code), .. } if code == "50000"),
+        "{err:?}"
+    );
+    assert_eq!(count_tx(&c).await, 1);
+    let out = run(&c, "SELECT @@TRANCOUNT AS t", &[]).await;
+    assert_eq!(
+        first_batch(&out)
+            .column(0)
+            .as_primitive::<Int64Type>()
+            .value(0),
+        0,
+        "the session is still usable"
     );
 }
