@@ -5,7 +5,8 @@ would, and checks the paths that unit tests cannot reach: the Tauri IPC, the `Ch
 the binary `query_page` responses and their Arrow decoding inside WebKitGTK. The contract is
 in `docs/m3-contracts.md` §9. CI runs it as the job **Webview smoke (Linux)** in
 `.github/workflows/ci.yml`. The job runs on the full lane and on the fast lane of the
-`wip/*-e2e` and `wip/*-app` branches.
+`wip/*-e2e`, `wip/*-app` and `wip/*-integrate` branches. Since M3 the job sets
+`OXBASE_E2E_REQUIRE_EDIT=1`, so the edit step must run.
 
 ## What it checks
 

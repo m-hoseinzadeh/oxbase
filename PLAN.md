@@ -240,6 +240,45 @@ applied in one transaction where every update and delete must hit exactly one ro
 designer model, preview and apply; the Tauri commands; the `[m3]` fixtures; and the webview
 smoke test that closes the M2 gap (Linux, `tauri-driver`, full lane).
 
+**M3 as built (notes, 2026-11-01).** The exit check passed in the CI conformance job (Linux,
+Docker fixtures, run 41254616693; numbers in the README, *Conformance harness*): `roundtrip` and
+`capabilities` pass for table, column, index, foreign key and check on PostgreSQL 18.6, MySQL
+8.4.13, MariaDB 11.8.9 and SQLite 3.54.1 (40 of 40 cells), and CI now requires them
+(`OXBASE_CONFORMANCE_REQUIRE_M3_ROUNDTRIP=1`). Each round trip keeps a seeded row through every
+alter and uses a reserved-word column and a renamed column with a quote and a non-ASCII
+character. The services edit and designer live tests run against every engine's real cells
+(`OXBASE_SERVICES_REQUIRE_M3_CELLS=1`). The M2 gap is closed on Linux: the webview smoke test
+drives the debug app through WebKitGTK (`tauri-driver`), and page latency through IPC plus
+Arrow decoding in the webview was p95 11 ms; it also edits a cell, applies and sees it after a
+reload. On the same code (`milestone/m3` at 58b0545), the full CI lane (Rust tests: 665 passed
+on Linux and macOS, 664 on Windows; OS keychain tests on all three; conformance; webview smoke)
+and the Bundle workflow (Linux x86_64, macOS aarch64 and x86_64, Windows x86_64) passed in
+manual runs 41255149525 and 41255151166. Where the build differs from the text above or from
+`docs/m3-contracts.md` (the contract file marks each deviation *As built*):
+
+- PostgreSQL registers its own `PgComparator` (PostgreSQL defaults filled in on both sides, then
+  the shared walk) instead of `RulesComparator(PgRules)`. Sessions now pin
+  `standard_conforming_strings=on`, and generated DDL writes backslash literals as `E'...'`.
+- MySQL / MariaDB: when a check, generated column, expression default or expression key uses a
+  renamed column, renames move into the main `ALTER` as `CHANGE COLUMN` (MySQL refuses the
+  separate rename). Removing character set, collation, `ON UPDATE` or `INVISIBLE` needs an
+  explicit null extra; an absent one keeps the old value.
+- SQLite rebuild: copies values without `CAST` (casts to NUMERIC-affinity types lose data),
+  runs renames natively after the copy so SQLite rewrites triggers and views, guards against
+  triggers missing from the context, and checks foreign keys database-wide filtered to the
+  table. Clauses the model cannot hold (`ON CONFLICT`, key `COLLATE`) make a rebuild
+  `Unsupported`.
+- Designer validation checks names in two groups (indexes; constraints), so MySQL's FK-backing
+  index may share its FK's name, and treats names that differ only in case as duplicates on
+  every engine (no per-engine case flag yet).
+- Webview smoke: Linux only. No Windows job (the PostgreSQL fixture is a Linux container) and
+  macOS has no WebDriver for WKWebView. Integration found one bug no unit test could: Glide
+  reports the overlay editor's cell in grid columns (row markers included), so edits opened on
+  the next column; fixed in `ui/src/workbench/results/gridCoords.ts`.
+- Not modelled yet: a PRIMARY KEY's own `DEFERRABLE` on PostgreSQL (lost if the designer
+  changes the key's columns); identity / auto-increment changes on an existing column have no
+  capability of their own (the UI gates them on the type-change capability).
+
 Order of work: M0–M3 prove the architecture. M4 and M7 are where the per-database matrix gets tested for real. M8 and M10 reuse the Comparator and DdlGenerator cells and get much cheaper if M3 is done right.
 
 ## 7. Main risks
