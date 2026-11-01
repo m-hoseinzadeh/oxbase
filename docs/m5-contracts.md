@@ -555,4 +555,25 @@ the `miniz_oxide` backend (already in the graph), `zip` 9.2.1 (MIT, `deflate` on
 
 ## 13. Deviations (as built)
 
-None yet. Streams record deviations from this file here, with the reason.
+Streams record deviations from this file here, with the reason.
+
+- **load, SQL Server method** (§4.3): the registered `MsSqlBulkLoader` uses
+  `multi_row_insert`, not `tds_bulk_load`. tiberius' `bulk_insert` needs each value as the exact
+  `ColumnData` variant of the column's server type (an `int` column refuses an `I64`, `datetime2`
+  needs its scale, ...), and a half-sent `INSERT BULK` stream cannot be abandoned in-band, so a
+  cancel would have to finish it (inserting what was sent) or close the session. Parameterized
+  `INSERT`s keep the server's conversions and the driver's attention-based cancel. Statements
+  bind at most 2 098 parameters and 1 000 rows; binary parameters are wrapped in
+  `CONVERT(varbinary(max), @Pn)` and decimal texts padded to one scale per column, because a
+  `VALUES` list types each column from all its rows (a NULL is declared `nvarchar(1)` by the
+  driver, and mixed decimal scales would be rounded). `IDENTITY_INSERT` handling is as specified.
+- **load, SQLite method** (§4.3, one of the two allowed): `multi_row_insert` through
+  `InsertLoader` with 32 766 parameters, inside the service's transaction; no worker-side
+  prepared statement, so the SQLite driver is unchanged.
+- **load, PostgreSQL driver addition** (§2.1): `PgConnection` and its `Tx` return `Some(self)`
+  from `as_any`, and `oxbase-pg`'s `conn.rs` has a crate-private `CopySession` (the `COPY ... FROM
+  STDIN` entry point). It takes the connection's statement lock like any statement, streams
+  256 KiB `CopyData` chunks produced on demand, and on cancel drops the sink (`CopyFail`),
+  returns `Cancelled` at once and keeps the lock in a background task, which sends cancel
+  requests if the server has not ended the `COPY` within 200 ms (a `COPY` blocked on a lock reads
+  no input). The next statement (the service's `ROLLBACK`) runs after that.

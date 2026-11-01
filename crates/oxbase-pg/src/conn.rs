@@ -952,6 +952,12 @@ impl Connection for PgConnection {
         }
         Ok(())
     }
+
+    /// M5: the bulk loader of this crate runs `COPY ... FROM STDIN` on the session
+    /// ([`CopySession`]).
+    fn as_any(&self) -> Option<&(dyn std::any::Any + Send + Sync)> {
+        Some(self)
+    }
 }
 
 /// An open transaction. Statements run on the same session as the connection's.
@@ -987,6 +993,11 @@ impl Tx for PgTx {
     async fn rollback(self: Box<Self>) -> Result<()> {
         self.finish("ROLLBACK").await
     }
+
+    /// M5: the transaction's session, for `COPY ... FROM STDIN` ([`CopySession`]).
+    fn as_any(&self) -> Option<&(dyn std::any::Any + Send + Sync)> {
+        Some(self)
+    }
 }
 
 impl Drop for PgTx {
@@ -997,4 +1008,135 @@ impl Drop for PgTx {
             self.shared.tx_open.store(false, Ordering::Release);
         }
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// COPY FROM STDIN (M5 bulk load)
+
+/// About how many bytes of `COPY` data go into one `CopyData` message.
+pub(crate) const COPY_CHUNK: usize = 256 * 1024;
+/// How long an aborted `COPY` may take to end by itself before cancel requests follow.
+const COPY_ABORT_GRACE: Duration = Duration::from_millis(200);
+
+/// The session behind a [`PgConnection`] or one of its transactions, for
+/// `COPY ... FROM STDIN` (M5, `docs/m5-contracts.md` §4.3). The bulk loader of this crate
+/// reaches it through `Connection::as_any` / `Tx::as_any`; nothing outside the crate can.
+///
+/// # How a `COPY` runs
+///
+/// - It takes the connection's statement lock like any statement (so it queues behind a
+///   running one and nothing interleaves with it), after a pending rollback of a dropped `Tx`.
+/// - Rows travel as `CopyData` messages of about [`COPY_CHUNK`] bytes, produced on demand by the
+///   caller's `fill`, so only one chunk is held in memory. `tokio-postgres` applies the
+///   socket's backpressure to every send.
+/// - On the caller's token, or [`Connection::cancel_running`], the copy is abandoned at once:
+///   dropping the sink makes `tokio-postgres` send `CopyFail`, so the server aborts the `COPY`
+///   (the transaction is then failed and must be rolled back), and `copy_in` returns
+///   `Err(Cancelled)` immediately. A background task keeps the statement lock until the server
+///   has ended the `COPY` and sends cancel requests (with the statement path's backoff) if
+///   that takes longer than [`COPY_ABORT_GRACE`] (a `COPY` waiting for a lock reads no more
+///   input, so `CopyFail` alone would not reach it). The next statement on the connection (the
+///   caller's `ROLLBACK`) runs after that.
+/// - Notices raised during the `COPY` (triggers) are discarded: no result stream carries them.
+#[derive(Clone)]
+pub(crate) struct CopySession(Arc<Shared>);
+
+impl CopySession {
+    /// The session of `any` when it is a [`PgConnection`] or a transaction of one.
+    pub(crate) fn from_any(any: &(dyn std::any::Any + Send + Sync)) -> Option<Self> {
+        if let Some(conn) = any.downcast_ref::<PgConnection>() {
+            return Some(Self(conn.shared.clone()));
+        }
+        any.downcast_ref::<PgTx>().map(|tx| Self(tx.shared.clone()))
+    }
+
+    /// Runs `sql` (a `COPY ... FROM STDIN` in text format) and feeds it the data `fill`
+    /// appends: it is called repeatedly with an empty buffer and returns `true` while more data
+    /// follows. Returns the row count the server reports. See the type docs for cancellation.
+    pub(crate) async fn copy_in<F>(
+        &self,
+        sql: &str,
+        fill: F,
+        cancel: &CancellationToken,
+    ) -> Result<u64>
+    where
+        F: FnMut(&mut String) -> Result<bool> + Send,
+    {
+        let shared = &self.0;
+        if cancel.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        let client = shared.client()?;
+        let stop = lock(&shared.stop_all).child_token();
+        let mut notices = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Err(Error::Cancelled),
+            () = stop.cancelled() => return Err(Error::Cancelled),
+            guard = shared.exec.clone().lock_owned() => guard,
+        };
+        if shared.rollback_pending.swap(false, Ordering::AcqRel)
+            && let Err(e) = client.batch_execute("ROLLBACK").await
+        {
+            tracing::debug!(error = %from_pg(&e), "rollback of a dropped transaction failed");
+        }
+        let mut work = Box::pin(copy_rows(&client, sql, fill));
+        let outcome = tokio::select! {
+            biased;
+            result = &mut work => Some(result),
+            () = cancel.cancelled() => None,
+            () = stop.cancelled() => None,
+        };
+        if let Some(result) = outcome {
+            while notices.try_recv().is_some() {}
+            return result;
+        }
+        // Dropping the sink (inside `work`) sends `CopyFail`.
+        drop(work);
+        let shared = shared.clone();
+        tokio::spawn(async move {
+            let mut ended = Box::pin(async {
+                // Answered after the server has processed the end of the `COPY`.
+                let _ = client.batch_execute("").await;
+            });
+            if tokio::time::timeout(COPY_ABORT_GRACE, ended.as_mut())
+                .await
+                .is_err()
+                && tokio::time::timeout(DRAIN_LIMIT, cancel_until_done(&shared, ended.as_mut()))
+                    .await
+                    .is_err()
+            {
+                tracing::warn!("a cancelled PostgreSQL COPY did not end within {DRAIN_LIMIT:?}");
+            }
+            while notices.try_recv().is_some() {}
+            // `notices` (the statement lock) is dropped here.
+        });
+        Err(Error::Cancelled)
+    }
+}
+
+/// The `COPY` itself: start it, stream the chunks `fill` produces, finish.
+async fn copy_rows<F>(client: &Client, sql: &str, mut fill: F) -> Result<u64>
+where
+    F: FnMut(&mut String) -> Result<bool> + Send,
+{
+    use futures::SinkExt as _;
+
+    let sink = client
+        .copy_in::<_, bytes::Bytes>(sql)
+        .await
+        .map_err(|e| from_pg(&e))?;
+    let mut sink = std::pin::pin!(sink);
+    loop {
+        let mut chunk = String::with_capacity(COPY_CHUNK + COPY_CHUNK / 8);
+        let more = fill(&mut chunk)?;
+        if !chunk.is_empty() {
+            sink.send(bytes::Bytes::from(chunk))
+                .await
+                .map_err(|e| from_pg(&e))?;
+        }
+        if !more {
+            break;
+        }
+    }
+    sink.as_mut().finish().await.map_err(|e| from_pg(&e))
 }

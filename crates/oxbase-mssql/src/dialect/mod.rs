@@ -31,7 +31,12 @@
 //! Not in M4: database-level DDL triggers (not listed), synonyms (no object kind), users, roles
 //! and permissions (kinds applicable, no fetchers: pending cells), partition schemes and
 //! functions, full-text catalogs, external tables, assemblies.
+//!
+//! M5 (**load** stream): the import [`MsSqlBulkLoader`] (`bulk.rs`), batched multi-row
+//! `INSERT`s under the 2 100-parameter limit, with `IDENTITY_INSERT` when an identity column is
+//! loaded.
 
+mod bulk;
 mod caps;
 mod compare;
 mod ddl;
@@ -45,6 +50,7 @@ use oxbase_dialect::{
 };
 use oxbase_types::{Engine, ObjectKind};
 
+pub use bulk::MsSqlBulkLoader;
 pub use caps::MsSqlCapabilities;
 pub use compare::MsSqlRules;
 
@@ -86,6 +92,8 @@ pub fn register(reg: &mut DialectRegistry) {
     reg.register_tree_layout(engine, tree_layout());
     reg.register_capabilities(engine, Arc::new(MsSqlCapabilities));
     reg.register_quoting(engine, Arc::new(BracketQuoting));
+    // M5: import bulk loads as batched multi-row INSERTs (bulk.rs, load stream).
+    reg.register_bulk_loader(engine, Arc::new(MsSqlBulkLoader::new()));
     reg.mark_not_applicable_except(engine, &APPLICABLE);
 }
 
