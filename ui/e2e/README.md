@@ -70,7 +70,12 @@ import / export step (step 9) once the integrator turns it on.
    - It reads the written file from disk and compares it with the source: the same header, five
      rows, and `id`, `name`, `amount` (exact decimal text), `born`, `active` and `note` equal,
      where text starting with `=`, `+`, `-`, `@`, tab or CR carries the formula guard's leading
-     `'` (`=1+1` becomes `'=1+1`, `@SUM(A1)` becomes `'@SUM(A1)`).
+     `'` (`=1+1` becomes `'=1+1`, `@SUM(A1)` becomes `'@SUM(A1)`). `at` must be the same
+     instant: `T` or a space, the number of fraction digits and a `Z` / `+00:00` offset are the
+     writer's choice (a value without an offset counts as UTC); an empty field stays empty.
+   - It has not run yet: the webview smoke job does not run on `wip/*-perf`, and the hook
+     belongs to the app stream. Run it on a `wip/*-app` or `wip/*-integrate` branch that has the
+     hook before setting `OXBASE_E2E_REQUIRE_M5=1`.
    - Finally it drops its table, also when the step fails.
    - Until the M5 streams are merged, a failure of this step is also reported as a skip with a
      warning. With `OXBASE_E2E_REQUIRE_M5=1` (the integrator sets it once the app, services,

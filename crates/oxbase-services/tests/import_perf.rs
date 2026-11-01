@@ -5,16 +5,23 @@
 //! `[m5.perf] engines` (PostgreSQL and MySQL; `OXBASE_PERF_ENGINES=postgres,mysql,sqlite`
 //! overrides the list):
 //!
-//! 1. a small probe import (create mode, one transaction) whose checksum must match, so a
+//! 1. a small probe import (create mode, one transaction) whose checksum must match and whose
+//!    rows, read back ordered by `id`, must equal the generator's values column by column
+//!    (NULL vs 0 / empty, decimals, doubles bit for bit, bools, dates, timestamps to the
+//!    microsecond without a time-zone shift, notes with LF / CRLF / quotes / non-ASCII), so a
 //!    wrong value conversion fails in seconds rather than after the big run;
 //! 2. the full import into `m5_perf` (create mode, `Batches { commit_rows }`, `Stop` on the
 //!    first row issue) must finish with every row read and committed, the checksum query of
 //!    `[m5.perf.checksum]` must return the generator's numbers, the progress events must be
 //!    monotonic and frequent (at most `progress_max_gap_ms` or `progress_max_gap_fraction` of
 //!    the file apart, the last one reporting every byte) and the resident memory may grow at
-//!    most `rss_growth_limit_mb`;
+//!    most `rss_growth_limit_mb`. On top of the contract's either/or rule no gap may exceed
+//!    [`GAP_CEILING`] (a stall where `bytesRead` stops moving), the same rules apply from
+//!    `Started` to the first progress event, and from the last progress event to `Finished`
+//!    at most `progress_max_gap_ms` once it reports every row committed (else [`GAP_CEILING`]);
 //! 3. a second import (append into a pre-created `m5_perf_cancel`) is cancelled once a quarter
-//!    of the file is read: `Cancelled` must arrive within `cancel_deadline_ms` and the table
+//!    of the file is read: `Cancelled` must arrive within `cancel_deadline_ms` of the call to
+//!    `ImportService::cancel` (the clock starts before the call) and the table
 //!    must hold exactly `report.rowsCommitted` (> 0) rows, the documented leftover of an
 //!    append in batches (§5.2).
 //!
@@ -24,12 +31,13 @@
 //! **Pending.** Until the read, services and load streams are merged, `oxbase_io`'s CSV reader
 //! or `ImportService::start` are `unimplemented!("m5: ...")`. The test detects that (a probe
 //! before any big work), prints `PENDING` with the reason, still generates the full file and
-//! checks its size, and passes. With `OXBASE_REQUIRE_M5_PERF=1` (set by the integrator once
-//! the streams are merged) a pending part fails the test.
+//! checks its size, and passes. With `OXBASE_REQUIRE_M5_PERF=1` a pending part fails the test.
+//! The `import-perf` job sets it on its `1 GB CSV import` step only, for the full lane and
+//! `wip/*-integrate` (never at workflow or job level).
 //!
-//! Without `OXBASE_PERF_DIR` the test does nothing (the conformance job runs every ignored
-//! test of this crate; the 1 GB run belongs to the `import-perf` job only), unless
-//! `OXBASE_REQUIRE_M5_PERF=1`.
+//! Without `OXBASE_PERF_DIR` the test does nothing, even with `OXBASE_REQUIRE_M5_PERF=1`: the
+//! conformance job runs every ignored test of this crate, and the 1 GB run belongs to the
+//! `import-perf` job only, which sets both variables.
 //!
 //! ```sh
 //! scripts/fixtures-certs.sh && scripts/ci-fixtures.sh up postgres mysql
@@ -79,6 +87,11 @@ const MAX_BYTES: u64 = 1_300_000_000;
 const PROBE_ROWS: u64 = 20_000;
 /// The longest wait for the next import event before the run counts as stalled.
 const STALL: Duration = Duration::from_secs(300);
+/// No gap between progress events (or from `Started` to the first one, or from the last one
+/// to the terminal event) may be longer than this, whatever share of the file it covers.
+const GAP_CEILING: Duration = Duration::from_secs(10);
+/// At most this many column mismatches of the probe read-back are listed in the failure.
+const MAX_MISMATCHES: usize = 25;
 
 // ---------------------------------------------------------------------------------------------
 // Fixtures and environment
@@ -501,6 +514,55 @@ impl Live {
             .collect()
     }
 
+    /// Runs `sql` on the base session; every row of the first result set.
+    async fn query_rows(&self, sql: &str) -> Vec<Vec<Value>> {
+        let _exclusive = self.session.exclusive().await;
+        let stream = self
+            .session
+            .connection()
+            .execute(sql, &[], CancellationToken::new())
+            .await
+            .unwrap_or_else(|e| panic!("{}: {sql}: {e}", self.key));
+        let out = oxbase_driver::collect(stream)
+            .await
+            .unwrap_or_else(|e| panic!("{}: {sql}: {e}", self.key));
+        let set = out
+            .result_sets
+            .first()
+            .unwrap_or_else(|| panic!("{}: {sql}: no result set", self.key));
+        let mut rows = Vec::new();
+        for batch in &set.batches {
+            for r in 0..batch.num_rows() {
+                rows.push(
+                    (0..batch.num_columns())
+                        .map(|c| {
+                            oxbase_driver::cell_value(batch.column(c).as_ref(), r).unwrap_or_else(
+                                |e| panic!("{}: {sql}: row {r} column {c}: {e}", self.key),
+                            )
+                        })
+                        .collect(),
+                );
+            }
+        }
+        rows
+    }
+
+    /// Every row of `obj` ordered by `id`, the columns in the file's order.
+    async fn read_back(&self, obj: &ObjectRef) -> Vec<Vec<Value>> {
+        let quoting = self
+            .dialects
+            .quoting(self.engine)
+            .unwrap_or_else(|e| panic!("{}: no Quoting: {e}", self.key));
+        let columns: Vec<String> = COLUMNS.iter().map(|c| quoting.quote_ident(c)).collect();
+        let sql = format!(
+            "SELECT {} FROM {} ORDER BY {}",
+            columns.join(", "),
+            quoting.qualify(obj),
+            quoting.quote_ident("id")
+        );
+        self.query_rows(&sql).await
+    }
+
     async fn execute(&self, sql: &str) {
         let _exclusive = self.session.exclusive().await;
         let stream = self
@@ -623,6 +685,8 @@ struct Snapshot {
 struct RunOutcome {
     terminal: ImportEvent,
     started_total: Option<u64>,
+    /// When the `Started` event arrived.
+    started_at: Option<Instant>,
     method: Option<BulkMethod>,
     progress: Vec<Snapshot>,
     commits: Vec<u64>,
@@ -684,6 +748,7 @@ async fn run_import(
         Err(join) => panic!("{what}: the start task ended: {join}"),
     };
     let mut started_total = None;
+    let mut started_at = None;
     let mut method = None;
     let mut progress: Vec<Snapshot> = Vec::new();
     let mut commits = Vec::new();
@@ -710,6 +775,7 @@ async fn run_import(
                 total_bytes, plan, ..
             } => {
                 started_total = Some(*total_bytes);
+                started_at = Some(now);
                 method = Some(plan.method);
             }
             ImportEvent::Progress {
@@ -736,11 +802,15 @@ async fn run_import(
                 {
                     let reached = *bytes_read as f64 / *total_bytes as f64;
                     if reached >= fraction {
+                        // The latency counts from the call, so time spent inside `cancel`
+                        // counts too.
+                        let at = Instant::now();
+                        let found = live.service.cancel(id);
                         assert!(
-                            live.service.cancel(id),
+                            found,
                             "{what}: ImportService::cancel did not find the running import"
                         );
-                        cancelled_at = Some((Instant::now(), reached));
+                        cancelled_at = Some((at, reached));
                     }
                 }
             }
@@ -770,6 +840,7 @@ async fn run_import(
                 return Ok(RunOutcome {
                     terminal: event,
                     started_total,
+                    started_at,
                     method,
                     progress,
                     commits,
@@ -818,16 +889,21 @@ struct Cadence {
     max_gap: Duration,
     /// Largest share of the file between two consecutive progress events.
     max_gap_fraction: f64,
-    /// From Started's arrival (approximated by the run start) to the first progress event.
+    /// From the `Started` event to the first progress event.
     first_after: Duration,
+    /// From the last progress event to the terminal event.
+    last_to_terminal: Duration,
     commits: usize,
 }
 
-/// Checks the progress rules of docs/m5-contracts.md §9.2 (3).
+/// Checks the progress rules of docs/m5-contracts.md §9.2 (3), plus [`GAP_CEILING`] on every
+/// gap and the same rules on the edges (`Started` -> first progress, last progress ->
+/// terminal event).
 fn check_progress(
     what: &str,
     cfg: &PerfConfig,
     outcome: &RunOutcome,
+    rows: u64,
     file_bytes: u64,
     begun: Instant,
 ) -> Cadence {
@@ -837,14 +913,36 @@ fn check_progress(
         "{what}: only {} progress events for {file_bytes} bytes",
         progress.len()
     );
-    let max_gap_ms = Duration::from_millis(cfg.progress_max_gap_ms);
+    let max_gap = Duration::from_millis(cfg.progress_max_gap_ms);
+    let first = progress[0];
+    let last = *progress.last().expect("checked above");
+    let started_at = outcome.started_at.unwrap_or(begun);
     let mut cadence = Cadence {
         events: progress.len(),
-        first_after: progress[0].at.duration_since(begun),
+        first_after: first.at.saturating_duration_since(started_at),
+        last_to_terminal: outcome.terminal_at.saturating_duration_since(last.at),
         commits: outcome.commits.len(),
         ..Cadence::default()
     };
     let mut violations = Vec::new();
+    // The contract's rule (time or bytes) and the absolute ceiling, for one gap.
+    let mut check_gap = |label: &str, gap: Duration, from: u64, to: u64| {
+        let fraction = to.saturating_sub(from) as f64 / file_bytes as f64;
+        if (gap > max_gap && fraction > cfg.progress_max_gap_fraction) || gap > GAP_CEILING {
+            violations.push(format!(
+                "{label}: {} ms and {:.2}% of the file (bytesRead {from} -> {to})",
+                gap.as_millis(),
+                fraction * 100.0
+            ));
+        }
+        fraction
+    };
+    check_gap(
+        "Started -> first progress",
+        cadence.first_after,
+        0,
+        first.bytes_read,
+    );
     for pair in progress.windows(2) {
         let (a, b) = (pair[0], pair[1]);
         for (name, before, after) in [
@@ -861,18 +959,26 @@ fn check_progress(
         }
         assert_eq!(a.total_bytes, b.total_bytes, "{what}: totalBytes changed");
         let gap = b.at.duration_since(a.at);
-        let fraction = (b.bytes_read - a.bytes_read) as f64 / file_bytes as f64;
+        let fraction = check_gap("between progress events", gap, a.bytes_read, b.bytes_read);
         cadence.max_gap = cadence.max_gap.max(gap);
         cadence.max_gap_fraction = cadence.max_gap_fraction.max(fraction);
-        if gap > max_gap_ms && fraction > cfg.progress_max_gap_fraction {
-            violations.push(format!(
-                "{} ms and {:.2}% of the file between progress at {} and {} bytes",
-                gap.as_millis(),
-                fraction * 100.0,
-                a.bytes_read,
-                b.bytes_read
-            ));
-        }
+    }
+    // Nothing is read after the last progress event, so only time counts: the contract's
+    // interval once that event already reports every row committed (only `Finished` is
+    // left), else the ceiling (the last batches may still be inserted and committed).
+    let tail_limit = if last.rows_committed == rows {
+        max_gap
+    } else {
+        GAP_CEILING
+    };
+    if cadence.last_to_terminal > tail_limit {
+        violations.push(format!(
+            "last progress -> terminal event: {} ms (limit {} ms; that progress reported \
+             {} of {rows} rows committed)",
+            cadence.last_to_terminal.as_millis(),
+            tail_limit.as_millis(),
+            last.rows_committed
+        ));
     }
     for pair in outcome.commits.windows(2) {
         assert!(
@@ -884,12 +990,12 @@ fn check_progress(
     }
     assert!(
         violations.is_empty(),
-        "{what}: progress gaps over {} ms and {}% of the file: {}",
+        "{what}: progress gaps over {} ms and {}% of the file, or over {} s: {}",
         cfg.progress_max_gap_ms,
         cfg.progress_max_gap_fraction * 100.0,
+        GAP_CEILING.as_secs(),
         violations.join("; ")
     );
-    let last = progress.last().expect("checked above");
     assert_eq!(
         last.bytes_read, file_bytes,
         "{what}: the last progress event before Finished reports {} of {file_bytes} bytes",
@@ -897,6 +1003,149 @@ fn check_progress(
     );
     assert_eq!(last.total_bytes, file_bytes, "{what}: progress totalBytes");
     cadence
+}
+
+// ---------------------------------------------------------------------------------------------
+// Probe read-back: every column of every probe row against the generator
+
+/// An exact decimal cell as cents (`79.07`, `-0.05`, `79.070`); `None` when it is not one.
+fn decimal_cents(value: &Value) -> Option<i128> {
+    let (Value::Decimal(text) | Value::Text(text)) = value else {
+        return None;
+    };
+    let text = text.trim();
+    let (negative, digits) = text
+        .strip_prefix('-')
+        .map_or((false, text), |rest| (true, rest));
+    let (units, fraction) = digits.split_once('.').unwrap_or((digits, ""));
+    if units.is_empty() || !units.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let fraction = fraction.trim_end_matches('0');
+    if fraction.len() > 2 || !fraction.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let cents: i128 = format!("{fraction:0<2}").parse().ok()?;
+    let value = units.parse::<i128>().ok()? * 100 + cents;
+    Some(if negative { -value } else { value })
+}
+
+fn int_cell(value: &Value) -> Option<i128> {
+    match value {
+        Value::Int(v) => Some(i128::from(*v)),
+        Value::UInt(v) => Some(i128::from(*v)),
+        _ => None,
+    }
+}
+
+fn bool_cell(value: &Value) -> Option<bool> {
+    match value {
+        Value::Bool(b) => Some(*b),
+        // MySQL / MariaDB `BOOL` is `TINYINT(1)`.
+        Value::Int(0) | Value::UInt(0) => Some(false),
+        Value::Int(1) | Value::UInt(1) => Some(true),
+        _ => None,
+    }
+}
+
+fn date_cell(value: &Value) -> Option<chrono::NaiveDate> {
+    match value {
+        Value::Date(d) => Some(*d),
+        Value::Text(t) => chrono::NaiveDate::parse_from_str(t.trim(), "%Y-%m-%d").ok(),
+        _ => None,
+    }
+}
+
+/// A timestamp cell; a `TimestampTz` counts by its UTC instant (the fixtures run in UTC, so a
+/// shifted value is a conversion bug).
+fn timestamp_cell(value: &Value) -> Option<chrono::NaiveDateTime> {
+    match value {
+        Value::Timestamp(t) => Some(*t),
+        Value::TimestampTz(t) => Some(t.naive_utc()),
+        Value::Text(t) => {
+            chrono::NaiveDateTime::parse_from_str(t.trim(), "%Y-%m-%d %H:%M:%S%.f").ok()
+        }
+        _ => None,
+    }
+}
+
+/// Compares the probe table's rows (from [`Live::read_back`]) with `generator::row(1..=n)`;
+/// the mismatches, at most [`MAX_MISMATCHES`] of them listed, plus their total.
+fn probe_mismatches(rows: &[Vec<Value>], n: u64) -> (Vec<String>, usize) {
+    let mut listed = Vec::new();
+    let mut total = 0usize;
+    let mut mismatch = |m: String| {
+        total += 1;
+        if listed.len() < MAX_MISMATCHES {
+            listed.push(m);
+        }
+    };
+    if u64::try_from(rows.len()).ok() != Some(n) {
+        mismatch(format!("{} rows read back, expected {n}", rows.len()));
+    }
+    for (index, got) in rows.iter().enumerate() {
+        let i = u64::try_from(index).expect("small") + 1;
+        let want = generator::row(i);
+        if got.len() != COLUMNS.len() {
+            mismatch(format!("row {i}: {} columns", got.len()));
+            continue;
+        }
+        let checks: [(&str, bool); 9] = [
+            ("id", int_cell(&got[0]) == Some(i128::from(want.id))),
+            ("code", matches!(&got[1], Value::Text(t) if *t == want.code)),
+            (
+                "qty",
+                match (&got[2], want.qty) {
+                    (Value::Null, None) => true,
+                    (cell, Some(q)) => int_cell(cell) == Some(i128::from(q)),
+                    _ => false,
+                },
+            ),
+            (
+                "amount",
+                decimal_cents(&got[3]) == Some(i128::from(want.amount_cents)),
+            ),
+            (
+                "price",
+                matches!(&got[4], Value::Float(f) if f.to_bits() == want.price.to_bits()),
+            ),
+            ("active", bool_cell(&got[5]) == Some(want.active)),
+            ("born", date_cell(&got[6]) == Some(want.born)),
+            ("at", timestamp_cell(&got[7]) == Some(want.at)),
+            (
+                "note",
+                match (&got[8], &want.note) {
+                    (Value::Null, None) => true,
+                    (Value::Text(t), Some(w)) => t == w,
+                    _ => false,
+                },
+            ),
+        ];
+        for (column, (name, ok)) in checks.iter().enumerate() {
+            if !ok {
+                mismatch(format!(
+                    "row {i} {name}: got {:?}, expected {}",
+                    got[column],
+                    expected_text(&want, name)
+                ));
+            }
+        }
+    }
+    (listed, total)
+}
+
+fn expected_text(want: &generator::Row, column: &str) -> String {
+    match column {
+        "id" => want.id.to_string(),
+        "code" => format!("{:?}", want.code),
+        "qty" => format!("{:?}", want.qty),
+        "amount" => generator::amount_text(want.amount_cents),
+        "price" => format!("{:?}", want.price),
+        "active" => want.active.to_string(),
+        "born" => want.born.to_string(),
+        "at" => want.at.format("%Y-%m-%d %H:%M:%S%.6f").to_string(),
+        _ => format!("{:?}", want.note),
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1020,9 +1269,19 @@ async fn import_checks(
         files.probe_gen.checksum.expected(&key),
         "{what}: checksum (count, sum id, sum qty, notes, note length, amount cents)"
     );
+    let read_back = live.read_back(&probe_table).await;
+    let (mismatches, total) = probe_mismatches(&read_back, PROBE_ROWS);
+    assert_eq!(
+        total,
+        0,
+        "{what}: {total} values differ from the generator when read back (first {}): {}",
+        mismatches.len(),
+        mismatches.join("; ")
+    );
     live.drop_table(&probe_table).await;
     println!(
-        "M5 perf [{key}]: probe import ok ({PROBE_ROWS} rows in {} ms, method {:?})",
+        "M5 perf [{key}]: probe import ok ({PROBE_ROWS} rows in {} ms, method {:?}; every \
+         column read back equals the generator)",
         outcome.elapsed.as_millis(),
         outcome.method
     );
@@ -1049,7 +1308,7 @@ async fn import_checks(
     .await?;
     let peak = sampler.finish();
     assert_finished(&what, &outcome, cfg.rows, files.full_gen.bytes);
-    let cadence = check_progress(&what, cfg, &outcome, files.full_gen.bytes, begun);
+    let cadence = check_progress(&what, cfg, &outcome, cfg.rows, files.full_gen.bytes, begun);
     result.method = outcome.method;
     result.rows = cfg.rows;
     result.bytes = files.full_gen.bytes;
@@ -1058,7 +1317,8 @@ async fn import_checks(
     result.rss_growth = baseline.zip(peak).map(|(b, p)| p.saturating_sub(b));
     println!(
         "M5 perf [{key}]: imported {} rows, {:.1} MB in {:.1} s: {:.0} rows/s, {:.1} MB/s; \
-         {} progress events (first after {} ms, max gap {} ms / {:.2}% of the file), {} commits",
+         {} progress events (first {} ms after Started, max gap {} ms / {:.2}% of the file, \
+         last {} ms before Finished), {} commits",
         result.rows,
         result.bytes as f64 / 1e6,
         result.import_secs,
@@ -1068,6 +1328,7 @@ async fn import_checks(
         cadence.first_after.as_millis(),
         cadence.max_gap.as_millis(),
         cadence.max_gap_fraction * 100.0,
+        cadence.last_to_terminal.as_millis(),
         cadence.commits
     );
     if let Some(growth) = result.rss_growth {
@@ -1260,12 +1521,16 @@ async fn import_1gb_csv() {
     install_panic_log();
     let required = env_flag("OXBASE_REQUIRE_M5_PERF");
     let Some(dir) = env_nonempty("OXBASE_PERF_DIR").map(PathBuf::from) else {
-        assert!(
-            !required,
-            "OXBASE_REQUIRE_M5_PERF=1 but OXBASE_PERF_DIR is not set"
-        );
+        // A skip even when OXBASE_REQUIRE_M5_PERF=1: the conformance job runs every ignored
+        // test of this crate without OXBASE_PERF_DIR; the import-perf job sets both.
         println!(
-            "M5 perf: skipped (OXBASE_PERF_DIR is not set; the CI job import-perf runs this check)"
+            "M5 perf: skipped (OXBASE_PERF_DIR is not set{}; the CI job import-perf runs this \
+             check)",
+            if required {
+                ", OXBASE_REQUIRE_M5_PERF=1 is ignored without it"
+            } else {
+                ""
+            }
         );
         return;
     };

@@ -258,8 +258,10 @@ jobs:
   # and MB/s (crates/oxbase-services/tests/import_perf.rs). A release-like build (`--profile
   # perf`) and only the two fixtures it needs. Full lane, plus the fast lane of the perf and
   # integration branches (wip/*-perf, wip/*-integrate). Until the read / services / load streams
-  # are merged the test reports "pending" and passes; OXBASE_REQUIRE_M5_PERF=1 (integration)
-  # makes that a failure.
+  # are merged the test reports "pending" and passes; OXBASE_REQUIRE_M5_PERF=1 makes that a
+  # failure. It is set on the "1 GB CSV import" step only (full lane and wip/*-integrate), never
+  # at workflow or job level: the conformance job runs this test too (--include-ignored, no
+  # OXBASE_PERF_DIR, where it is a skip).
   import-perf:
     name: Import perf (1 GB CSV)
     if: >-
@@ -297,6 +299,9 @@ jobs:
       - name: 1 GB CSV import (PostgreSQL, MySQL)
         env:
           OXBASE_PERF_DIR: ${{ runner.temp }}/m5-perf
+          # Mandatory on the full lane and the integration branch (a skeleton left in the
+          # reader, services or loader fails the exit check); "pending" passes on wip/*-perf.
+          OXBASE_REQUIRE_M5_PERF: ${{ (!startsWith(github.ref, 'refs/heads/wip/') || endsWith(github.ref, '-integrate')) && '1' || '0' }}
         run: cargo test -p oxbase-services --profile perf --locked --test import_perf -- --include-ignored --test-threads 1 --nocapture
 
       - name: Delete the generated CSV

@@ -1244,6 +1244,29 @@ function parseCsv(text) {
   return records;
 }
 
+/**
+ * A timestamp's text as a comparable instant key: `YYYY-MM-DD`, `T` or a space,
+ * `HH:MM:SS`, any number of fraction digits and an optional `Z` / `+HH:MM` / `+HHMM` offset
+ * (a text without one counts as UTC). `""` stays `""` (NULL); text that is not a timestamp gives
+ * `null`, which matches nothing.
+ */
+function instantKey(text) {
+  if (text === "") return "";
+  const m =
+    /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?(Z|[+-]\d{2}:?\d{2})?$/.exec(
+      text.trim(),
+    );
+  if (!m) return null;
+  const [, y, mo, d, h, mi, s, fraction = "", offset = "Z"] = m;
+  let seconds = Date.UTC(+y, +mo - 1, +d, +h, +mi, +s) / 1000;
+  if (offset !== "Z") {
+    const sign = offset[0] === "-" ? -1 : 1;
+    const digits = offset.slice(1).replace(":", "");
+    seconds -= sign * (Number(digits.slice(0, 2)) * 3600 + Number(digits.slice(2, 4)) * 60);
+  }
+  return `${seconds}.${fraction.padEnd(9, "0")}`;
+}
+
 /** What the CSV writer's default formula guard makes of a text value (docs/m5-contracts.md §3.8). */
 function guarded(text) {
   return /^[=+\-@\t\r]/.test(text) ? `'${text}` : text;
@@ -1409,9 +1432,9 @@ async function importExportSteps(table) {
   if (outRows.length !== rows.length) {
     throw new Error(`the export has ${outRows.length} rows, expected ${rows.length}`);
   }
-  // Columns compared as text: id, name and note (formula guard on by default), amount (exact
-  // decimal), born (ISO date) and active (true / false). `at` is left out: its text form is the
-  // writer's choice.
+  // Every column. As text: id, name and note (formula guard on by default), amount (exact
+  // decimal), born (ISO date) and active (true / false). `at` as an instant: `T` or a space and
+  // the number of fraction digits are the writer's choice, the instant is not.
   const col = (name) => header.indexOf(name);
   const mismatches = [];
   rows.forEach((source, r) => {
@@ -1430,6 +1453,13 @@ async function importExportSteps(table) {
           `row ${r + 1} ${name}: ${JSON.stringify(got[col(name)])} != ${JSON.stringify(value)}`,
         );
       }
+    }
+    const at = got[col("at")] ?? "";
+    const wantAt = instantKey(source[col("at")]);
+    if (wantAt === null || instantKey(at) !== wantAt) {
+      mismatches.push(
+        `row ${r + 1} at: ${JSON.stringify(at)} is not the instant ${JSON.stringify(source[col("at")])}`,
+      );
     }
   });
   if (mismatches.length > 0) throw new Error(`exported values differ: ${mismatches.join("; ")}`);
