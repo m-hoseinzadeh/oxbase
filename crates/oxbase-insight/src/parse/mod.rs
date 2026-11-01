@@ -807,8 +807,9 @@ mod tests {
         let ms = kinds(SqlDialect::TSql, "N'x' @v #t [a b]");
         let got: Vec<Tk> = ms.iter().map(|(k, _)| *k).collect();
         assert_eq!(got, [Tk::Str, Tk::Param, Tk::Word, Tk::Quoted]);
-        assert!(
-            significant_tokens(SqlDialect::Sqlite, "abc", 5..9).is_empty(),
+        assert_eq!(
+            significant_tokens(SqlDialect::Sqlite, "abc", 5..9).len(),
+            0,
             "an invalid range gives no tokens"
         );
     }

@@ -382,11 +382,11 @@ fn context_table() {
     }
     assert!(rows >= 80, "at least 80 cases, got {rows}");
     assert!(checked >= 400, "{checked} checks");
-    assert!(
-        failures.is_empty(),
-        "{} failures:\n{}",
-        failures.len(),
-        failures.join("\n")
+    assert_eq!(
+        failures,
+        Vec::<String>::new(),
+        "{} failures",
+        failures.len()
     );
 }
 
@@ -513,7 +513,7 @@ fn keyword_lists_fit_the_position() {
         assert!(ctx.keywords.contains(&"DESC"));
         // No keywords where no keyword is expected.
         let ctx = at(*engine, "SELECT * FROM ‸");
-        assert!(ctx.keywords.is_empty());
+        assert_eq!(ctx.keywords, Vec::<&str>::new());
     }
 }
 
