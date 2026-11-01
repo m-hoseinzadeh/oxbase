@@ -341,9 +341,9 @@ async fn scenario(key: &'static str, engine: Engine) {
 
 async fn steps(live: &Live, names: &[String; 5]) {
     let key = live.key;
-    let [a, b, c, d, e] = names;
+    let [t_build, t_edit, t_design, t_tx, t_import] = names;
     live.run(&format!(
-        "CREATE TABLE {a} (id INT NOT NULL PRIMARY KEY, name VARCHAR(20))"
+        "CREATE TABLE {t_build} (id INT NOT NULL PRIMARY KEY, name VARCHAR(20))"
     ))
     .await;
 
@@ -374,8 +374,8 @@ async fn steps(live: &Live, names: &[String; 5]) {
         .schemas
         .iter()
         .flat_map(|s| &s.relations)
-        .find(|r| r.name.eq_ignore_ascii_case(a))
-        .unwrap_or_else(|| panic!("{key}: {a} missing"));
+        .find(|r| r.name.eq_ignore_ascii_case(t_build))
+        .unwrap_or_else(|| panic!("{key}: {t_build} missing"));
     let cols: Vec<(String, bool)> = rel
         .columns
         .iter()
@@ -420,17 +420,17 @@ async fn steps(live: &Live, names: &[String; 5]) {
 
     // Editor DDL.
     live.run(&format!(
-        "CREATE TABLE {b} (id INT NOT NULL PRIMARY KEY, label VARCHAR(10))"
+        "CREATE TABLE {t_edit} (id INT NOT NULL PRIMARY KEY, label VARCHAR(10))"
     ))
     .await;
-    let took = live.wait_for(b, true, "editor CREATE TABLE").await;
+    let took = live.wait_for(t_edit, true, "editor CREATE TABLE").await;
     assert!(took <= live.limit, "{key}: {} ms", took.as_millis());
-    live.run(&format!("DROP TABLE {b}")).await;
-    let took = live.wait_for(b, false, "editor DROP TABLE").await;
+    live.run(&format!("DROP TABLE {t_edit}")).await;
+    let took = live.wait_for(t_edit, false, "editor DROP TABLE").await;
     assert!(took <= live.limit, "{key}: {} ms", took.as_millis());
 
     // Designer apply.
-    let mut design = TableDesign::new_table(live.table(c));
+    let mut design = TableDesign::new_table(live.table(t_design));
     design.columns.push(column("id", DataType::INT32, false));
     design
         .columns
@@ -452,7 +452,7 @@ async fn steps(live: &Live, names: &[String; 5]) {
         .await
         .unwrap_or_else(|e| panic!("{key}: designer apply: {e}"));
     assert!(applied.outcome.committed, "{key}: {:?}", applied.outcome);
-    let took = live.wait_for(c, true, "designer apply").await;
+    let took = live.wait_for(t_design, true, "designer apply").await;
     assert!(took <= live.limit, "{key}: {} ms", took.as_millis());
     let cache = live.caches.cache(&live.cache_key()).await.unwrap();
     let designed = cache
@@ -460,7 +460,7 @@ async fn steps(live: &Live, names: &[String; 5]) {
         .schemas
         .iter()
         .flat_map(|s| &s.relations)
-        .find(|r| r.name.eq_ignore_ascii_case(c))
+        .find(|r| r.name.eq_ignore_ascii_case(t_design))
         .unwrap();
     assert_eq!(designed.columns.len(), 2, "{key}");
     let status = live.caches.status(live.session, None).await.unwrap();
@@ -474,12 +474,14 @@ async fn steps(live: &Live, names: &[String; 5]) {
         _ => "BEGIN TRANSACTION",
     };
     live.run(begin).await;
-    live.run(&format!("CREATE TABLE {d} (id INT NOT NULL PRIMARY KEY)"))
-        .await;
+    live.run(&format!(
+        "CREATE TABLE {t_tx} (id INT NOT NULL PRIMARY KEY)"
+    ))
+    .await;
     tokio::time::sleep(COALESCE + Duration::from_millis(700)).await;
     live.run("COMMIT").await;
     let took = live
-        .wait_for(d, true, "editor CREATE TABLE committed by a later run")
+        .wait_for(t_tx, true, "editor CREATE TABLE committed by a later run")
         .await;
     assert!(took <= live.limit, "{key}: {} ms", took.as_millis());
 
@@ -506,7 +508,7 @@ async fn steps(live: &Live, names: &[String; 5]) {
         ],
         target: ImportTarget {
             session: live.session,
-            table: live.table(e),
+            table: live.table(t_import),
             mode: TargetMode::Create,
         },
         primary_key: vec!["id".into()],
@@ -537,7 +539,7 @@ async fn steps(live: &Live, names: &[String; 5]) {
             _ => {}
         }
     }
-    let took = live.wait_for(e, true, "import create").await;
+    let took = live.wait_for(t_import, true, "import create").await;
     assert!(took <= live.limit, "{key}: {} ms", took.as_millis());
 
     // Forget the profile.

@@ -477,7 +477,7 @@ async fn invalidation_refreshes_only_the_changed_relations() {
         source: ChangeSource::Query,
         changes: ["DROP TABLE Orders", "CREATE TABLE public.FRESH (id int)"]
             .into_iter()
-            .flat_map(|sql| oxbase_sql::schema_changes(oxbase_sql::SqlDialect::Postgres, sql))
+            .flat_map(|sql| oxbase_sql::schema_changes(SqlDialect::Postgres, sql))
             .collect(),
     });
     let status = h.service.status(h.session, None).await.unwrap();
@@ -510,7 +510,7 @@ async fn events_on_the_bus_reach_the_cache() {
         database: Some("app".into()),
         source: ChangeSource::Query,
         changes: oxbase_sql::schema_changes(
-            oxbase_sql::SqlDialect::Postgres,
+            SqlDialect::Postgres,
             "CREATE FUNCTION f() RETURNS int AS 'select 1' LANGUAGE sql",
         ),
     });
@@ -665,7 +665,7 @@ async fn engines_without_a_reader_fail_once() {
 fn transaction_ends_republish_the_changes_they_held() {
     let events = SchemaEvents::new();
     let mut rx = events.subscribe();
-    let pg = oxbase_sql::SqlDialect::Postgres;
+    let pg = SqlDialect::Postgres;
     let session = SessionId::new();
     let other = SessionId::new();
     let db = Some("app".to_owned());
@@ -717,7 +717,7 @@ async fn changes_during_the_first_build_are_read_after_it() {
         database: None,
         source: ChangeSource::Query,
         changes: oxbase_sql::schema_changes(
-            oxbase_sql::SqlDialect::Postgres,
+            SqlDialect::Postgres,
             "CREATE TABLE public.late (id int)",
         ),
     });
@@ -778,10 +778,7 @@ async fn creates_the_partial_read_cannot_find_refresh_everything() {
         session: h.session,
         database: None,
         source: ChangeSource::Query,
-        changes: oxbase_sql::schema_changes(
-            oxbase_sql::SqlDialect::Postgres,
-            "CREATE TABLE ghost (id int)",
-        ),
+        changes: oxbase_sql::schema_changes(SqlDialect::Postgres, "CREATE TABLE ghost (id int)"),
     });
     let started = Instant::now();
     while h.server.reads().len() < 4 {
