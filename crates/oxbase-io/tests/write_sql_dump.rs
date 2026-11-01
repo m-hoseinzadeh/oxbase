@@ -387,6 +387,31 @@ fn same_engine_table_keeps_its_definition() {
 }
 
 #[test]
+fn a_renamed_table_renames_its_constraints() {
+    // A dump written under another name loads next to its source: PostgreSQL constraint
+    // names are unique per schema.
+    let (table, batch) = orders();
+    let context = WriteContext {
+        dialects: Some(dialects()),
+        table: Some(table),
+        source_engine: Some(Engine::Postgres),
+    };
+    let options = SqlDumpOptions {
+        table: Some(ObjectRef::table(None, Some("public"), "orders_copy")),
+        ..SqlDumpOptions::new(Engine::Postgres)
+    };
+    let text = dump(Engine::Postgres, options, &context, &[batch]);
+    assert!(
+        text.contains("CREATE TABLE \"public\".\"orders_copy\" ("),
+        "{text}"
+    );
+    assert!(text.contains("\"orders_copy_pkey\""), "{text}");
+    assert!(text.contains("\"orders_copy_name_check\""), "{text}");
+    assert!(!text.contains("\"orders_pkey\""), "{text}");
+    assert!(!text.contains("\"orders_name_check\""), "{text}");
+}
+
+#[test]
 fn across_engines_the_source_sql_is_dropped() {
     let (table, batch) = orders();
     for engine in [Engine::MySql, Engine::Sqlite, Engine::MsSql] {

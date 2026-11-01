@@ -150,6 +150,42 @@ fn dump_name(options: &SqlDumpOptions, source: Option<&ObjectRef>) -> ObjectRef 
     name
 }
 
+/// Renames the keys, indexes and constraints of a table the dump writes under another name
+/// than its source (`SqlDumpOptions::table`), so the dump can load next to the source table
+/// (PostgreSQL and SQL Server constraint and index names are unique per schema): `old` in a
+/// name becomes the new table name; a constraint name without it is dropped (the target names
+/// the constraint), an index name without it gets the new table name as a prefix.
+fn rename_constraints(table: &mut TableDef, old: &str, notes: &mut Vec<String>) {
+    let new = table.obj.name.clone();
+    let renamed =
+        |name: &str| (!old.is_empty() && name.contains(old)).then(|| name.replace(old, &new));
+    let mut changed = false;
+    let mut rename_optional = |name: &mut Option<String>| {
+        if let Some(current) = name.take() {
+            *name = renamed(&current);
+            changed = true;
+        }
+    };
+    if let Some(pk) = &mut table.primary_key {
+        rename_optional(&mut pk.name);
+    }
+    for fk in &mut table.foreign_keys {
+        rename_optional(&mut fk.name);
+    }
+    for check in &mut table.checks {
+        rename_optional(&mut check.name);
+    }
+    for index in &mut table.indexes {
+        index.name = renamed(&index.name).unwrap_or_else(|| format!("{new}_{}", index.name));
+        changed = true;
+    }
+    if changed {
+        notes.push(format!(
+            "the table is written as {new}: its keys, indexes and constraints were renamed to match"
+        ));
+    }
+}
+
 /// A table definition from the rows' Arrow types: nullable columns, no keys.
 fn from_schema(schema: &Schema, name: ObjectRef) -> TableDef {
     let mut table = TableDef::new(name);
@@ -397,6 +433,9 @@ pub(crate) fn writer(
         Some(def) => {
             let mut table = def.clone();
             table.obj = dump_name(options, Some(&def.obj));
+            if table.obj.name != def.obj.name {
+                rename_constraints(&mut table, &def.obj.name, &mut notes);
+            }
             if !same_engine {
                 notes.push(format!(
                     "written for {engine} from another engine: native types, defaults, \
