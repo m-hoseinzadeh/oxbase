@@ -268,8 +268,6 @@ jobs:
       || endsWith(github.ref, '-integrate')
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    env:
-      OXBASE_PERF_DIR: ${{ runner.temp }}/m5-perf
     steps:
       - uses: actions/checkout@v7
         with:
@@ -295,11 +293,16 @@ jobs:
       - name: Disk before the import
         run: df -h / "$RUNNER_TEMP"
 
+      # The `runner` context is not available in a job-level `env`, hence per step.
       - name: 1 GB CSV import (PostgreSQL, MySQL)
+        env:
+          OXBASE_PERF_DIR: ${{ runner.temp }}/m5-perf
         run: cargo test -p oxbase-services --profile perf --locked --test import_perf -- --include-ignored --test-threads 1 --nocapture
 
       - name: Delete the generated CSV
         if: always()
+        env:
+          OXBASE_PERF_DIR: ${{ runner.temp }}/m5-perf
         run: |
           df -h / "$RUNNER_TEMP"
           rm -rf "$OXBASE_PERF_DIR"
