@@ -398,7 +398,8 @@ async fn m4_types_decode_exactly() {
             .unwrap()
             .as_bytes()
     );
-    assert_eq!(text(b, "c_xml"), "<a b=\"1\" />");
+    // The server's own serialization of N'<a b="1"/>'.
+    assert_eq!(text(b, "c_xml"), "<a b=\"1\"/>");
     let json: serde_json::Value = serde_json::from_str(&text(b, "c_json")).unwrap();
     assert_eq!(json, serde_json::json!({"a": 1, "b": [true, null]}));
     let vector: Vec<f64> = serde_json::from_str(&text(b, "c_vector")).unwrap();

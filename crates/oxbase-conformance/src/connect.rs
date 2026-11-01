@@ -511,13 +511,13 @@ impl Ctx {
                 "expected plaintext without SSH, got tls={tls} ssh={ssh}"
             ));
         }
-        if let Some(prefix) = e.version_prefix.as_deref() {
-            if !version_matches(e.engine, &version, prefix)? {
-                return Err(format!(
-                    "server reports {}, fixture expects {prefix}",
-                    version.raw()
-                ));
-            }
+        if let Some(prefix) = e.version_prefix.as_deref()
+            && !version_matches(e.engine, &version, prefix)?
+        {
+            return Err(format!(
+                "server reports {}, fixture expects {prefix}",
+                version.raw()
+            ));
         }
         Ok(format!("server {} ({ms} ms)", version.raw()))
     }
