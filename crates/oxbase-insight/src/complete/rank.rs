@@ -192,7 +192,7 @@ impl<'a> Collector<'a> {
             cache,
             pattern: Pattern::new(&ctx.prefix, ctx.quote),
             rules: cache.map_or(dialect.case_rules, SchemaCache::case_rules),
-            path: cache.map(SchemaCache::search_schemas).unwrap_or_default(),
+            path: cache.map_or_else(Vec::new, SchemaCache::search_schemas),
             recent,
             limit,
             cap: limit.saturating_add(SLACK + 1),

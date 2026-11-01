@@ -90,6 +90,30 @@ fn signature(name: &str, args: &str, returns: Option<&str>) -> String {
     }
 }
 
+/// The schemas a name typed after the qualifier may live in.
+#[derive(Debug, Clone, Copy)]
+enum Scope {
+    /// No qualifier: every schema (names outside the search path are inserted qualified).
+    Any,
+    /// `schema.` or `database.schema.`.
+    Schema(u32),
+    /// The qualifier names no schema of the cache (or there is no cache).
+    Nowhere,
+}
+
+/// The first catalog relation a name in the statement refers to (search path first, then any
+/// schema for a single part).
+fn resolve_named(cache: &SchemaCache, parts: &[Ident]) -> Option<RelationId> {
+    cache
+        .resolve_relation(parts)
+        .first()
+        .copied()
+        .or_else(|| match parts {
+            [one] => cache.relations_named(one).first().copied(),
+            _ => None,
+        })
+}
+
 fn part(text: &str) -> Ident {
     Ident {
         text: text.to_owned(),
@@ -107,23 +131,29 @@ impl Collector<'_> {
         }
     }
 
-    /// The schema the qualifier names: `Some(None)` without a qualifier (every schema),
-    /// `Some(Some(s))` for `schema.` / `database.schema.`, `None` when it names no schema.
-    fn qualifier_schema(&self) -> Option<Option<u32>> {
-        let cache = self.cache?;
-        match self.ctx.qualifier.as_slice() {
-            [] => Some(None),
-            [schema] => cache.resolve_schema(schema).map(Some),
+    /// Which schemas the qualifier before the cursor allows.
+    fn qualifier_scope(&self) -> Scope {
+        let Some(cache) = self.cache else {
+            return Scope::Nowhere;
+        };
+        let found = match self.ctx.qualifier.as_slice() {
+            [] => return Scope::Any,
+            [schema] => cache.resolve_schema(schema),
             [database, schema] => {
                 let db = &cache.snapshot().database;
-                self.rules
+                if self
+                    .rules
                     .schemas
                     .matches(&database.text, database.quoted, db)
-                    .then(|| cache.resolve_schema(schema).map(Some))
-                    .flatten()
+                {
+                    cache.resolve_schema(schema)
+                } else {
+                    None
+                }
             }
             _ => None,
-        }
+        };
+        found.map_or(Scope::Nowhere, Scope::Schema)
     }
 
     /// `name` of schema `s`, qualified with the schema when no qualifier was typed and `s` is
@@ -300,8 +330,10 @@ impl Collector<'_> {
         let Some(cache) = self.cache else {
             return Ok(());
         };
-        let Some(schema) = self.qualifier_schema() else {
-            return Ok(());
+        let schema = match self.qualifier_scope() {
+            Scope::Nowhere => return Ok(()),
+            Scope::Any => None,
+            Scope::Schema(s) => Some(s),
         };
         let expected = if procedures {
             Expected::Procedure
@@ -424,8 +456,10 @@ impl Collector<'_> {
         let Some(cache) = self.cache else {
             return Ok(());
         };
-        let Some(schema) = self.qualifier_schema() else {
-            return Ok(());
+        let schema = match self.qualifier_scope() {
+            Scope::Nowhere => return Ok(()),
+            Scope::Any => None,
+            Scope::Schema(s) => Some(s),
         };
         let group = self.group(expected, sub::MAIN);
         for (hit, tier) in self.search(pass, &[name_kind], schema, None, 0) {
@@ -547,13 +581,13 @@ impl Collector<'_> {
         let Some(cache) = self.cache else {
             return Ok(());
         };
-        match self.qualifier_schema() {
-            None => Ok(()),
-            Some(Some(s)) => {
+        match self.qualifier_scope() {
+            Scope::Nowhere => Ok(()),
+            Scope::Schema(s) => {
                 let hits = self.search(pass, &[NameKind::Relation], Some(s), None, 0);
                 self.relation_items(cache, hits, sub::MAIN)
             }
-            Some(None) => {
+            Scope::Any => {
                 let path = self.path.clone();
                 let mut on_path = 0;
                 for s in &path {
@@ -636,19 +670,6 @@ impl Collector<'_> {
         }
     }
 
-    /// The first catalog relation a name in the statement refers to (search path first, then
-    /// any schema for a single part).
-    fn resolve_named(&self, cache: &SchemaCache, parts: &[Ident]) -> Option<RelationId> {
-        cache
-            .resolve_relation(parts)
-            .first()
-            .copied()
-            .or_else(|| match parts {
-                [one] => cache.relations_named(one).first().copied(),
-                _ => None,
-            })
-    }
-
     /// Join conditions from foreign keys between the relations in scope and other relations
     /// (`customers c ON c.id = o.customer_id`).
     fn joins(&mut self, pass: Pass) -> Result<()> {
@@ -668,7 +689,7 @@ impl Collector<'_> {
                 taken.insert(w.text.to_lowercase());
             }
             if let (RelationSource::Named(parts), Some(w)) = (&r.source, written)
-                && let Some(id) = self.resolve_named(cache, parts)
+                && let Some(id) = resolve_named(cache, parts)
             {
                 anchors.push((id, self.as_written(w)));
             }
@@ -836,9 +857,7 @@ impl Collector<'_> {
         }
         let columns = match &rel.source {
             RelationSource::Named(parts) => {
-                let found = self
-                    .cache
-                    .and_then(|cache| self.resolve_named(cache, parts));
+                let found = self.cache.and_then(|cache| resolve_named(cache, parts));
                 match (found, parts.as_slice()) {
                     (Some(id), _) => Columns::Catalog(id),
                     // A CTE written as a plain name.
@@ -878,20 +897,15 @@ impl Collector<'_> {
     ) -> Vec<(String, Option<String>)> {
         let ctx = self.ctx;
         let relations: Vec<RelationId> = match (self.cache, block) {
-            (Some(cache), Some(b)) => ctx
-                .outline
-                .queries
-                .get(b)
-                .map(|q| {
-                    q.relations
-                        .iter()
-                        .filter_map(|r| match &r.source {
-                            RelationSource::Named(parts) => self.resolve_named(cache, parts),
-                            _ => None,
-                        })
-                        .collect()
-                })
-                .unwrap_or_default(),
+            (Some(cache), Some(b)) => ctx.outline.queries.get(b).map_or_else(Vec::new, |q| {
+                q.relations
+                    .iter()
+                    .filter_map(|r| match &r.source {
+                        RelationSource::Named(parts) => resolve_named(cache, parts),
+                        _ => None,
+                    })
+                    .collect()
+            }),
             _ => Vec::new(),
         };
         let Some(cache) = self.cache else {
@@ -973,7 +987,7 @@ impl Collector<'_> {
             && let Some(cache) = self.cache
         {
             // `x.` where `x` is a relation that is not in scope (or there is no FROM yet).
-            if let Some(id) = self.resolve_named(cache, &ctx.qualifier) {
+            if let Some(id) = resolve_named(cache, &ctx.qualifier) {
                 sources.push(Source {
                     handle: None,
                     columns: Columns::Catalog(id),
@@ -991,8 +1005,9 @@ impl Collector<'_> {
                     Columns::Catalog(id) => self
                         .cache
                         .and_then(|c| c.relation(*id))
-                        .map(|r| r.columns.iter().map(|c| c.name.to_lowercase()).collect())
-                        .unwrap_or_default(),
+                        .map_or_else(Vec::new, |r| {
+                            r.columns.iter().map(|c| c.name.to_lowercase()).collect()
+                        }),
                     Columns::Listed(list) => list.iter().map(|(n, _)| n.to_lowercase()).collect(),
                 };
                 for n in names {

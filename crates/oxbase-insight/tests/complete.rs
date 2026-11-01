@@ -696,8 +696,8 @@ fn ctes_and_derived_tables_give_their_columns() {
         queries: vec![top.clone(), body],
         refs: vec![],
     };
-    c.scope = top.relations.clone();
-    c.ctes = top.ctes.clone();
+    c.scope.clone_from(&top.relations);
+    c.ctes.clone_from(&top.ctes);
     let list = run(&c, &pg(), Some(&cache));
     assert_eq!(labels(&list), ["id", "created_at"]);
     assert_eq!(

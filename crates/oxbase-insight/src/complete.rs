@@ -199,8 +199,8 @@ impl RecentNames {
         self.stamps.insert(name.to_lowercase(), self.clock);
         if self.stamps.len() > self.capacity + self.capacity / 4 {
             let mut by_age: Vec<u64> = self.stamps.values().copied().collect();
-            by_age.sort_unstable_by(|a, b| b.cmp(a));
-            let oldest_kept = by_age[self.capacity - 1];
+            by_age.sort_unstable();
+            let oldest_kept = by_age[by_age.len() - self.capacity];
             self.stamps.retain(|_, stamp| *stamp >= oldest_kept);
         }
     }
