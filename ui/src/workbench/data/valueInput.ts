@@ -2,7 +2,7 @@
  * Client-side hints for typed values (the core's `convert` grammar, docs/m3-contracts.md §5).
  * They only warn while typing; the core is the authority and rejects what it cannot parse.
  */
-import type { CellInput, InputKind } from "../../api";
+import type { CellInput, DataType, InputKind } from "../../api";
 
 const PATTERNS: Partial<Record<InputKind["type"], { re: RegExp; hint: string }>> = {
   integer: { re: /^[+-]?\d+$/, hint: "a whole number" },
@@ -103,4 +103,89 @@ export function inputLabel(input: CellInput): string {
 export function sameInput(a: CellInput, b: CellInput): boolean {
   if (a.type !== b.type) return false;
   return a.type !== "text" || a.text === (b as { text: string }).text;
+}
+
+/** Whether the column holds XML (edited as text, converted by the server). */
+export function isXmlType(dataType: DataType | undefined): boolean {
+  return dataType?.type === "other" && dataType.name.toLowerCase() === "xml";
+}
+
+/** Bytes of a `0x` hex, `\\x` hex or `base64:` value, or `null` when it does not parse. */
+export function byteLength(text: string): number | null {
+  const t = text.trim();
+  const hex = /^(0x|\\x)([0-9a-f]*)$/i.exec(t);
+  if (hex) {
+    const digits = hex[2] ?? "";
+    return digits.length % 2 === 0 ? digits.length / 2 : null;
+  }
+  const b64 = /^base64:([A-Za-z0-9+/]*)(={0,2})$/.exec(t);
+  if (b64) {
+    const body = b64[1] ?? "";
+    const pad = (b64[2] ?? "").length;
+    if ((body.length + pad) % 4 !== 0) return null;
+    return ((body.length + pad) / 4) * 3 - pad;
+  }
+  return null;
+}
+
+/** A problem with an XML fragment (the server accepts several top-level nodes), or `null`. */
+function xmlProblem(text: string): string | null {
+  if (typeof DOMParser === "undefined") return null;
+  // The value is wrapped so a fragment (several top-level elements, as SQL Server's xml type
+  // allows) parses; a leading XML declaration may only start a document, so it is dropped.
+  const body = text.replace(/^﻿?\s*<\?xml(?:\s[^?]*)?\?>/, "");
+  const doc = new DOMParser().parseFromString(
+    `<oxbase-root>${body}</oxbase-root>`,
+    "application/xml",
+  );
+  return doc.getElementsByTagName("parsererror").length > 0 ? "not well-formed XML" : null;
+}
+
+/**
+ * What the text should look like for the column's type, beyond the kind's grammar (decimal
+ * precision and scale such as `money`'s 4 places, binary lengths, XML), or `null`. Only a hint:
+ * the core and the server decide.
+ */
+export function typedProblem(
+  kind: InputKind,
+  text: string,
+  dataType: DataType | undefined,
+): string | null {
+  const basic = inputProblem(kind, text);
+  if (basic || !dataType) return basic;
+  const t = text.trim();
+  if (kind.type === "decimal" && dataType.type === "decimal") {
+    const m = /^[+-]?(\d*)(?:\.(\d*))?$/.exec(t);
+    if (!m) return null;
+    const whole = (m[1] ?? "").replace(/^0+/, "");
+    const fraction = m[2] ?? "";
+    const { precision, scale } = dataType;
+    if (scale !== null && fraction.replace(/0+$/, "").length > scale) {
+      return `at most ${scale} decimal ${scale === 1 ? "place" : "places"}`;
+    }
+    if (precision !== null && whole.length > precision - (scale ?? 0)) {
+      return `at most ${precision - (scale ?? 0)} digits before the point`;
+    }
+    return null;
+  }
+  if (kind.type === "bytes") {
+    const n = byteLength(t);
+    if (n === null) return "expected an even number of hex digits or valid base64";
+    const max =
+      dataType.type === "binary" || dataType.type === "var_binary" ? dataType.length : null;
+    if (max !== null && n > max) return `${n} bytes: at most ${max} fit`;
+    return null;
+  }
+  if (isXmlType(dataType)) return xmlProblem(text);
+  return null;
+}
+
+/** A new random UUID (version 4), for the "New" button of UUID columns. */
+export function newUuid(): string {
+  if (typeof crypto.randomUUID === "function") return crypto.randomUUID();
+  const b = crypto.getRandomValues(new Uint8Array(16));
+  b[6] = ((b[6] ?? 0) & 0x0f) | 0x40;
+  b[8] = ((b[8] ?? 0) & 0x3f) | 0x80;
+  const hex = Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }

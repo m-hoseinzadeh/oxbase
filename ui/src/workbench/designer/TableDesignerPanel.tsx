@@ -40,7 +40,7 @@ import {
   IndexesEditor,
   OptionsEditor,
 } from "./DesignerTabs";
-import { NO_DESIGNER } from "./designModel";
+import { designProblems, NO_DESIGNER, tableReadOnlyReason } from "./designModel";
 
 export interface TableDesignerProps {
   sessionId: string;
@@ -246,10 +246,13 @@ export function TableDesignerPanel({
       : preview.status === "loading"
         ? preview.previous
         : null;
-  const errors = current?.issues.filter((i) => i.severity === "error") ?? [];
+  // Problems found before asking the server (engine rules of the designer traits).
+  const localIssues = design && dirty ? designProblems(design, caps?.engine) : [];
+  const errors = [...localIssues, ...(current?.issues ?? [])].filter((i) => i.severity === "error");
   const steps = current?.script.steps ?? [];
   const canApply =
     current !== null && errors.length === 0 && steps.length > 0 && !applying && !!caps;
+  const shownIssues = [...localIssues, ...(shown?.issues ?? [])];
 
   async function apply() {
     if (!design || !current) return;
@@ -295,14 +298,16 @@ export function TableDesignerPanel({
 
   const designerCaps = caps?.designer ?? NO_DESIGNER;
   const engine = caps?.engine;
-  const readOnly = caps !== null && (creating ? !designerCaps.createTable : false);
+  const tableLock = creating ? null : tableReadOnlyReason(loaded);
+  const readOnly = caps !== null && (creating ? !designerCaps.createTable : tableLock !== null);
   const editorProps: EditorProps | null = design
     ? {
         design,
         onChange: change,
         caps: designerCaps,
-        issues: current?.issues ?? shown?.issues ?? [],
+        issues: [...localIssues, ...(current?.issues ?? shown?.issues ?? [])],
         engine,
+        serverVersion: caps?.serverVersion,
         isNew: creating,
         disabled: !caps || applying || readOnly,
       }
@@ -372,8 +377,8 @@ export function TableDesignerPanel({
         </div>
       ) : null}
       {readOnly ? (
-        <div className="banner banner--info" role="status">
-          The designer cannot create tables on this database.
+        <div className="banner banner--info" role="status" data-testid="designer-read-only">
+          {tableLock ?? "The designer cannot create tables on this database."}
         </div>
       ) : null}
       {loadError ? (
@@ -483,9 +488,9 @@ export function TableDesignerPanel({
                 Preview failed: {preview.message}
               </p>
             ) : null}
-            {shown && shown.issues.length > 0 ? (
+            {shownIssues.length > 0 ? (
               <ul className="designer__issues" aria-label="Issues">
-                {shown.issues.map((i) => (
+                {shownIssues.map((i) => (
                   <li
                     key={`${i.path}:${i.message}`}
                     className={`designer__issue designer__issue--${i.severity}`}

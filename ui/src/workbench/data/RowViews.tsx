@@ -85,6 +85,7 @@ export function RowForm({
               </div>
               <ValueEditor
                 kind={f.column.input}
+                dataType={f.column.dataType}
                 value={f.value}
                 label={f.column.name}
                 nullable={f.column.nullable}

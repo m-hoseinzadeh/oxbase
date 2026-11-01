@@ -33,6 +33,7 @@
   --engine-mysql: #00758f;
   --engine-mariadb: #8a5a2b;
   --engine-sqlite: #4b5563;
+  --engine-mssql: #a4262c;
   --engine-other: #6b7280;
   --engine-fg: #ffffff;
 
@@ -69,6 +70,7 @@
     --engine-mysql: #2e9bb3;
     --engine-mariadb: #b58553;
     --engine-sqlite: #8b95a5;
+    --engine-mssql: #e06c71;
     --engine-other: #8b95a5;
     --engine-fg: #0d1117;
   }
@@ -370,6 +372,10 @@ select:disabled {
 
 .engine-badge--sqlite {
   background: var(--engine-sqlite);
+}
+
+.engine-badge--mssql {
+  background: var(--engine-mssql);
 }
 
 /* --- modal dialogs --------------------------------------------------------------------- */
