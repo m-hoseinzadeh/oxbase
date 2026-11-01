@@ -329,12 +329,16 @@ fn tstz(i: i64) -> Option<i64> {
     (i % 41 != 0).then(|| EPOCH_2000_MICROS + i * 11_000_000 + (i * 13) % 1_000_000)
 }
 
+/// RFC 4122 version 4 UUIDs (MariaDB's `UUID` type refuses other variants).
 fn uid(i: i64) -> Option<[u8; 16]> {
     (i % 43 != 0).then(|| {
-        u128::try_from(i)
+        let mut b = u128::try_from(i)
             .expect("positive")
             .wrapping_mul(0x9E37_79B9_7F4A_7C15_F39C_C060_5CED_C834)
-            .to_be_bytes()
+            .to_be_bytes();
+        b[6] = (b[6] & 0x0f) | 0x40;
+        b[8] = (b[8] & 0x3f) | 0x80;
+        b
     })
 }
 
@@ -349,15 +353,16 @@ fn doc(i: i64) -> Option<String> {
 }
 
 fn uuid_text(b: &[u8; 16]) -> String {
-    let hex: String = b.iter().map(|x| format!("{x:02x}")).collect();
-    format!(
-        "{}-{}-{}-{}-{}",
-        &hex[0..8],
-        &hex[8..12],
-        &hex[12..16],
-        &hex[16..20],
-        &hex[20..32]
-    )
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(36);
+    for (pos, byte) in b.iter().enumerate() {
+        if matches!(pos, 4 | 6 | 8 | 10) {
+            out.push('-');
+        }
+        out.push(char::from(HEX[usize::from(byte >> 4)]));
+        out.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    out
 }
 
 fn date_text(days: i32) -> String {

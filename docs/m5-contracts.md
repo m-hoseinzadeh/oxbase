@@ -563,10 +563,14 @@ Streams record deviations from this file here, with the reason.
   needs its scale, ...), and a half-sent `INSERT BULK` stream cannot be abandoned in-band, so a
   cancel would have to finish it (inserting what was sent) or close the session. Parameterized
   `INSERT`s keep the server's conversions and the driver's attention-based cancel. Statements
-  bind at most 2 098 parameters and 1 000 rows; binary parameters are wrapped in
-  `CONVERT(varbinary(max), @Pn)` and decimal texts padded to one scale per column, because a
-  `VALUES` list types each column from all its rows (a NULL is declared `nvarchar(1)` by the
-  driver, and mixed decimal scales would be rounded). `IDENTITY_INSERT` handling is as specified.
+  bind at most 2 098 parameters and 1 000 rows. The loader declares the parameters itself, one
+  SQL Server type per load column with typed NULLs (driver addition: crate-private
+  `ParamSession` in `oxbase-mssql`'s `driver/conn.rs`, reached through `as_any`, which
+  `MsSqlConnection` and its `Tx` now return), so every full-size statement has the same text and
+  `@params` and SQL Server reuses its plan; with the `Value`-declared parameters of
+  `Connection::execute` a NULL is `nvarchar(1)`, the `@params` text changes with every NULL
+  pattern and each 2 000-parameter statement is compiled anew (about 1 200 rows/s on the CI
+  fixture). `IDENTITY_INSERT` handling is as specified.
 - **load, SQLite method** (§4.3, one of the two allowed): `multi_row_insert` through
   `InsertLoader` with 32 766 parameters, inside the service's transaction; no worker-side
   prepared statement, so the SQLite driver is unchanged.
