@@ -1,6 +1,6 @@
 //! Building SQL with bound parameters (M3): [`SqlWriter`], the expression safety check
 //! [`check_expression`], `LIKE` escaping, and the grid's table-data query
-//! ([`select_table_data`]: `SELECT * FROM t [WHERE filter] [ORDER BY sort] [LIMIT n]`).
+//! ([`select_table_data`]: `SELECT [TOP (n)] * FROM t [WHERE filter] [ORDER BY sort] [LIMIT n]`).
 //!
 //! Everything here is generic over the engine's [`Quoting`]: identifiers are quoted with
 //! [`Quoting::quote_ident`] / [`Quoting::qualify`], parameters use [`Quoting::placeholder`], and
@@ -105,7 +105,7 @@ pub fn escape_like(q: &dyn Quoting, text: &str) -> String {
 /// - no comment start (`--`, `/*`, and `#` where [`crate::LexRules::hash_comments`]);
 /// - every string and quoted identifier is terminated (`'...'`, `"..."`, `` `...` ``, with
 ///   doubling, backslash escapes where the engine has them, PostgreSQL `E'...'` and `$tag$`
-///   strings);
+///   strings, `[...]` with `]]` doubling where [`crate::LexRules::bracket_identifiers`]);
 /// - parentheses are balanced and never close more than they opened.
 ///
 /// It is a lexical check, not a parser: it refuses some valid SQL (a `;` inside an unknown kind
@@ -132,6 +132,7 @@ pub fn check_expression(q: &dyn Quoting, text: &str) -> Result<()> {
             }
             '"' => i = skip_quoted(&chars, i, rules.backslash_escapes)?,
             '`' => i = skip_quoted(&chars, i, false)?,
+            '[' if rules.bracket_identifiers => i = skip_bracketed(&chars, i)?,
             '$' if rules.dollar_quotes && (i == 0 || !is_ident_char(chars[i - 1])) => {
                 i = match dollar_tag_end(&chars, i) {
                     Some(tag_end) => skip_dollar_string(&chars, i, tag_end)?,
@@ -198,6 +199,24 @@ fn skip_quoted(chars: &[char], start: usize, backslash: bool) -> Result<usize> {
     Err(Error::invalid_input(format!(
         "the SQL expression has an unterminated {quote}...{quote}"
     )))
+}
+
+/// Index just past the `[...]` identifier that starts at `start`, where `]]` stands for `]`.
+fn skip_bracketed(chars: &[char], start: usize) -> Result<usize> {
+    let mut j = start + 1;
+    while j < chars.len() {
+        if chars[j] == ']' {
+            if chars.get(j + 1) == Some(&']') {
+                j += 2;
+                continue;
+            }
+            return Ok(j + 1);
+        }
+        j += 1;
+    }
+    Err(Error::invalid_input(
+        "the SQL expression has an unterminated [...] identifier",
+    ))
 }
 
 /// If a dollar-quote tag (`$$` or `$tag$`) starts at `start`, the index just past it.
@@ -481,8 +500,10 @@ pub fn write_order_by(
     Ok(!sort.is_empty())
 }
 
-/// The grid's table-data statement: `SELECT * FROM <qualified table> [WHERE <filter>]
-/// [ORDER BY <sort>] [<limit clause>]`, with every filter value bound.
+/// The grid's table-data statement: `SELECT [<top clause>] * FROM <qualified table> [WHERE
+/// <filter>] [ORDER BY <sort>] [<limit clause>]`, with every filter value bound. The limit is a
+/// [`Quoting::top_clause`] after `SELECT` when the engine has one (SQL Server `TOP (n)`), else
+/// a [`Quoting::limit_clause`] at the end.
 ///
 /// `table` (the loaded definition, when the caller has it) lets unknown columns fail early and
 /// pattern operators cast non-text columns. The query is validated first
@@ -503,7 +524,12 @@ pub fn select_table_data(
         )));
     }
     let mut w = SqlWriter::new(q);
-    w.push("SELECT * FROM ").qualified(&query.table);
+    let top = query.limit.and_then(|n| q.top_clause(n));
+    w.push("SELECT ");
+    if let Some(top) = &top {
+        w.push(top).push(" ");
+    }
+    w.push("* FROM ").qualified(&query.table);
     if let Some(filter) = query.filter.as_ref().filter(|f| !f.is_empty()) {
         w.push(" WHERE ");
         write_filter(&mut w, filter, table)?;
@@ -512,7 +538,7 @@ pub fn select_table_data(
         w.push(" ORDER BY ");
         write_order_by(&mut w, &query.sort, table)?;
     }
-    if let Some(limit) = query.limit {
+    if let (Some(limit), None) = (query.limit, &top) {
         let clause = q.limit_clause(limit);
         w.push(" ").push(&clause);
     }
@@ -629,6 +655,53 @@ mod tests {
         assert!(check_expression(&PgQuoting, "x = $q$ never closed").is_err());
         assert!(check_expression(&BacktickQuoting, "a = 1 # comment").is_err());
         assert!(check_expression(&AnsiQuoting, "a = 1 # not a comment here").is_ok());
+    }
+
+    /// SQL Server (and SQLite) read `[...]` as an identifier: a quote inside it is not a string
+    /// start, so `[a'] ; DROP TABLE t --'` must not pass as one string (M4).
+    #[test]
+    fn expression_check_knows_bracket_identifiers() {
+        for q in [&BracketQuoting as &dyn Quoting, &AnsiQuoting] {
+            assert!(check_expression(q, "[a'] ; DROP TABLE t --'").is_err());
+            assert!(check_expression(q, "[it's] = N'x;y'").is_ok());
+            assert!(check_expression(q, "[a]]b;c] > 0").is_ok());
+            assert!(check_expression(q, "[a]]b").is_err(), "unterminated");
+            assert!(check_expression(q, "[qty] >= (0)").is_ok());
+        }
+        assert!(check_expression(&BracketQuoting, "len([code]) > 0").is_ok());
+        assert!(check_expression(&BracketQuoting, "x = 1 -- c").is_err());
+        // PostgreSQL arrays are not identifiers.
+        assert!(check_expression(&PgQuoting, "a[1] = 2").is_ok());
+    }
+
+    #[test]
+    fn sql_server_table_data_uses_top_and_brackets() {
+        let t = table();
+        let mut q = TableDataQuery::new(t.obj.clone());
+        q.filter = Some(Filter::condition(
+            "name",
+            FilterOp::Contains,
+            vec!["[50%]".into()],
+        ));
+        q.sort = vec![SortKey {
+            column: "name".into(),
+            descending: true,
+            nulls: Some(NullsOrder::First),
+        }];
+        q.limit = Some(200);
+        let st = select_table_data(&BracketQuoting, &q, Some(&t)).unwrap();
+        assert_eq!(
+            st.sql,
+            "SELECT TOP (200) * FROM [public].[t] WHERE [name] LIKE @P1 ESCAPE N'!' ORDER BY \
+             CASE WHEN [name] IS NULL THEN 0 ELSE 1 END, [name] DESC"
+        );
+        assert_eq!(st.params, [Value::Text("%![50!%]%".into())]);
+        let id = Filter::condition("id", FilterOp::StartsWith, vec!["1".into()]);
+        let st = select_table_data(&BracketQuoting, &query(id), Some(&t)).unwrap();
+        assert_eq!(
+            st.sql,
+            "SELECT * FROM [public].[t] WHERE CAST([id] AS nvarchar(max)) LIKE @P1 ESCAPE N'!'"
+        );
     }
 
     #[test]

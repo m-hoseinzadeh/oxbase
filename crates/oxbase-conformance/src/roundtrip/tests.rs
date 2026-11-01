@@ -156,7 +156,7 @@ fn missing_roles_name_what_a_cell_needs() {
     );
     // No driver yet: nothing runs, whatever is registered.
     assert_eq!(
-        runnable_kinds(&toy, Engine::MsSql),
+        runnable_kinds(&toy, Engine::MongoDb),
         Vec::<ObjectKind>::new()
     );
     assert_eq!(
@@ -211,6 +211,41 @@ fn set(cells: &mut [Cell], kind: ObjectKind, check: Check, status: CellStatus) {
 }
 
 #[test]
+fn the_m4_guard_also_requires_sql_server() {
+    let reg = adapter::provisional_registry();
+    let fx = Fixtures::parse("schema_version = 1\n", "t").unwrap();
+    let engines = vec![engine("ms", Engine::MsSql)];
+    let cells = plan_engine_in(&reg, "ms", Engine::MsSql);
+    let m3 = GateOptions {
+        skipped_ok: false,
+        require_m3: true,
+        require_m4: false,
+    };
+    // SQL Server is not an M3 engine: pending is fine without the guard.
+    assert_eq!(gate(&cells, &fx, &engines, &reg, m3), Vec::<String>::new());
+    let m4 = GateOptions {
+        require_m4: true,
+        ..m3
+    };
+    let problems = gate(&cells, &fx, &engines, &reg, m4);
+    assert!(
+        problems[0].starts_with("ms: missing designer roles"),
+        "{problems:#?}"
+    );
+    assert!(
+        problems
+            .iter()
+            .all(|p| p.contains("OXBASE_CONFORMANCE_REQUIRE_M4 is set")),
+        "{problems:#?}"
+    );
+    assert_eq!(
+        problems.iter().filter(|p| p.contains("must pass")).count(),
+        10,
+        "{problems:#?}"
+    );
+}
+
+#[test]
 fn gate_accepts_pending_unless_m3_is_required() {
     let reg = adapter::provisional_registry();
     let fx = Fixtures::parse("schema_version = 1\n", "t").unwrap();
@@ -224,6 +259,7 @@ fn gate_accepts_pending_unless_m3_is_required() {
     let required = GateOptions {
         skipped_ok: false,
         require_m3: true,
+        require_m4: false,
     };
     let problems = gate(&cells, &fx, &engines, &reg, required);
     assert!(
@@ -328,7 +364,7 @@ async fn values(conn: &dyn Connection, cancel: &CancellationToken) -> Option<Str
 #[tokio::test]
 async fn run_script_follows_phases_captures_and_checks() {
     let tmp = tempfile::tempdir().unwrap();
-    let (_ctx, s) = sqlite_session(tmp.path()).await;
+    let (_ctx, s) = Box::pin(sqlite_session(tmp.path())).await;
     let conn = s.connection().as_ref();
     let cancel = CancellationToken::new();
     exec(conn, "CREATE TABLE t (a INTEGER)", &[], &cancel)
@@ -790,6 +826,7 @@ fn toy_sqlite_round_trip_passes_every_cell_and_cleans_up() {
     let required = GateOptions {
         skipped_ok: false,
         require_m3: true,
+        require_m4: false,
     };
     // Every cell passes; at most the roles the toy does not provide (a DmlWriter) are left.
     for p in gate(&cells, &fx, &engines, &reg, required) {
@@ -931,6 +968,7 @@ fn a_required_change_both_sides_skip_leaves_the_cell_pending() {
     let required = GateOptions {
         skipped_ok: false,
         require_m3: true,
+        require_m4: false,
     };
     let problems = gate(&cells, &fx, &engines, &reg, required);
     assert!(
@@ -1009,7 +1047,7 @@ path = \"target/conformance/lite_nom3-unused.sqlite\"
 #[tokio::test]
 async fn stale_scratch_tables_are_dropped_by_age() {
     let tmp = tempfile::tempdir().unwrap();
-    let (_ctx, s) = sqlite_session(tmp.path()).await;
+    let (_ctx, s) = Box::pin(sqlite_session(tmp.path())).await;
     let conn = s.connection().as_ref();
     let cancel = CancellationToken::new();
     let reg = adapter::registry();

@@ -103,6 +103,7 @@ export function CellEditor({
       ) : (
         <ValueEditor
           kind={column.input}
+          dataType={column.dataType}
           value={value}
           onChange={setValue}
           label={column.name}

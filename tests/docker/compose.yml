@@ -19,7 +19,11 @@
 # "oxbase_tls" (init/<engine>/03-tls-user.sql, plus tls/pg_hba.conf for PostgreSQL). The normal
 # "oxbase" user keeps working with and without TLS. The "ssh" service is an OpenSSH bastion with
 # TCP forwarding enabled that reaches the engines by service name (postgres:5432, mysql:3306,
-# mariadb:3306).
+# mariadb:3306, mssql:1433).
+# M4: mssql serves the same certificate (TLS offered, not forced; TDS 8.0 strict too) and has a
+# TLS-only login "oxbase_tls" enforced by a LOGON trigger. Its entrypoint applies
+# init/mssql/*.sql in name order with sqlcmd and records their SHA-256 in oxbase_test; a partial
+# or outdated seed is dropped and rebuilt, and a failing script stops the container.
 # A service only reports "healthy" once its seed has finished, so `up --wait` returning means
 # the fixtures are ready for the conformance harness.
 #
@@ -256,11 +260,34 @@ services:
     # once (rebuilding oxbase_test if an earlier seed did not finish), then marks the container as
     # seeded.
     entrypoint: ["/bin/bash", "/oxbase-init/entrypoint.sh"]
+    # M4 TLS (docs/m4-contracts.md §5.1): the wrapper copies the fixture certificate and key
+    # (host files are 0600, owned by the host user) to /etc/oxbase-tls and writes mssql.conf, so
+    # it starts as root; sqlservr then runs as root too (supported by the image), which keeps
+    # the key readable without a privilege drop.
+    user: root
     ports:
       - "127.0.0.1:15433:1433"
     volumes:
       - mssql-data:/var/opt/mssql
       - ./init/mssql:/oxbase-init:ro
+      - type: bind
+        source: ../../target/fixtures/tls/ca.pem
+        target: /oxbase-tls-src/ca.pem
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ../../target/fixtures/tls/server.pem
+        target: /oxbase-tls-src/server.pem
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ../../target/fixtures/tls/server-key.pem
+        target: /oxbase-tls-src/server-key.pem
+        read_only: true
+        bind:
+          create_host_path: false
     healthcheck:
       test:
         - CMD-SHELL

@@ -6,3 +6,7 @@ This product is licensed under the Apache License, Version 2.0 (see LICENSE).
 Oxbase depends on third-party open-source software. Each dependency is
 distributed under its own license, as recorded in Cargo.lock and
 ui/pnpm-lock.yaml, and checked in CI by cargo-deny (see deny.toml).
+
+vendor/tiberius is a copy of the tiberius 0.13.0 crate (https://github.com/prisma/tiberius),
+licensed MIT OR Apache-2.0 (vendor/tiberius/LICENSE-MIT.txt, vendor/tiberius/LICENSE-APACHE.txt),
+with the changes listed in vendor/tiberius/OXBASE.md.

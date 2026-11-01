@@ -20,8 +20,13 @@
 //! - [`DdlContext`] for [`DdlGenerator`], [`DmlTarget`] / [`DmlPlan`] for [`DmlWriter`],
 //!   [`DesignerCapabilities`] from [`Capabilities::designer`].
 //!
+//! M4 adds SQL Server: [`BracketQuoting`] qualifies names without the database (SQL Server
+//! reads one database per session, [`DatabaseScope::Session`]), limits a `SELECT` with
+//! [`Quoting::top_clause`] (`TOP (n)`), and [`LexRules::bracket_identifiers`] makes
+//! [`sql::check_expression`] read `[...]` identifiers (also on for SQLite's [`AnsiQuoting`]).
+//!
 //! How engine crates register their cells: see [`DialectRegistry`] (*Registration*). The
-//! contracts are in `docs/m2-contracts.md` and `docs/m3-contracts.md`.
+//! contracts are in `docs/m2-contracts.md`, `docs/m3-contracts.md` and `docs/m4-contracts.md`.
 
 mod capability;
 pub mod compare;

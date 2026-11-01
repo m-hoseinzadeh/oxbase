@@ -20,16 +20,17 @@
 //!       ├─ Views, Materialized views, Functions, Procedures, Sequences  (folders)
 //! ```
 //!
-//! M2 layouts (each engine stream registers its own; these are the contract):
+//! M2 layouts and the M4 SQL Server layout (each engine registers its own; these are the
+//! contract):
 //!
-//! | Node kind | PostgreSQL | MySQL / MariaDB | SQLite |
-//! |---|---|---|---|
-//! | root | Database | Database | Database (`main`, `temp` when used, attached) |
-//! | Database | Schema | folders: Table, View, Function, Procedure, Sequence (MariaDB 10.3+) | folders: Table, View |
-//! | Schema | folders: Table, View, MatView, Function, Procedure (11+), Sequence | - | - |
-//! | Table | folders: Column, Index, ForeignKey, Check, Trigger | same | same |
-//! | View | folders: Column, Trigger | folder: Column | folders: Column, Trigger |
-//! | MatView | folders: Column, Index | - | - |
+//! | Node kind | PostgreSQL | MySQL / MariaDB | SQLite | SQL Server (M4) |
+//! |---|---|---|---|---|
+//! | root | Database | Database | Database (`main`, `temp` when used, attached) | Database |
+//! | Database | Schema | folders: Table, View, Function, Procedure, Sequence (MariaDB 10.3+) | folders: Table, View | Schema |
+//! | Schema | folders: Table, View, MatView, Function, Procedure (11+), Sequence | - | - | folders: Table, View, Function, Procedure, Sequence, Type |
+//! | Table | folders: Column, Index, ForeignKey, Check, Trigger | same | same | same |
+//! | View | folders: Column, Trigger | folder: Column | folders: Column, Trigger | folders: Column, Index, Trigger |
+//! | MatView | folders: Column, Index | - | - | - |
 //!
 //! Routines, sequences and the other leaves have no children.
 
@@ -40,8 +41,9 @@ use oxbase_types::ObjectKind;
 /// How databases relate to sessions on an engine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DatabaseScope {
-    /// One session sees exactly one database (PostgreSQL). Objects of another database are
-    /// read through a session opened on that database; `ObjectRef::catalog` names it.
+    /// One session sees exactly one database (PostgreSQL, SQL Server). Objects of another
+    /// database are read through a session opened on that database; `ObjectRef::catalog` names
+    /// it.
     Session,
     /// One session sees every database, and a database is what other engines call a schema
     /// (MySQL, MariaDB). Fetchers filter by `ObjectRef::catalog` with a bound parameter.

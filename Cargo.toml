@@ -63,6 +63,9 @@ default-members = [
     "crates/oxbase-cli",
     "crates/oxbase-conformance",
 ]
+# Vendored, patched third-party crates (see [patch.crates-io] below): never workspace members,
+# so workspace lints, clippy and `cargo test --workspace` do not apply to them.
+exclude = ["vendor"]
 
 [workspace.package]
 version = "0.0.1"
@@ -171,6 +174,13 @@ tokio-postgres-rustls = { version = "0.14.0", default-features = false, features
 # off per connection, but deny.toml must allow that license.
 mysql_async = { version = "0.37.1", default-features = false, features = ["default-rustls-ring"] }
 rusqlite = { version = "0.41.1", features = ["bundled"] }
+# M4: SQL Server (TDS 7.4) client, MIT OR Apache-2.0. Built WITHOUT any TLS backend: its `rustls`
+# feature pulls tokio-rustls with default features (aws-lc-rs) and hard-codes the aws-lc
+# provider, and `native-tls` / `vendored-openssl` are OpenSSL. oxbase-mssql runs the TLS
+# handshake itself with rustls + ring (docs/m4-contracts.md §2). `tds73` = date/time/datetime2/
+# datetimeoffset types; `chrono` = conversions. Never enable `rustls`, `native-tls`,
+# `vendored-openssl`, `winauth`, `integrated-auth-gssapi` or the default features.
+tiberius = { version = "0.13.0", default-features = false, features = ["tds73", "chrono"] }
 
 # --- network: TLS (rustls + ring) and SSH (russh + ring) ---
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12", "logging"] }
@@ -221,3 +231,10 @@ opt-level = 1
 [profile.release]
 lto = "thin"
 codegen-units = 16
+
+# Patched third-party crates. tiberius 0.13.0 decodes `money` / `smallmoney` through `f64`, which
+# rounds amounts above about 9.007e11; the vendored copy decodes them to an exact scale-4
+# `Numeric` (one function, see vendor/tiberius/OXBASE.md). Drop this once upstream decodes money
+# exactly or the own TDS decoder (docs/m4-contracts.md §11) replaces tiberius.
+[patch.crates-io]
+tiberius = { path = "vendor/tiberius" }

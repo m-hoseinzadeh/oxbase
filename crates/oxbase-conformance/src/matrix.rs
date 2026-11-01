@@ -25,8 +25,7 @@ pub const PENDING_CAPABILITIES: &str = "pending (no live capability probe for th
 /// The milestone that brings `engine`'s driver, for engines that have none yet.
 pub const fn driver_milestone(engine: Engine) -> Option<&'static str> {
     match engine {
-        Engine::Postgres | Engine::MySql | Engine::MariaDb | Engine::Sqlite => None,
-        Engine::MsSql => Some("M4"),
+        Engine::Postgres | Engine::MySql | Engine::MariaDb | Engine::Sqlite | Engine::MsSql => None,
         Engine::MongoDb | Engine::Redis => Some("M7"),
     }
 }

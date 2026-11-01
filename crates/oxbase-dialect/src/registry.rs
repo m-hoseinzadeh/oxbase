@@ -254,7 +254,7 @@ struct EngineEntry {
 /// - [`Capabilities::designer`](crate::Capabilities::designer) in its existing capabilities.
 ///
 /// [`DialectRegistry::missing_designer_roles`] must be empty for PostgreSQL, MySQL, MariaDB and
-/// SQLite. Services resolve `(engine, Table) → DdlGenerator / Comparator` for the designer and
+/// SQLite, and from M4 for SQL Server (`oxbase_mssql::dialect::register`). Services resolve `(engine, Table) → DdlGenerator / Comparator` for the designer and
 /// `engine → DmlWriter / Quoting` for grid edits; a missing role is `Error::Unsupported`, which
 /// the UI shows as "read-only on this engine".
 #[derive(Default, Clone)]

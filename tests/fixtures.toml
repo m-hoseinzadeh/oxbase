@@ -95,9 +95,24 @@ container_port = 1433
 user = "sa"
 password = "Oxbase_Fixture_Pw_2026"
 database = "oxbase_test"
-trust_server_certificate = true
 version_query = "SELECT @@VERSION"
 version_prefix = "Microsoft SQL Server 2025"
+# M4 (docs/m4-contracts.md §5): the server presents the [tls] server certificate (mssql.conf
+# `[network] tlscert/tlskey`, mounted read-only; key readable by the mssql user, uid 10001),
+# accepts TLS 1.2 and 1.3, and does NOT force encryption (`forceencryption = 0`), so plain and
+# `Disable` connections keep working. The M0 `trust_server_certificate = true` shortcut is gone:
+# TLS checks use VerifyFull / VerifyCa with the fixture CA, like the other engines. SQL Server
+# 2025 also accepts TDS 8.0 strict encryption (`options.encrypt = "strict"`) on the same port.
+tds8_strict = true
+
+# M4: a login the server accepts only over TLS. SQL Server cannot require TLS per login, so the
+# fixture adds a server-level LOGON trigger (`oxbase_tls_only`) that rolls back any login of
+# `oxbase_tls` whose `CONNECTIONPROPERTY('encrypt_option')` is not 'TRUE'. Same grants as `sa`
+# needs for the tests on oxbase_test (db_owner there).
+[engines.mssql.tls_user]
+user = "oxbase_tls"
+password = "Oxbase_Fixture_Pw_2026"
+database = "oxbase_test"
 
 [engines.mongodb]
 kind = "mongodb"
@@ -148,7 +163,8 @@ ca_cert = "ca.pem"
 ca_key = "ca-key.pem"
 server_cert = "server.pem"
 server_key = "server-key.pem"
-server_sans = ["localhost", "127.0.0.1", "postgres", "mysql", "mariadb"]
+# M4: `mssql` added (VerifyFull through the SSH bastion); scripts/fixtures-certs.sh must match.
+server_sans = ["localhost", "127.0.0.1", "postgres", "mysql", "mariadb", "mssql"]
 # Client certificate for mutual-TLS tests, signed by the same CA (CN = the TLS user).
 client_cert = "client.pem"
 client_key = "client-key.pem"
@@ -188,6 +204,7 @@ host_key_fingerprint = "host_key.fingerprint"
 postgres = { host = "postgres", port = 5432 }
 mysql = { host = "mysql", port = 3306 }
 mariadb = { host = "mariadb", port = 3306 }
+mssql = { host = "mssql", port = 1433 }
 
 # --- M2: seed objects for the object tree, fetchers and query runs -------------------------
 # Only the NAMES live here, so the dialect streams, the conformance harness and the live tests
@@ -245,6 +262,21 @@ objects = ["m2_parent", "m2_child", "m2_view", "m2_fn", "m2_proc", "m2_trg"]
 [m2.mariadb]
 init_sql = "tests/docker/init/mariadb/04-m2.sql"
 database = "oxbase_test"
+objects = ["m2_parent", "m2_child", "m2_view", "m2_fn", "m2_proc", "m2_trg", "m2_seq"]
+
+[m2.mssql]
+# M4. Objects in schema `m2` of oxbase_test, created by init_sql (applied by the fixture's
+# entrypoint wrapper, like 01-schema.sql). Differences from the shared shape: `note` is
+# nvarchar(max) (text is deprecated); the check is `len(code) > 0`; the table comment is the
+# MS_Description extended property; m2_trg is AFTER INSERT (SQL Server has no BEFORE triggers)
+# and sets qty to 0 where the inserted qty is negative; m2_proc(@n int) runs `SELECT @n AS n`.
+# A second database oxbase_m2_other with dbo.m2_other_t (id int PRIMARY KEY), like PostgreSQL,
+# proves the tree opens a session per database.
+init_sql = "tests/docker/init/mssql/04-m2.sql"
+database = "oxbase_test"
+schema = "m2"
+other_database = "oxbase_m2_other"
+other_table = "m2_other_t"
 objects = ["m2_parent", "m2_child", "m2_view", "m2_fn", "m2_proc", "m2_trg", "m2_seq"]
 
 [m2.sqlite]
@@ -309,7 +341,91 @@ database = "oxbase_test"
 init_sql = "tests/docker/init/mariadb/05-m3.sql"
 database = "oxbase_test"
 
+[m3.mssql]
+# M4. Seed tables in schema `m3` of oxbase_test, scratch tables too. Types: id int
+# IDENTITY(1,1) PRIMARY KEY (seed rows 1-3 inserted in order); code varchar(20) NOT NULL UNIQUE;
+# name nvarchar(max); amount decimal(12,2); flag bit; born date; at datetime2(6);
+# doc json (SQL Server 2025 native type); data varbinary(64); total AS (amount * 2) PERSISTED.
+# m3_edit_pk also has an AFTER INSERT, UPDATE, DELETE trigger m3_edit_pk_audit WITHOUT
+# `SET NOCOUNT ON` that inserts one row per affected row into m3.m3_edit_audit (id int
+# IDENTITY PRIMARY KEY, edit_id int, op char(1), at datetime2 DEFAULT SYSDATETIME()): the extra
+# row counts and the OUTPUT restriction on tables with triggers must not break the grid
+# writer's "exactly one row" check (docs/m4-contracts.md §4.5).
+init_sql = "tests/docker/init/mssql/05-m3.sql"
+database = "oxbase_test"
+schema = "m3"
+
 [m3.sqlite]
 # Applied to a fresh temp database file, like [m2.sqlite].
 init_sql = "tests/docker/init/sqlite/02-m3.sql"
 database = "main"
+
+# --- M4: SQL Server specifics ---------------------------------------------------------------
+# Names only, like [m2] / [m3] (docs/m4-contracts.md §5). The fixtures stream writes
+# `init_sql`; the driver, fetch and ddl streams assert these shapes in their live tests
+# (crates/oxbase-mssql/tests/*.rs, #[ignore]d, run by the conformance job).
+#
+# Schema `m4` of oxbase_test:
+#   m4_types       one column per type family, for the Arrow mapping and parameter tests:
+#                  id int PRIMARY KEY, c_tinyint tinyint, c_smallint smallint, c_int int,
+#                  c_bigint bigint, c_bit bit, c_decimal decimal(18,4), c_numeric numeric(38,10),
+#                  c_money money, c_smallmoney smallmoney, c_float float, c_real real,
+#                  c_date date, c_time time(7), c_datetime datetime, c_datetime2 datetime2(7),
+#                  c_smalldatetime smalldatetime, c_dto datetimeoffset(7), c_char char(10),
+#                  c_varchar varchar(50), c_varchar_max varchar(max), c_nchar nchar(10),
+#                  c_nvarchar nvarchar(50), c_nvarchar_max nvarchar(max), c_text text,
+#                  c_ntext ntext, c_binary binary(16), c_varbinary varbinary(64),
+#                  c_varbinary_max varbinary(max), c_image image, c_guid uniqueidentifier,
+#                  c_xml xml, c_json json, c_vector vector(3), c_variant sql_variant,
+#                  c_hierarchyid hierarchyid, c_geometry geometry, c_geography geography,
+#                  c_rowversion rowversion.
+#                  Row id 1: the values of docs/m4-contracts.md §5.3 (one per column);
+#                  row id 2: every column but id NULL (rowversion is never NULL).
+#   m4_features    id int IDENTITY(100, 5) NOT NULL, CONSTRAINT pk_m4_features PRIMARY KEY
+#                  CLUSTERED (id); code varchar(20) NULL; qty int NOT NULL CONSTRAINT
+#                  df_m4_features_qty DEFAULT (1); price decimal(10,2) NOT NULL;
+#                  total AS (qty * price) PERSISTED; label AS (upper(code)) (not persisted);
+#                  rv rowversion; status nvarchar(10) NOT NULL CONSTRAINT df_m4_features_status
+#                  DEFAULT (N'new'), CONSTRAINT ck_m4_features_qty CHECK (qty >= 0);
+#                  unique filtered index m4_features_code_uq ON (code) WHERE code IS NOT NULL;
+#                  nonclustered index m4_features_qty_ix ON (qty DESC) INCLUDE (price);
+#                  table comment (MS_Description) "M4 features"; column comment on qty "how many".
+#   m4_temporal    system-versioned: id int PRIMARY KEY, val nvarchar(20), valid_from datetime2
+#                  GENERATED ALWAYS AS ROW START HIDDEN, valid_to datetime2 GENERATED ALWAYS AS
+#                  ROW END HIDDEN, PERIOD FOR SYSTEM_TIME (valid_from, valid_to), history table
+#                  m4.m4_temporal_history.
+#   m4_iview       indexed view WITH SCHEMABINDING: SELECT id, qty FROM m4.m4_features WHERE
+#                  qty > 0, with unique clustered index m4_iview_ix (id).
+#   m4_view_trg    INSTEAD OF INSERT trigger on m4_iview (lists under the view's Triggers).
+#   m4_itvf(@n int)  inline table-valued function: RETURNS TABLE AS RETURN SELECT ... WHERE id > @n.
+#   m4_mtvf(@n int)  multi-statement table-valued function returning @t TABLE (n int).
+#   m4_code_t      alias type varchar(20) NOT NULL; m4_rows_t table type (id int, name
+#                  nvarchar(50)); m4_proc_tvp(@rows m4.m4_rows_t READONLY) procedure.
+#   m4_messages    procedure: PRINT N'm4 print'; RAISERROR(N'm4 info', 10, 1); SELECT 1 AS a;
+#                  SELECT 2 AS b; (multiple result sets; the INFO messages are a known gap).
+#   m4_ddl_trg     database-level DDL trigger (FOR CREATE_TABLE, does nothing): must NOT appear
+#                  under any table's Triggers folder.
+[m4]
+schema = "m4"
+types_table = "m4_types"
+features_table = "m4_features"
+temporal_table = "m4_temporal"
+temporal_history = "m4_temporal_history"
+indexed_view = "m4_iview"
+indexed_view_index = "m4_iview_ix"
+view_trigger = "m4_view_trg"
+inline_tvf = "m4_itvf"
+multi_tvf = "m4_mtvf"
+alias_type = "m4_code_t"
+table_type = "m4_rows_t"
+tvp_procedure = "m4_proc_tvp"
+messages_procedure = "m4_messages"
+ddl_trigger = "m4_ddl_trg"
+# Edit-table names of [m3] reused by the mssql grid writer tests; the audit table of §[m3.mssql].
+edit_audit_table = "m3_edit_audit"
+
+[m4.mssql]
+init_sql = "tests/docker/init/mssql/06-m4.sql"
+database = "oxbase_test"
+# The fixture CA's VerifyFull name for direct connections (the SSH target uses "mssql").
+tls_server_name = "localhost"

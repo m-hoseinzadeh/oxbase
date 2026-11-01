@@ -15,15 +15,17 @@
 //!
 //! - `range` is a byte range into the script. It starts at the first character of the
 //!   statement and ends after its last character. It **excludes** leading whitespace, leading
-//!   ordinary comments, trailing whitespace and the terminator (`;`, or the current MySQL
-//!   `DELIMITER`). Comments *inside* the statement and trailing comments before the terminator
-//!   on the same statement stay in. MySQL executable comments `/*! ... */` and optimizer hints
-//!   `/*+ ... */` are statement content, never "leading comments".
+//!   ordinary comments, trailing whitespace and the terminator (`;`, the current MySQL
+//!   `DELIMITER`, or a T-SQL `GO` line). Comments *inside* the statement and trailing
+//!   comments before the terminator on the same statement stay in. MySQL executable
+//!   comments `/*! ... */` and optimizer hints `/*+ ... */` are statement content, never
+//!   "leading comments".
 //! - `text` is `script[range]`, unchanged.
 //! - `segment_end` is the byte just past the statement's terminator, or `range.end` when it
 //!   has none (the last statement of a script without a trailing `;`). [`statement_at`] uses it.
 //! - A segment that holds only whitespace and comments (`;;`, a trailing comment) produces no
-//!   statement. Client directives (MySQL `DELIMITER x`) produce no statement either.
+//!   statement. Client directives (MySQL `DELIMITER x`, T-SQL `GO`) produce no statement
+//!   either.
 //! - Statements come out in script order and never overlap.
 //!
 //! # Dialect rules
@@ -72,9 +74,22 @@
 //! - `BEGIN [DEFERRED|IMMEDIATE|EXCLUSIVE] [TRANSACTION];` outside a trigger is an ordinary
 //!   statement.
 //!
-//! **T-SQL** ([`SqlDialect::TSql`], placeholder until M4): a line holding only `GO`
-//! (case-insensitive, optional count and trailing comment) ends a batch; `;` does not split.
-//! `[...]` identifiers, `N'...'` strings, nested block comments.
+//! **T-SQL** ([`SqlDialect::TSql`], M4):
+//! - `'...'` and `N'...'` strings with `''` doubling (a backslash is an ordinary character);
+//!   `[...]` identifiers with `]]` doubling; `"..."` identifiers; `--` line comments; block
+//!   comments **nest**; `@` and `#` are word characters (`@var`, `#temp`, `@@ROWCOUNT`);
+//! - **batches**: a line holding only `GO` (case-insensitive, optionally indented with spaces
+//!   or tabs, optionally followed by a repeat count and a `--` comment) ends a batch. `GO`
+//!   inside a string, an identifier or a comment, or with other text on its line (`GOTO x`,
+//!   `SELECT 1 GO`), is not a separator. The `GO` line is not part of any statement; the
+//!   batch before it owns it (its `segment_end` is the end of the `GO` line). The
+//!   repeat count is accepted and ignored (the batch runs once);
+//! - **one statement = one batch** (`docs/m4-contracts.md` §6): `;` never splits, inside a
+//!   batch it is ordinary content (T-SQL batches are sent whole: `DECLARE`d variables,
+//!   `#temp` tables, `IF ... RETURN` and `CREATE PROCEDURE`, which must be alone in its batch,
+//!   all keep working). A batch's trailing `;` stays in its text (`MERGE` needs it); `;`
+//!   before the first content of a batch is dropped, so a batch of only `;` is no statement.
+//!   [`statement_at`] therefore returns the `GO` batch around the offset.
 //!
 //! [`StatementKind`] is only a hint for the UI (whether the statement probably returns rows);
 //! the query runner never relies on it.
@@ -129,7 +144,8 @@ pub struct Position {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum StatementKind {
     /// Starts with `SELECT`, `WITH`, `VALUES`, `TABLE`, `SHOW`, `DESCRIBE`/`DESC`, `EXPLAIN`,
-    /// `PRAGMA`, `CALL`, `FETCH` or `(` (first keyword, case-insensitive).
+    /// `PRAGMA`, `CALL`, `FETCH` or `(` (first keyword, case-insensitive). T-SQL: `SELECT`,
+    /// `WITH`, `EXEC`, `EXECUTE`, `VALUES` or `(` as the first keyword of the batch.
     Query,
     Other,
 }

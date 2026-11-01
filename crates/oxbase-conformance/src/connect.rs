@@ -2,8 +2,8 @@
 //!
 //! Every check goes through the real stack the app uses: [`ConnectionManager`] with
 //! [`default_drivers`], a [`MemorySecretStore`] holding the fixture passwords, and the russh
-//! tunnel provider. Engines without an M1 driver (mssql, mongodb, redis) report every check as
-//! pending with the milestone that brings their driver.
+//! tunnel provider. Engines without a driver yet (mongodb, redis) report every check as pending
+//! with the milestone that brings their driver; SQL Server runs them since M4.
 //!
 //! | Check | What passes |
 //! |---|---|
@@ -267,7 +267,8 @@ fn failed_all(e: &ResolvedEngine, why: &str) -> Vec<ConnCell> {
 pub(crate) struct Ctx {
     pub(crate) mgr: ConnectionManager,
     secrets: Arc<MemorySecretStore>,
-    fixtures: Fixtures,
+    // Boxed: every check future holds a Ctx, and the fixtures file is large.
+    fixtures: Box<Fixtures>,
 }
 
 type CheckResult = Result<String, String>;
@@ -283,7 +284,7 @@ impl Ctx {
         Self {
             mgr,
             secrets,
-            fixtures: fixtures.clone(),
+            fixtures: Box::new(fixtures.clone()),
         }
     }
 
@@ -511,15 +512,13 @@ impl Ctx {
                 "expected plaintext without SSH, got tls={tls} ssh={ssh}"
             ));
         }
-        if let Some(prefix) = e.version_prefix.as_deref() {
-            let want = ServerVersion::parse(prefix)
-                .map_err(|err| format!("version_prefix {prefix:?}: {err}"))?;
-            if version != want {
-                return Err(format!(
-                    "server reports {}, fixture expects {prefix}",
-                    version.raw()
-                ));
-            }
+        if let Some(prefix) = e.version_prefix.as_deref()
+            && !version_matches(e.engine, &version, prefix)?
+        {
+            return Err(format!(
+                "server reports {}, fixture expects {prefix}",
+                version.raw()
+            ));
         }
         Ok(format!("server {} ({ms} ms)", version.raw()))
     }
@@ -753,11 +752,24 @@ async fn cancel_once(
     }
 }
 
+/// Whether the server version matches the fixture's `version_prefix`: the parsed version, or
+/// for SQL Server the start of the `@@VERSION` banner ("Microsoft SQL Server 2025"), which is
+/// what the driver keeps as the raw version text.
+fn version_matches(engine: Engine, version: &ServerVersion, prefix: &str) -> Result<bool, String> {
+    if engine == Engine::MsSql {
+        return Ok(version.raw().starts_with(prefix));
+    }
+    let want =
+        ServerVersion::parse(prefix).map_err(|err| format!("version_prefix {prefix:?}: {err}"))?;
+    Ok(*version == want)
+}
+
 /// A statement that runs for 30 s (or forever, on SQLite) without returning rows.
 const fn long_statement(engine: Engine) -> &'static str {
     match engine {
         Engine::Postgres => "SELECT pg_sleep(30)",
         Engine::MySql | Engine::MariaDb => "SELECT SLEEP(30)",
+        Engine::MsSql => "WAITFOR DELAY '00:00:30'",
         _ => "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) SELECT max(x) FROM c",
     }
 }
@@ -766,6 +778,10 @@ const fn long_statement(engine: Engine) -> &'static str {
 const fn rows_statement(engine: Engine) -> &'static str {
     match engine {
         Engine::Postgres => "SELECT g AS n, md5(g::text) AS h FROM generate_series(1, 200000) AS g",
+        Engine::MsSql => {
+            "SELECT value AS n, CONVERT(char(32), HASHBYTES('MD5', CAST(value AS varchar(10))), 2) \
+             AS h FROM GENERATE_SERIES(1, 200000)"
+        }
         // Six digit tables give 0..999999; the top digit below 2 keeps 200 000 of them.
         Engine::MySql | Engine::MariaDb => {
             "SELECT d0.n + 10 * d1.n + 100 * d2.n + 1000 * d3.n + 10000 * d4.n + 100000 * d5.n \
@@ -820,8 +836,28 @@ mod tests {
         assert_eq!(cells.len(), ConnCheck::ALL.len());
         assert!(cells.iter().all(|c| c.status == CellStatus::Pending));
         assert_eq!(cells[0].label(), "pending (M7)");
-        let mssql = static_cells(&engine("mssql", Engine::MsSql), true).unwrap();
-        assert_eq!(mssql[0].label(), "pending (M4)");
+        // SQL Server has its driver since M4: its checks run.
+        assert!(static_cells(&engine("mssql", Engine::MsSql), true).is_none());
+    }
+
+    #[test]
+    fn sql_server_version_matches_the_banner() {
+        let v = ServerVersion::parse("Microsoft SQL Server 2025 (RTM-CU10) - 17.0.4005.7 (X64)")
+            .unwrap();
+        assert_eq!(
+            version_matches(Engine::MsSql, &v, "Microsoft SQL Server 2025"),
+            Ok(true)
+        );
+        assert_eq!(
+            version_matches(Engine::MsSql, &v, "Microsoft SQL Server 2022"),
+            Ok(false)
+        );
+        let pg = ServerVersion::parse("PostgreSQL 18.6 on x86_64").unwrap();
+        assert_eq!(
+            version_matches(Engine::Postgres, &pg, "PostgreSQL 18.6"),
+            Ok(true)
+        );
+        assert!(version_matches(Engine::Postgres, &pg, "no digits").is_err());
     }
 
     #[test]

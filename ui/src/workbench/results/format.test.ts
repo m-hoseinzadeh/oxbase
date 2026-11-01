@@ -133,5 +133,14 @@ describe("formatCell", () => {
       }),
     ).toBe("varchar");
     expect(columnTypeLabel({ name: "c", dataType: "Int32", nullable: true })).toBe("Int32");
+    // MySQL and SQL Server report the type family under one key.
+    expect(
+      columnTypeLabel({
+        name: "c",
+        dataType: "FixedSizeBinary[16]",
+        nullable: true,
+        metadata: { "oxbase.native_type": "uniqueidentifier" },
+      }),
+    ).toBe("uniqueidentifier");
   });
 });

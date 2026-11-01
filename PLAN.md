@@ -55,7 +55,7 @@ crates/
   oxbase-pg           tokio-postgres (+ postgres-types)
   oxbase-mysql        mysql_async (MySQL + MariaDB, version-flagged)
   oxbase-sqlite       rusqlite on spawn_blocking (bundled SQLite)
-  oxbase-mssql        tiberius (TDS, rustls)
+  oxbase-mssql        tiberius (TDS 7.4, no TLS backend) + oxbase's own rustls/ring TLS
   oxbase-mongo        mongodb crate + rquickjs mongo-shell subset
   oxbase-redis        redis crate (cluster, sentinel, TLS, pub/sub)
   oxbase-net          SSH tunnels (russh), TLS config (rustls), tunnel pool
@@ -279,6 +279,56 @@ manual runs 41255149525 and 41255151166. Where the build differs from the text a
   changes the key's columns); identity / auto-increment changes on an existing column have no
   capability of their own (the UI gates them on the type-change capability).
 
+**M4 contracts (Design step, 2026-11-01).** `docs/m4-contracts.md` fixes the SQL Server
+contracts. Driver: `tiberius` 0.13.0 for TDS 7.4, built without a TLS backend, because its
+`rustls` feature pulls aws-lc (tokio-rustls default features, hard-coded aws-lc provider) and its
+other backends are OpenSSL; `oxbase-mssql` runs the TLS handshake itself with rustls + ring (TLS
+records inside PRELOGIN packets for TDS 7.4, direct TLS with ALPN `tds/8.0` for TDS 8.0 strict)
+and replays the server's PRELOGIN answer to tiberius. Cancel is an in-band attention (works
+through SSH), with the socket closed when the drain does not finish within 1.5 s. Accepted gaps
+of tiberius: no `PRINT` messages, no row counts for plain batches, coarse result metadata
+(integers as `Int64`, decimals as text). SQL Server reads one database per session
+(`DatabaseScope::Session`, like PostgreSQL), names are `[schema].[name]`; the tree adds a Types
+folder and indexes under views; DDL is transactional, defaults are named constraints,
+renames use `sp_rename`, IDENTITY cannot change on an existing column; the grid writer returns
+one row per affected row through `OUTPUT ... INTO` a table variable, so triggers and `NOCOUNT`
+cannot break the "exactly one row" check. Fixtures gain TLS on the mssql container, a TLS-only
+login enforced by a logon trigger, the SSH target `mssql:1433` and the `[m2.mssql]`,
+`[m3.mssql]` and `[m4]` names. Six streams (driver, fetch, ddl, sql, fixtures, app) fill the
+skeleton of `crates/oxbase-mssql`.
+
+**M4 as built (notes, 2026-11-01).** The exit check passed in the CI conformance job (Linux,
+Docker fixtures, with `OXBASE_CONFORMANCE_REQUIRE_M4=1`, the 5-engine guard; numbers in the
+README, *Conformance harness*): on PostgreSQL 18.6, MySQL 8.4.13, MariaDB 11.8.9, SQLite 3.54.1
+and SQL Server 2025 (17.0.5035) every M1 connection check passes (27 of 27 applicable; SQL
+Server: plain, TLS `VerifyFull` as the TLS-only login, SSH, TLS over SSH, cancel, 200k-row
+stream), every `fetch_list` cell passes (55; SQL Server 13: database, schema, table, column,
+index, foreign key, check, view, function, procedure, trigger, sequence, type) and `roundtrip`
+and `capabilities` pass for table, column, index, foreign key and check (50 of 50 cells). The
+services live tests run on SQL Server too: a 1 000 000-row query streamed in 3.5-4.4 s (two
+runs) with random 200-row pages at p95 0.20 ms, a cancel after about 200 000 rows ended the run
+in about 1 s and the editor's next `SELECT 1` took under 100 ms (on a new session), and the
+edit and designer cycles pass with SQL Server's own grid writer and DDL cells. On the same code
+(`milestone/m4` at d47cb5d), the full CI lane (Rust tests: 766 passed on Linux and macOS, 765 on
+Windows; OS keychain tests on all three; conformance; webview smoke, IPC plus Arrow decoding p95
+11 ms) and the Bundle workflow (Linux x86_64, macOS aarch64 and x86_64, Windows x86_64) passed in
+manual runs 41298470889 and 41298472236. Where the build differs from the text above or from
+`docs/m4-contracts.md` (its §13 lists every deviation):
+
+- tiberius gaps as planned: no `PRINT` messages (the editor says so for SQL Server), no row
+  counts for plain batches, coarse result metadata. tiberius itself decodes `money` through
+  `f64`; oxbase carries a vendored copy (`vendor/tiberius`, one patched function) that decodes
+  `money` / `smallmoney` exactly.
+- `Tx::commit` fails (error 50000) when the server already ended the transaction, instead of
+  reporting a commit; `begin()` still nests inside an editor's own `BEGIN TRAN`.
+- After a cancel mid-stream SQL Server behaves like MySQL / MariaDB in the query service: the
+  attention drain of a streaming result takes longer than the service's 1 s wait, so the next
+  run gets a new session and the warning about lost `#temp` tables and settings.
+- The SQL Server fixture enforces the TLS-only login with a logon trigger that reads
+  `sys.dm_exec_connections` and runs `sqlservr` as root inside the container.
+- The webview smoke test stays on PostgreSQL; the SQL Server UI (connection dialog, designer
+  types and options, PRINT note) is covered by Vitest only.
+
 Order of work: M0–M3 prove the architecture. M4 and M7 are where the per-database matrix gets tested for real. M8 and M10 reuse the Comparator and DdlGenerator cells and get much cheaper if M3 is done right.
 
 ## 7. Main risks
@@ -286,7 +336,7 @@ Order of work: M0–M3 prove the architecture. M4 and M7 are where the per-datab
 | Risk | Mitigation |
 |---|---|
 | Scope (this is Navicat parity, a multi-quarter effort) | Strict milestone exit criteria. M10–M12 can move to v1.1 without blocking the core. |
-| SQL Server through tiberius: no Windows integrated auth on Linux/macOS, gaps around bulk copy | SQL auth and Azure AD first. Test bulk insert early in M4. |
+| SQL Server through tiberius: no Windows integrated auth on Linux/macOS, gaps around bulk copy; no TLS backend we can use (aws-lc / OpenSSL), no INFO messages, no batch row counts, coarse result metadata (M4 evaluation) | SQL auth first (Entra later). oxbase does the TDS TLS itself (rustls + ring). The INFO / count / metadata gaps are accepted for M4; a TDS client of our own or upstream changes replace tiberius behind `MsSqlConnection` later. Bulk insert is tested with M5 import. |
 | Mongo shell compatibility | Support a defined subset (find, aggregate, CRUD, `db.*` helpers) and say so in the docs |
 | Autocomplete quality across dialects | tree-sitter for context plus a catalog-driven engine; measure on real schemas |
 | Webview differences (WebKitGTK on Linux is the weakest) | Run CI smoke tests on each OS's webview; keep the canvas grid off DOM-heavy paths |

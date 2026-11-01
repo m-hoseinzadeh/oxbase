@@ -5,8 +5,15 @@
  * separate state, never an empty string.
  */
 import { type KeyboardEvent, useEffect, useRef } from "react";
-import type { CellInput, InputKind } from "../../api";
-import { formatJson, inputProblem, nowText, placeholderFor } from "./valueInput";
+import type { CellInput, DataType, InputKind } from "../../api";
+import {
+  formatJson,
+  isXmlType,
+  newUuid,
+  nowText,
+  placeholderFor,
+  typedProblem,
+} from "./valueInput";
 
 export interface TypedInputProps {
   kind: InputKind;
@@ -18,6 +25,8 @@ export interface TypedInputProps {
   /** Multi-line editors (JSON, long text) grow; single-line ones stay one row. */
   compact?: boolean | undefined;
   testId?: string | undefined;
+  /** The column's type, for type-specific editors (XML). */
+  dataType?: DataType | undefined;
 }
 
 /** One typed text input (no NULL state). */
@@ -30,6 +39,7 @@ export function TypedInput({
   onKeyDown,
   compact,
   testId,
+  dataType,
 }: TypedInputProps) {
   const common = {
     "aria-label": label,
@@ -73,11 +83,11 @@ export function TypedInput({
       </select>
     );
   }
-  if (kind.type === "json" && !compact) {
+  if ((kind.type === "json" || isXmlType(dataType)) && !compact) {
     return (
       <textarea
         {...common}
-        className="value-input value-input--json"
+        className={`value-input value-input--${kind.type === "json" ? "json" : "xml"}`}
         spellCheck={false}
         rows={Math.min(12, Math.max(3, text.split("\n").length))}
         value={text}
@@ -112,6 +122,8 @@ export interface ValueEditorProps {
   disabled?: boolean | undefined;
   autoFocus?: boolean | undefined;
   onKeyDown?: ((event: KeyboardEvent<HTMLElement>) => void) | undefined;
+  /** The column's type: finer hints (decimal places, binary length, XML) and editors. */
+  dataType?: DataType | undefined;
 }
 
 /** A typed editor for one cell: the value, or NULL / DEFAULT. */
@@ -125,9 +137,10 @@ export function ValueEditor({
   disabled,
   autoFocus,
   onKeyDown,
+  dataType,
 }: ValueEditorProps) {
   const text = value.type === "text" ? value.text : "";
-  const problem = value.type === "text" && text !== "" ? inputProblem(kind, text) : null;
+  const problem = value.type === "text" && text !== "" ? typedProblem(kind, text, dataType) : null;
   const now = nowText(kind);
   const root = useRef<HTMLDivElement>(null);
   // Focus the editor once when it opens (the grid's cell overlay).
@@ -144,6 +157,7 @@ export function ValueEditor({
           label={label}
           disabled={disabled}
           onKeyDown={onKeyDown}
+          dataType={dataType}
           onChange={(t) => onChange({ type: "text", text: t })}
         />
       ) : (
@@ -195,6 +209,17 @@ export function ValueEditor({
             onClick={() => onChange({ type: "text", text: now })}
           >
             Now
+          </button>
+        ) : null}
+        {kind.type === "uuid" && value.type === "text" ? (
+          <button
+            type="button"
+            className="button button--small"
+            disabled={disabled}
+            title="A new random UUID"
+            onClick={() => onChange({ type: "text", text: newUuid() })}
+          >
+            New
           </button>
         ) : null}
         {kind.type === "json" && value.type === "text" ? (

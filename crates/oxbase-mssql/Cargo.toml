@@ -11,6 +11,35 @@ authors.workspace = true
 [lints]
 workspace = true
 
+# M4 (Design step). Every dependency the driver, fetch and ddl streams need is listed here so no
+# stream touches Cargo.lock. A stream that needs another crate adds it with an explicit version
+# and reports it for hoisting (docs/m4-contracts.md §1).
 [dependencies]
+oxbase-types.workspace = true
+oxbase-driver.workspace = true
+oxbase-dialect.workspace = true
+# rustls client configuration (ring) shared by every driver; re-exports `rustls`.
+oxbase-net.workspace = true
+# TDS 7.4 protocol, built without a TLS backend (see the root Cargo.toml).
+tiberius.workspace = true
+# The TLS handshake oxbase runs itself (TDS 7.x inside PRELOGIN packets, TDS 8.0 strict).
+rustls.workspace = true
+tokio-rustls.workspace = true
+# tiberius speaks futures-io; `compat` adapts tokio sockets and TLS streams to it.
+tokio-util = { workspace = true, features = ["compat"] }
+tokio.workspace = true
+futures.workspace = true
+async-trait.workspace = true
+arrow-array.workspace = true
+arrow-schema.workspace = true
+bytes.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
+pretty_assertions.workspace = true
+tokio.workspace = true
+# Live tests read tests/fixtures.toml.
+toml.workspace = true

@@ -467,6 +467,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "asynchronous-codec"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a860072022177f903e59730004fb5dc13db9275b79bb2aef7ba8ce831956c233"
+dependencies = [
+ "bytes",
+ "futures-sink",
+ "futures-util",
+ "memchr",
+ "pin-project-lite",
+]
+
+[[package]]
 name = "atk"
 version = "0.18.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -953,6 +966,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "connection-string"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "510ca239cf13b7f8d16a2b48f263de7b4f8c566f0af58d901031473c76afb1e3"
+
+[[package]]
 name = "const-oid"
 version = "0.9.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1033,6 +1052,12 @@ dependencies = [
  "core-foundation",
  "libc",
 ]
+
+[[package]]
+name = "core_detect"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7f8f80099a98041a3d1622845c271458a2d73e688351bf3cb999266764b81d48"
 
 [[package]]
 name = "cpubits"
@@ -1665,6 +1690,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4ef6b89e5b37196644d8796de5268852ff179b44e96276cf4290264843743bb7"
 
 [[package]]
+name = "encoding_rs"
+version = "0.8.44"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "89253175e704ab869b04f9db224d38630e0211a53841a79181deae0889e169f5"
+dependencies = [
+ "cfg-if",
+ "core_detect",
+ "multiversion_no_op",
+ "rustversion",
+ "scopeguard",
+ "simdutf8",
+]
+
+[[package]]
 name = "endi"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1973,6 +2012,12 @@ name = "futures-task"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cd417de3d1d015fc3bfd2b1ea46dfc7bab72ef86f1cc7cc9c78e728b34a6d1fd"
+
+[[package]]
+name = "futures-timer"
+version = "3.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "af43fadb8a98512d547e37b4e92e0ced13e205c061b87b4623eff01d918d6968"
 
 [[package]]
 name = "futures-util"
@@ -3196,6 +3241,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "multiversion_no_op"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "743fb55ba31b18fb1ecef6bdc9aa2743314978ac084044301a7eee33fb99a20d"
+
+[[package]]
 name = "mysql-common-derive"
 version = "0.32.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3798,6 +3849,28 @@ version = "0.0.1"
 [[package]]
 name = "oxbase-mssql"
 version = "0.0.1"
+dependencies = [
+ "arrow-array",
+ "arrow-schema",
+ "async-trait",
+ "bytes",
+ "chrono",
+ "futures",
+ "oxbase-dialect",
+ "oxbase-driver",
+ "oxbase-net",
+ "oxbase-types",
+ "pretty_assertions",
+ "rustls",
+ "serde_json",
+ "tiberius",
+ "tokio",
+ "tokio-rustls",
+ "tokio-util",
+ "toml 1.1.8+spec-1.1.0",
+ "tracing",
+ "uuid",
+]
 
 [[package]]
 name = "oxbase-mysql"
@@ -3887,6 +3960,7 @@ dependencies = [
  "oxbase-designer",
  "oxbase-dialect",
  "oxbase-driver",
+ "oxbase-mssql",
  "oxbase-mysql",
  "oxbase-net",
  "oxbase-pg",
@@ -4375,6 +4449,12 @@ name = "precomputed-hash"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "925383efa346730478fb4838dbe9137d2a47675ad789c546d150a6e1dd4ab31c"
+
+[[package]]
+name = "pretty-hex"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9a65843dfefbafd3c879c683306959a6de478443ffe9c9adf02f5976432402d7"
 
 [[package]]
 name = "pretty_assertions"
@@ -5051,6 +5131,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "secrecy"
+version = "0.10.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e891af845473308773346dc847b2c23ee78fe442e0472ac50e22a18a93d3ae5a"
+dependencies = [
+ "zeroize",
+]
+
+[[package]]
 name = "secret-service"
 version = "5.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5387,6 +5476,12 @@ name = "simd-adler32"
 version = "0.3.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a219298ac11a56ea9a6d2120044824d6f01aeb034955e7af7bc16858527deea"
+
+[[package]]
+name = "simdutf8"
+version = "0.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 
 [[package]]
 name = "siphasher"
@@ -6106,6 +6201,44 @@ dependencies = [
 ]
 
 [[package]]
+name = "tiberius"
+version = "0.13.0"
+dependencies = [
+ "async-trait",
+ "asynchronous-codec",
+ "byteorder",
+ "bytes",
+ "chrono",
+ "connection-string",
+ "encoding_rs",
+ "enumflags2",
+ "futures-timer",
+ "futures-util",
+ "libc",
+ "num-traits",
+ "once_cell",
+ "pin-project-lite",
+ "pretty-hex",
+ "secrecy",
+ "thiserror 2.0.21",
+ "tiberius-macros",
+ "tracing",
+ "uuid",
+ "zeroize",
+]
+
+[[package]]
+name = "tiberius-macros"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "907fed5ea55695d902cc3359fffa4a35021dfa9b95ab4eb9c8376d42ffb9eec8"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "time"
 version = "0.3.55"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6267,6 +6400,7 @@ checksum = "e464cf451ba96ebfc6f9b6542f17ee8b8956e33f1e40d9690624e59d7a7f8a4b"
 dependencies = [
  "bytes",
  "futures-core",
+ "futures-io",
  "futures-sink",
  "libc",
  "pin-project-lite",
@@ -6420,6 +6554,7 @@ version = "0.1.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "63e71662fa4b2a2c3a26f570f037eb95bb1f85397f3cd8076caed2f026a6d100"
 dependencies = [
+ "log",
  "pin-project-lite",
  "tracing-attributes",
  "tracing-core",

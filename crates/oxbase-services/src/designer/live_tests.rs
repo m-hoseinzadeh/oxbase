@@ -1,5 +1,5 @@
-//! Live tests of the table designer against the Docker fixtures (PostgreSQL, MySQL, MariaDB)
-//! and a SQLite file: create two scratch tables through the designer, then add a column, an
+//! Live tests of the table designer against the Docker fixtures (PostgreSQL, MySQL, MariaDB,
+//! SQL Server since M4) and a SQLite file: create two scratch tables through the designer, then add a column, an
 //! index, a foreign key and a check; the preview text, the apply, and the reloaded design equal
 //! to the edited model (the engine's comparator finds no difference); and the conflict when the
 //! table changed between load and apply.
@@ -209,7 +209,7 @@ async fn designer_steps(live: &Live, parent: &ObjectRef, child: &ObjectRef) {
     let mut late = reloaded.clone();
     late.columns.push(column("late", DataType::INT32, true));
     let q = live.qualified(child);
-    live.sql(&format!("ALTER TABLE {q} ADD COLUMN other_col int"))
+    live.sql(&add_column_sql(live.engine, &q, "other_col int"))
         .await;
     let err = live
         .designer
@@ -241,6 +241,15 @@ async fn designer_steps(live: &Live, parent: &ObjectRef, child: &ObjectRef) {
     );
 }
 
+/// `ALTER TABLE` adding `column` (T-SQL has no `COLUMN` keyword there).
+fn add_column_sql(engine: Engine, qualified: &str, column: &str) -> String {
+    if engine == Engine::MsSql {
+        format!("ALTER TABLE {qualified} ADD {column}")
+    } else {
+        format!("ALTER TABLE {qualified} ADD COLUMN {column}")
+    }
+}
+
 macro_rules! per_engine {
     ($($name:ident => ($key:literal, $engine:expr);)*) => {
         $(
@@ -258,10 +267,11 @@ per_engine! {
     mysql_designer_round_trip => ("mysql", Engine::MySql);
     mariadb_designer_round_trip => ("mariadb", Engine::MariaDb);
     sqlite_designer_round_trip => ("sqlite", Engine::Sqlite);
+    mssql_designer_round_trip => ("mssql", Engine::MsSql);
 }
 
 #[test]
-fn live_engines_are_the_m3_sql_engines() {
+fn live_engines_are_the_m4_sql_engines() {
     let engines: Vec<Engine> = ENGINES.iter().map(|(_, e)| *e).collect();
     assert_eq!(
         engines,
@@ -269,8 +279,13 @@ fn live_engines_are_the_m3_sql_engines() {
             Engine::Postgres,
             Engine::MySql,
             Engine::MariaDb,
-            Engine::Sqlite
+            Engine::Sqlite,
+            Engine::MsSql
         ]
+    );
+    assert_eq!(
+        add_column_sql(Engine::MsSql, "[dbo].[t]", "c int"),
+        "ALTER TABLE [dbo].[t] ADD c int"
     );
 }
 
@@ -524,7 +539,7 @@ async fn generic_steps(live: &Live, table: &ObjectRef, transactional: bool) {
         true,
     ));
     let q = live.qualified(table);
-    live.sql(&format!("ALTER TABLE {q} ADD COLUMN other_col integer"))
+    live.sql(&add_column_sql(live.engine, &q, "other_col integer"))
         .await;
     let err = live
         .designer

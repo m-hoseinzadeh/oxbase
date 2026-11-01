@@ -67,6 +67,9 @@ export function nodeDetail(node: TreeNode): string {
   if (pk?.type === "bool" && pk.value) parts.push("PK");
   const current = summary.extras?.current;
   if (current?.type === "bool" && current.value) parts.push("current");
+  // A database that is not online (SQL Server `state`) is listed; opening it fails.
+  const state = textExtra(summary.extras?.state);
+  if (state && state.toUpperCase() !== "ONLINE") parts.push(state.toLowerCase().replace(/_/g, " "));
   if (summary.row_estimate !== undefined && summary.ref.kind !== "column") {
     parts.push(`~${compactCount(summary.row_estimate)} rows`);
   }

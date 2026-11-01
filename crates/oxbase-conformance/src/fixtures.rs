@@ -86,6 +86,9 @@ pub struct Fixtures {
     /// M3: round-trip scratch names and the editable seed tables (`[m3]` and `[m3.<engine>]`).
     #[serde(default)]
     pub m3: Option<M3Fixture>,
+    /// M4: SQL Server seed names (`[m4]` and `[m4.<engine>]`).
+    #[serde(default)]
+    pub m4: Option<M4Fixture>,
     /// Where the file came from, for error messages. Not part of the TOML.
     #[serde(skip)]
     pub origin: String,
@@ -359,7 +362,91 @@ impl M3Fixture {
     }
 }
 
+/// The `[m4]` table: names of the SQL Server objects of `docs/m4-contracts.md` §5.3 (shape
+/// documented next to the table in `tests/fixtures.toml`), all in `schema`. Every field is
+/// optional and unknown keys are kept in `other` (the `[m4.<engine>]` tables among them), like
+/// [`M3Fixture`].
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct M4Fixture {
+    /// The schema every `[m4]` object lives in.
+    pub schema: Option<String>,
+    pub types_table: Option<String>,
+    pub features_table: Option<String>,
+    pub temporal_table: Option<String>,
+    pub temporal_history: Option<String>,
+    pub indexed_view: Option<String>,
+    /// The unique clustered index of `indexed_view` (listed under the view).
+    pub indexed_view_index: Option<String>,
+    /// The INSTEAD OF trigger of `indexed_view` (listed under the view).
+    pub view_trigger: Option<String>,
+    pub inline_tvf: Option<String>,
+    pub multi_tvf: Option<String>,
+    pub alias_type: Option<String>,
+    pub table_type: Option<String>,
+    pub tvp_procedure: Option<String>,
+    pub messages_procedure: Option<String>,
+    /// A database-level DDL trigger: not a table's trigger, never listed under one.
+    pub ddl_trigger: Option<String>,
+    /// The audit table of the `[m3]` edit table (schema of `[m3.<engine>]`).
+    pub edit_audit_table: Option<String>,
+    /// `[m4.<engine>]` tables and any other key, as written.
+    #[serde(flatten)]
+    pub other: BTreeMap<String, toml::Value>,
+}
+
+/// One `[m4.<engine>]` table: where the engine's M4 objects live.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct M4EngineSeed {
+    /// The engine's M4 init script, relative to the workspace root (applied by the Docker init).
+    pub init_sql: Option<String>,
+    /// The database the `[m4]` schema lives in.
+    pub database: Option<String>,
+    /// The name a `VerifyFull` direct connection checks the certificate against.
+    pub tls_server_name: Option<String>,
+}
+
+impl M4Fixture {
+    /// The `[m4.<name>]` table, if there is one and it parses.
+    pub fn engine(&self, name: &str) -> Option<M4EngineSeed> {
+        match self.other.get(name)? {
+            toml::Value::Table(t) => t.clone().try_into().ok(),
+            _ => None,
+        }
+    }
+
+    /// Every schema-level object `[m4]` names (tables, views, routines, types), without the
+    /// view children and the DDL trigger.
+    pub fn schema_objects(&self) -> Vec<&str> {
+        [
+            &self.types_table,
+            &self.features_table,
+            &self.temporal_table,
+            &self.temporal_history,
+            &self.indexed_view,
+            &self.inline_tvf,
+            &self.multi_tvf,
+            &self.alias_type,
+            &self.table_type,
+            &self.tvp_procedure,
+            &self.messages_procedure,
+        ]
+        .into_iter()
+        .filter_map(Option::as_deref)
+        .collect()
+    }
+}
+
 impl Fixtures {
+    /// The M4 table of the fixture `name` (falling back to the engine kind's name), with the
+    /// shared `[m4]` table.
+    pub fn m4_seed(&self, name: &str, engine: Engine) -> Option<(&M4Fixture, M4EngineSeed)> {
+        let m4 = self.m4.as_ref()?;
+        let seed = m4.engine(name).or_else(|| m4.engine(engine.as_str()))?;
+        Some((m4, seed))
+    }
+
     /// The M3 table of the fixture `name` (falling back to the engine kind's name), with the
     /// shared `[m3]` table.
     pub fn m3_seed(&self, name: &str, engine: Engine) -> Option<(&M3Fixture, M3EngineSeed)> {
@@ -429,6 +516,7 @@ impl Fixtures {
         }
         fixtures.validate_m2()?;
         fixtures.validate_m3()?;
+        fixtures.validate_m4()?;
         Ok(fixtures)
     }
 
@@ -477,6 +565,21 @@ impl Fixtures {
                 && let Err(e) = t.clone().try_into::<M3EngineSeed>()
             {
                 return Err(self.invalid(format!("m3.{name}: {}", e.to_string().trim())));
+            }
+        }
+        Ok(())
+    }
+
+    /// Rejects an `[m4.<name>]` table whose known keys have the wrong type.
+    fn validate_m4(&self) -> Result<(), FixturesError> {
+        let Some(m4) = &self.m4 else {
+            return Ok(());
+        };
+        for (name, value) in &m4.other {
+            if let toml::Value::Table(t) = value
+                && let Err(e) = t.clone().try_into::<M4EngineSeed>()
+            {
+                return Err(self.invalid(format!("m4.{name}: {}", e.to_string().trim())));
             }
         }
         Ok(())
@@ -757,6 +860,82 @@ path = "target/fixtures/t.sqlite"
                 .unwrap_or_else(|| panic!("[m3.{name}]"));
             assert!(seed.database.is_some(), "[m3.{name}] database");
         }
+        // M4: SQL Server has the TLS user, the bastion target and all three seed tables
+        // (m4-contracts §5, §8).
+        assert!(
+            ssh.targets.contains_key("mssql"),
+            "[ssh.targets] lacks mssql"
+        );
+        assert!(
+            fx.engines["mssql"].tls_user.is_some(),
+            "mssql has no tls_user"
+        );
+        // [tls] server_sans and the certificate script's DNS names agree, mssql included.
+        let sans: Vec<&str> = fx.tls.as_ref().unwrap().extra["server_sans"]
+            .as_array()
+            .expect("[tls] server_sans")
+            .iter()
+            .filter_map(toml::Value::as_str)
+            .collect();
+        let certs =
+            std::fs::read_to_string(workspace_root().join("scripts/fixtures-certs.sh")).unwrap();
+        let dns_line = certs
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("server_dns_sans=("))
+            .and_then(|l| l.strip_suffix(')'))
+            .expect("server_dns_sans=(...) in scripts/fixtures-certs.sh");
+        let dns: Vec<&str> = dns_line.split_whitespace().collect();
+        assert!(sans.contains(&"mssql"), "[tls] server_sans: {sans:?}");
+        for san in sans
+            .iter()
+            .filter(|s| s.parse::<std::net::IpAddr>().is_err())
+        {
+            assert!(
+                dns.contains(san),
+                "fixtures-certs.sh lacks DNS SAN {san}: {dns:?}"
+            );
+        }
+        let (_, m2) = fx.m2_seed("mssql", Engine::MsSql).expect("[m2.mssql]");
+        assert!(m2.init_sql.is_some() && m2.schema.is_some(), "[m2.mssql]");
+        assert_eq!(m2.database.as_deref(), Some("oxbase_test"));
+        assert!(m2.other_database.is_some(), "[m2.mssql] other_database");
+        let (_, m3) = fx.m3_seed("mssql", Engine::MsSql).expect("[m3.mssql]");
+        assert_eq!(m3.schema.as_deref(), Some("m3"));
+        let (m4, seed) = fx.m4_seed("mssql", Engine::MsSql).expect("[m4.mssql]");
+        assert_eq!(seed.database.as_deref(), Some("oxbase_test"));
+        assert_eq!(seed.tls_server_name.as_deref(), Some("localhost"));
+        assert_eq!(m4.schema.as_deref(), Some("m4"));
+        assert_eq!(m4.schema_objects().len(), 11, "{:?}", m4.schema_objects());
+        for (what, v) in [
+            ("indexed_view_index", &m4.indexed_view_index),
+            ("view_trigger", &m4.view_trigger),
+            ("ddl_trigger", &m4.ddl_trigger),
+            ("edit_audit_table", &m4.edit_audit_table),
+        ] {
+            assert!(v.is_some(), "[m4] {what}");
+        }
+        // Every init script the fixtures name exists, and the SQL Server ones are ASCII (sqlcmd
+        // reads them in the container's code page).
+        let mut scripts: Vec<String> = Vec::new();
+        for e in &engines {
+            if let Some((_, s)) = fx.m2_seed(&e.name, e.engine) {
+                scripts.extend(s.init_sql.clone());
+            }
+            if let Some((_, s)) = fx.m3_seed(&e.name, e.engine) {
+                scripts.extend(s.init_sql);
+            }
+            if let Some((_, s)) = fx.m4_seed(&e.name, e.engine) {
+                scripts.extend(s.init_sql);
+            }
+        }
+        assert!(scripts.len() >= 11, "{scripts:?}");
+        for script in &scripts {
+            let text = std::fs::read_to_string(in_workspace(script))
+                .unwrap_or_else(|e| panic!("{script}: {e}"));
+            if script.contains("/mssql/") {
+                assert!(text.is_ascii(), "{script} is not ASCII");
+            }
+        }
         let dbg = format!("{ssh:?} {:?}", fx.engines["postgres"]);
         assert!(!dbg.contains(&ssh.password), "{dbg}");
         for e in &engines {
@@ -800,6 +979,24 @@ also_future = 1
         assert!(fx.m3_seed("lite", Engine::Postgres).is_none());
         // No [m3] at all is fine.
         assert!(Fixtures::parse(SAMPLE, "s").unwrap().m3.is_none());
+    }
+
+    #[test]
+    fn m4_table_parses_and_rejects_bad_types() {
+        let text = format!(
+            "{M3}[m4]\nschema = \"m4\"\nalias_type = \"t\"\nfuture = 1\n[m4.sqlite]\n\
+             init_sql = \"x.sql\"\ndatabase = \"m4db\"\n"
+        );
+        let fx = Fixtures::parse(&text, "m4").unwrap();
+        let (m4, seed) = fx.m4_seed("lite", Engine::Sqlite).unwrap();
+        assert_eq!(m4.schema.as_deref(), Some("m4"));
+        assert_eq!(m4.schema_objects(), ["t"]);
+        assert_eq!(seed.database.as_deref(), Some("m4db"));
+        assert!(fx.m4_seed("lite", Engine::MsSql).is_none());
+        assert!(Fixtures::parse(M3, "m3").unwrap().m4.is_none());
+        let bad = text.replace("database = \"m4db\"", "database = 3");
+        let err = Fixtures::parse(&bad, "m4").unwrap_err().to_string();
+        assert!(err.contains("m4.sqlite"), "{err}");
     }
 
     #[test]
