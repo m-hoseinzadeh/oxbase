@@ -73,11 +73,12 @@ pub fn open(
 }
 
 /// The XLSX writer over `file` (see [`crate::create_writer`]).
+// The signature is the contract (docs/m5-contracts.md §3.5); the writer only reads the schema.
+#[allow(clippy::needless_pass_by_value)]
 pub fn writer(
     file: SinkFile,
     schema: SchemaRef,
     options: &XlsxWriteOptions,
 ) -> Result<Box<dyn SinkWriter>> {
-    let _ = (file, schema, options);
-    unimplemented!("m5: write")
+    crate::write::xlsx::writer(file, &schema, options)
 }

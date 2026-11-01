@@ -42,5 +42,14 @@ zip = { version = "9.2.1", default-features = false, features = ["deflate"] }
 [dev-dependencies]
 pretty_assertions.workspace = true
 tokio.workspace = true
+# Writer tests (tests/write_*.rs): SQL dumps through each engine's real dialect cells, and the
+# SQLite dump executed on an in-memory database.
+oxbase-pg.workspace = true
+oxbase-mysql.workspace = true
+oxbase-sqlite.workspace = true
+oxbase-mssql.workspace = true
+rusqlite.workspace = true
+# tests/write_sql_live.rs (ignored; Docker fixtures): the dumps run statement by statement.
+oxbase-sql.workspace = true
 # read stream: the sample-file expectations in tests/fixtures.toml [m5.files].
 toml.workspace = true
