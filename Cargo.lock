@@ -3960,6 +3960,7 @@ dependencies = [
  "oxbase-designer",
  "oxbase-dialect",
  "oxbase-driver",
+ "oxbase-mssql",
  "oxbase-mysql",
  "oxbase-net",
  "oxbase-pg",

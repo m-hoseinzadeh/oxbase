@@ -51,7 +51,10 @@ On PostgreSQL, MySQL, MariaDB and SQLite (M1 connections: plain, TLS, SSH, keych
   keys switched off only for the copy. Apply refuses when the table changed on the server since
   it was loaded. What each engine and version supports comes from its capabilities.
 
-Contracts: [docs/m3-contracts.md](docs/m3-contracts.md). SQL Server follows in M4.
+Contracts: [docs/m3-contracts.md](docs/m3-contracts.md). SQL Server follows in M4, in progress:
+the contracts are in [docs/m4-contracts.md](docs/m4-contracts.md) (driver on `tiberius` with
+oxbase's own rustls TLS, the SQL Server tree, designer and grid writer, fixtures); until its
+streams land, SQL Server is "pending (M4)" in the conformance matrix.
 
 ## Layout
 
@@ -163,6 +166,11 @@ creates (`m2_parent`, `m2_child`, `m2_view`, `m2_fn`, `m2_proc`, `m2_trg`, `m2_s
 `m2_mview` in schema `m2` and a second database `oxbase_m2_other`), so the fetcher and tree tests
 agree on names. SQLite has no container: its tests apply `tests/docker/init/sqlite/01-m2.sql`
 to a temporary file.
+
+M3 and M4 seeds: `[m3]` names the round-trip scratch tables and the editable seed tables;
+`[m2.mssql]`, `[m3.mssql]` and `[m4]` (M4) name the SQL Server seeds (schemas `m2`, `m3`, `m4` of
+`oxbase_test`, applied by the container's entrypoint wrapper), the TLS-only login `oxbase_tls`
+(enforced by a logon trigger) and the SSH target `mssql:1433`; see `docs/m4-contracts.md` §5.
 
 The scripts only touch the `oxbase-fixtures` project. `OXBASE_FIXTURES_TIMEOUT` (default 300 s) sets
 how long `fixtures-up.sh` waits. CI uses `scripts/ci-fixtures.sh up|logs|down` on the same
