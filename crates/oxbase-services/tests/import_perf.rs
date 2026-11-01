@@ -219,9 +219,12 @@ fn install_panic_log() {
     ONCE.call_once(|| {
         let default = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
-            let message = info
-                .payload_as_str()
-                .map_or_else(|| "(non-text panic payload)".to_owned(), str::to_owned);
+            let payload = info.payload();
+            let message = payload
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_owned())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "(non-text panic payload)".to_owned());
             PANICS
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -545,6 +548,36 @@ impl Live {
         out
     }
 
+    /// Runs this engine's checksum query over a two-row derived table (no DDL), so the query
+    /// text, the result types and the note-length rule are checked before any import: ids 1
+    /// and 2, qty -3 and NULL, amounts 1.25 and -0.75, notes `a🚀` (2 code points, 3 UTF-16
+    /// units) and NULL.
+    async fn checksum_self_test(&self, cfg: &PerfConfig) {
+        let template = cfg
+            .checksum
+            .get(&self.key)
+            .and_then(toml::Value::as_str)
+            .unwrap_or_else(|| panic!("[m5.perf.checksum] has no query for {}", self.key));
+        let note = self
+            .dialects
+            .quoting(self.engine)
+            .unwrap_or_else(|e| panic!("{}: no Quoting: {e}", self.key))
+            .literal(&Value::Text("a\u{1F680}".to_owned()));
+        let derived = format!(
+            "(SELECT 1 AS id, -3 AS qty, 1.25 AS amount, {note} AS note \
+             UNION ALL SELECT 2, NULL, -0.75, NULL) t"
+        );
+        let row = self.query_row(&template.replace("{table}", &derived)).await;
+        let got: Vec<i128> = row.iter().map(as_i128).collect();
+        let lengths: i128 = if self.key == "mssql" { 3 } else { 2 };
+        let want: [i128; 6] = [2, 3, -3, 1, lengths, 50];
+        assert_eq!(
+            got, want,
+            "{}: checksum query over a derived table ({row:?})",
+            self.key
+        );
+    }
+
     async fn close(self) {
         let _ = self.manager.close(self.session.id()).await;
     }
@@ -658,8 +691,8 @@ async fn run_import(
     let mut cancelled_at: Option<(Instant, f64)> = None;
     loop {
         let event = match tokio::time::timeout(STALL, events.recv()).await {
-            Err(_) => panic!(
-                "{what}: no import event for {} s (last progress: {:?})",
+            Err(elapsed) => panic!(
+                "{what}: no import event for {} s ({elapsed}; last progress: {:?})",
                 STALL.as_secs(),
                 progress.last()
             ),
@@ -936,6 +969,8 @@ async fn run_engine(
             "not registered (InsertLoader fallback)"
         }
     );
+    live.checksum_self_test(cfg).await;
+    println!("M5 perf [{key}]: checksum query self-test ok");
     if let Some(Pending(reason)) = reader_pending {
         result.pending = Some(reason.clone());
         live.close().await;
@@ -1305,14 +1340,13 @@ async fn import_1gb_csv() {
 
     let summary = summary_table(&cfg, &files.full_gen, gen_secs, &results);
     println!("\n{summary}");
-    if let Some(path) = env_nonempty("GITHUB_STEP_SUMMARY") {
-        if let Ok(mut f) = std::fs::OpenOptions::new()
+    if let Some(path) = env_nonempty("GITHUB_STEP_SUMMARY")
+        && let Ok(mut f) = std::fs::OpenOptions::new()
             .append(true)
             .create(true)
             .open(path)
-        {
-            let _ = writeln!(f, "{summary}");
-        }
+    {
+        let _ = writeln!(f, "{summary}");
     }
     if !env_flag("OXBASE_PERF_KEEP_CSV") {
         for path in [&files.full, &files.probe, &files.header] {
@@ -1450,7 +1484,10 @@ fn generator_output_parses_back_to_its_checksum() {
             "row {i} price {}",
             record[4]
         );
-        assert_eq!(record[5], if i % 3 == 0 { "true" } else { "false" });
+        assert_eq!(
+            record[5],
+            if i.is_multiple_of(3) { "true" } else { "false" }
+        );
         let born = chrono::NaiveDate::parse_from_str(&record[6], "%Y-%m-%d").unwrap();
         assert_eq!(born, expected.born, "row {i} born");
         let at =

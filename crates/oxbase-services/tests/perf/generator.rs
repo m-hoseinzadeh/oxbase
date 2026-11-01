@@ -105,23 +105,24 @@ const CODE_MODULUS: u64 = 36u64.pow(8);
 
 /// The values of row `i` (1-based).
 pub fn row(i: u64) -> Row {
-    let qty = (i % 17 != 0).then(|| i64::try_from((i * 31) % 10_007).expect("below 10007") - 5_000);
+    let qty = (!i.is_multiple_of(17))
+        .then(|| i64::try_from((i * 31) % 10_007).expect("below 10007") - 5_000);
     let cents = i64::try_from((i * 7_907) % 10_000_000).expect("below 10^7");
-    let amount_cents = if i % 11 == 0 { -cents } else { cents };
+    let amount_cents = if i.is_multiple_of(11) { -cents } else { cents };
     let price = f64::from(u32::try_from(i % 1_000).expect("below 1000")) / 7.0;
     let days = i64::try_from((i * 37) % 20_000).expect("below 20000");
     let born = epoch_date() + TimeDelta::days(days);
     let seconds = i64::try_from(i * 7).expect("fits");
     let micros = i64::try_from(i % 1_000_000).expect("below 10^6");
     let at = at_base() + TimeDelta::seconds(seconds) + TimeDelta::microseconds(micros);
-    let note = (i % 13 != 0).then(|| format!("{} #{i}", NOTE_FRAGMENTS[usize_of(i % 8)]));
+    let note = (!i.is_multiple_of(13)).then(|| format!("{} #{i}", NOTE_FRAGMENTS[usize_of(i % 8)]));
     Row {
         id: i,
         code: code(i),
         qty,
         amount_cents,
         price,
-        active: i % 3 == 0,
+        active: i.is_multiple_of(3),
         born,
         at,
         note,
