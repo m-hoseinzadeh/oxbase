@@ -13,8 +13,9 @@
 //! - **One call per batch.** [`BulkLoader::load`] inserts every row of one batch, or fails. The
 //!   service re-chunks the source stream to about [`BulkLimits::rows_per_call`] rows per call
 //!   and always calls inside a transaction it opened ([`LoadSession::tx`]), so a failed call
-//!   rolls back with the transaction (on transactional storage). A loader never commits, never
-//!   begins a transaction and never changes session settings that outlive the call.
+//!   rolls back with the transaction (on transactional storage). A loader never commits and never
+//!   begins a transaction; session settings it needs go in [`BulkLoader::prepare`] (undone in
+//!   [`BulkLoader::finish`]), which the service calls once on its dedicated import session.
 //! - **Names and values.** Identifiers go through the engine's [`Quoting`]; values are bound
 //!   parameters or travel through the engine's bulk protocol (PostgreSQL `COPY ... FROM STDIN`,
 //!   SQL Server TDS bulk load). Never SQL literals.
@@ -329,6 +330,35 @@ pub trait BulkLoader: Send + Sync {
 
     /// The batch-size rules on server version `version`.
     fn limits(&self, version: &ServerVersion) -> BulkLimits;
+
+    /// Called once by the import service on its dedicated session before the first
+    /// [`BulkLoader::load`], outside any transaction. For session settings the loads need
+    /// (MySQL `SET time_zone = '+00:00'` so `TIMESTAMP` columns take UTC instants; SQL Server
+    /// `SET IDENTITY_INSERT <table> ON` when an identity column is loaded). The session is
+    /// closed after the import, so nothing here outlives it. Default: nothing.
+    async fn prepare(
+        &self,
+        session: LoadSession<'_>,
+        target: &LoadTarget<'_>,
+        cancel: CancellationToken,
+    ) -> Result<()> {
+        let _ = (session, target, cancel);
+        Ok(())
+    }
+
+    /// Called once after the last [`BulkLoader::load`] (also after a failure or a cancel, best
+    /// effort, errors ignored there), outside any transaction, to undo [`BulkLoader::prepare`]
+    /// where that matters (SQL Server allows `IDENTITY_INSERT` on one table per session).
+    /// Default: nothing.
+    async fn finish(
+        &self,
+        session: LoadSession<'_>,
+        target: &LoadTarget<'_>,
+        cancel: CancellationToken,
+    ) -> Result<()> {
+        let _ = (session, target, cancel);
+        Ok(())
+    }
 
     /// Inserts every row of `batch` (in the load schema of `target`) into `target.table` on
     /// `session` and returns the number of rows sent. Fails as a whole; the caller rolls the

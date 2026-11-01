@@ -69,6 +69,14 @@ keychain secrets; SQL Server since M4):
 Contracts: [docs/m3-contracts.md](docs/m3-contracts.md) and
 [docs/m4-contracts.md](docs/m4-contracts.md) (SQL Server).
 
+**In progress (M5): import and export.** CSV / TSV, JSON, XLSX, Parquet and SQL dump files, a
+wizard with mapping and preview, fast per-engine bulk loading (PostgreSQL `COPY`, multi-row
+inserts, SQL Server bulk load) and export of any table, query or result. Files are chosen in
+native dialogs shown by the Rust side; the UI only ever holds opaque file handles. The contracts
+are frozen in [docs/m5-contracts.md](docs/m5-contracts.md); the crate `oxbase-io` and the
+import / export services are being filled in by the M5 workstreams, so none of this is in the
+app yet.
+
 ## Layout
 
 ```
@@ -88,10 +96,12 @@ crates/
   oxbase-conformance                              cross-engine conformance harness
   app-tauri                                       Tauri 2 shell (no logic)
 ui/                                               React + TS + Vite front end
-tests/fixtures.toml                               test DB connection params and M2-M4 seed object
-                                                  names (single source of truth)
+tests/fixtures.toml                               test DB connection params, M2-M4 seed object
+                                                  names and the M5 import / export expectations
+                                                  (single source of truth)
+tests/data/m5/                                    small hand-written import samples (M5)
 docs/                                             frozen contracts per milestone (m1-contracts.md
-                                                  to m4-contracts.md)
+                                                  to m5-contracts.md)
 ```
 
 ## Prerequisites
@@ -186,6 +196,12 @@ M3 and M4 seeds: `[m3]` names the round-trip scratch tables and the editable see
 `[m2.mssql]`, `[m3.mssql]` and `[m4]` (M4) name the SQL Server seeds (schemas `m2`, `m3`, `m4` of
 `oxbase_test`, applied by the container's entrypoint wrapper), the TLS-only login `oxbase_tls`
 (enforced by a logon trigger) and the SSH target `mssql:1433`; see `docs/m4-contracts.md` §5.
+
+M5 adds no seed objects: import and export tests create and drop scratch tables
+`m5_t_<case>_<token>` (`[m5]`). `[m5.files."<name>"]` lists what each sample in `tests/data/m5`
+must read as (rows, columns, types, values, issues, encodings); XLSX and Parquet samples are
+built at runtime. `[m5.perf]` and `[m5.perf.checksum]` define the 1 GB import exit check, whose
+CSV is generated on the CI runner and never committed (`docs/m5-contracts.md` §8-9).
 
 The scripts only touch the `oxbase-fixtures` project. `OXBASE_FIXTURES_TIMEOUT` (default 300 s) sets
 how long `fixtures-up.sh` waits. CI uses `scripts/ci-fixtures.sh up|logs|down` on the same
@@ -441,7 +457,9 @@ value after a reload.
   (`scripts/keychain-tests.sh`) on Linux, macOS and Windows; UI lint, typecheck, test and build;
   the conformance harness and the M1-M4 live tests against the Docker fixtures; the webview
   smoke test (Linux; also on the fast lane of `wip/*-e2e`, `wip/*-app` and `wip/*-integrate`);
-  `cargo deny` (advisories, bans, licenses, sources).
+  `cargo deny` (advisories, bans, licenses, sources). M5 adds an `import-perf` job (the 1 GB
+  CSV import exit check, `docs/m5-contracts.md` §9): full lane, plus the fast lane of
+  `wip/*-perf` and `wip/*-integrate`.
 - `.github/workflows/bundle.yml` (push to main, manual): Tauri dev bundles for Linux x86_64,
   Windows x86_64 and macOS aarch64/x86_64, uploaded as workflow artifacts.
   `scripts/ci-verify-signing.mjs` checks what was produced: `codesign --verify --deep --strict`,

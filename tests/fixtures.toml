@@ -429,3 +429,238 @@ init_sql = "tests/docker/init/mssql/06-m4.sql"
 database = "oxbase_test"
 # The fixture CA's VerifyFull name for direct connections (the SSH target uses "mssql").
 tls_server_name = "localhost"
+
+# --- M5: import / export -------------------------------------------------------------------
+# Contract: docs/m5-contracts.md §8-9. No new seed objects and no init scripts: every import or
+# export test creates its own tables and drops them.
+#
+# Scratch tables: "<scratch_prefix><case>_<token>" (token as in [m3]: 10 lowercase base36
+# characters from unix seconds and process id), created in [m5.<engine>] database / schema,
+# dropped in a guard that also runs on failure or panic; at start every "<scratch_prefix>*"
+# table older than `stale_after_secs` is dropped (left by a killed run). Names are quoted with
+# the engine's Quoting, never interpolated raw.
+#
+# Sample files: tests/data/m5 (small, hand-written, committed byte for byte; .gitattributes
+# turns line-end conversion off). XLSX and Parquet samples are NOT committed: tests build them
+# at runtime into a temp dir (rust_xlsxwriter / parquet ArrowWriter, before the M5 writers
+# exist), as listed under [m5.generated].
+[m5]
+data_dir = "tests/data/m5"
+scratch_prefix = "m5_t_"
+stale_after_secs = 3600
+# Rows every engine's import / export round trip uses (generated in the test, deterministic).
+roundtrip_rows = 10000
+
+[m5.postgres]
+database = "oxbase_test"
+schema = "public"
+
+[m5.mysql]
+database = "oxbase_test"
+
+[m5.mariadb]
+database = "oxbase_test"
+
+[m5.mssql]
+database = "oxbase_test"
+schema = "dbo"
+
+[m5.sqlite]
+# A fresh temp database file per test (like [m2.sqlite]).
+database = "main"
+
+# Expected reading of each committed sample (read stream tests; names relative to data_dir).
+# rows = data rows; columns = column count; issues = row issues with default options
+# (allow_ragged = true); encoding = what Auto resolves to; bom = a BOM was removed.
+[m5.files."basic.csv"]
+rows = 5
+columns = 7
+# id int, name text, amount decimal(9,2), born date (row 4 NULL), at timestamp (ISO with
+# space or T, 6 fraction digits), active bool, note text. Row 3 holds a quoted LF and a
+# quoted CRLF; row 4 is UTF-8 with an emoji; row 5 starts with "=" and "@" (formula guard on
+# export).
+types = ["int", "text", "decimal", "date", "timestamp", "bool", "text"]
+encoding = "utf8"
+bom = false
+
+[m5.files."crlf.csv"]
+# basic.csv with CRLF row ends; quoted line breaks inside fields kept as they are.
+rows = 5
+columns = 7
+
+[m5.files."bom_utf8.csv"]
+rows = 2
+columns = 2
+encoding = "utf8"
+bom = true
+values = ["é", "€"]
+
+[m5.files."utf16le_bom.csv"]
+rows = 2
+columns = 2
+encoding = "utf16le"
+bom = true
+values = ["é", "日本"]
+
+[m5.files."utf16be_bom.csv"]
+rows = 2
+columns = 2
+encoding = "utf16be"
+bom = true
+values = ["é", "日本"]
+
+[m5.files."windows1252.csv"]
+# No BOM, not UTF-8: Auto resolves to windows1252.
+rows = 2
+columns = 2
+encoding = "windows1252"
+values = ["café", "€5"]
+
+[m5.files."latin1.csv"]
+# Read with encoding = "latin1": 0x80 is U+0080 (with windows1252 it would be "€").
+rows = 2
+columns = 2
+values = ["café", "\u0080"]
+
+[m5.files."empty.csv"]
+rows = 0
+columns = 0
+# The preview warns "the file is empty"; open() refuses (no columns).
+
+[m5.files."header_only.csv"]
+rows = 0
+columns = 3
+types = ["text", "text", "text"]
+
+[m5.files."ragged.csv"]
+# Row 2 has 2 fields (padded with NULL, no issue with allow_ragged); row 3 has 4 fields (one
+# issue: extra field); with allow_ragged = false both are issues.
+rows = 4
+columns = 3
+issues = 1
+
+[m5.files."duplicate_headers.csv"]
+columns = 4
+names = ["id", "column_2", "name", "name_2"]
+
+[m5.files."no_header.csv"]
+# header = false
+rows = 2
+columns = 3
+names = ["column_1", "column_2", "column_3"]
+types = ["int", "text", "decimal"]
+
+[m5.files."semicolon_decimal_comma.csv"]
+# delimiter ";", decimal_separator ",", thousands_separator "."
+rows = 2
+columns = 3
+types = ["int", "decimal", "decimal"]
+values = ["1234.56", "-7.25"]
+
+[m5.files."null_tokens.csv"]
+# null_tokens = ["", "\\N", "NULL"]: rows 1-3 NULL, row 4 "x".
+rows = 4
+columns = 2
+nulls = 3
+
+[m5.files."basic.tsv"]
+# CsvReadOptions::tsv(); row 1 has a quoted tab.
+rows = 2
+columns = 3
+
+[m5.files."wide.csv"]
+rows = 3
+columns = 300
+
+[m5.files."long_field.csv"]
+# One 100 000-character field (under the 64 MiB field cap).
+rows = 2
+columns = 2
+
+[m5.files."unterminated_quote.csv"]
+# A quote that never closes: the field runs to the end of the file; read as one row whose
+# field holds the rest of the file (rows = 1) with a warning, never a hang or an unbounded
+# buffer.
+rows = 1
+columns = 2
+
+[m5.files."array.json"]
+# Keys in first-seen order over the sample: id, name, amount, big, flag, tags, meta, born,
+# extra_late. tags / meta are json (compact text); big 9007199254740993 must survive exactly
+# (int64, not a double); amount is float (1e3 is an exponent form).
+rows = 3
+columns = 9
+types = ["int", "text", "float", "int", "bool", "json", "json", "date", "text"]
+
+[m5.files."lines.ndjson"]
+# Blank line skipped; nested values json.
+rows = 3
+columns = 3
+
+[m5.files."empty_array.json"]
+rows = 0
+columns = 0
+
+[m5.files."not_objects.json"]
+# Elements 1 and 2 are not objects: two row issues; one row with id 3.
+rows = 3
+columns = 1
+issues = 2
+
+[m5.files."utf16le_bom.json"]
+rows = 1
+columns = 2
+encoding = "utf16le"
+
+[m5.files."truncated.json"]
+# Malformed file (not a malformed value): open/next_batch fails with InvalidInput naming the
+# position after row 1.
+error = "invalid_input"
+
+# Built at runtime (never committed). Each test writes its sample into a temp dir first.
+[m5.generated]
+# Sheets "Data" (header row 1) and "Second"; cells: integers, 1.5, booleans, a date cell
+# (2001-02-03, number format yyyy-mm-dd), a date-time cell, a formula =1+2 with cached value 3
+# (read as 3, never evaluated), an error cell #DIV/0! (row issue), a string "=HYPERLINK(...)"
+# written with write_string (read back as text), an empty row in the middle (NULLs).
+xlsx = "types.xlsx"
+# Columns: id int64, price decimal128(12,2), at timestamp(us, "UTC"), day date32,
+# tags list<utf8>, payload binary, note utf8 (with NULLs); 3 row groups of 1000 rows; snappy.
+parquet = "types.parquet"
+
+# The 1 GB import exit check (docs/m5-contracts.md §9). The CSV is generated on the CI
+# runner into $OXBASE_PERF_DIR (never committed, deleted at the end) by the deterministic
+# generator specified there; the test fails when the file is smaller than min_bytes.
+[m5.perf]
+rows = 10000000
+min_bytes = 1000000000
+# Mandatory engines; the job may add "sqlite" (a file under $OXBASE_PERF_DIR).
+engines = ["postgres", "mysql"]
+table = "m5_perf"
+cancel_table = "m5_perf_cancel"
+# The full import: TransactionPolicy::Batches { rows = commit_rows }.
+commit_rows = 100000
+# Progress: consecutive Progress events at most progress_max_gap_ms apart, or no more than
+# progress_max_gap_fraction of the file's bytes apart; bytes and rows never go down; the last
+# event before Finished reports every byte.
+progress_max_gap_ms = 1500
+progress_max_gap_fraction = 0.01
+# RSS (Linux /proc/self/status VmRSS) may grow at most this much over its value right
+# before the import starts.
+rss_growth_limit_mb = 512
+# Cancel run: Batches of commit_rows into cancel_table; cancel once bytes_read passes this
+# fraction; the terminal Cancelled event must arrive within cancel_deadline_ms; afterwards the
+# table holds exactly report.rows_committed rows (> 0).
+cancel_after_fraction = 0.25
+cancel_deadline_ms = 2000
+
+# Checksum queries per engine; {table} is the qualified, quoted table name. Each returns one
+# row: count, sum(id), sum(qty), count(note), sum of note lengths, sum of amount in cents. The
+# generator computes the same six numbers; note length is in Unicode code points except on SQL
+# Server, where it is in UTF-16 code units (DATALENGTH of nvarchar / 2).
+[m5.perf.checksum]
+postgres = "SELECT count(*), sum(id), sum(qty), count(note), sum(char_length(note)), sum((amount * 100)::bigint) FROM {table}"
+mysql = "SELECT COUNT(*), SUM(id), SUM(qty), COUNT(note), SUM(CHAR_LENGTH(note)), SUM(CAST(amount * 100 AS SIGNED)) FROM {table}"
+mariadb = "SELECT COUNT(*), SUM(id), SUM(qty), COUNT(note), SUM(CHAR_LENGTH(note)), SUM(CAST(amount * 100 AS SIGNED)) FROM {table}"
+sqlite = "SELECT count(*), sum(id), sum(qty), count(note), sum(length(note)), sum(CAST(round(amount * 100) AS INTEGER)) FROM {table}"
+mssql = "SELECT COUNT_BIG(*), SUM(CAST(id AS bigint)), SUM(CAST(qty AS bigint)), COUNT_BIG(note), SUM(CAST(DATALENGTH(note) / 2 AS bigint)), SUM(CAST(amount * 100 AS bigint)) FROM {table}"

@@ -1,0 +1,5 @@
+[
+  {"id": 1, "name": "plain", "amount": 12.5, "big": 9007199254740993, "flag": true, "tags": ["a", "b"], "meta": {"k": "v", "n": [1, 2]}, "born": "2001-02-03"},
+  {"id": 2, "name": "quote \" and \\ backslash", "amount": -0.75, "big": null, "flag": false, "tags": [], "meta": null, "born": null},
+  {"id": 3, "name": "naïve 日本語 🚀", "amount": 1e3, "flag": null, "extra_late": "only here"}
+]

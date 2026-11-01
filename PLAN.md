@@ -29,7 +29,7 @@ Status: draft, 2026-10-31. Oxbase is a clean-room implementation: it reuses no c
 │ features    → designer, diff/sync, transfer, model,   │
 │               bi, ai, import/export                   │
 │ dialects    → per-DB Fetcher / DdlGen / Comparator /  │
-│               Capabilities / DmlWriter                │
+│               Capabilities / DmlWriter / BulkLoader   │
 │ drivers     → pg · mysql · sqlite · mssql · mongo ·   │
 │               redis, behind one async trait           │
 │ infra       → ssh/tls tunnels, secrets, storage, log  │
@@ -328,6 +328,32 @@ manual runs 41298470889 and 41298472236. Where the build differs from the text a
   `sys.dm_exec_connections` and runs `sqlservr` as root inside the container.
 - The webview smoke test stays on PostgreSQL; the SQL Server UI (connection dialog, designer
   types and options, PRINT note) is covered by Vitest only.
+
+**M5 contracts (Design step, 2026-11-01).** `docs/m5-contracts.md` fixes the import / export
+contracts. `oxbase-io` reads and writes files only, synchronously behind async adapters with
+bounded queues: CSV / TSV (`csv` + `encoding_rs`: UTF-8, UTF-16, Windows-1252, true Latin-1,
+BOMs), JSON (array streamed element by element, NDJSON; nested values as JSON text), XLSX
+(`calamine` streaming cell reader; `rust_xlsxwriter` in constant-memory mode with sheet
+splitting at 1 048 576 rows and formula-injection protection), Parquet (`parquet` 60, the
+workspace's arrow major; Snappy, gzip, Brotli, LZ4 and zstd) and SQL dumps (export only: the
+target engine's `DdlGenerator` and `Quoting` literals). Readers infer types over a sample and
+produce batches in one canonical Arrow type per logical type; unreadable cells are NULL plus a
+row issue. Writers write a temporary file in the destination directory and rename it on
+success. A new per-engine role `BulkLoader` (`oxbase_dialect::bulk`, outside the conformance
+matrix) loads those batches: PostgreSQL `COPY FROM STDIN` through tokio-postgres (reached with
+the new `Connection::as_any`), MySQL / MariaDB multi-row parameterized inserts (no `LOAD DATA
+LOCAL INFILE`: off by default on the server and it lets the server pick client files), SQLite
+prepared inserts, SQL Server TDS bulk load; batch sizes follow each engine's parameter limit
+(65 535, 65 535, 32 766, 2 100); a generic multi-row `INSERT` loader is the fallback for every
+engine. `oxbase-services` gains `ImportService` (preview, plan, run on a dedicated child session
+with target modes create / append / truncate / delete-all / replace, error and transaction
+policies, a per-engine table of what a cancel leaves behind, cancel within 2 s) and
+`ExportService` (a table with filter and sort, one query, or every stored row of a result,
+spilled ones included). The webview never sends file paths: `file_pick_open` / `file_pick_save`
+show native dialogs from Rust and return opaque handles that the import and export commands
+take. The exit check is a CI job `import-perf` that generates a 1 GB CSV on the runner and
+imports it into PostgreSQL and MySQL with checksum, progress, memory and cancel assertions. Six
+streams (read, write, load, services, app, perf) fill the skeletons.
 
 Order of work: M0–M3 prove the architecture. M4 and M7 are where the per-database matrix gets tested for real. M8 and M10 reuse the Comparator and DdlGenerator cells and get much cheaper if M3 is done right.
 

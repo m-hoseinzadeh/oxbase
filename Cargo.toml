@@ -248,3 +248,10 @@ codegen-units = 16
 # exactly or the own TDS decoder (docs/m4-contracts.md §11) replaces tiberius.
 [patch.crates-io]
 tiberius = { path = "vendor/tiberius" }
+
+# M5: the 1 GB import exit check (docs/m5-contracts.md §9) runs optimized, without the slow
+# fat LTO link: `cargo test -p oxbase-services --profile perf --test import_perf`.
+[profile.perf]
+inherits = "release"
+lto = false
+codegen-units = 16
