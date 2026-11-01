@@ -731,7 +731,7 @@ fn pseudo_relations_answer_their_qualifier_only() {
             "INSERT INTO t (a, b) VALUES (1, 2) ON CONFLICT (a) DO UPDATE SET b = ‸",
         );
         assert_eq!(scope(&ctx), ["t"], "{engine:?}");
-        assert!(ctx.outline.queries[0].relations.len() == 1);
+        assert_eq!(ctx.outline.queries[0].relations.len(), 1);
     }
     for engine in MY {
         let ctx = at(

@@ -679,7 +679,7 @@ fn visible_helpers_follow_isolation_and_cte_owners() {
             .collect();
         assert_eq!(ctes, ["c"], "{engine:?}");
         assert_eq!(o.queries[branch].cte_parent, Some(0));
-        assert!(o.visible_relations(branch).len() == 1, "{engine:?}");
+        assert_eq!(o.visible_relations(branch).len(), 1, "{engine:?}");
 
         // A derived table does not see the relations next to it.
         let o = parse(
