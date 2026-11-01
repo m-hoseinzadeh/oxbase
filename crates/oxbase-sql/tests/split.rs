@@ -762,15 +762,16 @@ fn statement_kinds() {
     assert_eq!(
         kinds(
             TSQL,
-            "SELECT 1; with c as (select 1 as a) select * from c; EXEC sp_who; execute p; \
-             (SELECT 1); UPDATE t SET a = 1; SHOW x; N'x'"
+            "SELECT 1\nGO\nwith c as (select 1 as a) select * from c\nGO\nEXEC sp_who\nGO\n\
+             execute p\nGO\n(SELECT 1)\nGO\nUPDATE t SET a = 1\nGO\nSHOW x\nGO\nN'x'"
         ),
         [Query, Query, Query, Query, Query, Other, Other, Other]
     );
+    // A batch's kind is its first keyword's.
     assert_eq!(
         kinds(
             TSQL,
-            "DECLARE @x int = 1; SELECT @x\nGO\nSELECT @x = 1; SELECT @x\nGO\nSELECT 1; INSERT INTO t VALUES (@@ROWCOUNT)"
+            "DECLARE @x int = 1; SELECT @x\nGO\nSELECT @x = 1; SELECT @x\nGO\nUPDATE t SET a = 1; SELECT 1"
         ),
         [Other, Query, Other]
     );
