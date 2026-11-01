@@ -1,19 +1,27 @@
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { useEffect, useRef } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { RunEvent, StatementSpan, TreeNode } from "../../api";
+import type { CacheStatus, RunEvent, StatementSpan, TreeNode } from "../../api";
 import { refreshSessions, resetConnectionsStore } from "../../connections/store";
 import type { SessionSummary } from "../../connections/types";
 import { tauriCore } from "../../test/tauriMock";
 import { QueryEditorPanel } from "./QueryEditorPanel";
-import type { SqlEditorProps } from "./SqlEditor";
+import type { EditorInsight, FormatOutcome, SqlEditorProps } from "./SqlEditor";
 
 vi.mock("@tauri-apps/api/core", async () => (await import("../../test/tauriMock")).tauriCore);
 
+/** What the stand-in editor received and how its format command ends. */
+const editorMock = vi.hoisted(() => ({
+  insight: undefined as EditorInsight | undefined,
+  formatOutcome: { status: "formatted" } as FormatOutcome,
+  inserted: [] as string[],
+}));
+
 // Monaco needs a real browser: a textarea stands in, driven through the same handle.
 vi.mock("./SqlEditor", () => ({
-  SqlEditor: ({ initialValue, editorRef }: SqlEditorProps) => {
+  SqlEditor: ({ initialValue, editorRef, insight }: SqlEditorProps) => {
     const area = useRef<HTMLTextAreaElement>(null);
+    editorMock.insight = insight;
     useEffect(() => {
       editorRef.current = {
         getText: () => area.current?.value ?? "",
@@ -31,6 +39,12 @@ vi.mock("./SqlEditor", () => ({
         },
         select: (start, end) => area.current?.setSelectionRange(start, end),
         focus: () => area.current?.focus(),
+        format: async () => {
+          const outcome = editorMock.formatOutcome;
+          editorMock.insight?.onFormat?.(outcome);
+          return outcome;
+        },
+        insertSnippet: (body) => editorMock.inserted.push(body),
       };
       return () => {
         editorRef.current = null;
@@ -70,6 +84,21 @@ function database(name: string, current = false): TreeNode {
 
 const SCRIPT = "SELECT 1;\nSELECT 2;";
 
+const CACHE: CacheStatus = {
+  key: { profileId: "p-1", database: "app" },
+  state: "ready",
+  source: "disk",
+  building: false,
+  generation: 7,
+  readAt: "2026-11-01T10:00:00Z",
+  relationCount: 3,
+  columnCount: 12,
+  routineCount: 0,
+  truncated: false,
+  lastBuildMs: 20,
+  lastError: null,
+};
+
 let onEvent: ((event: RunEvent) => void) | null = null;
 
 function mockCore() {
@@ -100,6 +129,20 @@ function mockCore() {
         return true;
       case "query_close_editor":
         return null;
+      case "schema_cache_status":
+        return CACHE;
+      case "snippet_list":
+        return [
+          {
+            id: "builtin:select",
+            name: "Select rows",
+            prefix: "sel",
+            body: "SELECT $0",
+            description: "",
+            engines: [],
+            builtin: true,
+          },
+        ];
       default:
         throw new Error(`unexpected command ${cmd}`);
     }
@@ -255,6 +298,46 @@ describe("QueryEditorPanel", () => {
     act(() => releaseClose?.());
     await waitFor(() => expect(calls("query_run")).toHaveLength(2));
     expect(calls("query_run")[1]).toMatchObject({ sessionId: "s-2", editorId: "editor-1" });
+  });
+
+  it("gives the editor its insight target and shows the schema cache", async () => {
+    await renderPanel();
+    await waitFor(() =>
+      expect(screen.getByTestId("schema-cache-status")).toHaveTextContent("Schema: 3 tables"),
+    );
+    expect(calls("schema_cache_status").at(-1)).toEqual({ sessionId: "s-1", database: "app" });
+    expect(editorMock.insight).toMatchObject({
+      editorId: "editor-1",
+      engine: "postgres",
+      sessionId: "s-1",
+      database: "app",
+      generation: 7,
+    });
+  });
+
+  it("formats on demand and reports a failure", async () => {
+    await renderPanel();
+    editorMock.formatOutcome = { status: "failed", message: "the formatter gave up" };
+    fireEvent.click(screen.getByRole("button", { name: "Format" }));
+    await waitFor(() =>
+      expect(screen.getByRole("status")).toHaveTextContent(
+        "Could not format: the formatter gave up",
+      ),
+    );
+    editorMock.formatOutcome = { status: "formatted" };
+    fireEvent.click(screen.getByRole("button", { name: "Format" }));
+    await waitFor(() => expect(screen.getByRole("status")).not.toHaveTextContent("Could not"));
+  });
+
+  it("opens the snippet manager and inserts a snippet", async () => {
+    await renderPanel();
+    editorMock.inserted = [];
+    fireEvent.click(screen.getByRole("button", { name: "Snippets…" }));
+    const dialog = await screen.findByRole("dialog", { name: "Snippets" });
+    fireEvent.click(await within(dialog).findByText("Select rows"));
+    fireEvent.click(within(dialog).getByRole("button", { name: "Insert" }));
+    expect(editorMock.inserted).toEqual(["SELECT $0"]);
+    expect(screen.queryByRole("dialog")).toBeNull();
   });
 
   it("needs an open connection", () => {

@@ -22,9 +22,19 @@ import { spanOffsets } from "../positions";
 import { ResultsArea } from "../results/ResultsArea";
 import { IDLE_RUN, isActive, type ResultInfo, runReducer } from "../results/runState";
 import { openExport } from "../transfer/store";
+import { hasInsight } from "./insight/controller";
+import { SchemaCacheIndicator } from "./insight/SchemaCacheIndicator";
+import { SnippetManager } from "./insight/SnippetManager";
+import { useSchemaCache } from "./insight/useSchemaCache";
 import { languageFor, messagesNoteFor, type SqlLanguage } from "./language";
 import { Splitter } from "./Splitter";
-import { type EditorCommand, SqlEditor, type SqlEditorHandle } from "./SqlEditor";
+import {
+  type EditorCommand,
+  type EditorInsight,
+  type FormatOutcome,
+  SqlEditor,
+  type SqlEditorHandle,
+} from "./SqlEditor";
 
 interface DatabaseList {
   status: "idle" | "loading" | "ok" | "error";
@@ -60,6 +70,7 @@ export function QueryEditorPanel({
   const [run, dispatch] = useReducer(runReducer, IDLE_RUN);
   const [hint, setHint] = useState<string | null>(null);
   const [split, setSplit] = useState(0.45);
+  const [snippetsOpen, setSnippetsOpen] = useState(false);
   const editorRef = useRef<SqlEditorHandle | null>(null);
   const runId = useRef<string | null>(null);
   const runSeq = useRef(0);
@@ -270,6 +281,48 @@ export function QueryEditorPanel({
   const engine = session?.engine;
   const language: SqlLanguage = languageFor(engine);
   const selectedDatabase = database ?? databases.current ?? "";
+  const insightOn = hasInsight(engine);
+  // The cache of the editor's connection and database (the session's own one when unset).
+  const insightDatabase = database ?? databases.current ?? null;
+  const cache = useSchemaCache(insightOn && session ? session.id : null, insightDatabase);
+
+  function onFormat(outcome: FormatOutcome) {
+    switch (outcome.status) {
+      case "failed":
+        setHint(`Could not format: ${outcome.message}`);
+        break;
+      case "stale":
+        setHint("The text changed while formatting; nothing was replaced.");
+        break;
+      case "unavailable":
+        setHint("Formatting needs a connection to a SQL database.");
+        break;
+      case "unchanged":
+        setHint("Already formatted.");
+        break;
+      case "formatted":
+        setHint(null);
+        break;
+    }
+  }
+
+  async function format() {
+    const editor = editorRef.current;
+    if (!editor?.format) return;
+    // The editor reports the outcome through `onFormat`.
+    await editor.format();
+    editor.focus();
+  }
+
+  const insight: EditorInsight = {
+    editorId,
+    engine: insightOn ? (engine ?? null) : null,
+    sessionId: session?.id ?? null,
+    database: insightDatabase,
+    generation: cache.status?.generation ?? null,
+    onCacheState: cache.noteCacheState,
+    onFormat,
+  };
   const elapsed = active ? now - startedAt.current : run.elapsedMs;
   const disabled = !session || active;
 
@@ -370,6 +423,27 @@ export function QueryEditorPanel({
         >
           Export…
         </button>
+        <span className="toolbar__divider" aria-hidden="true" />
+        <button
+          type="button"
+          className="button"
+          data-testid="format-button"
+          disabled={!insightOn}
+          onClick={() => void format()}
+          title="Format the selection's statements, or all (Shift+Alt+F)"
+        >
+          Format
+        </button>
+        <button
+          type="button"
+          className="button"
+          data-testid="snippets-button"
+          onClick={() => setSnippetsOpen(true)}
+          title="Manage SQL snippets"
+        >
+          Snippets…
+        </button>
+        <SchemaCacheIndicator view={cache} connected={insightOn && session !== null} />
         <span
           className="query-editor__status"
           role="status"
@@ -388,6 +462,7 @@ export function QueryEditorPanel({
             editorRef={editorRef}
             onCommand={onCommand}
             ariaLabel="SQL editor"
+            insight={insight}
           />
         </div>
         <Splitter value={split} onChange={setSplit} label="Resize editor and results" />
@@ -395,6 +470,13 @@ export function QueryEditorPanel({
           <ResultsArea run={run} messagesNote={messagesNoteFor(engine)} onExport={exportResult} />
         </div>
       </div>
+      {snippetsOpen ? (
+        <SnippetManager
+          engine={insightOn ? (engine ?? null) : null}
+          onClose={() => setSnippetsOpen(false)}
+          onInsert={(body) => editorRef.current?.insertSnippet?.(body)}
+        />
+      ) : null}
     </section>
   );
 }
