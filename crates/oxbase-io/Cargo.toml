@@ -45,3 +45,6 @@ oxbase-mysql.workspace = true
 oxbase-sqlite.workspace = true
 oxbase-mssql.workspace = true
 rusqlite.workspace = true
+# tests/write_sql_live.rs (ignored; Docker fixtures): the dumps run statement by statement.
+oxbase-sql.workspace = true
+toml.workspace = true

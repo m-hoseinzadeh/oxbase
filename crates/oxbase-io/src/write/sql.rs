@@ -83,7 +83,7 @@ fn push_fraction(nanos: u32, digits: u32, out: &mut String) -> bool {
         out.push('.');
         out.push_str(&text);
     }
-    nanos % scale != 0
+    !nanos.is_multiple_of(scale)
 }
 
 /// `yyyy-mm-dd<sep>hh:mm:ss[.f…]` with at most `digits` fractional digits; `true` when digits
@@ -94,7 +94,7 @@ fn push_datetime(t: &NaiveDateTime, sep: char, digits: u32, out: &mut String) ->
 }
 
 /// `hh:mm:ss[.f…]` with at most `digits` fractional digits; `true` when digits were dropped.
-fn push_time(t: &NaiveTime, digits: u32, out: &mut String) -> bool {
+fn push_time(t: NaiveTime, digits: u32, out: &mut String) -> bool {
     let _ = write!(out, "{}", t.format("%H:%M:%S"));
     push_fraction(t.nanosecond(), digits, out)
 }
@@ -572,7 +572,7 @@ impl SqlSink {
             (Temporal::MySql, Value::TimestampTz(t)) => {
                 (push_datetime(&t.naive_utc(), ' ', digits, &mut text), false)
             }
-            (_, Value::Time(t)) => (push_time(t, digits, &mut text), false),
+            (_, Value::Time(t)) => (push_time(*t, digits, &mut text), false),
             _ => return None,
         };
         let quoted = self.quoting.quote_str(&text);

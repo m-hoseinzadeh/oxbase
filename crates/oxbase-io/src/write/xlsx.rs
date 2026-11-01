@@ -189,7 +189,7 @@ fn float_cell(array: &dyn Array, index: usize) -> Option<f64> {
 
 /// `true` when `nanos` has digits below a millisecond (Excel keeps milliseconds).
 fn below_millisecond(nanos: u32) -> bool {
-    nanos % 1_000_000 != 0
+    !nanos.is_multiple_of(1_000_000)
 }
 
 impl Cells {
