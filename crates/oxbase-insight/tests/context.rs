@@ -361,7 +361,9 @@ const TABLE: &[(&[Engine], &str, &[Expected])] = &[
 fn context_table() {
     let mut failures = Vec::new();
     let mut checked = 0;
+    let mut rows = 0;
     for (engines, text, expected) in TABLE {
+        rows += 1;
         for engine in *engines {
             let ctx = at(*engine, text);
             checked += 1;
@@ -378,7 +380,7 @@ fn context_table() {
             }
         }
     }
-    assert!(TABLE.len() >= 80, "at least 80 cases");
+    assert!(rows >= 80, "at least 80 cases, got {rows}");
     assert!(checked >= 400, "{checked} checks");
     assert!(
         failures.is_empty(),
