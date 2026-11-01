@@ -14,7 +14,8 @@
 //! SELECT t.[id], t.[name], ... FROM [s].[t] AS t    -- read-back after triggers ran
 //!   JOIN @k AS k ON t.[id] = k.[id];                -- (SELECT k.* FROM @k without read_back)
 //! SET NOCOUNT OFF;                                  -- a batch without parameters runs in
-//! ```                                               -- the session's own scope
+//!                                                   -- the session's own scope
+//! ```
 //!
 //! - `INSERT ... OUTPUT INSERTED.<key> INTO @k VALUES (...)` / `DEFAULT VALUES` gets generated
 //!   keys (identity, `NEWID()` / `NEWSEQUENTIALID()` defaults) without `SCOPE_IDENTITY()`.

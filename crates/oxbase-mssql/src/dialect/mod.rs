@@ -130,7 +130,7 @@ pub fn tree_layout() -> TreeLayout {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oxbase_dialect::{CellStatus, Quoting};
+    use oxbase_dialect::CellStatus;
     use oxbase_types::ServerVersion;
 
     #[test]

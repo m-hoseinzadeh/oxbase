@@ -44,9 +44,10 @@ own crate's `Cargo.toml`, checks the license against `deny.toml` and reports it 
 
 **Live tests** go in `crates/oxbase-mssql/tests/*.rs`, `#[ignore]`d, reading
 `tests/fixtures.toml`. They run in the conformance CI job only once `-p oxbase-mssql` is in its
-two cargo lines (§8.1). Until the fixtures stream lands that, the other streams run their live
-tests on their own branch by adding `-p oxbase-mssql` to those two lines **on their wip branch
-only** and reverting it before hand-off (or the orchestrator lands §8.1 first).
+two cargo lines (§8.1), a change outside the Design step's paths. Until it lands, no SQL Server
+live test runs in CI: the orchestrator should land §8.1 first (two words in `ci.yml`) or let
+each of the driver, fetch and ddl streams make that edit on its own branch. The plain (non-TLS)
+SQL Server fixture already runs in the conformance job today (`sa`, database `oxbase_test`).
 
 ## 2. Driver (`oxbase_mssql::driver`, driver stream)
 
@@ -139,9 +140,11 @@ Rules (also in the `oxbase_mssql::driver` module docs):
   `ServerVersion::parse(ProductVersion)` with `raw` = `@@VERSION`'s first line;
   `current_database()` = `DB_NAME()` (a later `USE` in the session is not tracked, as on MySQL);
   the SPID is kept for logs.
-- Session defaults are the server's (ANSI settings as every modern client sets them through
-  LOGIN7 option flags). The driver changes nothing else, so `SET NOCOUNT` is `OFF` and DML
-  reports counts.
+- Session settings: tiberius sets the LOGIN7 ODBC flag, so the server applies the ANSI
+  defaults (`QUOTED_IDENTIFIER`, `ANSI_NULLS`, `ANSI_PADDING`, `ANSI_WARNINGS`,
+  `CONCAT_NULL_YIELDS_NULL` on), which filtered indexes, indexed views and indexed computed
+  columns require. `SET TEXTSIZE 2147483647` above keeps `text` / `ntext` / `(max)` values
+  whole. Nothing else is changed: `SET NOCOUNT` stays `OFF`, so DML reports counts.
 
 ### 2.4 Statements, results and transactions
 
@@ -285,8 +288,8 @@ Kinds and decisions:
 - **Schema** (`SchemaDef`): owner (principal name), comment.
 - **Table** (`TableDef`):
   - columns in `column_id` order: `native_type` as written in DDL (`int`, `varchar(20)`,
-    `nvarchar(max)`, `decimal(12,2)`, `datetime2(6)`, `varbinary(max)`, alias types as
-    `[schema].[name]`... unquoted `schema.name`), `data_type` (§3.4), `nullable`,
+    `nvarchar(max)`, `decimal(12,2)`, `datetime2(6)`, `varbinary(max)`; alias types as
+    `schema.name`, unquoted), `data_type` (§3.4), `nullable`,
     `default` = the default constraint's definition as stored (`((1))`, `(N'new')`,
     `(getdate())`) with `extras::DEFAULT_CONSTRAINT` = its name, `collation` only when it differs
     from the database default, `comment` (`MS_Description`);
@@ -299,10 +302,7 @@ Kinds and decisions:
     `extras::ROW_VERSION = true`;
   - temporal period columns: `extras::PERIOD` = `row_start` / `row_end`, `extras::HIDDEN`;
     `extras::SPARSE`;
-  - `primary_key` with its constraint name; `props::CLUSTERED` on the table's extras is not
-    used: the PK's clustering is reported by the PK-backing index in the Index listing
-    (`PRIMARY_KEY = true`, `CLUSTERED`) and kept in `TableDef.extras` as `clustered_pk`? No:
-    see the next item.
+  - `primary_key` with its constraint name (clustering: see below);
   - `indexes` (not the PK): unique constraints (`is_constraint = true`) and indexes with
     `columns` (key columns in key order, `descending`), `unique`, `predicate` = filter
     definition as stored (`([code] IS NOT NULL)`), extras `CLUSTERED` (bool), `INDEX_KIND`,
@@ -325,19 +325,19 @@ Kinds and decisions:
 - **View** (`ViewDef`): `definition` = the text after `AS` of the module definition (the
   fetcher strips `CREATE VIEW ... AS`, keeping comments inside the body), `columns`, comment,
   extras `CHECK_OPTION` (`cascaded` when `WITH CHECK OPTION`), `SCHEMA_BINDING`, `ENCRYPTED`.
-- **Function / Procedure** (`RoutineDef`): `args` from `sys.parameters` (name without `@`... no:
-  **with** the `@`, as T-SQL writes it; `mode` `In` or `InOut` for `OUTPUT`; `native_type`;
-  `default` not available from the catalog for T-SQL modules → `None`), `returns` (`int`,
-  `TABLE` for inline, `@t TABLE (...)` text for multi-statement from the definition is not
-  parsed: `TABLE`), `language` = `SQL` or `CLR`, `body` = `None`, `definition` = full module
-  text, comment, extras `FUNCTION_KIND`, `SCHEMA_BINDING`, `ENCRYPTED`, `EXECUTE_AS`,
-  `READONLY_ARGS`. No `signature` (no overloading).
+- **Function / Procedure** (`RoutineDef`): `args` from `sys.parameters` (name **with** the `@`,
+  as T-SQL writes it; `mode` `In`, or `InOut` for `OUTPUT`; `native_type`; `default` `None`:
+  the catalog does not keep T-SQL parameter defaults), `returns` (the scalar type, or `TABLE`
+  for both kinds of table-valued function), `language` = `SQL` or `CLR`, `body` = `None`,
+  `definition` = full module text, comment, extras `FUNCTION_KIND`, `SCHEMA_BINDING`,
+  `ENCRYPTED`, `EXECUTE_AS`, `READONLY_ARGS`. No `signature` (no overloading).
 - **Trigger** (`TriggerDef`): DML triggers only; `timing` `After` or `InsteadOf` (`FOR` =
   `After`), `events` from `sys.trigger_events`, `level` `Statement`, `update_columns` empty,
   `condition` `None`, `function` `None`, `definition` = full text, `enabled` = `!is_disabled`,
   extras `ENCRYPTED`, `EXECUTE_AS`, `NOT_FOR_REPLICATION`.
-- **Sequence** (`SequenceDef`): start, increment, min, max, cache (`NULL` when `NO CACHE`,
-  extras), cycle, data type in extras (`native_type`... as `props::DATA_TYPE`), no `owned_by`.
+- **Sequence** (`SequenceDef`): start, increment, min, max, cache (`None` for `NO CACHE`),
+  cycle, the type (`int`, `bigint`, `decimal(p,0)`, ...) as `props::DATA_TYPE` text in extras,
+  no `owned_by`.
 - **Type** (`GenericDef`): `definition` = a `CREATE TYPE` statement the fetcher writes from the
   catalog (alias: `CREATE TYPE [s].[t] FROM varchar(20) NOT NULL`; table: `CREATE TYPE [s].[t]
   AS TABLE (...)` with columns, keys and checks), extras `TYPE_KIND`, `BASE_TYPE`, `NOT_NULL`.
@@ -425,9 +425,10 @@ On top of the M3 `DdlGenerator` rules (one step per statement, descriptions, ord
 - **Computed columns:** `[c] AS (<expr>) [PERSISTED]`; any change is drop + add (destructive:
   the column moves to the end).
 - **Primary key:** `ALTER TABLE ... ADD CONSTRAINT [pk] PRIMARY KEY [CLUSTERED|NONCLUSTERED]
-  (...)`; change = drop (by name) + add, after dropping foreign keys of other tables that
-  reference it? No: those are `Unsupported` in M4 ("drop the referencing foreign keys first"),
-  like PostgreSQL. New PK names default to `PK_<table>`.
+  (...)`; a change is drop (by name) + add. Foreign keys of other tables that reference it
+  block the drop: the server's error is reported ("drop the referencing foreign keys first",
+  as on PostgreSQL); the generator does not drop other tables' keys. New PK names default to
+  `PK_<table>`.
 - **Indexes:** `CREATE [UNIQUE] [CLUSTERED|NONCLUSTERED] INDEX [ix] ON [s].[t] ([c] ASC|DESC,
   ...) [INCLUDE ([c], ...)] [WHERE <predicate>]`; unique constraints: `ALTER TABLE ... ADD
   CONSTRAINT [uq] UNIQUE [CLUSTERED|NONCLUSTERED] (...)`; drop: `DROP INDEX [ix] ON [s].[t]` /
@@ -561,9 +562,9 @@ END;
 ```
 
 `CONNECTIONPROPERTY` needs no `VIEW SERVER STATE`. A plain connection as `oxbase_tls` fails
-with error 17892 (logon trigger), which the driver reports as `Error::Auth`... no: as
-`Error::Sql` with code `17892`; the conformance TLS cell expects "`Disable` as `oxbase_tls`
-fails", whatever the category.
+with error 17892 (logon failed because of a trigger), which the driver reports as
+`Error::Sql { code: Some("17892") }`; the conformance TLS cell only expects "`Disable` as
+`oxbase_tls` fails".
 
 ### 5.3 Seeds
 
@@ -667,10 +668,12 @@ name; the TLS-over-SSH cell verifies name `mssql` (SAN added in 5.1).
   time(n), datetime, datetime2(n), smalldatetime, datetimeoffset(n), char(n), varchar(n|max),
   nchar(n), nvarchar(n|max), binary(n), varbinary(n|max), uniqueidentifier, xml, json` (2025+,
   from `serverVersion`), `sql_variant`, `hierarchyid`, `geometry`, `geography`); options from
-  `capabilities_get` (identity instead of auto-increment, computed persisted / not, clustered
-  index checkbox from `supports(Index, CLUSTERED)`... exposed as `designer` + engine; filtered
-  index predicate, included columns, no prefix lengths, no deferrable); notes shown with the
-  preview.
+  `capabilities_get` (`designer`: identity instead of auto-increment, computed persisted or
+  not, filtered-index predicate, no expression keys, no prefix lengths, no deferrable) and, for
+  options the designer capabilities do not carry (clustered indexes, included columns), from
+  the engine (`mssql`): a "Clustered" checkbox on indexes and the primary key and an
+  "Included columns" list, written as the `clustered` / `include_columns` extras; notes shown
+  with the preview.
 - **Tree:** the `Types` folder; database nodes of non-online databases show the server's
   error when expanded.
 - **e2e:** only if cheap: the smoke test stays on PostgreSQL in M4.
