@@ -21,6 +21,7 @@
 //! cargo test -p oxbase-services --lib import::live_tests -- --ignored --test-threads 1
 //! ```
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -82,7 +83,10 @@ pub(crate) fn norm(value: &Value) -> String {
         Value::UInt(u) => u.to_string(),
         Value::Float(f) => norm_text(&f.to_string()),
         Value::Decimal(text) | Value::Text(text) => norm_text(text),
-        Value::Bytes(bytes) => bytes.iter().map(|b| format!("{b:02x}")).collect(),
+        Value::Bytes(bytes) => bytes.iter().fold(String::new(), |mut out, b| {
+            let _ = write!(out, "{b:02x}");
+            out
+        }),
         Value::Date(d) => d.format("%Y-%m-%d").to_string(),
         Value::Time(t) => t.format("%H:%M:%S%.6f").to_string(),
         Value::Timestamp(t) => t.format("%Y-%m-%d %H:%M:%S%.6f").to_string(),
