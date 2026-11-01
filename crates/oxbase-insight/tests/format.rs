@@ -663,7 +663,7 @@ fn format_perf_budget() {
             let started = Instant::now();
             let out = format(&d, &script, &FormatOptions::default()).unwrap();
             best = best.min(started.elapsed());
-            assert!(!out.is_empty());
+            assert_ne!(out, "");
         }
         eprintln!(
             "format perf: {engine:?} {} KiB in {best:?} (budget {budget:?})",
