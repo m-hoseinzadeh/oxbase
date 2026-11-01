@@ -330,9 +330,9 @@ jobs:
   # 20-column synthetic cache over 240 cursor positions (crates/oxbase-insight/tests/
   # complete_perf.rs prints p50 / p95 / max per scenario), in a release-like build (`--profile
   # perf`); OXBASE_REQUIRE_M6_PERF=1 turns a budget overrun into a failure. Then the live
-  # 5k-table PostgreSQL variant (crates/oxbase-services/tests/schema_cache_perf.rs, cache
-  # stream) once that test exists. Full lane, plus the fast lane of the perf, complete, cache
-  # and integration branches.
+  # 5k-table PostgreSQL variant (crates/oxbase-services/tests/schema_cache_perf.rs: catalog
+  # build, reload and completion through InsightService). Full lane, plus the fast lane of the
+  # perf, complete, cache and integration branches.
   insight-perf:
     name: Insight perf (5k-table completion)
     if: >-
@@ -345,10 +345,6 @@ jobs:
     timeout-minutes: 45
     env:
       OXBASE_REQUIRE_M6_PERF: "1"
-      # The budget covers context_at + complete together (§5): on main and the integration
-      # branch the test fails while context_at is still a skeleton instead of timing
-      # complete() alone over hand-built contexts.
-      OXBASE_REQUIRE_M6_CONTEXT: ${{ (github.ref == 'refs/heads/main' || endsWith(github.ref, '-integrate')) && '1' || '0' }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -372,39 +368,24 @@ jobs:
       - name: Completion latency on the synthetic 5k-table cache (release)
         run: cargo test -p oxbase-insight --release --locked --test complete_perf -- --ignored --nocapture
 
-      # The live variant belongs to the cache stream; until it lands there is nothing to run.
-      - name: Look for the live 5k-table test
-        id: live
-        run: |
-          if [ -f crates/oxbase-services/tests/schema_cache_perf.rs ]; then
-            echo "present=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "present=false" >> "$GITHUB_OUTPUT"
-            echo "schema_cache_perf.rs is not on this branch yet: live variant pending"
-          fi
-
       - name: Build the live perf test (perf profile)
-        if: steps.live.outputs.present == 'true'
         run: cargo test -p oxbase-services --profile perf --locked --test schema_cache_perf --no-run
 
       - name: Generate fixture TLS PKI and SSH keys
-        if: steps.live.outputs.present == 'true'
         run: bash scripts/fixtures-certs.sh
 
       - name: Start the PostgreSQL fixture
-        if: steps.live.outputs.present == 'true'
         run: bash scripts/ci-fixtures.sh up postgres
 
       - name: Completion latency on a live 5k-table PostgreSQL schema
-        if: steps.live.outputs.present == 'true'
         run: cargo test -p oxbase-services --profile perf --locked --test schema_cache_perf -- --ignored --nocapture
 
       - name: Dump fixture logs
-        if: failure() && steps.live.outputs.present == 'true'
+        if: failure()
         run: bash scripts/ci-fixtures.sh logs postgres
 
       - name: Tear down database fixtures
-        if: always() && steps.live.outputs.present == 'true'
+        if: always()
         run: bash scripts/ci-fixtures.sh down
 
   # The built app driven through its real webview (docs/m3-contracts.md §9, ui/e2e/README.md):
@@ -478,12 +459,14 @@ jobs:
         run: bash scripts/e2e-fixtures.sh up
 
       # M3: the table-data edit step is mandatory (a skip fails the job). M5: so is the
-      # import / export step (the debug app's --e2e-file-dir hook, ui/e2e/README.md).
+      # import / export step (the debug app's --e2e-file-dir hook, ui/e2e/README.md). M6: so is
+      # the code-insight step (completion, diagnostics, format, IPC latency).
       - name: Webview smoke test
         env:
           OXBASE_E2E_OUT: ${{ runner.temp }}/e2e
           OXBASE_E2E_REQUIRE_EDIT: "1"
           OXBASE_E2E_REQUIRE_M5: "1"
+          OXBASE_E2E_REQUIRE_M6: "1"
         run: bash scripts/e2e-smoke.sh
 
       - name: Upload e2e results

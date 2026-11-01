@@ -19,6 +19,7 @@ use tauri::State;
 use uuid::Uuid;
 
 use crate::error::CommandError;
+use crate::insight::InsightState;
 use crate::profiles::SecretInput;
 use crate::workbench::WorkbenchState;
 
@@ -196,15 +197,19 @@ pub async fn save_profile(
     .await
 }
 
-/// Deletes a profile and its keychain secrets. Open sessions of it stay open.
+/// Deletes a profile, its keychain secrets and (M6) its schema caches with their persisted
+/// snapshots. Open sessions of it stay open.
 #[tauri::command]
 pub async fn delete_profile(
     state: State<'_, ConnectionsState>,
+    insight: State<'_, InsightState>,
     id: Uuid,
 ) -> std::result::Result<bool, CommandError> {
     let (repo, store) = (Arc::clone(&state.profiles), state.secrets());
+    let caches = Arc::clone(insight.service().caches());
     isolated(Vec::new(), async move {
-        profiles::delete_profile(repo.as_ref(), store.as_ref(), id).await
+        profiles::delete_profile_and_caches(repo.as_ref(), store.as_ref(), caches.as_ref(), id)
+            .await
     })
     .await
 }

@@ -153,4 +153,24 @@ mod tests {
         assert!(!reg.has_bulk_loader(Engine::MongoDb));
         assert!(!reg.has_bulk_loader(Engine::Redis));
     }
+
+    #[test]
+    fn every_sql_engine_has_its_insight_roles() {
+        // M6 integration (docs/m6-contracts.md §1): a catalog reader and language data that
+        // passes `SqlLanguage::validate` for every SQL engine.
+        let reg = default_dialects();
+        for engine in [
+            Engine::Postgres,
+            Engine::MySql,
+            Engine::MariaDb,
+            Engine::Sqlite,
+            Engine::MsSql,
+        ] {
+            assert_eq!(
+                reg.missing_insight_roles(engine),
+                Vec::<String>::new(),
+                "{engine}"
+            );
+        }
+    }
 }

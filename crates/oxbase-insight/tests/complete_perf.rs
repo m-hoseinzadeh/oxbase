@@ -17,20 +17,16 @@
 //! `complete_p95_ms`, a cancellation slower than `cancel_limit_ms`) fails the test; without it
 //! the numbers are printed only.
 //!
-//! Until the context stream fills `context_at` (it is a skeleton on the complete branch), the
-//! test times `complete` over hand-built contexts of the same scenarios (what `context_at` must
-//! read there) and says so; `OXBASE_REQUIRE_M6_CONTEXT=1` makes that a failure.
+//! Every timing covers the real pipeline from text + offset to the ranked list:
+//! `context_at` (the tolerant parser) followed by `complete` (no hand-built contexts).
 
-use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use oxbase_insight::{
-    CancellationToken, Clause, CompletionKind, CompletionList, Cte, CursorContext, Dialect,
-    Expected, Ident, Outline, QueryBlock, RelationSource, SchemaCache, ScopeRelation,
-    StatementClass, complete, context_at,
+    CancellationToken, CompletionKind, CompletionList, Dialect, SchemaCache, complete, context_at,
 };
 use oxbase_schema_cache::synthetic::{SyntheticSpec, snapshot};
 use oxbase_types::{Engine, ErrorCategory};
@@ -157,8 +153,6 @@ fn related_pairs(cache: &SchemaCache) -> Vec<(String, String)> {
 struct Position {
     text: String,
     offset: usize,
-    /// The context `context_at` must read there (used while it is a skeleton).
-    mock: CursorContext,
 }
 
 fn expand(s: &Scenario, (table, table2): &(String, String), schema: &str) -> Position {
@@ -173,199 +167,7 @@ fn expand(s: &Scenario, (table, table2): &(String, String), schema: &str) -> Pos
     let at = body.find("<|>").expect("scenario text has a <|> cursor");
     let offset = text.len() + at;
     text.push_str(&body.replace("<|>", ""));
-    let mock = mock_context(&s.name, &text, offset, table, table2);
-    Position { text, offset, mock }
-}
-
-fn ident(text: &str) -> Ident {
-    Ident {
-        text: text.to_owned(),
-        quoted: false,
-    }
-}
-
-fn named(name: &str, alias: Option<&str>) -> ScopeRelation {
-    ScopeRelation {
-        source: RelationSource::Named(vec![ident(name)]),
-        alias: alias.map(ident),
-        column_aliases: vec![],
-        range: 0..0,
-    }
-}
-
-/// What `context_at` reads at each scenario's cursor (§4.2), built by hand.
-fn mock_context(name: &str, text: &str, offset: usize, table: &str, table2: &str) -> CursorContext {
-    let bytes = text.as_bytes();
-    let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
-    let mut start = offset;
-    while start > 0 && is_word(bytes[start - 1]) {
-        start -= 1;
-    }
-    let mut qualifier = Vec::new();
-    let mut at = start;
-    while at > 0 && bytes[at - 1] == b'.' {
-        let mut part_start = at - 1;
-        while part_start > 0 && is_word(bytes[part_start - 1]) {
-            part_start -= 1;
-        }
-        qualifier.insert(0, ident(&text[part_start..at - 1]));
-        at = part_start;
-    }
-    let statement_start = text[..offset].rfind(';').map_or(0, |i| i + 1);
-    let select = [Expected::Column, Expected::Function, Expected::Keyword];
-    let from = [Expected::Relation, Expected::Schema];
-    let mut outline = Outline::empty(statement_start..text.len());
-    let mut ctes = Vec::new();
-    let (class, clause, expected, scope, keywords): (_, _, Vec<Expected>, _, Vec<&'static str>) =
-        match name {
-            "statement-start" => (
-                StatementClass::Empty,
-                Clause::Start,
-                vec![Expected::Keyword, Expected::Snippet],
-                vec![],
-                vec![
-                    "SELECT", "INSERT", "UPDATE", "DELETE", "WITH", "CREATE", "ALTER", "DROP",
-                ],
-            ),
-            "from-empty" | "from-prefix" | "from-fuzzy" => (
-                StatementClass::Select,
-                Clause::From,
-                from.to_vec(),
-                vec![],
-                vec![],
-            ),
-            "schema-qualified" => (
-                StatementClass::Select,
-                Clause::From,
-                vec![Expected::Relation],
-                vec![],
-                vec![],
-            ),
-            "join-target" => (
-                StatementClass::Select,
-                Clause::Join,
-                from.to_vec(),
-                vec![named(table, Some("a"))],
-                vec![],
-            ),
-            "select-list-prefix" | "function-prefix" => (
-                StatementClass::Select,
-                Clause::SelectList,
-                select.to_vec(),
-                vec![named(table, Some("t"))],
-                vec!["DISTINCT", "CASE", "FROM"],
-            ),
-            "qualified-column" => (
-                StatementClass::Select,
-                Clause::SelectList,
-                vec![Expected::Column],
-                vec![named(table, Some("t")), named(table2, Some("u"))],
-                vec![],
-            ),
-            "long-script" => (
-                StatementClass::Select,
-                Clause::SelectList,
-                vec![Expected::Column],
-                vec![named(table, Some("t"))],
-                vec![],
-            ),
-            "join-on" => (
-                StatementClass::Select,
-                Clause::JoinOn,
-                select.to_vec(),
-                vec![named(table, Some("a")), named(table2, Some("b"))],
-                vec!["AND", "OR", "NOT"],
-            ),
-            "where-unqualified" => (
-                StatementClass::Select,
-                Clause::Where,
-                select.to_vec(),
-                vec![named(table, Some("a")), named(table2, Some("b"))],
-                vec!["AND", "OR", "NOT", "EXISTS"],
-            ),
-            "insert-columns" => (
-                StatementClass::Insert,
-                Clause::InsertColumns,
-                vec![Expected::Column],
-                vec![named(table, None)],
-                vec![],
-            ),
-            "update-set" => (
-                StatementClass::Update,
-                Clause::UpdateSet,
-                vec![Expected::Column],
-                vec![named(table, None)],
-                vec![],
-            ),
-            "cte-columns" => {
-                let cte = Cte {
-                    name: ident("x"),
-                    columns: vec![ident("id"), ident("created_at")],
-                    query: Some(1),
-                    range: 0..0,
-                };
-                let top = QueryBlock {
-                    range: outline.range.clone(),
-                    parent: None,
-                    ctes: vec![cte.clone()],
-                    relations: vec![ScopeRelation {
-                        source: RelationSource::Cte { query: 0, index: 0 },
-                        alias: None,
-                        column_aliases: vec![],
-                        range: 0..0,
-                    }],
-                    output: vec![],
-                    star: false,
-                    clauses: vec![],
-                };
-                let body = QueryBlock {
-                    range: 0..0,
-                    parent: Some(0),
-                    ctes: vec![],
-                    relations: vec![named(table, None)],
-                    output: vec![ident("id"), ident("created_at")],
-                    star: false,
-                    clauses: vec![],
-                };
-                let scope = top.relations.clone();
-                outline.class = StatementClass::Select;
-                outline.queries = vec![top, body];
-                ctes.push(cte);
-                (
-                    StatementClass::Select,
-                    Clause::SelectList,
-                    vec![Expected::Column],
-                    scope,
-                    vec![],
-                )
-            }
-            other => panic!("no hand-built context for scenario {other}; add one"),
-        };
-    CursorContext {
-        offset,
-        statement: statement_start..text.len(),
-        class,
-        clause,
-        word: start..offset,
-        prefix: text[start..offset].to_owned(),
-        quote: None,
-        qualifier,
-        expected,
-        keywords,
-        scope,
-        ctes,
-        outline,
-    }
-}
-
-/// `true` when `context_at` is implemented (it panics while it is a skeleton).
-fn context_at_works(dialect: &Dialect) -> bool {
-    // Silence the expected panic message of the skeleton.
-    let hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
-    let ok = catch_unwind(AssertUnwindSafe(|| context_at(dialect, "SELECT 1", 7))).is_ok();
-    std::panic::set_hook(hook);
-    ok
+    Position { text, offset }
 }
 
 fn kind_matches(item: CompletionKind, expect: CompletionKind) -> bool {
@@ -421,19 +223,7 @@ fn completion_latency_on_the_exit_check_cache() {
 
     let mut dialect = Dialect::builtin(Engine::Postgres).expect("PostgreSQL dialect");
     dialect.case_rules = cache.case_rules();
-    let real_context = context_at_works(&dialect);
-    if real_context {
-        println!("context: oxbase_insight::context_at");
-    } else {
-        println!(
-            "context: PENDING - context_at is still a skeleton; timing complete() over \
-             hand-built contexts of the same cursors"
-        );
-        assert!(
-            !flag("OXBASE_REQUIRE_M6_CONTEXT"),
-            "context_at is not implemented (OXBASE_REQUIRE_M6_CONTEXT=1)"
-        );
-    }
+    println!("pipeline: oxbase_insight::context_at + complete (release-like build)");
     let snippets = oxbase_insight::snippets::builtin_snippets();
     let pairs = related_pairs(&cache);
     let other_schema = snap
@@ -446,11 +236,7 @@ fn completion_latency_on_the_exit_check_cache() {
     let scenarios = scenarios(perf);
 
     let run = |p: &Position, token: &CancellationToken| -> CompletionList {
-        let ctx = if real_context {
-            context_at(&dialect, &p.text, p.offset)
-        } else {
-            p.mock.clone()
-        };
+        let ctx = context_at(&dialect, &p.text, p.offset);
         complete(&ctx, &dialect, Some(&cache), &snippets, limit, token).expect("completion")
     };
 
@@ -537,7 +323,7 @@ fn completion_latency_on_the_exit_check_cache() {
         .or_else(|| scenarios.first())
         .expect("a scenario");
     let position = expand(fuzzy, &pairs[0], &other_schema);
-    let cancel_after = cancel_latency(&position, &dialect, &cache, real_context);
+    let cancel_after = cancel_latency(&position, &dialect, &cache);
     println!(
         "cancellation: returned {:.3} ms after cancel (limit {} ms)",
         ms(cancel_after),
@@ -553,7 +339,7 @@ fn completion_latency_on_the_exit_check_cache() {
     let cancelled = CancellationToken::new();
     cancelled.cancel();
     let err = complete(
-        &position.mock,
+        &context_at(&dialect, &position.text, position.offset),
         &dialect,
         Some(&cache),
         &[],
@@ -581,12 +367,7 @@ fn completion_latency_on_the_exit_check_cache() {
 
 /// How long a running completion takes to return after its token is cancelled (the worst of
 /// 20 tries, each cancelling at a different moment).
-fn cancel_latency(
-    position: &Position,
-    dialect: &Dialect,
-    cache: &SchemaCache,
-    real_context: bool,
-) -> Duration {
+fn cancel_latency(position: &Position, dialect: &Dialect, cache: &SchemaCache) -> Duration {
     let mut worst = Duration::ZERO;
     for attempt in 0..20_u64 {
         let token = CancellationToken::new();
@@ -598,15 +379,10 @@ fn cancel_latency(
             let cache = cache.clone();
             let text = position.text.clone();
             let offset = position.offset;
-            let mock = position.mock.clone();
             std::thread::spawn(move || {
                 started.store(true, Ordering::SeqCst);
                 loop {
-                    let ctx = if real_context {
-                        context_at(&dialect, &text, offset)
-                    } else {
-                        mock.clone()
-                    };
+                    let ctx = context_at(&dialect, &text, offset);
                     match complete(&ctx, &dialect, Some(&cache), &[], 200, &token) {
                         Err(e) if e.category() == ErrorCategory::Cancelled => {
                             return Instant::now();

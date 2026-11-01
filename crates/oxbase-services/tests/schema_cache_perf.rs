@@ -8,8 +8,11 @@
 //! (the `insight-perf` job, `--profile perf`) the build and reload limits are enforced; the
 //! memory budget always is.
 //!
-//! The completion scenarios through `InsightService::complete` belong to the complete stream
-//! and are added at integration.
+//! Then runs every `[[m6.perf.scenarios]]` entry through `InsightService::complete` on the
+//! reloaded cache (the app's path: gate, cache lookup, `context_at` + `complete` on the blocking
+//! pool, UTF-16 conversion), `{table}` / `{table2}` being related tables of the perf schema, and
+//! prints p50 / p95 / max per scenario. Every scenario must return an item of its `expect` kind;
+//! with `OXBASE_REQUIRE_M6_PERF=1` a scenario's p95 above `complete_p95_ms` fails the test.
 //!
 //! `#[ignore]`d: `cargo test -p oxbase-services --test schema_cache_perf -- --ignored --nocapture`.
 
@@ -20,15 +23,18 @@ use std::time::{Duration, Instant};
 use oxbase_driver::collect;
 use oxbase_net::ssh::RusshTunnelProvider;
 use oxbase_schema_cache::{MEMORY_BUDGET_BYTES, MatchMode, NameKind, NameQuery, SchemaCache};
+use oxbase_services::insight::{CompletionResponse, InsightConfig, InsightRequest, InsightService};
 use oxbase_services::schema_cache::{
     CacheSource, CacheState, RefreshScope, SchemaCacheConfig, SchemaCacheService, SchemaEvents,
 };
+use oxbase_services::snippets::SnippetService;
 use oxbase_services::{
     CancellationToken, ConnectionManager, ProvidedSecrets, default_dialects, default_drivers,
 };
 use oxbase_store::{
-    AppDb, ConnectionProfile, MemorySecretStore, ProfileAddress, SchemaCacheRepository, Secret,
-    SecretRef, SecretSlot, SecretStore, SqliteSchemaCacheRepository, TlsMode, TlsSettings,
+    AppDb, ConnectionProfile, MemorySecretStore, MemorySnippetRepository, ProfileAddress,
+    SchemaCacheRepository, Secret, SecretRef, SecretSlot, SecretStore, SqliteSchemaCacheRepository,
+    TlsMode, TlsSettings,
 };
 use oxbase_types::{Engine, Value};
 
@@ -244,6 +250,138 @@ fn time_lookup(
     ));
 }
 
+/// The perf schema's table `i` (named like `ensure_schema` names it).
+fn perf_table(schema: &str, i: u64) -> String {
+    const NAMES: [&str; 5] = ["customer", "orders", "invoice", "product", "shipment"];
+    let name = NAMES[usize::try_from(i % 5).unwrap_or(0)];
+    format!("{schema}.t{i:04}_{name}")
+}
+
+/// One `[[m6.perf.scenarios]]` entry expanded for one table pair: the text and the cursor.
+fn scenario_text(
+    scenario: &toml::Value,
+    table: &str,
+    table2: &str,
+    schema: &str,
+) -> (String, usize) {
+    let fill = |t: &str| {
+        t.replace("{table2}", table2)
+            .replace("{table}", table)
+            .replace("{schema}", schema)
+    };
+    let repeat = scenario
+        .get("repeat")
+        .and_then(toml::Value::as_integer)
+        .and_then(|r| usize::try_from(r).ok())
+        .unwrap_or(0);
+    let mut text = fill("SELECT id, created_at\nFROM {table}\nWHERE id > 10;\n").repeat(repeat);
+    let body = fill(&s(scenario, "text"));
+    let at = body.find("<|>").expect("scenario text has a <|> cursor");
+    let offset = text.len() + at;
+    text.push_str(&body.replace("<|>", ""));
+    (text, offset)
+}
+
+/// One `InsightService::complete` call and how long it took.
+async fn timed_complete(
+    insight: &InsightService,
+    request: InsightRequest,
+    limit: usize,
+) -> (Duration, CompletionResponse) {
+    let started = Instant::now();
+    let response = insight
+        .complete(request, Some(limit), CancellationToken::new())
+        .await
+        .unwrap_or_else(|e| panic!("completion failed: {e}"));
+    (started.elapsed(), response)
+}
+
+/// Runs the `[[m6.perf.scenarios]]` through `InsightService::complete` on the live cache.
+/// Returns the scenarios over budget and the ones without an item of their `expect` kind.
+async fn completion_scenarios(
+    insight: &InsightService,
+    session: oxbase_services::SessionId,
+    perf: &toml::Value,
+    schema: &str,
+    tables: u64,
+) -> (Vec<String>, Vec<String>) {
+    let budget = Duration::from_millis(n(perf, "complete_p95_ms"));
+    let (warmup, iterations) = (n(perf, "warmup"), n(perf, "iterations"));
+    let limit = usize::try_from(n(perf, "limit")).unwrap_or(200);
+    let scenarios = perf["scenarios"].as_array().expect("[[m6.perf.scenarios]]");
+    // 16 related pairs spread over the schema: table i + 1 references table i.
+    let pairs: Vec<(String, String)> = (0..16_u64)
+        .map(|k| {
+            let i = (k * (tables / 16)).min(tables.saturating_sub(2));
+            (perf_table(schema, i), perf_table(schema, i + 1))
+        })
+        .collect();
+    let mut seq = 0_u64;
+    let mut over = Vec::new();
+    let mut wrong = Vec::new();
+    let mut all = Vec::new();
+    for scenario in scenarios {
+        let name = s(scenario, "name");
+        let expect = s(scenario, "expect");
+        let positions: Vec<(String, usize)> = pairs
+            .iter()
+            .map(|(t, t2)| scenario_text(scenario, t, t2, schema))
+            .collect();
+        let mut run = |i: u64| {
+            let (text, offset) = &positions[usize::try_from(i).unwrap_or(0) % positions.len()];
+            seq += 1;
+            let request = InsightRequest {
+                editor_id: "m6-perf".to_owned(),
+                seq,
+                engine: Engine::Postgres,
+                session_id: Some(session),
+                database: None,
+                text: text.clone(),
+                offset: *offset,
+            };
+            timed_complete(insight, request, limit)
+        };
+        let mut found = false;
+        for i in 0..warmup.max(16) {
+            let (_, response) = run(i).await;
+            assert!(!response.superseded, "{name}: superseded");
+            found |= response.items.iter().any(|item| {
+                let kind = serde_json::to_value(item.kind).unwrap_or_default();
+                kind == expect.as_str() || (expect == "table" && kind == "view")
+            });
+        }
+        if !found {
+            wrong.push(format!("{name}: no {expect} item"));
+        }
+        let mut samples = Vec::new();
+        let mut items = 0;
+        for i in 0..iterations {
+            let (elapsed, response) = run(i).await;
+            items = items.max(response.items.len());
+            samples.push(elapsed);
+        }
+        let (p50, p95, max) = percentiles(&mut samples);
+        report(&format!(
+            "complete {name:<20} p50 {p50} us, p95 {p95} us, max {max} us, {items} items"
+        ));
+        if p95 > budget.as_micros() {
+            over.push(format!(
+                "{name}: p95 {p95} us over {} ms",
+                budget.as_millis()
+            ));
+        }
+        all.extend(samples);
+    }
+    let (p50, p95, max) = percentiles(&mut all);
+    report(&format!(
+        "complete overall (InsightService, live 5k-table cache): {} runs, p50 {p50} us, p95 {p95} \
+         us, max {max} us (budget p95 {} ms)",
+        all.len(),
+        budget.as_millis()
+    ));
+    (over, wrong)
+}
+
 #[tokio::test]
 #[ignore = "needs the postgres fixture"]
 async fn pg_5k_tables_build_reload_and_memory() {
@@ -371,13 +509,13 @@ async fn pg_5k_tables_build_reload_and_memory() {
 
     // Reload from the app database (a restart): no catalog read.
     drop(caches);
-    let reloaded = SchemaCacheService::new(
+    let reloaded = Arc::new(SchemaCacheService::new(
         Arc::clone(&manager),
-        dialects,
+        Arc::clone(&dialects),
         Arc::new(SqliteSchemaCacheRepository::new(app_db)),
         SchemaEvents::new(),
         SchemaCacheConfig::default(),
-    );
+    ));
     let started = Instant::now();
     let again = reloaded.cache(&key).await.expect("reloaded");
     let reload = started.elapsed();
@@ -434,9 +572,21 @@ async fn pg_5k_tables_build_reload_and_memory() {
         warmup,
         iterations,
     );
-    report("completion scenarios through InsightService::complete: added by the complete stream");
+
+    // Completion through the service the app uses, on the reloaded live cache.
+    let insight = InsightService::new(
+        dialects,
+        Arc::clone(&reloaded),
+        Arc::new(SnippetService::new(
+            Arc::new(MemorySnippetRepository::new()),
+        )),
+        InsightConfig::default(),
+    );
+    let (over, wrong) = completion_scenarios(&insight, base.id(), perf, &schema, tables).await;
+    assert_eq!(wrong, Vec::<String>::new(), "completion results");
 
     if require_perf() {
+        assert_eq!(over, Vec::<String>::new(), "completion latency over budget");
         assert!(
             ms(build) <= n(perf, "build_limit_ms"),
             "build took {} ms",
