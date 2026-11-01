@@ -335,6 +335,6 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(input.id, None);
-        assert!(input.engines.is_empty());
+        assert_eq!(input.engines, Vec::<Engine>::new());
     }
 }

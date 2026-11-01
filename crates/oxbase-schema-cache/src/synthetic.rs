@@ -4,7 +4,7 @@
 //! Deterministic: the same spec always gives the same snapshot. Names are built from small
 //! word lists (`customer_order_17`, `created_at`, `warehouse_id`), so prefixes are shared by
 //! many names the way real schemas share them; every table has an `id` primary key, and
-//! `<word>_id` columns get foreign keys to a table of that word when there is one.
+//! every fifth column is a `<noun>_id` foreign key to an earlier table of the same schema.
 
 use oxbase_types::{
     CatalogColumn, CatalogForeignKey, CatalogRelation, CatalogRoutine, CatalogSchema,
@@ -177,10 +177,18 @@ pub fn snapshot(spec: &SyntheticSpec) -> CatalogSnapshot {
     snap.schemas = schema_names.iter().map(CatalogSchema::new).collect();
     snap.read_at_ms = 1_700_000_000_000;
 
-    for t in 0..spec.tables {
-        let a = NOUNS[rng.below(NOUNS.len())];
-        let b = NOUNS[rng.below(NOUNS.len())];
-        let name = format!("{a}_{b}_{t}");
+    let n_schemas = snap.schemas.len();
+    // (first noun, name) of every relation, drawn up front so foreign keys can point at
+    // earlier relations of the same schema.
+    let names: Vec<(&str, String)> = (0..spec.tables)
+        .map(|t| {
+            let a = NOUNS[rng.below(NOUNS.len())];
+            let b = NOUNS[rng.below(NOUNS.len())];
+            (a, format!("{a}_{b}_{t}"))
+        })
+        .collect();
+    for (t, (_, name)) in names.iter().enumerate() {
+        let name = name.clone();
         let mut columns = vec![CatalogColumn {
             name: "id".to_owned(),
             native_type: "bigint".to_owned(),
@@ -189,22 +197,25 @@ pub fn snapshot(spec: &SyntheticSpec) -> CatalogSnapshot {
         }];
         let mut foreign_keys = Vec::new();
         for c in 1..spec.columns_per_table {
-            let (base, fk) = if c % 5 == 1 {
-                let noun = NOUNS[rng.below(NOUNS.len())];
-                (format!("{noun}_id"), Some(noun))
-            } else {
-                (COLUMN_WORDS[rng.below(COLUMN_WORDS.len())].to_owned(), None)
+            // Every fifth column references an earlier relation of the same schema (relation
+            // t lives in schema t % n_schemas) when there is one.
+            let earlier = t / n_schemas;
+            let target =
+                (c % 5 == 1 && earlier > 0).then(|| t - n_schemas * (1 + rng.below(earlier)));
+            let base = match target {
+                Some(r) => format!("{}_id", names[r].0),
+                None => COLUMN_WORDS[rng.below(COLUMN_WORDS.len())].to_owned(),
             };
             let col_name = if columns.iter().any(|x| x.name == base) {
                 format!("{base}_{c}")
             } else {
                 base
             };
-            if let Some(noun) = fk {
+            if let Some(r) = target {
                 foreign_keys.push(CatalogForeignKey {
                     columns: vec![col_name.clone()],
                     ref_schema: None,
-                    ref_table: format!("{noun}_{noun}_{}", t % 7),
+                    ref_table: names[r].1.clone(),
                     ref_columns: vec!["id".to_owned()],
                 });
             }
@@ -223,7 +234,7 @@ pub fn snapshot(spec: &SyntheticSpec) -> CatalogSnapshot {
         if kind == RelationKind::View {
             foreign_keys.clear();
         }
-        let schema = t % snap.schemas.len();
+        let schema = t % n_schemas;
         snap.schemas[schema].relations.push(CatalogRelation {
             name,
             kind,

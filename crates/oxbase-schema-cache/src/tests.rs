@@ -267,6 +267,22 @@ fn synthetic_catalogs_are_deterministic_and_sized() {
         cols.dedup();
         assert_eq!(cols.len(), 12, "duplicate column in {}", r.name);
     }
+    // Foreign keys point at relations of the same schema.
+    let mut fks = 0;
+    for schema in &a.schemas {
+        for r in &schema.relations {
+            for fk in &r.foreign_keys {
+                fks += 1;
+                assert!(
+                    schema.relations.iter().any(|x| x.name == fk.ref_table),
+                    "{} -> {}",
+                    r.name,
+                    fk.ref_table
+                );
+            }
+        }
+    }
+    assert!(fks > 300, "{fks} foreign keys");
     let my = synthetic::snapshot(&synthetic::SyntheticSpec {
         engine: Engine::MySql,
         ..spec

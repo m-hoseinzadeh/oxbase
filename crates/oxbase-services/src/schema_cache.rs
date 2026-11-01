@@ -422,15 +422,14 @@ mod tests {
         assert_eq!(v["relationCount"], 0);
         assert_eq!(v["lastError"], serde_json::Value::Null);
 
-        let cache =
-            oxbase_schema_cache::SchemaCache::new(oxbase_schema_cache::synthetic::snapshot(
-                &oxbase_schema_cache::synthetic::SyntheticSpec {
-                    tables: 10,
-                    columns_per_table: 3,
-                    routines: 2,
-                    ..oxbase_schema_cache::synthetic::SyntheticSpec::exit_check()
-                },
-            ));
+        let cache = SchemaCache::new(oxbase_schema_cache::synthetic::snapshot(
+            &oxbase_schema_cache::synthetic::SyntheticSpec {
+                tables: 10,
+                columns_per_table: 3,
+                routines: 2,
+                ..oxbase_schema_cache::synthetic::SyntheticSpec::exit_check()
+            },
+        ));
         let status = CacheStatus::missing(key).with_cache(&cache);
         assert_eq!(
             (

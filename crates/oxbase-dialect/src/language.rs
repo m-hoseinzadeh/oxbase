@@ -742,14 +742,16 @@ mod tests {
 
     #[test]
     fn validate_reports_bad_data() {
+        const BAD_FUNCTIONS: &[FunctionInfo] = &[func("b", "", "x", Scalar, 2, Some(1), "")];
+        const BAD_TYPES: &[TypeInfo] = &[
+            ty("INT", TypeParams::None, "a"),
+            ty("int", TypeParams::None, "b"),
+        ];
         let bad = SqlLanguage {
             keywords: &["SELECT", "FROM"],
             reserved: &["where"],
-            functions: &[func("b", "", "x", Scalar, 2, Some(1), "")],
-            types: &[
-                ty("INT", TypeParams::None, "a"),
-                ty("int", TypeParams::None, "b"),
-            ],
+            functions: BAD_FUNCTIONS,
+            types: BAD_TYPES,
             ..SqlLanguage::standard()
         };
         let problems = bad.validate().join("\n");
@@ -775,7 +777,7 @@ mod tests {
         assert!(!std.is_keyword("orders"));
         assert_eq!(std.function("count").len(), 1);
         assert_eq!(std.function("Coalesce")[0].max_args, None);
-        assert!(std.function("nope").is_empty());
+        assert_eq!(std.function("nope").to_vec(), Vec::<FunctionInfo>::new());
         assert_eq!(
             std.type_info("varchar").map(|t| t.params),
             Some(TypeParams::Length)

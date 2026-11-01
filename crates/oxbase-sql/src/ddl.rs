@@ -247,6 +247,8 @@ mod tests {
     use DdlObject as O;
     use DdlVerb as V;
 
+    const NOTHING: Vec<(DdlVerb, DdlObject, String)> = Vec::new();
+
     fn names(dialect: SqlDialect, sql: &str) -> Vec<(DdlVerb, DdlObject, String)> {
         schema_changes(dialect, sql)
             .into_iter()
@@ -270,10 +272,13 @@ mod tests {
     #[test]
     fn plain_statements_change_nothing() {
         let pg = SqlDialect::Postgres;
-        assert!(names(pg, "SELECT * FROM t").is_empty());
-        assert!(names(pg, "INSERT INTO t VALUES ('CREATE TABLE x')").is_empty());
-        assert!(names(pg, "-- DROP TABLE t\nSELECT 1").is_empty());
-        assert!(names(pg, "GRANT ALTER ON t TO u").is_empty());
+        assert_eq!(names(pg, "SELECT * FROM t"), NOTHING);
+        assert_eq!(
+            names(pg, "INSERT INTO t VALUES ('CREATE TABLE x')"),
+            NOTHING
+        );
+        assert_eq!(names(pg, "-- DROP TABLE t\nSELECT 1"), NOTHING);
+        assert_eq!(names(pg, "GRANT ALTER ON t TO u"), NOTHING);
     }
 
     #[test]

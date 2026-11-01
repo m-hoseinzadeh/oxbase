@@ -102,18 +102,20 @@ crates/
   oxbase-designer, oxbase-diff, oxbase-transfer,  feature crates
   oxbase-io, oxbase-backup, oxbase-model,
   oxbase-bi, oxbase-ai, oxbase-jobs
-  oxbase-store                                    app DB (history), documents, keychain secrets
+  oxbase-store                                    app DB (history, snippets, schema-cache
+                                                  snapshots), documents, keychain secrets
   oxbase-services                                 orchestration shared by both front ends
   oxbase-cli                                      headless runner (binary: `oxbase`)
   oxbase-conformance                              cross-engine conformance harness
   app-tauri                                       Tauri 2 shell (no logic)
 ui/                                               React + TS + Vite front end
 tests/fixtures.toml                               test DB connection params, M2-M4 seed object
-                                                  names and the M5 import / export expectations
-                                                  (single source of truth)
+                                                  names, the M5 import / export expectations and
+                                                  the M6 insight perf scenarios (single source of
+                                                  truth)
 tests/data/m5/                                    small hand-written import samples (M5)
 docs/                                             frozen contracts per milestone (m1-contracts.md
-                                                  to m5-contracts.md)
+                                                  to m6-contracts.md)
 ```
 
 ## Prerequisites
@@ -433,7 +435,7 @@ M1-M3 cell of the five SQL engines must pass and nothing may be skipped); CI set
 
 Profiles live in `connections.json` in the config directory (`OXBASE_CONFIG_DIR` overrides it).
 From M2 the app database `oxbase.db` (query history and settings, SQLite with versioned
-migrations) lives in the local data directory: `~/.local/share/oxbase` on Linux,
+migrations; from M6 also user snippets and schema-cache snapshots, names and types only) lives in the local data directory: `~/.local/share/oxbase` on Linux,
 `~/Library/Application Support/dev.oxbase.app` on macOS, `%LOCALAPPDATA%\oxbase` on Windows
 (`OXBASE_DATA_DIR` overrides it). Query results that do not fit in memory spill to Arrow IPC
 files under `<temp>/oxbase-results/run-*`, deleted when the run or the app closes. History stores
@@ -517,7 +519,8 @@ value after a reload.
   smoke test (Linux; also on the fast lane of `wip/*-e2e`, `wip/*-app` and `wip/*-integrate`);
   `cargo deny` (advisories, bans, licenses, sources); the `import-perf` job (M5, the 1 GB CSV
   import exit check, `docs/m5-contracts.md` §9, with `OXBASE_REQUIRE_M5_PERF=1`): full lane,
-  plus the fast lane of `wip/*-perf` and `wip/*-integrate`.
+  plus the fast lane of `wip/*-perf` and `wip/*-integrate`. M6 adds an `insight-perf` job
+  (completion latency on a 5k-table catalog, `docs/m6-contracts.md` §5).
 - `.github/workflows/bundle.yml` (push to main, manual): Tauri dev bundles for Linux x86_64,
   Windows x86_64 and macOS aarch64/x86_64, uploaded as workflow artifacts.
   `scripts/ci-verify-signing.mjs` checks what was produced: `codesign --verify --deep --strict`,
