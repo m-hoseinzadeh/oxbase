@@ -548,3 +548,91 @@ async fn insert_loader_runs_one_statement_per_chunk_in_the_transaction() {
         .unwrap_err();
     assert!(err.is_cancelled());
 }
+
+/// A catalog reader that answers with an empty snapshot of the connection's engine.
+struct EmptyCatalog;
+
+#[async_trait]
+impl oxbase_dialect::CatalogReader for EmptyCatalog {
+    async fn read(
+        &self,
+        c: &dyn Connection,
+        _scope: &oxbase_dialect::CatalogScope,
+        _cancel: CancellationToken,
+    ) -> Result<oxbase_types::CatalogSnapshot> {
+        Ok(oxbase_types::CatalogSnapshot::new(
+            c.engine(),
+            c.server_version().clone(),
+            "db",
+        ))
+    }
+}
+
+#[test]
+fn insight_roles_fall_back_and_report_what_m6_needs() {
+    let mut reg = DialectRegistry::new();
+    // Every engine gets the standard language data until it registers its own.
+    assert!(!reg.has_language(Engine::Postgres));
+    assert!(reg.language(Engine::Postgres).is_keyword("select"));
+    assert_eq!(reg.language(Engine::Postgres).engine, None);
+    let Err(no_reader) = reg.catalog_reader(Engine::Postgres) else {
+        panic!("no catalog reader is registered yet");
+    };
+    assert_eq!(no_reader.category(), ErrorCategory::Unsupported);
+    assert_eq!(
+        reg.missing_insight_roles(Engine::Postgres),
+        vec![
+            "postgres: no CatalogReader".to_owned(),
+            "postgres: no SqlLanguage".to_owned()
+        ]
+    );
+
+    reg.register_catalog_reader(Engine::Postgres, Arc::new(EmptyCatalog));
+    reg.register_language(
+        Engine::Postgres,
+        oxbase_dialect::SqlLanguage {
+            engine: Some(Engine::Postgres),
+            reserved: &["select"],
+            ..oxbase_dialect::SqlLanguage::standard()
+        },
+    );
+    assert!(reg.has_catalog_reader(Engine::Postgres));
+    assert!(reg.has_language(Engine::Postgres));
+    assert_eq!(
+        reg.language(Engine::Postgres).engine,
+        Some(Engine::Postgres)
+    );
+    let missing = reg.missing_insight_roles(Engine::Postgres);
+    assert_eq!(missing.len(), 1, "{missing:?}");
+    assert!(
+        missing[0].starts_with("postgres: SqlLanguage: "),
+        "{missing:?}"
+    );
+    reg.register_language(Engine::Postgres, oxbase_dialect::SqlLanguage::standard());
+    assert_eq!(
+        reg.missing_insight_roles(Engine::Postgres),
+        Vec::<String>::new()
+    );
+}
+
+#[tokio::test]
+async fn a_registered_catalog_reader_reads_through_the_connection() {
+    let mut reg = DialectRegistry::new();
+    reg.register_catalog_reader(Engine::MySql, Arc::new(EmptyCatalog));
+    let conn = MockDriver::new(Engine::MySql)
+        .connect(&ConnectParams::network(Engine::MySql, "mock"))
+        .await
+        .unwrap();
+    let snap = reg
+        .catalog_reader(Engine::MySql)
+        .unwrap()
+        .read(
+            conn.as_ref(),
+            &oxbase_dialect::CatalogScope::full(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(snap.engine, Engine::MySql);
+    assert_eq!(snap.relation_count(), 0);
+}

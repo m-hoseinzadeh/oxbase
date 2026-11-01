@@ -46,6 +46,16 @@
     "allow-import-cancel",
     "allow-export-run",
     "allow-export-cancel",
+    "allow-insight-complete",
+    "allow-insight-diagnose",
+    "allow-insight-hover",
+    "allow-insight-close-editor",
+    "allow-format-sql",
+    "allow-schema-cache-refresh",
+    "allow-schema-cache-status",
+    "allow-snippet-list",
+    "allow-snippet-save",
+    "allow-snippet-delete",
     "dialog:allow-open"
   ]
 }

@@ -44,6 +44,10 @@ futures.workspace = true
 tempfile.workspace = true
 # M5: import / export (file readers and writers, bulk loaders through oxbase-dialect).
 oxbase-io.workspace = true
+# M6: code insight (completion, diagnostics, hover, formatter, built-in snippets) and the
+# schema identifier cache.
+oxbase-insight.workspace = true
+oxbase-schema-cache.workspace = true
 
 [dev-dependencies]
 oxbase-driver = { workspace = true, features = ["mock"] }

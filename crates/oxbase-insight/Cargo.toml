@@ -12,5 +12,17 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
+oxbase-types.workspace = true
+# Tokens, statements, the formatter check (M6 public token API).
+oxbase-sql.workspace = true
+# Per-engine language data (`SqlLanguage`) and identifier quoting.
+oxbase-dialect.workspace = true
+oxbase-schema-cache.workspace = true
+# `CancellationToken` for superseded completion and diagnostics requests.
+tokio-util.workspace = true
+# Payload types shared with the app (completion kinds, severities, format options).
+serde.workspace = true
 
 [dev-dependencies]
+pretty_assertions.workspace = true
+serde_json.workspace = true

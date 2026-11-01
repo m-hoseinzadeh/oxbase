@@ -32,16 +32,23 @@
 //! (module [`dump`]: session statements, literals the target reads back, identity inserts), and
 //! [`DdlContext::exact_values`] asks for column types that keep imported values exactly.
 //!
+//! M6 adds code insight data: the per-engine [`CatalogReader`] role (module [`catalog`]: read
+//! every name of a database in a few queries for the schema cache) and the per-engine
+//! [`SqlLanguage`] data (module [`language`]: keywords, reserved words, built-in functions,
+//! data types, identifier characters), both registered next to the other engine-wide roles.
+//!
 //! How engine crates register their cells: see [`DialectRegistry`] (*Registration*). The
 //! contracts are in `docs/m2-contracts.md`, `docs/m3-contracts.md`, `docs/m4-contracts.md` and
-//! `docs/m5-contracts.md`.
+//! `docs/m5-contracts.md` and `docs/m6-contracts.md`.
 
 pub mod bulk;
 mod capability;
+pub mod catalog;
 pub mod compare;
 mod ddl;
 mod dml;
 pub mod dump;
+pub mod language;
 mod quoting;
 mod registry;
 pub mod sql;
@@ -58,9 +65,11 @@ pub use bulk::{
     BulkLimits, BulkLoader, BulkMethod, InsertLoader, LoadColumn, LoadSession, LoadTarget,
 };
 pub use capability::{DesignerCapabilities, Support};
+pub use catalog::{CatalogReader, CatalogScope, RelationName};
 pub use ddl::DdlContext;
 pub use dml::{DmlPlan, DmlTarget, write_column_list, write_key_predicate};
 pub use dump::{DumpLiteral, DumpSession, IdentityInsert};
+pub use language::{FunctionInfo, FunctionKind, SqlLanguage, TypeInfo, TypeParams};
 pub use quoting::{AnsiQuoting, BacktickQuoting, BracketQuoting, LexRules, PgQuoting, Quoting};
 pub use registry::{
     CellRole, CellStatus, CoverageMatrix, DESIGNER_KINDS, DialectRegistry, EngineRole, MissingCell,

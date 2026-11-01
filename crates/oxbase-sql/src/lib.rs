@@ -1,5 +1,7 @@
-//! SQL text processing: statement splitter (M2), secret redaction for history (M2); later the
-//! lexer for code insight, dialect AST (via `sqlparser`) and formatter.
+//! SQL text processing: statement splitter (M2), secret redaction for history (M2), and (M6) the
+//! public token API, the formatter's token-equivalence check and DDL detection used by code
+//! insight (`oxbase-insight`, which also holds the formatter). No SQL AST: M6 chose a tolerant
+//! hand-written parser over these tokens (`docs/m6-contracts.md` §1).
 //!
 //! # M2 API
 //!
@@ -7,6 +9,17 @@
 //! - [`statement_at`]: the statement under the cursor ("run current statement").
 //! - [`redact_secrets`]: mask obvious password literals before SQL text is stored in history.
 //! - Position helpers for the editor: [`position_at`] and [`byte_offset_from_utf16`].
+//!
+//! # M6 API (`docs/m6-contracts.md` §2)
+//!
+//! - [`tokenize`]: the splitter's tokens for code insight and the formatter ([`SqlToken`],
+//!   [`SqlTokenKind`], [`ident_value`]).
+//! - [`tokens_equivalent`]: the formatter's safety check (same tokens apart from whitespace and
+//!   keyword case, touching operators still touching, same statements).
+//! - [`schema_changes`]: the DDL a statement probably ran, for schema-cache invalidation.
+//! - [`utf16_offset_from_byte`]: the inverse of [`byte_offset_from_utf16`].
+//!
+//! All four are final (Design step, M6).
 //!
 //! Owner of the bodies of [`split`] and [`redact_secrets`]: the **sql** stream
 //! (`docs/m2-contracts.md`). Everything else here is final.
@@ -99,9 +112,16 @@ use std::ops::Range;
 
 use oxbase_types::Engine;
 
+mod ddl;
 mod lex;
 mod redact;
 mod splitter;
+mod tokens;
+
+pub use ddl::{DdlObject, DdlVerb, NamePart, SchemaChange, schema_changes};
+pub use tokens::{
+    SqlToken, SqlTokenKind, TokenMismatch, Tokens, ident_value, tokenize, tokens_equivalent,
+};
 
 /// The SQL dialect to split, chosen from the connection's engine with
 /// [`SqlDialect::for_engine`].
@@ -252,6 +272,14 @@ pub fn byte_offset_from_utf16(text: &str, utf16_offset: usize) -> usize {
     text.len()
 }
 
+/// Converts a byte offset in `text` into UTF-16 code units (a Monaco offset). An offset inside
+/// a multi-byte character counts as that character's start; offsets past the end clamp to the
+/// text's UTF-16 length.
+pub fn utf16_offset_from_byte(text: &str, byte_offset: usize) -> usize {
+    let end = floor_char_boundary(text, byte_offset);
+    text[..end].encode_utf16().count()
+}
+
 /// The largest char boundary `<= index` (clamped to the text).
 fn floor_char_boundary(text: &str, index: usize) -> usize {
     if index >= text.len() {
@@ -331,6 +359,16 @@ mod tests {
         assert_eq!(byte_offset_from_utf16(text, 4), 7);
         assert_eq!(byte_offset_from_utf16(text, 99), 7);
         assert_eq!(byte_offset_from_utf16("", 3), 0);
+        for (byte, units) in [(0, 0), (2, 1), (3, 1), (6, 3), (7, 4), (99, 4)] {
+            assert_eq!(utf16_offset_from_byte(text, byte), units, "byte {byte}");
+        }
+        for units in 0..=4 {
+            let byte = byte_offset_from_utf16(text, units);
+            assert_eq!(
+                byte_offset_from_utf16(text, utf16_offset_from_byte(text, byte)),
+                byte
+            );
+        }
     }
 
     #[test]

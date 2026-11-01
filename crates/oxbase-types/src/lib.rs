@@ -22,7 +22,11 @@
 //! - [`net`]: [`Endpoint`], [`TlsOptions`] / [`TlsMode`] and [`SshOptions`] (connection addressing,
 //!   TLS and SSH settings shared by drivers, `oxbase-net`, `oxbase-store` and services).
 //! - [`error`]: the single [`Error`] type and [`Result`] alias.
+//! - [`catalog`] (M6): [`CatalogSnapshot`], every schema-level name of one database for code
+//!   insight, and the identifier case rules [`IdentCase`] / [`CaseRules`].
+//! - [`snippet`] (M6): editor [`Snippet`]s and their body syntax.
 
+pub mod catalog;
 pub mod data_type;
 pub mod def;
 pub mod diff;
@@ -37,9 +41,14 @@ pub mod progress;
 pub mod props;
 pub mod script;
 pub mod secret;
+pub mod snippet;
 pub mod value;
 pub mod version;
 
+pub use catalog::{
+    CaseRules, CatalogColumn, CatalogForeignKey, CatalogRelation, CatalogRoutine, CatalogSchema,
+    CatalogSnapshot, IdentCase, RelationKind, RoutineKind,
+};
 pub use data_type::DataType;
 pub use def::{
     ArgMode, CheckDef, ColumnDef, FkAction, ForeignKeyDef, GeneratedColumn, GenericDef,
@@ -60,5 +69,6 @@ pub use progress::{Progress, ProgressUnit};
 pub use props::{Extras, PropId};
 pub use script::{BoundStatement, Script, ScriptStep, StepCheck, StepCondition, StepPhase};
 pub use secret::Secret;
+pub use snippet::{Snippet, SnippetInput, validate_snippet_body};
 pub use value::Value;
 pub use version::ServerVersion;

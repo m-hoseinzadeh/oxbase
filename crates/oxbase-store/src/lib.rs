@@ -21,6 +21,14 @@
 //!   clear, prune) and its [`HistorySettings`]. [`MemoryHistoryRepository`] for tests;
 //!   [`SqliteHistoryRepository`] in the app database. Callers redact secrets before `append`.
 //!
+//! M6 contracts (see `docs/m6-contracts.md`):
+//!
+//! - [`SnippetRepository`]: user snippets ([`MemorySnippetRepository`],
+//!   [`SqliteSnippetRepository`]).
+//! - [`SchemaCacheRepository`]: persisted schema-cache snapshots per (profile, database), so
+//!   the editor has names at startup ([`MemorySchemaCacheRepository`],
+//!   [`SqliteSchemaCacheRepository`]). App database migration 2.
+//!
 //! Turning a profile into driver parameters (resolving secrets, opening tunnels) is the
 //! connection manager's job in `oxbase-services`.
 
@@ -39,6 +47,7 @@ use oxbase_types::{Error, Result};
 mod app_db;
 mod file_repo;
 pub mod history;
+pub mod insight;
 
 pub use app_db::{
     AppDb, DATA_DIR_ENV, HISTORY_SETTINGS_KEY, MIGRATIONS, Migration, SqliteHistoryRepository,
@@ -50,6 +59,10 @@ pub use file_repo::{
 pub use history::{
     HistoryEntry, HistoryQuery, HistoryRepository, HistorySettings, HistoryStatus,
     MemoryHistoryRepository,
+};
+pub use insight::{
+    MemorySchemaCacheRepository, MemorySnippetRepository, SchemaCacheRepository, SnippetRepository,
+    SqliteSchemaCacheRepository, SqliteSnippetRepository, StoredSnapshot,
 };
 
 /// Unknown JSON fields preserved across a load/save round trip.
