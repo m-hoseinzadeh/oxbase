@@ -44,7 +44,7 @@ pub(crate) struct Tok {
 #[derive(Debug, Clone)]
 pub(crate) struct Toks<'a> {
     pub text: &'a str,
-    pub toks: Vec<Tok>,
+    pub all: Vec<Tok>,
     /// The statement holds a MySQL executable comment (`/*! ... */`) whose content the parser
     /// does not read: findings that depend on the statement's structure are only hints.
     pub opaque: bool,
@@ -98,24 +98,28 @@ impl<'a> Toks<'a> {
         }
         let mut toks = merge(&raw, feat);
         pair_parens(&mut toks);
-        Self { text, toks, opaque }
+        Self {
+            text,
+            all: toks,
+            opaque,
+        }
     }
 
     pub fn len(&self) -> usize {
-        self.toks.len()
+        self.all.len()
     }
 
     pub fn kind(&self, i: usize) -> Option<Kind> {
-        self.toks.get(i).map(|t| t.kind)
+        self.all.get(i).map(|t| t.kind)
     }
 
     /// The token's text (empty past the end).
     pub fn text(&self, i: usize) -> &'a str {
-        self.toks.get(i).map_or("", |t| &self.text[t.start..t.end])
+        self.all.get(i).map_or("", |t| &self.text[t.start..t.end])
     }
 
     pub fn range(&self, i: usize) -> Range<usize> {
-        self.toks.get(i).map_or(0..0, |t| t.start..t.end)
+        self.all.get(i).map_or(0..0, |t| t.start..t.end)
     }
 
     /// `true` when token `i` is the word `kw` (ASCII case-insensitive).
@@ -140,9 +144,9 @@ impl<'a> Toks<'a> {
         self.is_punct(i, c)
             && i > 0
             && self
-                .toks
+                .all
                 .get(i - 1)
-                .zip(self.toks.get(i))
+                .zip(self.all.get(i))
                 .is_some_and(|(a, b)| a.end == b.start)
     }
 
@@ -153,7 +157,7 @@ impl<'a> Toks<'a> {
 
     /// The index of the `)` of the `(` at `i`, or `hi` when it is not closed before `hi`.
     pub fn close_of(&self, i: usize, hi: usize) -> usize {
-        self.toks
+        self.all
             .get(i)
             .and_then(|t| t.close)
             .filter(|&c| c < hi)

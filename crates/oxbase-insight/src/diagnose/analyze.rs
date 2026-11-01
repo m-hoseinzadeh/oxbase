@@ -7,6 +7,9 @@
 //! makes the statement `uncertain` (its catalog findings are then hints). A splitter statement
 //! may hold several SQL statements (a T-SQL batch, a routine body); [`analyze`] cuts it first.
 
+// Token indices are `i`, `j`, `k`, `c` (a closing parenthesis), the token list `t`, the block `b`.
+#![allow(clippy::many_single_char_names)]
+
 use std::ops::Range;
 
 use oxbase_dialect::SqlLanguage;
@@ -402,10 +405,11 @@ fn routine_body(t: &Toks<'_>, feat: &Features, start: usize, hi: usize) -> Optio
                     "RETURN" => return Some(k),
                     "DO" => return Some(k + 1),
                     "AS" if feat.batches && !t.is_word(k - 1, "EXECUTE") => return Some(k + 1),
-                    "ROW" if t.is_word(k - 1, "EACH") => {
-                        if !t.word_in(k + 1, &["WHEN", "BEGIN", "FOLLOWS", "PRECEDES"]) {
-                            return Some(k + 1);
-                        }
+                    "ROW"
+                        if t.is_word(k - 1, "EACH")
+                            && !t.word_in(k + 1, &["WHEN", "BEGIN", "FOLLOWS", "PRECEDES"]) =>
+                    {
+                        return Some(k + 1);
                     }
                     _ => {}
                 }
@@ -629,7 +633,7 @@ impl Parser<'_, '_> {
 
     fn name_at(&self, i: usize) -> Option<Name> {
         let t = self.t;
-        let tok = t.toks.get(i)?;
+        let tok = t.all.get(i)?;
         let raw = t.text(i);
         match tok.kind {
             Kind::Word => Some(Name {
@@ -743,9 +747,9 @@ impl Parser<'_, '_> {
 
     fn new_block(&mut self, parent: Option<usize>, lo: usize, hi: usize) -> usize {
         let t = self.t;
-        let start = t.toks.get(lo).map_or(self.st.range.end, |x| x.start);
+        let start = t.all.get(lo).map_or(self.st.range.end, |x| x.start);
         let end = if hi > lo {
-            t.toks.get(hi - 1).map_or(start, |x| x.end).max(start)
+            t.all.get(hi - 1).map_or(start, |x| x.end).max(start)
         } else {
             start
         };
@@ -1400,7 +1404,7 @@ impl Parser<'_, '_> {
         w.ex.no_refs = start == Cl::Head;
         let mut i = lo;
         while i < hi {
-            let Some(tok) = t.toks.get(i).copied() else {
+            let Some(tok) = t.all.get(i).copied() else {
                 break;
             };
             let next = match tok.kind {
@@ -1584,7 +1588,11 @@ impl Parser<'_, '_> {
         let r = t.range(i);
         let head = self.st.head;
         let next_paren = t.is_punct(i + 1, b'(');
-        if head == Head::Insert && matches!(w.cl, Cl::Head | Cl::Values) && self.starts_query(i, hi)
+        // `INSERT ... SELECT` / `INSERT ... VALUES` of the statement's own block (block 0).
+        if head == Head::Insert
+            && w.b == 0
+            && matches!(w.cl, Cl::Head | Cl::Values)
+            && self.starts_query(i, hi)
         {
             let end = self.insert_select_end(i, hi);
             self.query(i, end, Some(w.b));
@@ -1707,7 +1715,7 @@ impl Parser<'_, '_> {
             "UNION" | "INTERSECT" | "EXCEPT" | "MINUS" => Some(self.set_operation(w, i, hi)),
             "INTO" if !matches!(w.cl, Cl::Head | Cl::Values | Cl::Set) => {
                 self.enter(w, Cl::Into, r, "INTO");
-                Some(self.into_target(i + 1, hi))
+                Some(self.select_into(i + 1, hi))
             }
             "RETURNING" | "OUTPUT" if head != Head::Query && w.cl != Cl::Select => {
                 if up == "RETURNING" && !self.feat.returning {
@@ -1822,7 +1830,7 @@ impl Parser<'_, '_> {
     }
 
     /// The table of `SELECT ... INTO t` (created by the statement).
-    fn into_target(&mut self, i: usize, hi: usize) -> usize {
+    fn select_into(&mut self, i: usize, hi: usize) -> usize {
         let t = self.t;
         let mut j = i;
         while t.word_in(j, &["TABLE", "TEMP", "TEMPORARY", "UNLOGGED"]) {
@@ -2039,7 +2047,7 @@ impl Parser<'_, '_> {
     /// One token of an expression; returns the index after what it consumed.
     fn atom(&mut self, b: usize, i: usize, hi: usize, ex: &mut Ex) -> usize {
         let t = self.t;
-        let Some(tok) = t.toks.get(i).copied() else {
+        let Some(tok) = t.all.get(i).copied() else {
             return i + 1;
         };
         match tok.kind {
@@ -2218,13 +2226,13 @@ impl Parser<'_, '_> {
         let set_target = ex.set_list && ex.item_start && t.is_punct(next, b'=');
         let pseudo =
             parts.len() > 1 && has(words::PSEUDO_TABLES, &parts[0].text.to_ascii_uppercase());
-        let record = !ex.no_refs
-            && tail == Tail::Name
-            && !ex.after_for
-            && !(ex.no_bare && parts.len() == 1)
-            && !pseudo;
+        let skip = ex.no_refs
+            || tail != Tail::Name
+            || ex.after_for
+            || pseudo
+            || (ex.no_bare && parts.len() == 1);
         let last = parts.last().cloned();
-        if record {
+        if !skip {
             self.st.cols.push(ColRef {
                 parts,
                 block: b,

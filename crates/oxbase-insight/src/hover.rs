@@ -65,13 +65,13 @@ pub fn hover(
 /// The name token at `offset` (a cursor right after a name counts).
 fn token_at(toks: &Toks<'_>, offset: usize) -> Option<usize> {
     let is_name = |i: usize| matches!(toks.kind(i), Some(Kind::Word | Kind::Quoted));
-    let i = toks.toks.partition_point(|t| t.end < offset);
-    let tok = toks.toks.get(i)?;
+    let i = toks.all.partition_point(|t| t.end < offset);
+    let tok = toks.all.get(i)?;
     if tok.start <= offset && offset <= tok.end && is_name(i) {
         return Some(i);
     }
     // `(|name`: the cursor between a punctuation and the name it touches.
-    let next = toks.toks.get(i + 1)?;
+    let next = toks.all.get(i + 1)?;
     (tok.end == offset && next.start == offset && is_name(i + 1)).then_some(i + 1)
 }
 

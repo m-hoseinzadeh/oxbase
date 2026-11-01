@@ -58,11 +58,12 @@ pub(crate) fn unterminated(
 /// `)` without `(` and `(` never closed, within one statement.
 pub(crate) fn parens(t: &Toks<'_>, out: &mut Vec<Diagnostic>) {
     let mut open: Vec<usize> = Vec::new();
-    for tok in &t.toks {
+    for tok in &t.all {
         match tok.kind {
             Kind::Punct(b'(') => open.push(tok.start),
             Kind::Punct(b')') => {
-                if open.pop().is_none() {
+                let unmatched = open.pop().is_none();
+                if unmatched {
                     out.push(Diagnostic::new(
                         DiagnosticCode::UnbalancedParenthesis,
                         tok.start..tok.end,
@@ -91,7 +92,7 @@ pub(crate) fn directives(
     dialect: &Dialect,
     out: &mut Vec<Diagnostic>,
 ) {
-    for (i, tok) in t.toks.iter().enumerate() {
+    for (i, tok) in t.all.iter().enumerate() {
         if tok.kind != Kind::Word || !tok.line_start {
             continue;
         }
@@ -109,10 +110,10 @@ pub(crate) fn directives(
         }
         if !feat.go && t.is_word(i, "GO") {
             let mut next = i + 1;
-            if t.kind(next) == Some(Kind::Number) && !t.toks[next].line_start {
+            if t.kind(next) == Some(Kind::Number) && !t.all[next].line_start {
                 next += 1;
             }
-            let alone = t.toks.get(next).is_none_or(|n| n.line_start);
+            let alone = t.all.get(next).is_none_or(|n| n.line_start);
             let prev_ok = i == 0
                 || (matches!(
                     t.kind(i - 1),
@@ -126,7 +127,7 @@ pub(crate) fn directives(
                     )
                 ) && !(t.kind(i - 1) == Some(Kind::Word)
                     && dialect.language.is_keyword(t.text(i - 1))));
-            let next_ok = t.toks.get(next).is_none()
+            let next_ok = t.all.get(next).is_none()
                 || (t.kind(next) == Some(Kind::Word)
                     && has(words::STATEMENT_STARTS, &t.upper(next)));
             if alone && prev_ok && next_ok {
