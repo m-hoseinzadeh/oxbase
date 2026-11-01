@@ -9,7 +9,8 @@
 //! - every seed name is listed, with the ref `parent.child(kind, name)` (routine signatures
 //!   aside) and `system = false`;
 //! - `load` of every listed seed row returns a definition of that kind and name whose JSON
-//!   (what the webview receives) parses back to the same definition.
+//!   (what the webview receives) parses back to the same definition;
+//! - no name the group marks absent is listed (the `[m4]` DDL trigger in a Triggers folder).
 //!
 //! - the seed rows come in the order of §3.3 of `docs/m2-contracts.md`: columns by ordinal,
 //!   other kinds (databases aside) by name.
@@ -102,7 +103,8 @@ pub fn runnable_kinds(registry: &DialectRegistry, engine: Engine) -> Vec<ObjectK
 }
 
 /// The seed groups of `kind` for the fixture `e` (empty when the fixtures seed nothing): the
-/// `[m2]` groups, then the `[m4]` ones of an engine with an `[m4.<engine>]` table.
+/// `[m2]` groups, then the `[m4]` ones of an engine with an `[m4.<engine>]` table, every group
+/// of such an engine also carrying the `[m4]` names no list of `kind` may return.
 pub fn groups_for(fixtures: &Fixtures, e: &ResolvedEngine, kind: ObjectKind) -> Vec<SeedGroup> {
     let mut groups = fixtures
         .m2_seed(&e.name, e.engine)
@@ -110,6 +112,10 @@ pub fn groups_for(fixtures: &Fixtures, e: &ResolvedEngine, kind: ObjectKind) -> 
         .unwrap_or_default();
     if let Some((m4, seed)) = fixtures.m4_seed(&e.name, e.engine) {
         groups.extend(seeds::m4_groups(m4, &seed, kind));
+        let never = seeds::m4_never_listed(m4, kind);
+        for g in &mut groups {
+            g.absent.extend(never.iter().cloned());
+        }
     }
     groups
 }
@@ -499,6 +505,12 @@ pub async fn check_kind(
                 "{} not listed under {parent} (listed: {})",
                 missing.join(", "),
                 preview(&rows)
+            ));
+        }
+        if let Some(r) = rows.iter().find(|r| g.absent.contains(&r.obj.name)) {
+            return Err(format!(
+                "{} is listed under {parent}, but no {kind} list may show it",
+                r.obj
             ));
         }
         check_order(kind, &g.names, &rows).map_err(|err| format!("{err} under {parent}"))?;
@@ -920,6 +932,7 @@ mod tests {
         vec![SeedGroup {
             parent: db(),
             names: names.iter().map(|&n| n.to_owned()).collect(),
+            absent: Vec::new(),
         }]
     }
 
@@ -945,6 +958,7 @@ mod tests {
         let groups = vec![SeedGroup {
             parent: ObjectRef::root(),
             names: vec!["oxbase_test".to_owned()],
+            absent: Vec::new(),
         }];
         let detail = check(&Fake::new(rows), c.as_ref(), ObjectKind::Database, &groups)
             .await
@@ -953,6 +967,25 @@ mod tests {
             detail.starts_with("oxbase_test under the server: listed"),
             "{detail}"
         );
+    }
+
+    #[tokio::test]
+    async fn fails_when_a_name_that_must_stay_hidden_is_listed() {
+        let c = conn().await;
+        let f = Fake::new(views(&["m2_view", "m4_ddl_trg"]));
+        let mut groups = group(&["m2_view"]);
+        groups[0].absent.push("m4_ddl_trg".to_owned());
+        let err = check(&f, c.as_ref(), ObjectKind::View, &groups)
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("m4_ddl_trg") && err.contains("may show it"),
+            "{err}"
+        );
+        groups[0].absent = vec!["elsewhere".to_owned()];
+        check(&f, c.as_ref(), ObjectKind::View, &groups)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

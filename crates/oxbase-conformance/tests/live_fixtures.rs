@@ -136,13 +136,46 @@ fn harness_runs_against_all_engines_and_m1_connection_checks_pass() {
         guard::REQUIRE_ENV,
         problems.join("\n  ")
     );
+    // Without the guard, preview everything it would refuse: its own problems plus the
+    // fetch_list and roundtrip / capabilities gates run as if it were on (pending SQL Server
+    // cells included), so "nothing open" really means the guard can be turned on.
+    let mut open = problems;
+    if !require_m4 {
+        let fetch_m4 = fetch::GateOptions {
+            require_m4: true,
+            ..gate
+        };
+        open.extend(fetch::gate(
+            &report.cells,
+            &fx,
+            &resolved,
+            &registry,
+            fetch_m4,
+        ));
+        let rt_m4 = roundtrip::GateOptions {
+            require_m3: true,
+            require_m4: true,
+            ..m3
+        };
+        open.extend(roundtrip::gate(
+            &report.cells,
+            &fx,
+            &resolved,
+            &registry,
+            rt_m4,
+        ));
+    }
     println!(
         "5-engine guard ({}: {require_m4}): {}",
         guard::REQUIRE_ENV,
-        if problems.is_empty() {
-            "nothing open".to_owned()
+        if open.is_empty() {
+            "nothing open (every M4 engine passes; the guard can be turned on)".to_owned()
         } else {
-            format!("{} open: {}", problems.len(), problems.join("; "))
+            format!(
+                "{} open (failed, skipped or pending under the guard): {}",
+                open.len(),
+                open.join("; ")
+            )
         }
     );
 

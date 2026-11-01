@@ -113,7 +113,234 @@ pub fn gate(report: &Report, engines: &[ResolvedEngine]) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
+    use crate::adapter::ObjectKind;
+    use crate::connect::{ConnCell, ConnCheck};
+    use crate::matrix::{Cell, Check};
+    use crate::probe::{Handshake, ProbeOutcome, Target};
+    use crate::report::{EngineStatus, REPORT_SCHEMA_VERSION, Summary};
+
+    fn target(port: u16) -> Target {
+        Target::Tcp {
+            host: "127.0.0.1".to_owned(),
+            port,
+        }
+    }
+
+    fn resolved(name: &str, engine: Engine, port: u16) -> ResolvedEngine {
+        ResolvedEngine {
+            name: name.to_owned(),
+            engine,
+            target: target(port),
+            version_prefix: None,
+        }
+    }
+
+    fn status(name: &str, kind: Engine, port: u16, reachable: bool) -> EngineStatus {
+        EngineStatus {
+            name: name.to_owned(),
+            kind,
+            target: target(port),
+            probe: ProbeOutcome {
+                reachable,
+                latency_ms: 1,
+                handshake: Handshake::NotAttempted,
+                server_version: None,
+                version_matches: None,
+                expected_version: None,
+                error: (!reachable).then(|| "TCP connect failed: refused".to_owned()),
+            },
+        }
+    }
+
+    fn conn(name: &str, kind: Engine, check: ConnCheck, status: CellStatus) -> ConnCell {
+        ConnCell {
+            engine: name.to_owned(),
+            engine_kind: kind,
+            check,
+            status,
+            detail: Some(format!("{name} {}", status.label())),
+            elapsed_ms: None,
+        }
+    }
+
+    fn cell(name: &str, kind: Engine, object: ObjectKind, check: Check, st: CellStatus) -> Cell {
+        Cell {
+            engine: name.to_owned(),
+            engine_kind: kind,
+            object_kind: object,
+            check,
+            status: st,
+            detail: None,
+            elapsed_ms: None,
+        }
+    }
+
+    fn report(engines: Vec<EngineStatus>, connections: Vec<ConnCell>, cells: Vec<Cell>) -> Report {
+        Report {
+            report_schema_version: REPORT_SCHEMA_VERSION,
+            milestone: "M4".to_owned(),
+            generated_at_unix: 0,
+            fixtures_path: PathBuf::from("/repo/tests/fixtures.toml"),
+            compose_project: None,
+            allow_missing: false,
+            engines,
+            missing_engines: Vec::new(),
+            checks: Vec::new(),
+            summary: Summary::from_cells(&cells),
+            cells,
+            connection_checks: Vec::new(),
+            connections,
+            connection_summary: Summary::default(),
+        }
+    }
+
+    #[test]
+    fn the_gate_reports_every_open_item_of_the_five_engines_only() {
+        // SQLite has no fixture; mongodb and redis are outside the guard.
+        let engines = vec![
+            resolved("postgres", Engine::Postgres, 15432),
+            resolved("mysql", Engine::MySql, 15406),
+            resolved("mariadb", Engine::MariaDb, 15407),
+            resolved("mssql", Engine::MsSql, 15433),
+            resolved("mongodb", Engine::MongoDb, 15417),
+            resolved("redis", Engine::Redis, 15479),
+        ];
+        let r = report(
+            vec![
+                status("postgres", Engine::Postgres, 15432, true),
+                status("mysql", Engine::MySql, 15406, true),
+                status("mariadb", Engine::MariaDb, 15407, true),
+                status("mssql", Engine::MsSql, 15433, false),
+                status("mongodb", Engine::MongoDb, 15417, false),
+                status("redis", Engine::Redis, 15479, false),
+            ],
+            vec![
+                conn(
+                    "postgres",
+                    Engine::Postgres,
+                    ConnCheck::Connect,
+                    CellStatus::Pass,
+                ),
+                conn(
+                    "mysql",
+                    Engine::MySql,
+                    ConnCheck::Ssh,
+                    CellStatus::NotApplicable,
+                ),
+                conn("mssql", Engine::MsSql, ConnCheck::Tls, CellStatus::Fail),
+                conn(
+                    "mariadb",
+                    Engine::MariaDb,
+                    ConnCheck::Cancel,
+                    CellStatus::Skipped,
+                ),
+                conn("redis", Engine::Redis, ConnCheck::Connect, CellStatus::Fail),
+                conn(
+                    "mongodb",
+                    Engine::MongoDb,
+                    ConnCheck::Tls,
+                    CellStatus::Skipped,
+                ),
+            ],
+            vec![
+                cell(
+                    "postgres",
+                    Engine::Postgres,
+                    ObjectKind::Table,
+                    Check::FetchList,
+                    CellStatus::Pass,
+                ),
+                cell(
+                    "mysql",
+                    Engine::MySql,
+                    ObjectKind::Index,
+                    Check::Roundtrip,
+                    CellStatus::Fail,
+                ),
+                cell(
+                    "mssql",
+                    Engine::MsSql,
+                    ObjectKind::View,
+                    Check::FetchList,
+                    CellStatus::Skipped,
+                ),
+                // Pending is the fetch / roundtrip gates' business, not this one's.
+                cell(
+                    "mssql",
+                    Engine::MsSql,
+                    ObjectKind::Check,
+                    Check::Capabilities,
+                    CellStatus::Pending,
+                ),
+                cell(
+                    "mariadb",
+                    Engine::MariaDb,
+                    ObjectKind::Column,
+                    Check::Roundtrip,
+                    CellStatus::NotApplicable,
+                ),
+                cell(
+                    "mongodb",
+                    Engine::MongoDb,
+                    ObjectKind::Table,
+                    Check::FetchList,
+                    CellStatus::Fail,
+                ),
+                cell(
+                    "redis",
+                    Engine::Redis,
+                    ObjectKind::Table,
+                    Check::FetchList,
+                    CellStatus::Skipped,
+                ),
+            ],
+        );
+        let problems = gate(&r, &engines);
+        let has = |needle: &str| problems.iter().filter(|p| p.contains(needle)).count();
+        assert_eq!(has("no sqlite fixture"), 1, "{problems:?}");
+        assert_eq!(has("mssql: fixture unreachable"), 1, "{problems:?}");
+        assert_eq!(has("mssql tls connection check: fail"), 1, "{problems:?}");
+        assert_eq!(
+            has("mariadb cancel connection check: skipped"),
+            1,
+            "{problems:?}"
+        );
+        assert_eq!(has("mysql index roundtrip: fail"), 1, "{problems:?}");
+        assert_eq!(has("mssql view fetch_list: skipped"), 1, "{problems:?}");
+        assert_eq!(has("mongodb"), 0, "{problems:?}");
+        assert_eq!(has("redis"), 0, "{problems:?}");
+        assert_eq!(problems.len(), 6, "{problems:?}");
+
+        // All five present, reachable and passing: nothing open.
+        let five: Vec<ResolvedEngine> = M4_ENGINES
+            .iter()
+            .enumerate()
+            .map(|(i, &e)| resolved(e.as_str(), e, 15000 + u16::try_from(i).unwrap()))
+            .collect();
+        let ok = report(
+            five.iter()
+                .map(|e| status(&e.name, e.engine, 1, true))
+                .collect(),
+            five.iter()
+                .map(|e| conn(&e.name, e.engine, ConnCheck::Connect, CellStatus::Pass))
+                .collect(),
+            five.iter()
+                .map(|e| {
+                    cell(
+                        &e.name,
+                        e.engine,
+                        ObjectKind::Table,
+                        Check::FetchList,
+                        CellStatus::Pass,
+                    )
+                })
+                .collect(),
+        );
+        assert_eq!(gate(&ok, &five), Vec::<String>::new());
+    }
 
     #[test]
     fn the_guard_covers_the_five_sql_engines() {

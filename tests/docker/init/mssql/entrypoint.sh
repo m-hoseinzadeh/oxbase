@@ -17,10 +17,13 @@ SQLCMD="${OXBASE_SQLCMD:-/opt/mssql-tools18/bin/sqlcmd}"
 MARKER=/tmp/oxbase-fixture-seeded
 rm -f "$MARKER"
 
-# M4 TLS (docs/m4-contracts.md §5.1, TEST-ONLY PKI): serve the fixture certificate. TLS is offered
+# M4 TLS (docs/m4-contracts.md §5.1, TEST-ONLY PKI): serve the fixture certificate, TLS 1.2 and
+# 1.3 only (tlsprotocols, so the floor does not depend on the server's defaults). TLS is offered
 # but not forced (forceencryption = 0), so plaintext logins keep working; the TLS-only login
-# oxbase_tls is enforced by a logon trigger (03-tls-user.sql). Needs root (compose `user: root`)
-# to read the bind-mounted 0600 key.
+# oxbase_tls is enforced by a logon trigger (03-tls-user.sql). Deviation from §5.1: sqlservr runs
+# as root (compose `user: root`) with a root-owned 0600 copy of the key, instead of dropping to the
+# mssql user (uid 10001); root is needed to read the bind-mounted 0600 key, and existing fixture
+# volumes hold root-owned data files.
 tls_src=/oxbase-tls-src
 tls_dir=/etc/oxbase-tls
 for f in ca.pem server.pem server-key.pem; do
@@ -39,13 +42,18 @@ cat >/var/opt/mssql/mssql.conf <<EOF_CONF
 tlscert = $tls_dir/server.pem
 tlskey = $tls_dir/server-key.pem
 forceencryption = 0
+tlsprotocols = 1.2,1.3
 EOF_CONF
 
 /opt/mssql/bin/launch_sqlservr.sh /opt/mssql/bin/sqlservr &
 pid=$!
 # launch_sqlservr.sh does not forward signals, so send SIGTERM straight to the (oldest) sqlservr
-# process for a clean shutdown; the launcher exits once sqlservr has.
-trap 'pkill -TERM -o -x sqlservr 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true' TERM INT
+# process for a clean shutdown; the launcher exits once sqlservr has. Used by the trap and by the
+# failure paths below.
+stop_server() {
+    pkill -TERM -o -x sqlservr 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+}
+trap stop_server TERM INT
 
 # -b: exit non-zero on the first error; -I: QUOTED_IDENTIFIER ON (sqlcmd's default is OFF, which
 # filtered indexes, indexed views and computed-column indexes refuse).
@@ -78,7 +86,7 @@ for _ in $(seq 1 120); do
 done
 if [ "$ready" -ne 1 ]; then
     echo "oxbase-init: SQL Server did not become ready in time" >&2
-    kill -TERM "$pid" 2>/dev/null || true
+    stop_server
     wait "$pid" || true
     exit 1
 fi
@@ -104,7 +112,7 @@ case "$state" in
             echo "oxbase-init: applying $f"
             if ! sql -i "$f"; then
                 echo "oxbase-init: FAILED applying $f (see the sqlcmd error above); stopping" >&2
-                kill -TERM "$pid" 2>/dev/null || true
+                stop_server
                 wait "$pid" || true
                 exit 1
             fi

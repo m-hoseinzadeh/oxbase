@@ -22,16 +22,22 @@ pub const PARENT_COLUMNS: [&str; 3] = ["id", "code", "note"];
 pub const CHILD_COLUMNS: [&str; 3] = ["id", "parent_id", "qty"];
 
 /// One `Fetcher::list` call of a `fetch_list` cell: the rows under `parent` must include every
-/// name in `names`.
+/// name in `names` and none of `absent` (seed objects the tree must not show there, such as
+/// the `[m4]` database-level DDL trigger under a table's or view's Triggers folder).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SeedGroup {
     pub parent: ObjectRef,
     pub names: Vec<String>,
+    pub absent: Vec<String>,
 }
 
 impl SeedGroup {
     fn new(parent: ObjectRef, names: Vec<String>) -> Option<Self> {
-        (!names.is_empty()).then_some(Self { parent, names })
+        (!names.is_empty()).then_some(Self {
+            parent,
+            names,
+            absent: Vec::new(),
+        })
     }
 }
 
@@ -142,6 +148,15 @@ pub fn m4_groups(m4: &M4Fixture, seed: &M4EngineSeed, kind: ObjectKind) -> Vec<S
         _ => None,
     };
     group.into_iter().collect()
+}
+
+/// The `[m4]` seed objects no `list` of `kind` may return on an engine with an `[m4.<engine>]`
+/// table: the database-level DDL trigger is in no Triggers folder (`docs/m4-contracts.md` §3).
+pub fn m4_never_listed(m4: &M4Fixture, kind: ObjectKind) -> Vec<String> {
+    match kind {
+        ObjectKind::Trigger => m4.ddl_trigger.iter().cloned().collect(),
+        _ => Vec::new(),
+    }
 }
 
 fn owned_names(names: &[&str]) -> Vec<String> {
@@ -362,6 +377,9 @@ mod tests {
             m4g(ObjectKind::Table),
             Vec::<(ObjectRef, Vec<String>)>::new()
         );
+        // The DDL trigger must stay out of every Triggers folder.
+        assert_eq!(m4_never_listed(m4, ObjectKind::Trigger), v(&["m4_ddl_trg"]));
+        assert_eq!(m4_never_listed(m4, ObjectKind::Index), Vec::<String>::new());
         // No [m4.<engine>] elsewhere.
         assert!(fx.m4_seed("postgres", Engine::Postgres).is_none());
     }

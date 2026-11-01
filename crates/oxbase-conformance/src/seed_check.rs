@@ -198,11 +198,15 @@ async fn check(
             Vec::new(),
             "3".to_owned(),
         ));
+        // Seed 1, step 1, and at least past the seed rows. Not "= 3": the grid and DDL live
+        // tests insert and delete their own rows, which moves the identity on a reused volume.
         checks.push((
-            format!("{plain} next identity after the seed"),
-            "SELECT CONVERT(int, IDENT_CURRENT(@P1))".to_owned(),
+            format!("{plain} identity seed 1, step 1, at least 3"),
+            "SELECT CASE WHEN IDENT_SEED(@P1) = 1 AND IDENT_INCR(@P1) = 1 \
+             AND IDENT_CURRENT(@P1) >= 3 THEN 1 ELSE 0 END"
+                .to_owned(),
             vec![Value::Text(plain.clone())],
-            "3".to_owned(),
+            "1".to_owned(),
         ));
         checks.push((
             format!("{plain} has one DML trigger"),
