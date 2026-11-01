@@ -74,9 +74,15 @@ wildcards = "deny"
 # Path dependencies inside the workspace are fine without a version.
 allow-wildcard-paths = true
 highlight = "all"
+# TLS policy (PLAN.md, docs/m4-contracts.md §2.1): rustls with the ring provider only.
+# These bans make the rule a CI failure instead of a convention: enabling e.g. tiberius'
+# `rustls` feature or tokio-rustls default features would pull aws-lc-rs in.
 deny = [
-    # Candidate once drivers land (PLAN.md prefers rustls):
-    # { crate = "openssl-sys", reason = "use rustls; native OpenSSL complicates 3-OS builds" },
+    { crate = "openssl-sys", reason = "TLS is rustls+ring only; native OpenSSL complicates 3-OS builds" },
+    { crate = "openssl", reason = "TLS is rustls+ring only; native OpenSSL complicates 3-OS builds" },
+    { crate = "native-tls", reason = "TLS is rustls+ring only; no platform TLS stacks" },
+    { crate = "aws-lc-sys", reason = "TLS is rustls+ring only; aws-lc needs a C/CMake toolchain on every OS" },
+    { crate = "aws-lc-rs", reason = "TLS is rustls+ring only; select the ring crypto provider" },
 ]
 skip = []
 skip-tree = []

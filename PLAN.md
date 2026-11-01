@@ -316,8 +316,9 @@ manual runs 41298470889 and 41298472236. Where the build differs from the text a
 `docs/m4-contracts.md` (its §13 lists every deviation):
 
 - tiberius gaps as planned: no `PRINT` messages (the editor says so for SQL Server), no row
-  counts for plain batches, coarse result metadata. New: `money` is decoded through `f64`, so
-  values above about 9.0e11 lose their last digits (the driver test allows for it).
+  counts for plain batches, coarse result metadata. tiberius itself decodes `money` through
+  `f64`; oxbase carries a vendored copy (`vendor/tiberius`, one patched function) that decodes
+  `money` / `smallmoney` exactly.
 - `Tx::commit` fails (error 50000) when the server already ended the transaction, instead of
   reporting a commit; `begin()` still nests inside an editor's own `BEGIN TRAN`.
 - After a cancel mid-stream SQL Server behaves like MySQL / MariaDB in the query service: the

@@ -342,14 +342,12 @@ async fn m4_types_decode_exactly() {
         text(b, "c_numeric"),
         "1234567890123456789012345678.0123456789"
     );
-    // tiberius 0.13 decodes money through f64 (known gap, crate docs "Known gaps"): the
-    // largest money value comes back within the f64 spacing at that magnitude. Contract §5.3
-    // lists the exact value; the tolerance stays until Design records the gap in §11 or
-    // tiberius' money decoding is patched (reported to the orchestrator).
-    let money = col(b, "c_money").as_primitive::<Decimal128Type>().value(0);
-    assert!(
-        (money - 9_223_372_036_854_775_807).abs() <= 2048,
-        "money mantissa {money}"
+    // Exact (vendored tiberius decodes the on-wire integer, vendor/tiberius/OXBASE.md).
+    assert_eq!(
+        col(b, "c_money")
+            .as_primitive::<Decimal128Type>()
+            .value_as_string(0),
+        "922337203685477.5807"
     );
     assert_eq!(
         col(b, "c_smallmoney")
@@ -420,6 +418,50 @@ async fn m4_types_decode_exactly() {
         }
         assert!(b.column(i).is_null(1), "row 2 {} is NULL", f.name());
     }
+}
+
+/// `money` arrives as `MONEYN` (nullable column or expression) or as fixed-length `MONEY` /
+/// `SMALLMONEY` (`NOT NULL` column); both, and `sql_variant` holding money, decode exactly over
+/// the whole range (values that need more than 53 bits included).
+#[tokio::test]
+#[ignore = "needs the mssql fixture"]
+async fn money_decodes_exactly_in_every_encoding() {
+    let c = connect(&params()).await;
+    let sql = "
+CREATE TABLE #m4_money (id int PRIMARY KEY, m money NOT NULL, sm smallmoney NOT NULL,
+    mn money NULL, v sql_variant NULL);
+INSERT INTO #m4_money VALUES
+    (1, 922337203685477.5807, 214748.3647, -922337203685477.5808,
+        CAST(-922337203685477.5807 AS money)),
+    (2, -922337203685477.5808, -214748.3648, 900719925474.0993, CAST(0.0001 AS money)),
+    (3, 123456789012.3457, 0.0001, NULL, NULL);
+SELECT id, m, sm, mn, v, CAST(m AS money) AS m_expr FROM #m4_money ORDER BY id;";
+    let out = run(&c, sql, &[]).await;
+    let b = first_batch(&out);
+    assert_eq!(b.num_rows(), 3);
+    let dec = |name: &str, row: usize| {
+        let a = col(b, name).as_primitive::<Decimal128Type>();
+        assert!(!a.is_null(row), "{name} row {row} must not be NULL");
+        a.value_as_string(row)
+    };
+    assert_eq!(dec("m", 0), "922337203685477.5807");
+    assert_eq!(dec("m", 1), "-922337203685477.5808");
+    assert_eq!(dec("m", 2), "123456789012.3457");
+    assert_eq!(dec("m_expr", 1), "-922337203685477.5808");
+    assert_eq!(dec("sm", 0), "214748.3647");
+    assert_eq!(dec("sm", 1), "-214748.3648");
+    assert_eq!(dec("sm", 2), "0.0001");
+    assert_eq!(dec("mn", 0), "-922337203685477.5808");
+    assert_eq!(dec("mn", 1), "900719925474.0993");
+    assert!(col(b, "mn").is_null(2));
+    assert_eq!(text(b, "v"), "-922337203685477.5807");
+    assert_eq!(col(b, "v").as_string::<i32>().value(1), "0.0001");
+    assert!(col(b, "v").is_null(2));
+    assert!(
+        out.notices.is_empty(),
+        "no lossy-cell notices: {:?}",
+        out.notices
+    );
 }
 
 #[tokio::test]

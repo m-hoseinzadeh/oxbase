@@ -12,7 +12,7 @@
 //! | `tinyint`, `smallint`, `int`, `bigint` | `Int1`, `Int2`, `Int4`, `Int8`, `Intn` | `Int64` | one type for every integer (`Intn` hides the width) |
 //! | `real`, `float` | `Float4`, `Float8`, `Floatn` | `Float64` | `real` widened exactly |
 //! | `decimal(p,s)`, `numeric(p,s)` | `Decimaln`, `Numericn` | `Utf8` | exact text (`-12.50`); the scale is not in the metadata |
-//! | `money`, `smallmoney` | `Money`, `Money4` | `Decimal128(19, 4)` | exact up to ±900 719 925 474.0991: tiberius 0.13 decodes money through `f64`, so larger amounts are rounded to the nearest `f64` (known gap, see the crate docs) |
+//! | `money`, `smallmoney` | `Money`, `Money4` | `Decimal128(19, 4)` | exact over the whole range: the vendored tiberius decodes the on-wire integer to a scale-4 `Numeric` (`vendor/tiberius/OXBASE.md`) |
 //! | `date` | `Daten` | `Date32` | |
 //! | `time(n)` | `Timen` | `Time64(µs)` | 7th fractional digit (100 ns) truncated |
 //! | `datetime`, `smalldatetime` | `Datetime`, `Datetime4`, `Datetimen` | `Timestamp(µs, None)` | |
@@ -278,12 +278,10 @@ impl ColumnBuilder {
                 Some(FIXED_CELL_BYTES)
             }
             Self::Money(b) => {
-                let v = match value {
-                    ColumnData::F64(Some(v)) => money_scaled(*v)?,
-                    ColumnData::F32(Some(v)) => money_scaled(f64::from(*v))?,
-                    _ => return None,
+                let ColumnData::Numeric(Some(n)) = value else {
+                    return None;
                 };
-                b.append_value(v);
+                b.append_value(money_scaled(n.value(), n.scale())?);
                 Some(FIXED_CELL_BYTES)
             }
             Self::Date(b) => {
@@ -442,14 +440,22 @@ fn int_value(v: &ColumnData<'_>) -> Option<i64> {
     }
 }
 
-/// A `money` value (decoded by tiberius as `f64`) as a `Decimal128(19, 4)` mantissa.
-#[allow(
-    clippy::cast_possible_truncation,
-    reason = "bounded to |x| <= 1e20 before the cast"
-)]
-pub(crate) fn money_scaled(v: f64) -> Option<i128> {
-    let scaled = (v * 10_000.0).round();
-    (scaled.is_finite() && scaled.abs() <= 1e20).then_some(scaled as i128)
+/// A `money` value as a `Decimal128(19, 4)` mantissa. The vendored tiberius decodes money to
+/// an exact scale-4 `Numeric` from the on-wire integer (`vendor/tiberius/OXBASE.md`); another
+/// scale is rescaled exactly, and a value that does not fit 19 digits is refused.
+pub(crate) fn money_scaled(value: i128, scale: u8) -> Option<i128> {
+    const MONEY_SCALE: u8 = 4;
+    const MAX_19_DIGITS: i128 = 9_999_999_999_999_999_999;
+    let scaled = if scale <= MONEY_SCALE {
+        value.checked_mul(10_i128.checked_pow(u32::from(MONEY_SCALE - scale))?)?
+    } else {
+        let divisor = 10_i128.checked_pow(u32::from(scale - MONEY_SCALE))?;
+        // Only an exact rescale: money never carries more than 4 decimals.
+        (value % divisor == 0).then_some(value / divisor)?
+    };
+    (-MAX_19_DIGITS..=MAX_19_DIGITS)
+        .contains(&scaled)
+        .then_some(scaled)
 }
 
 /// Exact text of a `decimal` mantissa and scale (`-12.50`, `0.001`).
@@ -881,8 +887,9 @@ mod tests {
                 12_345_678_901_234_567_890_123_456_780_123_456_789,
                 10,
             ))),
-            ColumnData::F64(Some(123_456.789_1)),
-            ColumnData::F64(Some(-214_748.364_8)),
+            // money / smallmoney arrive as exact scale-4 Numeric (vendored tiberius).
+            ColumnData::Numeric(Some(Numeric::new_with_scale(i128::from(i64::MAX), 4))),
+            ColumnData::Numeric(Some(Numeric::new_with_scale(-2_147_483_648, 4))),
             ColumnData::F32(Some(3.25)),
             ColumnData::Date(Some(Date::new(0))),
             ColumnData::Time(Some(Time::new(863_991_234_567, 7))),
@@ -913,8 +920,8 @@ mod tests {
             ColumnData::Bit(None),
             ColumnData::Numeric(None),
             ColumnData::Numeric(None),
-            ColumnData::F64(None),
-            ColumnData::F64(None),
+            ColumnData::Numeric(None),
+            ColumnData::Numeric(None),
             ColumnData::F32(None),
             ColumnData::Date(None),
             ColumnData::Time(None),
@@ -941,8 +948,8 @@ mod tests {
         assert_eq!(text(4), "12345678901234.5678");
         assert_eq!(text(5), "1234567890123456789012345678.0123456789");
         let money = batch.column(6).as_primitive::<Decimal128Type>();
-        assert_eq!(money.value(0), 1_234_567_891);
-        assert_eq!(money.value_as_string(0), "123456.7891");
+        assert_eq!(money.value(0), 9_223_372_036_854_775_807);
+        assert_eq!(money.value_as_string(0), "922337203685477.5807");
         assert_eq!(
             batch
                 .column(7)
@@ -1028,11 +1035,22 @@ mod tests {
 
     #[test]
     fn money_scaling() {
-        assert_eq!(money_scaled(0.0001), Some(1));
-        assert_eq!(money_scaled(-214_748.364_8), Some(-2_147_483_648));
-        assert_eq!(money_scaled(f64::NAN), None);
-        assert_eq!(money_scaled(1e30), None);
-        assert_eq!(money_scaled(123_456_789.123_4), Some(1_234_567_891_234));
+        assert_eq!(money_scaled(1, 4), Some(1));
+        assert_eq!(money_scaled(-2_147_483_648, 4), Some(-2_147_483_648));
+        // The extremes of `money` are exact (no f64 on the way).
+        assert_eq!(
+            money_scaled(i128::from(i64::MAX), 4),
+            Some(9_223_372_036_854_775_807)
+        );
+        assert_eq!(
+            money_scaled(i128::from(i64::MIN), 4),
+            Some(-9_223_372_036_854_775_808)
+        );
+        assert_eq!(money_scaled(12, 0), Some(120_000));
+        assert_eq!(money_scaled(1_234_500, 6), Some(12_345));
+        assert_eq!(money_scaled(1_234_567, 6), None);
+        assert_eq!(money_scaled(10_i128.pow(30), 4), None);
+        assert_eq!(money_scaled(1_234_567_891_234, 4), Some(1_234_567_891_234));
     }
 
     #[test]

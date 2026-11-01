@@ -89,8 +89,6 @@
 //!   do.
 //! - Result metadata carries only the column name and a coarse type (no length, precision,
 //!   scale or nullability), which shapes the Arrow mapping ([`types`]).
-//! - `money` is decoded through `f64`: amounts above about ±900 719 925 474.0991 lose their
-//!   last digits (the largest `money` value comes back within 2048 units of the 4th decimal).
 //! - The `DONE_COUNT` bit is not exposed, so on the RPC path a DONE without a count reads as
 //!   `RowsAffected(0)` (control-of-flow statements, a statement that failed). The 0 that
 //!   directly follows a result set is skipped; others can still appear (sums stay correct).

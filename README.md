@@ -62,8 +62,9 @@ keychain secrets; SQL Server since M4):
   `sp_rename`; DDL runs in one transaction. The grid writer returns exactly one row per edit
   even with triggers. Known gaps (`docs/m4-contracts.md` §11 and §13): no `PRINT` output (the
   messages tab says so), no row counts for plain batches, integers arrive as 64-bit and
-  decimals as text, `money` above about 9.0e11 loses its last digits, `GO <n>` runs once, no
-  Windows / Entra authentication, named instances need a port.
+  decimals as text, `GO <n>` runs once, no Windows / Entra authentication, named instances
+  need a port. `money` is exact: tiberius is vendored with a patched money decoder
+  (`vendor/tiberius/OXBASE.md`).
 
 Contracts: [docs/m3-contracts.md](docs/m3-contracts.md) and
 [docs/m4-contracts.md](docs/m4-contracts.md) (SQL Server).

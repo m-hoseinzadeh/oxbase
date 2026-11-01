@@ -58,7 +58,7 @@ SQL Server fixture already runs in the conformance job today (`sa`, database `ox
 
 | Requirement | tiberius 0.13.0 | Decision |
 |---|---|---|
-| rustls + ring, no aws-lc / OpenSSL / native-tls | **Fails.** Feature `rustls` depends on `tokio-rustls = "0.26.4"` *with default features*, which enable `aws_lc_rs`, and `rustls_tls_stream.rs` falls back to `crypto::aws_lc_rs` when no process provider is installed. `native-tls` and `vendored-openssl` are OpenSSL on Linux. | Built with **no TLS backend** (`default-features = false, features = ["tds73", "chrono"]`). oxbase runs the TLS handshake itself (§2.2) with `oxbase_net::tls::client_config` (rustls 0.23 + ring). `cargo metadata` shows no `aws-lc-*`, `openssl*` or `native-tls` in the graph; the cargo-deny job checks it in CI. |
+| rustls + ring, no aws-lc / OpenSSL / native-tls | **Fails.** Feature `rustls` depends on `tokio-rustls = "0.26.4"` *with default features*, which enable `aws_lc_rs`, and `rustls_tls_stream.rs` falls back to `crypto::aws_lc_rs` when no process provider is installed. `native-tls` and `vendored-openssl` are OpenSSL on Linux. | Built with **no TLS backend** (`default-features = false, features = ["tds73", "chrono"]`). oxbase runs the TLS handshake itself (§2.2) with `oxbase_net::tls::client_config` (rustls 0.23 + ring). `cargo metadata` shows no `aws-lc-*`, `openssl*` or `native-tls` in the graph; `deny.toml` `[bans] deny` lists `openssl-sys`, `openssl`, `native-tls`, `aws-lc-sys` and `aws-lc-rs`, so the cargo-deny bans job fails if any of them enters. |
 | TDS 7.4 | Yes (LOGIN7 `SqlServerN` = 7.4). | Default. |
 | TDS 8.0 strict | Only with a TLS backend (`tds80` feature = TLS before PRELOGIN). | oxbase does the strict TLS itself (ALPN `tds/8.0`), then lets tiberius speak over it (§2.2). |
 | Cancel | `Client::cancel_query`: sends an ATTENTION packet and drains to the `DONE` with the attention bit. Needs `&mut Client`, i.e. after the result stream is dropped. A stream dropped in the middle of a token can leave the token reader out of step. | Attention in-band; if the drain fails or exceeds 1.5 s, close the socket (§2.6). No `KILL` (it ends the whole session). |
@@ -179,7 +179,7 @@ Result columns (full table and reasons in `oxbase_mssql::driver::types`):
 | `tinyint`, `smallint`, `int`, `bigint` | `Int64` (tiberius hides the width of nullable integers) |
 | `real`, `float` | `Float64` |
 | `decimal`, `numeric` | `Utf8`, exact text (scale not in the metadata) |
-| `money`, `smallmoney` | `Decimal128(19, 4)` |
+| `money`, `smallmoney` | `Decimal128(19, 4)`, exact over the whole range (vendored tiberius, §10) |
 | `date` | `Date32` |
 | `time(n)` | `Time64(Microsecond)` (100 ns digit truncated) |
 | `datetime`, `smalldatetime`, `datetime2(n)` | `Timestamp(Microsecond, None)` (100 ns digit truncated) |
@@ -732,13 +732,20 @@ integrator adds the rows (they only call the generic paths).
   `encoding_rs`: `(Apache-2.0 OR MIT) AND BSD-3-Clause`, allowed): `tiberius`,
   `tiberius-macros`, `asynchronous-codec`, `connection-string`, `encoding_rs`, `futures-timer`,
   `pretty-hex`, `secrecy`, `simdutf8`, `core_detect`, `multiversion_no_op`. No TLS stack:
-  `aws-lc-*`, `openssl*` and `native-tls` stay out of the graph (cargo-deny in CI).
+  `aws-lc-*`, `openssl*` and `native-tls` stay out of the graph: `deny.toml` `[bans] deny`
+  names `openssl-sys`, `openssl`, `native-tls`, `aws-lc-sys` and `aws-lc-rs` (cargo-deny bans
+  job in CI).
+- tiberius is used through `[patch.crates-io]` from `vendor/tiberius` (the 0.13.0 release,
+  MIT OR Apache-2.0, excluded from the workspace): `money` / `smallmoney` decode to an exact
+  scale-4 `Numeric` from the on-wire integer instead of an `f64`. `vendor/tiberius/OXBASE.md`
+  lists the change and how to update it.
 - `oxbase-mssql` depends on `oxbase-types`, `oxbase-driver`, `oxbase-dialect`, `oxbase-net`,
   `tiberius`, `rustls`, `tokio-rustls` (ring), `tokio-util` (`compat`), `tokio`, `futures`,
   `async-trait`, `arrow-array`, `arrow-schema`, `bytes`, `chrono`, `uuid`, `serde_json`,
   `tracing`; dev: `pretty_assertions`, `tokio`, `toml`. `oxbase-services` depends on
   `oxbase-mssql`.
-- `deny.toml` unchanged: the licenses above are already allowed.
+- `deny.toml`: the licenses above are already allowed; the TLS bans above were added at
+  integration.
 
 ## 11. Known gaps and follow-ups (accepted for M4)
 
@@ -817,10 +824,11 @@ The streams were merged on `milestone/m4`; CI passed with the 5-engine guard on
   follows a result set (the `DONEPROC` after `EXEC proc @P1`) is skipped. Plain batches report no
   counts (gap 2): the services multi-statement test sees `rows_affected = None` for every T-SQL
   batch.
-- **§5.3 money.** tiberius 0.13 decodes `money` through `f64`, so values above about 9.0e11 lose
-  their last digits: `c_money = 922337203685477.5807` is checked with a tolerance of 2048 units
-  of the fourth decimal (`driver_live`). Exact money needs the follow-up of §11 (a patched or own
-  TDS decoder).
+- **§5.3 money.** Upstream tiberius 0.13 decodes `money` through `f64` (amounts above about
+  9.0e11 lost their last digits). Fixed after the audit with a vendored, patched tiberius
+  (§10): `money` and `smallmoney` are exact, `driver_live` compares `c_money =
+  922337203685477.5807` exactly and checks both extremes as `MONEYN`, fixed-length `NOT NULL`
+  columns and `sql_variant`.
 - **§5.1 / §5.2 fixture.** `CONNECTIONPROPERTY` has no `encrypt_option`, so the logon trigger
   reads `sys.dm_exec_connections` (`WITH EXECUTE AS N'sa'`; `ORIGINAL_LOGIN()` still names the
   connecting login). The container runs `sqlservr` as root (compose `user: root`) with a
