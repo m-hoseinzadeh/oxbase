@@ -241,30 +241,30 @@ clause keyword at the same parenthesis depth.
 `context_at(dialect, text, offset) -> CursorContext { offset, statement, class, clause, word,
 prefix, quote, qualifier, expected, keywords, scope, ctes, outline }`, with `column_sources(case)`
 (done). The statement is the one `oxbase_sql::pick_statement` picks. Under 5 ms for a
-10 000-token statement (release). Required readings (`|` = cursor; the context tests cover each
+10 000-token statement (release). Required readings (`‸` = cursor; the context tests cover each
 on every dialect where the syntax exists, at least 80 cases):
 
 | Text | `expected` (first) | Notes |
 |---|---|---|
-| `|` (empty or a new statement) | Keyword, Snippet | `keywords` = statement starters |
-| `SELECT |` / `SELECT a, |` | Column, Function, Keyword | scope from the `FROM` after the cursor too |
-| `SELECT t.| FROM orders t` | Column | `qualifier = [t]`, `column_sources` = `orders` |
-| `SELECT s.|` with no `FROM` | Relation, Column | `qualifier = [s]` may be a schema |
-| `FROM |`, `JOIN |`, `UPDATE |`, `INSERT INTO |`, `DELETE FROM |`, `TRUNCATE |` | Relation, Schema | CTE names count as relations |
-| `FROM sales.|` | Relation | `qualifier = [sales]` |
-| `FROM db.sales.|` | Relation | three parts on PostgreSQL / SQL Server |
-| `JOIN b ON |` / `WHERE |` / `GROUP BY |` / `ORDER BY |` / `HAVING |` | Column, Function, Keyword | |
-| `FROM orders o |` | Keyword | `keywords` = `WHERE JOIN ... GROUP ORDER LIMIT` (alias already given) |
-| `FROM orders |` | Keyword | an alias may be typed: no names offered |
-| `INSERT INTO t (|` | Column | of `t` only |
-| `UPDATE t SET |` | Column | of `t` only |
-| `CAST(x AS |`, column definition type position | Type | |
-| `CALL |`, `EXEC |` | Procedure | |
-| `CREATE TABLE |`, `AS x|` (alias), `WITH x|` (CTE name) | (nothing) | a new name |
+| `‸` (empty or a new statement) | Keyword, Snippet | `keywords` = statement starters |
+| `SELECT ‸` / `SELECT a, ‸` | Column, Function, Keyword | scope from the `FROM` after the cursor too |
+| `SELECT t.‸ FROM orders t` | Column | `qualifier = [t]`, `column_sources` = `orders` |
+| `SELECT s.‸` with no `FROM` | Relation, Column | `qualifier = [s]` may be a schema |
+| `FROM ‸`, `JOIN ‸`, `UPDATE ‸`, `INSERT INTO ‸`, `DELETE FROM ‸`, `TRUNCATE ‸` | Relation, Schema | CTE names count as relations |
+| `FROM sales.‸` | Relation | `qualifier = [sales]` |
+| `FROM db.sales.‸` | Relation | three parts on PostgreSQL / SQL Server |
+| `JOIN b ON ‸` / `WHERE ‸` / `GROUP BY ‸` / `ORDER BY ‸` / `HAVING ‸` | Column, Function, Keyword | |
+| `FROM orders o ‸` | Keyword | `keywords` = `WHERE JOIN ... GROUP ORDER LIMIT` (alias already given) |
+| `FROM orders ‸` | Keyword | an alias may be typed: no names offered |
+| `INSERT INTO t (‸` | Column | of `t` only |
+| `UPDATE t SET ‸` | Column | of `t` only |
+| `CAST(x AS ‸`, column definition type position | Type | |
+| `CALL ‸`, `EXEC ‸` | Procedure | |
+| `CREATE TABLE ‸`, `AS x‸` (alias), `WITH x‸` (CTE name) | (nothing) | a new name |
 | inside `'...'`, a comment, a dollar body | (nothing) | |
-| `SELECT "Ord|` | Column, … | `quote = Some(b'"')`, `prefix = "Ord"`, `word` starts at the quote |
-| `WITH c AS (SELECT a FROM t) SELECT c.| FROM c` | Column | `ctes[0].columns = [a]` |
-| `SELECT (SELECT x.| FROM t2 x) FROM t1` | Column | inner scope first, then `t1` |
+| `SELECT "Ord‸` | Column, … | `quote = Some(b'"')`, `prefix = "Ord"`, `word` starts at the quote |
+| `WITH c AS (SELECT a FROM t) SELECT c.‸ FROM c` | Column | `ctes[0].columns = [a]` |
+| `SELECT (SELECT x.‸ FROM t2 x) FROM t1` | Column | inner scope first, then `t1` |
 
 `word` covers the identifier or keyword being typed (including an opening quote) and extends
 past the cursor to the end of that word; `prefix` is the typed part before the cursor, unquoted.
@@ -281,7 +281,7 @@ filter_text, replace }`. Rules:
   then CTE names; schemas and databases; built-in functions of `dialect.language` (filtered by
   `version`) and cached routines; types (language + cached types); keywords
   (`ctx.keywords` first, then any keyword of the dialect only at statement level); snippets that
-  apply to the engine at statement starts; `JOIN` items from foreign keys after `JOIN |`
+  apply to the engine at statement starts; `JOIN` items from foreign keys after `JOIN ‸`
   (`orders o ON o.customer_id = c.id`).
 - **Matching**: case-insensitive prefix first; fuzzy (`fuzzy_score`) fills up to `limit` when
   the prefix finds fewer. A typed prefix inside quotes matches exactly that text.
