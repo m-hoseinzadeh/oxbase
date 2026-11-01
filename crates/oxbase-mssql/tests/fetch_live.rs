@@ -20,13 +20,16 @@ use oxbase_driver::{CancellationToken, ConnectParams, Connection, collect};
 use oxbase_mssql::{MsSqlConnection, MsSqlDriver};
 use oxbase_types::{
     ArgMode, DataType, Engine, Error, FkAction, ObjectDef, ObjectKind, ObjectRef, ObjectSummary,
-    TlsMode, TlsOptions, TriggerEvent, TriggerLevel, TriggerTiming, Value, props,
+    PropId, TlsMode, TlsOptions, TriggerEvent, TriggerLevel, TriggerTiming, Value, props,
 };
 
 use oxbase_mssql::extras as x;
 
 /// The test's own schema for the M4 shapes.
 const M4: &str = "m4_fetch_live";
+/// A user schema whose name starts with `db_` like the fixed database-role schemas: its objects
+/// are user objects.
+const DB_SCHEMA: &str = "db_m4_fetch_live";
 /// The database DDL trigger created with the M4 shapes (must never be listed).
 const DDL_TRIGGER: &str = "m4_fetch_live_ddl_trg";
 
@@ -585,6 +588,9 @@ async fn loads_every_seeded_object() {
     assert_eq!(seq.max_value, Some(i128::from(i64::MAX)));
     assert!(!seq.cycle);
     assert_eq!(seq.owned_by, None);
+    // No CACHE clause: cached with the server's size.
+    assert_eq!(seq.cache, None);
+    assert_eq!(seq.extras.get(&DEFAULT_CACHE), Some(&Value::Bool(true)));
 }
 
 #[tokio::test]
@@ -786,7 +792,7 @@ fn m4_setup(f: &Fixture) -> Vec<String> {
         format!("CREATE TYPE {s}.{alias} FROM varchar(20) NOT NULL"),
         format!(
             "CREATE TYPE {s}.{table_type} AS TABLE (id int NOT NULL PRIMARY KEY, \
-             name nvarchar(50) NULL, CHECK (id > 0))"
+             name nvarchar(50) NULL, CHECK (id > 0), INDEX m4_fetch_tt_name_ix (name DESC))"
         ),
         format!(
             "CREATE TABLE {s}.{features} (\
@@ -867,6 +873,16 @@ fn m4_setup(f: &Fixture) -> Vec<String> {
             "CREATE TRIGGER {DDL_TRIGGER} ON DATABASE FOR CREATE_SYNONYM AS \
              BEGIN SET NOCOUNT ON; END"
         ),
+        format!("CREATE SCHEMA {DB_SCHEMA}"),
+        format!(
+            "CREATE TABLE {DB_SCHEMA}.db_m4_fetch_t (id int NOT NULL CONSTRAINT \
+             pk_db_m4_fetch_t PRIMARY KEY, a int NULL, b int NULL)"
+        ),
+        format!(
+            "CREATE NONCLUSTERED COLUMNSTORE INDEX db_m4_fetch_ncci ON \
+             {DB_SCHEMA}.db_m4_fetch_t (b, a)"
+        ),
+        format!("CREATE SEQUENCE {DB_SCHEMA}.db_m4_fetch_seq AS int NO CACHE"),
     ]
 }
 
@@ -893,6 +909,9 @@ fn m4_teardown(f: &Fixture) -> Vec<String> {
         format!("DROP TYPE IF EXISTS {s}.{}", f.m4("table_type")),
         format!("DROP TYPE IF EXISTS {s}.{}", f.m4("alias_type")),
         format!("DROP SCHEMA IF EXISTS {s}"),
+        format!("DROP TABLE IF EXISTS {DB_SCHEMA}.db_m4_fetch_t"),
+        format!("DROP SEQUENCE IF EXISTS {DB_SCHEMA}.db_m4_fetch_seq"),
+        format!("DROP SCHEMA IF EXISTS {DB_SCHEMA}"),
     ]
 }
 
@@ -1230,7 +1249,13 @@ async fn m4_assertions(c: &dyn Connection, f: &Fixture) {
     assert!(def.contains("[name] nvarchar(50) NULL"), "{def}");
     assert!(def.contains("PRIMARY KEY"), "{def}");
     assert!(def.contains("CHECK ([id]>(0))"), "{def}");
+    assert!(
+        def.contains("INDEX [m4_fetch_tt_name_ix] NONCLUSTERED ([name] DESC)"),
+        "{def}"
+    );
+    assert!(def.ends_with(')'), "{def}");
     assert_eq!(text(tt.extras.get(&x::TYPE_KIND)), Some("table"));
+    assert_eq!(tt.extras.get(&x::MEMORY_OPTIMIZED), None);
 
     // Sequence
     let ObjectDef::Sequence(seq) =
@@ -1245,7 +1270,68 @@ async fn m4_assertions(c: &dyn Connection, f: &Fixture) {
     assert_eq!(seq.max_value, Some(1000));
     assert!(seq.cycle);
     assert_eq!(seq.cache, Some(20));
+    assert_eq!(seq.extras.get(&DEFAULT_CACHE), None);
+
+    db_schema_assertions(c, f).await;
 
     // System objects: the sys schema's objects are flagged, user objects are not.
     assert!(!tables.iter().any(|t| t.system));
+}
+
+/// The `default_cache` sequence extra (cached with the server's size).
+const DEFAULT_CACHE: PropId = PropId::from_static("default_cache");
+
+/// A user schema named `db_...` and everything in it are user objects; a nonclustered
+/// columnstore index lists its columns as `columns`, with no INCLUDE columns.
+async fn db_schema_assertions(c: &dyn Connection, f: &Fixture) {
+    let schemas = list(c, ObjectKind::Schema, &f.database_ref()).await;
+    assert!(!find(&schemas, DB_SCHEMA).system, "{DB_SCHEMA}");
+    assert!(find(&schemas, "db_owner").system);
+    let schema = f.database_ref().child(ObjectKind::Schema, DB_SCHEMA);
+    let tables = list(c, ObjectKind::Table, &schema).await;
+    assert_eq!(names(&tables), vec!["db_m4_fetch_t"]);
+    assert!(!tables[0].system);
+    let table = tables[0].obj.clone();
+    for kind in [ObjectKind::Column, ObjectKind::Index] {
+        let children = list(c, kind, &table).await;
+        assert!(
+            children.iter().all(|s| !s.system),
+            "{kind}: {:?}",
+            names(&children)
+        );
+    }
+    let indexes = list(c, ObjectKind::Index, &table).await;
+    assert_eq!(
+        text(
+            find(&indexes, "db_m4_fetch_ncci")
+                .extras
+                .get(&x::INDEX_KIND)
+        ),
+        Some("nonclustered_columnstore")
+    );
+    let ObjectDef::Table(t) = load(c, &table).await else {
+        panic!("not a table");
+    };
+    let ncci = t
+        .indexes
+        .iter()
+        .find(|i| i.name == "db_m4_fetch_ncci")
+        .unwrap_or_else(|| panic!("no columnstore index in {:?}", t.indexes));
+    let mut cols: Vec<&str> = ncci.columns.iter().map(|k| k.name.as_str()).collect();
+    cols.sort_unstable();
+    assert_eq!(cols, vec!["a", "b"]);
+    assert_eq!(
+        ncci.extras.get(&props::INCLUDE_COLUMNS),
+        Some(&Value::Json(serde_json::json!([])))
+    );
+
+    let sequences = list(c, ObjectKind::Sequence, &schema).await;
+    assert_eq!(names(&sequences), vec!["db_m4_fetch_seq"]);
+    assert!(!sequences[0].system);
+    let ObjectDef::Sequence(seq) = load(c, &sequences[0].obj).await else {
+        panic!("not a sequence");
+    };
+    // NO CACHE: no size and no default-cache mark.
+    assert_eq!(seq.cache, None);
+    assert_eq!(seq.extras.get(&DEFAULT_CACHE), None);
 }

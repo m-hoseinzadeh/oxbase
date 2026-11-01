@@ -40,7 +40,7 @@ use oxbase_driver::{CancellationToken, Connection};
 use oxbase_types::{
     ArgMode, CheckDef, ColumnDef, Error, Extras, FkAction, ForeignKeyDef, GeneratedColumn,
     GenericDef, IdentityDef, IndexColumn, IndexDef, ObjectDef, ObjectKind, ObjectRef,
-    ObjectSummary, PrimaryKeyDef, Result, RoutineArg, RoutineDef, SchemaDef, SequenceDef,
+    ObjectSummary, PrimaryKeyDef, PropId, Result, RoutineArg, RoutineDef, SchemaDef, SequenceDef,
     ServerVersion, TableDef, TriggerDef, TriggerEvent, TriggerLevel, TriggerTiming, Value, ViewDef,
     props,
 };
@@ -226,12 +226,33 @@ fn expect_parent(parent: &ObjectRef, kinds: &[ObjectKind], child: ObjectKind) ->
     }
 }
 
+/// Sequence (bool): cached with the size the server picks (`CACHE` without a size, the
+/// default); `SequenceDef::cache` is then `None`, as for `NO CACHE`, which has no such extra.
+/// Not yet in [`crate::extras`] (docs/m4-contracts.md §3.3 has only `cache`); the id is
+/// `default_cache`.
+pub(crate) const DEFAULT_CACHE: PropId = PropId::from_static("default_cache");
+
+/// The schemas of the fixed database roles. Every database has them (`schema_id` 16384 and
+/// up), so no user schema can take these names; a user schema that merely starts with `db_`
+/// (`db_sales`) is not one of them.
+const FIXED_ROLE_SCHEMAS: [&str; 9] = [
+    "db_owner",
+    "db_accessadmin",
+    "db_securityadmin",
+    "db_ddladmin",
+    "db_backupoperator",
+    "db_datareader",
+    "db_datawriter",
+    "db_denydatareader",
+    "db_denydatawriter",
+];
+
 /// `true` for the schemas SQL Server owns: `sys`, `INFORMATION_SCHEMA`, `guest` and the fixed
-/// database-role schemas (`schema_id >= 16384`).
+/// database-role schemas (`schema_id >= 16384`). Listings of a schema's objects pass `None`:
+/// the fixed-role schemas are then recognised by their exact names.
 pub(crate) fn is_system_schema(name: &str, schema_id: Option<i64>) -> bool {
     matches!(name, "sys" | "INFORMATION_SCHEMA" | "guest")
-        || schema_id.is_some_and(|id| id >= 16384)
-        || (schema_id.is_none() && name.starts_with("db_"))
+        || (FIXED_ROLE_SCHEMAS.contains(&name) && schema_id.is_none_or(|id| id >= 16384))
 }
 
 /// The schema of a schema-level object or table child.
@@ -672,11 +693,15 @@ async fn load_sequence(cx: &Cx<'_>, obj: &ObjectRef) -> Result<ObjectDef> {
     def.increment = row.opt_i128("increment")?.unwrap_or(1);
     def.min_value = row.opt_i128("minimum_value")?;
     def.max_value = row.opt_i128("maximum_value")?;
-    def.cache = if row.flag("is_cached")? {
-        row.opt_i64("cache_size")?.map(i128::from)
-    } else {
-        None
-    };
+    // `CACHE n` gives `is_cached = 1` and the size; a plain `CACHE` (and no clause at all, the
+    // default) gives `is_cached = 1` with a NULL size: the server picks the size. `cache` stays
+    // `None` for both that and `NO CACHE`, so the default is marked with [`DEFAULT_CACHE`].
+    if row.flag("is_cached")? {
+        def.cache = row.opt_i64("cache_size")?.map(i128::from);
+        if def.cache.is_none() {
+            def.extras.insert(DEFAULT_CACHE, true);
+        }
+    }
     def.cycle = row.flag("is_cycling")?;
     def.comment = row.opt_string("comment")?;
     Ok(ObjectDef::Sequence(def))
@@ -719,7 +744,11 @@ async fn load_type(cx: &Cx<'_>, obj: &ObjectRef) -> Result<ObjectDef> {
             let table_id = row
                 .opt_i64("type_table_object_id")?
                 .ok_or_else(|| not_found(&obj))?;
-            Some(table_type_definition(cx, &qualified, table_id).await?)
+            let memory_optimized = row.flag("is_memory_optimized")?;
+            if memory_optimized {
+                extras.insert(x::MEMORY_OPTIMIZED, true);
+            }
+            Some(table_type_definition(cx, &qualified, table_id, memory_optimized).await?)
         }
         _ => None,
     };
@@ -731,8 +760,17 @@ async fn load_type(cx: &Cx<'_>, obj: &ObjectRef) -> Result<ObjectDef> {
     }))
 }
 
-/// `CREATE TYPE ... AS TABLE (...)` from the catalog of a table type's table.
-async fn table_type_definition(cx: &Cx<'_>, qualified: &str, table_id: i64) -> Result<String> {
+/// `CREATE TYPE ... AS TABLE (...)` from the catalog of a table type's table: columns, the
+/// primary key, unique constraints, inline indexes (with `INCLUDE`, a filter and, for a
+/// memory-optimized type, `HASH ... WITH (BUCKET_COUNT = n)`), checks, and
+/// `WITH (MEMORY_OPTIMIZED = ON)`. Index options (fill factor, compression) are left out: a
+/// table type takes none.
+async fn table_type_definition(
+    cx: &Cx<'_>,
+    qualified: &str,
+    table_id: i64,
+    memory_optimized: bool,
+) -> Result<String> {
     let q = BracketQuoting;
     let mut parts = Vec::new();
     for col in columns(cx, table_id).await? {
@@ -780,13 +818,25 @@ async fn table_type_definition(cx: &Cx<'_>, qualified: &str, table_id: i64) -> R
             .join(", ")
     };
     for index in indexes(cx, table_id).await? {
-        let clustering = if index.clustered {
-            "CLUSTERED"
-        } else {
-            "NONCLUSTERED"
+        let hash = index.code == 7;
+        let clustering = match (index.clustered, hash) {
+            (true, _) => "CLUSTERED",
+            (false, false) => "NONCLUSTERED",
+            (false, true) => "NONCLUSTERED HASH",
         };
-        let cols = key_list(&index.def.columns);
-        parts.push(if index.primary {
+        // A hash index lists its columns without a direction.
+        let cols = if hash {
+            index
+                .def
+                .columns
+                .iter()
+                .map(|k| q.quote_ident(&k.name))
+                .collect::<Vec<_>>()
+                .join(", ")
+        } else {
+            key_list(&index.def.columns)
+        };
+        let mut s = if index.primary {
             format!("PRIMARY KEY {clustering} ({cols})")
         } else if index.def.is_constraint {
             format!("UNIQUE {clustering} ({cols})")
@@ -796,14 +846,35 @@ async fn table_type_definition(cx: &Cx<'_>, qualified: &str, table_id: i64) -> R
                 q.quote_ident(&index.def.name),
                 if index.def.unique { " UNIQUE" } else { "" }
             )
-        });
+        };
+        if !index.include.is_empty() {
+            let include = index
+                .include
+                .iter()
+                .map(|c| q.quote_ident(c))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let _ = write!(s, " INCLUDE ({include})");
+        }
+        if let Some(predicate) = &index.def.predicate {
+            let _ = write!(s, " WHERE {predicate}");
+        }
+        if let Some(buckets) = index.bucket_count {
+            let _ = write!(s, " WITH (BUCKET_COUNT = {buckets})");
+        }
+        parts.push(s);
     }
     for (check, _) in checks(cx, table_id).await? {
         parts.push(format!("CHECK {}", check.expression));
     }
     Ok(format!(
-        "CREATE TYPE {qualified} AS TABLE (\n    {}\n)",
-        parts.join(",\n    ")
+        "CREATE TYPE {qualified} AS TABLE (\n    {}\n){}",
+        parts.join(",\n    "),
+        if memory_optimized {
+            " WITH (MEMORY_OPTIMIZED = ON)"
+        } else {
+            ""
+        }
     ))
 }
 
@@ -825,6 +896,11 @@ async fn list_table_children(
 ) -> Result<Vec<ObjectSummary>> {
     expect_parent(parent, &[ObjectKind::Table, ObjectKind::View], kind)?;
     let parent = cx.in_session_database(parent)?;
+    // Two or three queries, not the one per list of docs/m4-contracts.md §3.5: the owner's
+    // object id (looked up by bound schema and name), then the children by that id (indexes:
+    // `INDEXES` and `INDEX_COLUMNS`). The child queries are shared with `load`, which needs the
+    // id anyway; `Cx::query` checks the token before each one, so a cancel between them still
+    // returns `Cancelled` with nothing partial.
     let owner = find_owner(cx, &parent, &parent).await?;
     let system = owner.shipped || is_system_schema(schema_of(&parent)?, None);
     // Refs keep the parent as the caller addressed it (the tree's node).
@@ -1017,6 +1093,12 @@ struct Index {
     def: IndexDef,
     primary: bool,
     clustered: bool,
+    /// `sys.indexes.type` (7 = hash, memory-optimized).
+    code: i64,
+    /// The `INCLUDE` columns (also in `def.extras[INCLUDE_COLUMNS]`).
+    include: Vec<String>,
+    /// `BUCKET_COUNT` of a hash index.
+    bucket_count: Option<i64>,
     comment: Option<String>,
 }
 
@@ -1063,34 +1145,40 @@ async fn indexes(cx: &Cx<'_>, id: i64) -> Result<Vec<Index>> {
         let code = row.i64("type")?;
         let parts = parts.remove(&index_id).unwrap_or_default();
         // The query orders by key ordinal (0 for non-key columns) then column id.
-        let mut keys: Vec<IndexColumn> = parts
-            .iter()
-            .filter(|p| p.key_ordinal > 0)
-            .map(|p| IndexColumn {
-                descending: p.descending,
-                ..IndexColumn::column(&p.name)
-            })
-            .collect();
-        if code == 6 && keys.is_empty() {
-            // A nonclustered columnstore index lists its columns without key ordinals.
-            keys = parts
-                .iter()
-                .filter(|p| !p.included)
-                .map(|p| IndexColumn::column(&p.name))
-                .collect();
-        }
-        let include: Vec<serde_json::Value> = parts
-            .iter()
-            .filter(|p| p.included && p.key_ordinal == 0)
-            .map(|p| serde_json::Value::from(p.name.clone()))
-            .collect();
+        let (keys, include): (Vec<IndexColumn>, Vec<String>) = match code {
+            // A nonclustered columnstore index has no key columns: `sys.index_columns` reports
+            // its column list (`ON t (a, b)`) with key ordinal 0 and `is_included_column = 1`.
+            // That list is the index's `columns`, in column order; nothing is an INCLUDE.
+            6 => (
+                parts.iter().map(|p| IndexColumn::column(&p.name)).collect(),
+                Vec::new(),
+            ),
+            // A clustered columnstore index covers every column of the table: it is listed
+            // with no columns at all (§3.3).
+            5 => (Vec::new(), Vec::new()),
+            _ => (
+                parts
+                    .iter()
+                    .filter(|p| p.key_ordinal > 0)
+                    .map(|p| IndexColumn {
+                        descending: p.descending,
+                        ..IndexColumn::column(&p.name)
+                    })
+                    .collect(),
+                parts
+                    .iter()
+                    .filter(|p| p.included && p.key_ordinal == 0)
+                    .map(|p| p.name.clone())
+                    .collect(),
+            ),
+        };
         let clustered = matches!(code, 1 | 5);
         let mut extras = Extras::new();
         extras.insert(props::CLUSTERED, clustered);
         extras.insert(x::INDEX_KIND, index_kind(code));
         extras.insert(
             props::INCLUDE_COLUMNS,
-            Value::Json(serde_json::Value::from(include)),
+            Value::Json(serde_json::Value::from(include.clone())),
         );
         if let Some(ff) = row.opt_i64("fill_factor")?.filter(|f| *f != 0) {
             extras.insert(props::FILL_FACTOR, ff);
@@ -1112,6 +1200,9 @@ async fn indexes(cx: &Cx<'_>, id: i64) -> Result<Vec<Index>> {
             },
             primary,
             clustered,
+            code,
+            include,
+            bucket_count: row.opt_i64("bucket_count")?,
             comment: row.opt_string("comment")?,
         });
     }
@@ -1215,7 +1306,9 @@ async fn triggers(cx: &Cx<'_>, id: i64, owner: &ObjectRef) -> Result<Vec<Trigger
             }
             let definition = row.opt_string("definition")?;
             let mut extras = Extras::new();
-            if definition.is_none() {
+            // A CLR trigger (`TA`) has no SQL module, so a NULL definition means encryption
+            // only for a T-SQL trigger.
+            if definition.is_none() && !row.flag("is_clr")? {
                 extras.insert(x::ENCRYPTED, true);
             }
             if let Some(principal) = row.opt_string("execute_as")? {
@@ -1257,9 +1350,14 @@ mod tests {
         assert!(is_system_schema("guest", Some(2)));
         assert!(is_system_schema("db_owner", Some(16384)));
         assert!(is_system_schema("db_datareader", None));
+        assert!(is_system_schema("db_denydatawriter", Some(16393)));
         assert!(!is_system_schema("dbo", Some(1)));
+        assert!(!is_system_schema("dbo", None));
         assert!(!is_system_schema("m2", Some(5)));
         assert!(!is_system_schema("db_custom", Some(7)));
+        assert!(!is_system_schema("db_custom", None));
+        assert!(!is_system_schema("db_sales", None));
+        assert!(!is_system_schema("db_owner_archive", None));
     }
 
     #[test]

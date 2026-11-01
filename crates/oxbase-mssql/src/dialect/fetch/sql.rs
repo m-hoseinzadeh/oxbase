@@ -276,6 +276,8 @@ SELECT CAST(i.index_id AS int) AS index_id, i.name, CAST(i.type AS int) AS type,
        (SELECT TOP (1) p.data_compression_desc FROM sys.partitions p \
          WHERE p.object_id = i.object_id AND p.index_id = i.index_id \
          ORDER BY p.partition_number) AS data_compression, \
+       (SELECT h.bucket_count FROM sys.hash_indexes h \
+         WHERE h.object_id = i.object_id AND h.index_id = i.index_id) AS bucket_count, \
        CAST((SELECT ep.value FROM sys.extended_properties ep WHERE ep.class = 7 \
              AND ep.major_id = i.object_id AND ep.minor_id = i.index_id \
              AND ep.name = N'MS_Description') AS nvarchar(4000)) AS comment \
@@ -323,7 +325,8 @@ pub(crate) const CHECKS: &str = concat!(
 /// `parent_class = 0` and are never listed.
 pub(crate) const TRIGGERS: &str = concat!(
     "SELECT tr.object_id, tr.name, tr.is_ms_shipped, tr.is_disabled, tr.is_instead_of_trigger, \
-       tr.is_not_for_replication, m.definition, ",
+       tr.is_not_for_replication, m.definition, \
+       CAST(CASE WHEN tr.type = 'TA' THEN 1 ELSE 0 END AS bit) AS is_clr, ",
     execute_as!(),
     " AS execute_as, \
        CAST(CASE WHEN EXISTS (SELECT 1 FROM sys.trigger_events e \
@@ -380,7 +383,7 @@ WHERE t.is_user_defined = 1 AND s.name = @P1"
 pub(crate) const TYPE: &str = concat!(
     "SELECT t.name, t.is_table_type, t.is_assembly_type, t.is_nullable, bt.name AS base_type, \
        CAST(t.max_length AS int) AS max_length, CAST(t.precision AS int) AS num_precision, \
-       CAST(t.scale AS int) AS scale, tt.type_table_object_id, ",
+       CAST(t.scale AS int) AS scale, tt.type_table_object_id, tt.is_memory_optimized, ",
     description!("6", "t.user_type_id"),
     " AS comment \
 FROM sys.types t JOIN sys.schemas s ON s.schema_id = t.schema_id \
@@ -480,6 +483,7 @@ mod tests {
                 "'AF'",
                 "'P'",
                 "'PC'",
+                "'TA'",
             ];
             let mut rest = sql.to_owned();
             for lit in fixed {
