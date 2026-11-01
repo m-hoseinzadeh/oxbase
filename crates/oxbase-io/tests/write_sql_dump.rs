@@ -286,7 +286,7 @@ fn sqlite_dump_runs_and_reads_back() {
 fn orders() -> (TableDef, RecordBatch) {
     let mut table = TableDef::new(ObjectRef::table(None, Some("public"), "orders"));
     let mut id = ColumnDef::new("id", DataType::INT64);
-    id.native_type = "bigint".to_owned();
+    "bigint".clone_into(&mut id.native_type);
     id.nullable = false;
     id.auto_increment = true;
     id.identity = Some(IdentityDef {
@@ -295,10 +295,10 @@ fn orders() -> (TableDef, RecordBatch) {
         increment: None,
     });
     let mut name = ColumnDef::new("name", DataType::Text);
-    name.native_type = "text".to_owned();
+    "text".clone_into(&mut name.native_type);
     name.comment = Some("who".to_owned());
     let mut total = ColumnDef::new("total", DataType::INT64);
-    total.native_type = "bigint".to_owned();
+    "bigint".clone_into(&mut total.native_type);
     total.generated = Some(GeneratedColumn {
         expression: "id * 2".to_owned(),
         stored: true,
@@ -371,7 +371,7 @@ fn across_engines_the_source_sql_is_dropped() {
             engine,
             SqlDumpOptions::new(engine),
             &context,
-            &[batch.clone()],
+            std::slice::from_ref(&batch),
         );
         assert!(text.contains("from another engine"), "{engine}:\n{text}");
         assert!(

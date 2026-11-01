@@ -24,6 +24,7 @@ struct CsvSink {
     options: CsvWriteOptions,
     /// Reused field texts of one record.
     fields: Vec<String>,
+    scratch: String,
     rows: u64,
     failed: bool,
     /// Columns whose timestamps had a non-UTC zone (written as UTC).
@@ -77,7 +78,10 @@ pub(crate) fn writer(
         .flexible(false)
         .buffer_capacity(64 * 1024);
     if let Some(escape) = options.escape {
-        builder.double_quote(false).escape(ascii("escape", escape)?);
+        ascii("escape", escape)?;
+        // Quoted by `quote_manually`: the `csv` crate escapes quotes but not the escape
+        // character itself, so `a\b` would be read back as `ab`.
+        builder.quote_style(::csv::QuoteStyle::Never);
     }
     let schema = normalized_schema(schema);
     let mut sink = CsvSink {
@@ -86,6 +90,7 @@ pub(crate) fn writer(
         forms,
         options: options.clone(),
         fields: vec![String::new(); schema.fields().len()],
+        scratch: String::new(),
         rows: 0,
         failed: false,
         zoned: BTreeSet::new(),
@@ -99,6 +104,7 @@ pub(crate) fn writer(
             }
         }
         sink.check_unquoted(0)?;
+        sink.quote_manually();
         sink.out.write_record(&sink.fields).map_err(csv_error)?;
     }
     Ok(Box::new(sink))
@@ -127,6 +133,40 @@ impl CsvSink {
             }
         }
         Ok(())
+    }
+
+    /// With an escape character, quotes the fields of the record here (quote style as asked,
+    /// plus every field holding the escape character), escaping quotes **and the escape
+    /// character**; the `csv` writer then writes them as they are.
+    fn quote_manually(&mut self) {
+        let Some(escape) = self.options.escape else {
+            return;
+        };
+        let (delimiter, quote) = (self.options.delimiter, self.options.quote);
+        let single = self.fields.len() == 1;
+        for field in &mut self.fields {
+            let special = field.contains([delimiter, quote, escape, '\n', '\r']);
+            let quoted = match self.options.quote_style {
+                QuoteStyle::Always => true,
+                QuoteStyle::Never => false,
+                // A lone empty field would be an empty line, which readers skip.
+                QuoteStyle::Necessary => special || (single && field.is_empty()),
+                QuoteStyle::NonNumeric => special || field.parse::<f64>().is_err(),
+            };
+            if !quoted {
+                continue;
+            }
+            self.scratch.clear();
+            self.scratch.push(quote);
+            for c in field.chars() {
+                if c == quote || c == escape {
+                    self.scratch.push(escape);
+                }
+                self.scratch.push(c);
+            }
+            self.scratch.push(quote);
+            std::mem::swap(field, &mut self.scratch);
+        }
     }
 
     fn write_batch(&mut self, batch: &RecordBatch) -> Result<()> {
@@ -165,6 +205,7 @@ impl CsvSink {
                 }
             }
             self.check_unquoted(self.rows + 1)?;
+            self.quote_manually();
             self.out.write_record(&self.fields).map_err(csv_error)?;
             self.rows += 1;
         }
