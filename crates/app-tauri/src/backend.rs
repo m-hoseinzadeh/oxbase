@@ -1,6 +1,7 @@
 //! Picks the core implementations the desktop app runs with: drivers, dialects, the secret
 //! store, the profile repository, the SSH tunnel provider, (M2) the tree, query and history
-//! services, and (M3) the edit and designer services. Construction only; no behaviour.
+//! services, (M3) the edit and designer services, and (M5) the import and export services and
+//! the file-handle registry. Construction only; no behaviour.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -8,7 +9,9 @@ use std::sync::Arc;
 use oxbase_net::ssh::RusshTunnelProvider;
 use oxbase_services::designer::DesignerService;
 use oxbase_services::edit::EditService;
+use oxbase_services::export::{ExportConfig, ExportService};
 use oxbase_services::history::HistoryService;
+use oxbase_services::import::{ImportConfig, ImportService};
 use oxbase_services::query::{QueryConfig, QueryService};
 use oxbase_services::tree::TreeService;
 use oxbase_services::{ConnectionManager, DriverRegistry};
@@ -20,6 +23,8 @@ use oxbase_store::{
 use crate::connections::ConnectionsState;
 use crate::data::DataState;
 use crate::designer::DesignerState;
+use crate::files::FilesState;
+use crate::transfer::TransferState;
 use crate::workbench::WorkbenchState;
 
 /// Every piece of Tauri state the commands use. All share one `ConnectionManager` and one
@@ -31,6 +36,10 @@ pub struct AppStates {
     pub data: DataState,
     /// M3: the table designer.
     pub designer: DesignerState,
+    /// M5: import and export.
+    pub transfer: TransferState,
+    /// M5: file handles from the native dialogs.
+    pub files: FilesState,
 }
 
 /// The drivers the app ships with: the shared registry from `oxbase-services` (PostgreSQL,
@@ -108,13 +117,28 @@ pub fn app_state_with(
     let designer = Arc::new(DesignerService::new(
         Arc::clone(&manager),
         Arc::clone(&tree),
+        Arc::clone(&dialects),
+    ));
+    let import = Arc::new(ImportService::new(
+        Arc::clone(&manager),
+        Arc::clone(&tree),
+        Arc::clone(&dialects),
+        ImportConfig::default(),
+    ));
+    let export = Arc::new(ExportService::new(
+        Arc::clone(&manager),
+        Arc::clone(&query),
+        Arc::clone(&tree),
         dialects,
+        ExportConfig::default(),
     ));
     AppStates {
         connections: ConnectionsState::new(manager, profile_repository(fallback_dir)),
         workbench: WorkbenchState::new(tree, query, history),
         data: DataState::new(edit),
         designer: DesignerState::new(designer),
+        transfer: TransferState::new(import, export),
+        files: FilesState::new(),
     }
 }
 
@@ -140,6 +164,20 @@ mod tests {
             states.data.service().dialects(),
             states.designer.service().dialects()
         ));
+        // M5: import and export share them too, and no file handle exists yet.
+        assert!(Arc::ptr_eq(
+            states.transfer.import().manager(),
+            states.connections.manager()
+        ));
+        assert!(Arc::ptr_eq(
+            states.transfer.export().dialects(),
+            states.designer.service().dialects()
+        ));
+        assert!(Arc::ptr_eq(
+            states.transfer.export().query(),
+            states.data.service().query()
+        ));
+        assert!(states.files.is_empty());
     }
 
     #[test]

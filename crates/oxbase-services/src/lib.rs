@@ -83,6 +83,20 @@
 //!   applies it on a dedicated session; [`designer::DesignerService::capabilities`] tells the UI
 //!   what the engine offers.
 //!
+//! # M5: import and export
+//!
+//! Contracts in `docs/m5-contracts.md`:
+//!
+//! - [`import::ImportService`] previews a file (`oxbase-io`), plans an import (mapping, target
+//!   mode, conversions, DDL) and runs it on a dedicated child session through the engine's
+//!   `BulkLoader` (`oxbase_dialect::bulk`), with progress, cancel, an error policy, a
+//!   transaction policy and a report.
+//! - [`export::ExportService`] writes a table (filter and sort), a query or a run's result
+//!   (every stored row, spilled ones included) into a file with any `oxbase-io` writer,
+//!   through a temporary file renamed on success.
+//!
+//! Both take file *paths*; turning the app's opaque file handles into paths is the app's job.
+//!
 //! **Sessions.** A session opened with [`ConnectionManager::open`] is a *base* session: the
 //! object tree reads metadata through it. Query editors never run on a base session; each
 //! editor gets a *child* session ([`ConnectionManager::open_child`]) with the same resolved
@@ -117,7 +131,9 @@ pub mod designer;
 mod dialects;
 mod drivers;
 pub mod edit;
+pub mod export;
 pub mod history;
+pub mod import;
 pub mod profiles;
 pub mod query;
 pub mod results;

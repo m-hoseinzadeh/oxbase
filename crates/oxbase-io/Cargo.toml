@@ -11,6 +11,30 @@ authors.workspace = true
 [lints]
 workspace = true
 
+# Contracts: docs/m5-contracts.md §3. Every format crate stays on the workspace's arrow major
+# (60): arrow-json and parquet 60.1.0.
 [dependencies]
+oxbase-types.workspace = true
+oxbase-driver.workspace = true
+oxbase-dialect.workspace = true
+arrow-array.workspace = true
+arrow-schema.workspace = true
+arrow-cast.workspace = true
+arrow-json.workspace = true
+parquet.workspace = true
+csv.workspace = true
+encoding_rs.workspace = true
+calamine.workspace = true
+rust_xlsxwriter.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
+pretty_assertions.workspace = true
+tokio.workspace = true

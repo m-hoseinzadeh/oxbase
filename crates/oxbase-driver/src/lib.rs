@@ -34,11 +34,22 @@
 //! [`ProgressSink`] next to their [`CancellationToken`] and report [`Progress`] events through
 //! it. Reporting is lossy and never blocks the operation.
 //!
+//! # Native access (M5)
+//!
+//! [`Connection::as_any`] and [`Tx::as_any`] hand a dialect cell of the *same engine crate* the
+//! concrete connection type, for the client library's own API where plain statements are not
+//! enough (PostgreSQL `COPY ... FROM STDIN`, SQL Server bulk load; `docs/m5-contracts.md` §4).
+//! Both default to `None`; nothing outside the engine crate may downcast.
+//!
+//! [`cell_value`] reads one Arrow cell as a [`Value`] (the inverse of what drivers produce), for
+//! bulk loaders and the SQL dump writer.
+//!
 //! # Feature `mock`
 //!
 //! Enables `mock::MockDriver`, an in-memory driver that streams fixed Arrow batches and honours
 //! cancellation. Higher layers use it in their tests.
 
+mod cell;
 mod params;
 mod progress;
 mod registry;
@@ -50,6 +61,7 @@ pub mod mock;
 use async_trait::async_trait;
 use oxbase_types::{Engine, Result, ServerVersion, Value};
 
+pub use cell::cell_value;
 pub use oxbase_types::{
     Endpoint, KeySource, KnownHostsPolicy, PemSource, Secret, SshAuth, SshOptions, TlsMode,
     TlsOptions,
@@ -137,6 +149,14 @@ pub trait Connection: Send + Sync {
 
     /// Closes the connection. Later calls fail with a connection error. Closing twice is `Ok`.
     async fn close(&self) -> Result<()>;
+
+    /// M5: the concrete connection, for dialect cells of the same engine crate that need the
+    /// client library's own API (PostgreSQL `COPY FROM STDIN`, SQL Server bulk load). `None` by
+    /// default; an engine returns `Some(self)` when one of its cells downcasts. Code outside the
+    /// engine crate must not downcast (PLAN §1, rule 3: no engine special cases elsewhere).
+    fn as_any(&self) -> Option<&(dyn std::any::Any + Send + Sync)> {
+        None
+    }
 }
 
 /// An open transaction.
@@ -156,4 +176,11 @@ pub trait Tx: Send + Sync {
     async fn commit(self: Box<Self>) -> Result<()>;
 
     async fn rollback(self: Box<Self>) -> Result<()>;
+
+    /// M5: the concrete transaction, like [`Connection::as_any`]. `None` by default. A native
+    /// load inside a transaction runs on the transaction's session (PostgreSQL and SQL Server
+    /// transactions are session state, so the engine reaches its client through this).
+    fn as_any(&self) -> Option<&(dyn std::any::Any + Send + Sync)> {
+        None
+    }
 }

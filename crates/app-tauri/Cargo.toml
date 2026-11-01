@@ -37,9 +37,14 @@ uuid.workspace = true
 arrow-array.workspace = true
 arrow-schema.workspace = true
 arrow-ipc.workspace = true
+# M5: import / export payloads (read and write options, previews).
+oxbase-io.workspace = true
+# M5: one-shot channel for the Rust-side native file dialogs.
+tokio.workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true
 oxbase-driver = { workspace = true, features = ["mock"] }
 serde_json.workspace = true
 tokio.workspace = true
+tempfile.workspace = true

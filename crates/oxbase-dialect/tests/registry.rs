@@ -441,3 +441,110 @@ fn missing_designer_roles_lists_what_m3_needs() {
     );
     assert!(empty.contains(&"sqlite: no DmlWriter".to_owned()));
 }
+
+#[test]
+fn bulk_loader_falls_back_to_multi_row_inserts() {
+    use oxbase_dialect::{BulkLimits, BulkLoader, BulkMethod};
+
+    let mut reg = DialectRegistry::new();
+    let v = ServerVersion::new(16, 0, 0);
+    let err = reg.bulk_loader(Engine::Postgres).err().unwrap();
+    assert_eq!(err.category(), ErrorCategory::Unsupported);
+
+    reg.register_quoting(Engine::Postgres, Arc::new(PgQuoting));
+    assert!(!reg.has_bulk_loader(Engine::Postgres));
+    let fallback = reg.bulk_loader(Engine::Postgres).unwrap();
+    assert_eq!(fallback.method(&v), BulkMethod::MultiRowInsert);
+    assert_eq!(
+        fallback.limits(&v),
+        BulkLimits::for_engine(Engine::Postgres)
+    );
+    // The bulk loader is not a matrix role: the engine roles are unchanged.
+    assert_eq!(
+        reg.engine_roles(Engine::Postgres),
+        vec![EngineRole::Quoting]
+    );
+
+    let mut limits = BulkLimits::for_engine(Engine::Postgres);
+    limits.rows_per_call = 7;
+    reg.register_bulk_loader(
+        Engine::Postgres,
+        Arc::new(oxbase_dialect::InsertLoader::new(
+            Arc::new(PgQuoting),
+            limits,
+        )),
+    );
+    assert!(reg.has_bulk_loader(Engine::Postgres));
+    assert_eq!(
+        reg.bulk_loader(Engine::Postgres)
+            .unwrap()
+            .limits(&v)
+            .rows_per_call,
+        7
+    );
+}
+
+#[tokio::test]
+async fn insert_loader_runs_one_statement_per_chunk_in_the_transaction() {
+    use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray};
+    use oxbase_dialect::{
+        BulkLimits, BulkLoader, InsertLoader, LoadColumn, LoadSession, LoadTarget,
+    };
+
+    let driver = MockDriver::new(Engine::Sqlite);
+    let conn = driver
+        .connect(&ConnectParams::network(Engine::Sqlite, "mock"))
+        .await
+        .unwrap();
+    let tx = conn.begin().await.unwrap();
+
+    let table = ObjectRef::table(Some("main"), None, "t");
+    let columns = vec![
+        LoadColumn::new("id", DataType::INT64),
+        LoadColumn::new("name", DataType::Text),
+    ];
+    let v = ServerVersion::new(3, 54, 1);
+    let target = LoadTarget {
+        table: &table,
+        columns: &columns,
+        version: &v,
+    };
+    let ids: ArrayRef = Arc::new(Int64Array::from_iter_values(0..5));
+    let names: ArrayRef = Arc::new(StringArray::from(vec!["a", "b", "c", "d", "e"]));
+    let batch = RecordBatch::try_new(target.schema(), vec![ids, names]).unwrap();
+
+    let mut limits = BulkLimits::for_engine(Engine::Sqlite);
+    limits.max_rows_per_statement = 2;
+    let loader = InsertLoader::new(Arc::new(AnsiQuoting), limits);
+    let session = LoadSession::new(conn.as_ref(), Some(tx.as_ref()));
+    let sent = loader
+        .load(session, &target, &batch, CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(sent, 5);
+    tx.commit().await.unwrap();
+
+    let log = driver.log();
+    let inserts: Vec<&String> = log.iter().filter(|s| s.starts_with("INSERT")).collect();
+    assert_eq!(inserts.len(), 3);
+    assert_eq!(
+        inserts[0].as_str(),
+        "INSERT INTO \"main\".\"t\" (\"id\", \"name\") VALUES (?, ?), (?, ?)"
+    );
+    assert_eq!(log.first().map(String::as_str), Some("BEGIN"));
+    assert_eq!(log.last().map(String::as_str), Some("COMMIT"));
+
+    // A cancelled token stops before the first statement.
+    let cancelled = CancellationToken::new();
+    cancelled.cancel();
+    let err = loader
+        .load(
+            LoadSession::new(conn.as_ref(), None),
+            &target,
+            &batch,
+            cancelled,
+        )
+        .await
+        .unwrap_err();
+    assert!(err.is_cancelled());
+}

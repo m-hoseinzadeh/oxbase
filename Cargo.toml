@@ -154,6 +154,16 @@ arrow-ipc = "60.1.0"
 # M2: `concat_batches` for result pages that span stored batches (oxbase-services).
 arrow-select = "60.1.0"
 
+# --- M5 import / export (oxbase-io; docs/m5-contracts.md §11) ---
+# arrow-json and parquet stay on the arrow major above (60).
+arrow-json = "60.1.0"
+arrow-cast = "60.1.0"
+parquet = { version = "60.1.0", default-features = false, features = ["arrow", "snap", "lz4", "zstd", "brotli", "flate2-rust_backend"] }
+csv = "1.4.0"
+encoding_rs = "0.8.44"
+calamine = { version = "0.37.0", features = ["dates"] }
+rust_xlsxwriter = { version = "0.102.0", features = ["constant_memory", "chrono"] }
+
 # --- observability ---
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }

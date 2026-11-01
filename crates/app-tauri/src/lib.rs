@@ -19,6 +19,12 @@
 //! * Table designer (M3, `src/designer.rs`): `designer_load`, `designer_preview`,
 //!   `designer_apply` and `capabilities_get`. Contract: `docs/m3-contracts.md` §7.
 //!
+//! * Import and export (M5): file handles from Rust-side native dialogs (`src/files.rs`:
+//!   `file_pick_open`, `file_pick_save`, `file_release`) and the transfer commands
+//!   (`src/transfer.rs`: `import_preview`, `import_plan`, `import_run`, `import_cancel`,
+//!   `export_run`, `export_cancel`). The webview never sends a file path. Contract:
+//!   `docs/m5-contracts.md` §6-7.
+//!
 //! Every fallible command rejects with [`error::CommandError`], serialized as
 //! `{ "category": "<snake_case ErrorCategory>", "message": "..." }`.
 //!
@@ -31,7 +37,9 @@ mod data;
 mod demo_page;
 mod designer;
 mod error;
+mod files;
 mod profiles;
+mod transfer;
 mod workbench;
 
 use serde::Serialize;
@@ -90,6 +98,8 @@ pub fn run() {
             app.manage(states.workbench);
             app.manage(states.data);
             app.manage(states.designer);
+            app.manage(states.transfer);
+            app.manage(states.files);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -124,6 +134,15 @@ pub fn run() {
             designer::designer_preview,
             designer::designer_apply,
             designer::capabilities_get,
+            files::file_pick_open,
+            files::file_pick_save,
+            files::file_release,
+            transfer::import_preview,
+            transfer::import_plan,
+            transfer::import_run,
+            transfer::import_cancel,
+            transfer::export_run,
+            transfer::export_cancel,
         ])
         .build(tauri::generate_context!())
         .expect("error while building the oxbase desktop shell");

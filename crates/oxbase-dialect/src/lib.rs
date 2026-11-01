@@ -25,9 +25,16 @@
 //! [`Quoting::top_clause`] (`TOP (n)`), and [`LexRules::bracket_identifiers`] makes
 //! [`sql::check_expression`] read `[...]` identifiers (also on for SQLite's [`AnsiQuoting`]).
 //!
+//! M5 adds bulk loading for import: the per-engine [`BulkLoader`] role (module [`bulk`]: load
+//! batches in a fixed Arrow schema, batch-size rules per engine, the generic multi-row
+//! [`InsertLoader`] every SQL engine falls back to), registered with
+//! [`DialectRegistry::register_bulk_loader`].
+//!
 //! How engine crates register their cells: see [`DialectRegistry`] (*Registration*). The
-//! contracts are in `docs/m2-contracts.md`, `docs/m3-contracts.md` and `docs/m4-contracts.md`.
+//! contracts are in `docs/m2-contracts.md`, `docs/m3-contracts.md`, `docs/m4-contracts.md` and
+//! `docs/m5-contracts.md`.
 
+pub mod bulk;
 mod capability;
 pub mod compare;
 mod ddl;
@@ -44,6 +51,9 @@ use oxbase_types::{
     ServerVersion, TableDef,
 };
 
+pub use bulk::{
+    BulkLimits, BulkLoader, BulkMethod, InsertLoader, LoadColumn, LoadSession, LoadTarget,
+};
 pub use capability::{DesignerCapabilities, Support};
 pub use ddl::DdlContext;
 pub use dml::{DmlPlan, DmlTarget, write_column_list, write_key_predicate};
