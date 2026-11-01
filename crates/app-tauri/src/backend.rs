@@ -145,32 +145,44 @@ pub fn app_state_with_repositories(
     ));
     let dialects = Arc::new(oxbase_services::default_dialects());
     let history = Arc::new(HistoryService::new(history));
+    // M6: the designer, import and query services publish schema changes on `events`; the
+    // schema cache service subscribes (docs/m6-contracts.md §3.5).
+    let events = SchemaEvents::new();
     let tree = Arc::new(TreeService::new(
         Arc::clone(&manager),
         Arc::clone(&dialects),
     ));
-    let query = Arc::new(QueryService::new(
-        Arc::clone(&manager),
-        Arc::clone(&dialects),
-        Arc::clone(&history),
-        QueryConfig::default(),
-    ));
+    let query = Arc::new(
+        QueryService::new(
+            Arc::clone(&manager),
+            Arc::clone(&dialects),
+            Arc::clone(&history),
+            QueryConfig::default(),
+        )
+        .with_schema_events(events.clone()),
+    );
     let edit = Arc::new(EditService::new(
         Arc::clone(&query),
         Arc::clone(&tree),
         Arc::clone(&dialects),
     ));
-    let designer = Arc::new(DesignerService::new(
-        Arc::clone(&manager),
-        Arc::clone(&tree),
-        Arc::clone(&dialects),
-    ));
-    let import = Arc::new(ImportService::new(
-        Arc::clone(&manager),
-        Arc::clone(&tree),
-        Arc::clone(&dialects),
-        ImportConfig::default(),
-    ));
+    let designer = Arc::new(
+        DesignerService::new(
+            Arc::clone(&manager),
+            Arc::clone(&tree),
+            Arc::clone(&dialects),
+        )
+        .with_schema_events(events.clone()),
+    );
+    let import = Arc::new(
+        ImportService::new(
+            Arc::clone(&manager),
+            Arc::clone(&tree),
+            Arc::clone(&dialects),
+            ImportConfig::default(),
+        )
+        .with_schema_events(events.clone()),
+    );
     let export = Arc::new(ExportService::new(
         Arc::clone(&manager),
         Arc::clone(&query),
@@ -178,9 +190,6 @@ pub fn app_state_with_repositories(
         Arc::clone(&dialects),
         ExportConfig::default(),
     ));
-    // M6: the designer, import and query services publish on `events` once the cache stream
-    // wires them (docs/m6-contracts.md §3.5).
-    let events = SchemaEvents::new();
     let caches = Arc::new(SchemaCacheService::new(
         Arc::clone(&manager),
         Arc::clone(&dialects),

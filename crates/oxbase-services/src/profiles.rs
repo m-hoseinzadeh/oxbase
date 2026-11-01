@@ -30,6 +30,7 @@ use oxbase_types::{Error, Result, Secret};
 use uuid::Uuid;
 
 use crate::ProvidedSecrets;
+use crate::schema_cache::SchemaCacheService;
 
 /// The typed, non-empty value for `slot`, if any.
 fn provided_value(provided: &ProvidedSecrets, slot: SecretSlot) -> Option<Secret> {
@@ -311,6 +312,21 @@ pub async fn delete_profile(
         if is_own_key(id, &key) {
             let _ = secrets.delete(&key).await;
         }
+    }
+    Ok(existed)
+}
+
+/// M6: [`delete_profile`], then the profile's schema caches and their persisted snapshots
+/// (`SchemaCacheService::forget_profile`, best effort: the profile is gone either way).
+pub async fn delete_profile_and_caches(
+    repo: &dyn ProfileRepository,
+    secrets: &dyn SecretStore,
+    caches: &SchemaCacheService,
+    id: Uuid,
+) -> Result<bool> {
+    let existed = delete_profile(repo, secrets, id).await?;
+    if let Err(e) = caches.forget_profile(id).await {
+        tracing::debug!(category = %e.category(), "dropping a profile's schema caches failed");
     }
     Ok(existed)
 }
