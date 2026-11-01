@@ -841,7 +841,7 @@ fn sqlite_dumps_keep_long_decimals_exact() {
     .unwrap();
     let schema = Arc::new(Schema::new(vec![Field::new(
         "amount",
-        values.data_type().clone(),
+        ArrowType::Decimal128(38, 10),
         true,
     )]));
     let batch = RecordBatch::try_new(schema, vec![Arc::new(values)]).unwrap();
