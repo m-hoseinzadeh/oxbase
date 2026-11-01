@@ -159,6 +159,13 @@ fn json_texts(field: &FieldRef, array: &dyn Array) -> Result<arrow_array::String
 
 // --- value accessors ----------------------------------------------------------------------
 
+/// `true` when cell `row` of `array` is NULL, including every cell of a `Null`-typed column
+/// (`SELECT NULL` on MySQL or SQL Server), whose `is_null` is `false` because it has no
+/// validity bitmap.
+pub(crate) fn null_at(array: &dyn Array, row: usize) -> bool {
+    array.is_null(row) || matches!(array.data_type(), ArrowType::Null)
+}
+
 /// The text of a string cell (`None` for other types).
 pub(crate) fn str_at(array: &dyn Array, row: usize) -> Option<&str> {
     match array.data_type() {

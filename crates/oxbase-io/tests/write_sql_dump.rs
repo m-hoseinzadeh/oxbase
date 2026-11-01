@@ -9,18 +9,19 @@ use std::sync::Arc;
 
 use arrow_array::{
     ArrayRef, BinaryArray, BooleanArray, Decimal128Array, FixedSizeBinaryArray, Int64Array,
-    RecordBatch, StringArray, TimestampMicrosecondArray,
+    NullArray, RecordBatch, StringArray, Time64NanosecondArray, TimestampMicrosecondArray,
+    TimestampNanosecondArray,
 };
-use arrow_schema::{DataType as ArrowType, Field, Schema};
-use oxbase_io::{SqlDumpOptions, WriteContext, WriteOptions};
+use arrow_schema::{DataType as ArrowType, Field, Schema, TimeUnit};
+use oxbase_io::{SinkReport, SqlDumpOptions, WriteContext, WriteOptions};
 use oxbase_types::{
     CheckDef, ColumnDef, DataType, Engine, ErrorCategory, Extras, GeneratedColumn, IdentityDef,
     ObjectRef, PrimaryKeyDef, TableDef,
 };
 use pretty_assertions::assert_eq;
 use write_support::{
-    BEYOND_DOUBLE, TRICKY, UNICODE, UUID_1, UUID_2, dialects, numbers, parts, sample, utc_micros,
-    write_all,
+    BEYOND_DOUBLE, TRICKY, UNICODE, UUID_1, UUID_2, date, dialects, micros, numbers, parts, sample,
+    utc_micros, write_all,
 };
 
 /// Three rows: escapes and Unicode, edge values, NULLs.
@@ -78,6 +79,16 @@ fn dump(
     context: &WriteContext,
     batches: &[RecordBatch],
 ) -> String {
+    dump_report(engine, options, context, batches).0
+}
+
+/// [`dump`] with the writer's report.
+fn dump_report(
+    engine: Engine,
+    options: SqlDumpOptions,
+    context: &WriteContext,
+    batches: &[RecordBatch],
+) -> (String, SinkReport) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("dump.sql");
     let options = WriteOptions::SqlDump(SqlDumpOptions {
@@ -88,7 +99,7 @@ fn dump(
     let text = std::fs::read_to_string(&path).unwrap();
     assert_eq!(report.bytes, u64::try_from(text.len()).unwrap());
     assert_eq!(parts(dir.path()), Vec::<String>::new());
-    text
+    (text, report)
 }
 
 fn two_per_insert(engine: Engine) -> SqlDumpOptions {
@@ -111,13 +122,16 @@ INSERT INTO \"export\" (\"flag\", \"n\", \"dec\", \"txt\", \"bin\", \"at_tz\", \
 (NULL, NULL, NULL, NULL, NULL, NULL, NULL);
 "
         }
+        // Timestamps with a zone: UTC wall-clock time without an offset (MariaDB and MySQL
+        // before 8.0.19 read no offset), under `time_zone = '+00:00'` restored at the end.
         Engine::MySql | Engine::MariaDb => {
             "INSERT INTO `export` (`flag`, `n`, `dec`, `txt`, `bin`, `at_tz`, `id`) VALUES
-(TRUE, 1, 12.50, 'it''s \\\\ back', X'00ff', '2023-11-14T22:13:20.123456+00:00', '12345678-9abc-def0-1234-56789abcdef0'),
+(TRUE, 1, 12.50, 'it''s \\\\ back', X'00ff', '2023-11-14 22:13:20.123456', '12345678-9abc-def0-1234-56789abcdef0'),
 (FALSE, 9007199254740993, -0.05, 'line
-next ☃ 🚀', X'', '1970-01-01T00:00:00+00:00', 'ffffffff-ffff-ffff-ffff-ffffffffffff');
+next ☃ 🚀', X'', '1970-01-01 00:00:00', 'ffffffff-ffff-ffff-ffff-ffffffffffff');
 INSERT INTO `export` (`flag`, `n`, `dec`, `txt`, `bin`, `at_tz`, `id`) VALUES
 (NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+SET time_zone = @oxbase_time_zone;
 "
         }
         Engine::Sqlite => {
@@ -174,6 +188,15 @@ fn golden_inserts_per_engine() {
         assert!(drop < text.find("CREATE TABLE").unwrap(), "{engine}");
         let inserts = &text[text.find("INSERT INTO").unwrap()..];
         assert_eq!(inserts, golden_inserts(engine), "{engine}");
+        let session_zone = text.find("SET time_zone = '+00:00';\n");
+        if matches!(engine, Engine::MySql | Engine::MariaDb) {
+            assert!(
+                session_zone.is_some_and(|at| at < drop),
+                "{engine}: the session time zone is set first:\n{text}"
+            );
+        } else {
+            assert!(session_zone.is_none(), "{engine}:\n{text}");
+        }
         // Every statement ends with `;` and the file uses `\n` only.
         assert!(!text.contains('\r'), "{engine}");
         assert!(!text.contains("\nGO"), "{engine}");
@@ -474,4 +497,210 @@ fn a_dump_needs_the_dialect_cells() {
     let err = write_all(&path, &options, &WriteContext::default(), &[small()]).unwrap_err();
     assert_eq!(err.category(), ErrorCategory::Unsupported);
     assert_eq!(write_support::files(dir.path()), Vec::<String>::new());
+}
+
+/// One row of date-time values: a SQL Server `datetime` tick as its driver reads it
+/// (`10:00:00.003333`), a nanosecond timestamp, a timestamp with a zone and a nanosecond time
+/// of day.
+fn date_times() -> RecordBatch {
+    let nanos = date(2024, 1, 2)
+        .and_hms_nano_opt(10, 0, 0, 123_456_789)
+        .unwrap()
+        .and_utc()
+        .timestamp_nanos_opt()
+        .unwrap();
+    let columns: Vec<ArrayRef> = vec![
+        Arc::new(TimestampMicrosecondArray::from(vec![micros(
+            2024, 1, 2, 10, 0, 0, 3_333,
+        )])),
+        Arc::new(TimestampNanosecondArray::from(vec![nanos])),
+        Arc::new(
+            TimestampMicrosecondArray::from(vec![micros(2024, 1, 2, 10, 0, 0, 500_000)])
+                .with_timezone("+00:00"),
+        ),
+        Arc::new(Time64NanosecondArray::from(vec![
+            36_000_000_000_000 + 123_456_789,
+        ])),
+    ];
+    let schema = Schema::new(vec![
+        Field::new(
+            "at",
+            ArrowType::Timestamp(TimeUnit::Microsecond, None),
+            true,
+        ),
+        Field::new(
+            "at_ns",
+            ArrowType::Timestamp(TimeUnit::Nanosecond, None),
+            true,
+        ),
+        Field::new("at_tz", utc_micros(), true),
+        Field::new("clock", ArrowType::Time64(TimeUnit::Nanosecond), true),
+    ]);
+    RecordBatch::try_new(Arc::new(schema), columns).unwrap()
+}
+
+#[test]
+fn date_time_literals_suit_the_target() {
+    let options = |engine| SqlDumpOptions {
+        include_create: false,
+        ..SqlDumpOptions::new(engine)
+    };
+    // SQL Server: naive timestamps through datetime2(7), which converts to `datetime` (and
+    // every other date-time type) with rounding; at most 7 fractional digits.
+    let (text, report) = dump_report(
+        Engine::MsSql,
+        options(Engine::MsSql),
+        &context(),
+        &[date_times()],
+    );
+    assert!(
+        text.ends_with(
+            "INSERT INTO [export] ([at], [at_ns], [at_tz], [clock]) VALUES\n\
+             (CAST(N'2024-01-02T10:00:00.003333' AS datetime2(7)), \
+             CAST(N'2024-01-02T10:00:00.1234567' AS datetime2(7)), \
+             N'2024-01-02T10:00:00.5+00:00', N'10:00:00.1234567');\n"
+        ),
+        "{text}"
+    );
+    let warnings = report.warnings.join("\n");
+    assert!(
+        warnings.contains("2 date-time values had more than 7 fractional"),
+        "{warnings}"
+    );
+
+    // MySQL / MariaDB: no offsets, at most 6 digits, UTC session time zone.
+    for engine in [Engine::MySql, Engine::MariaDb] {
+        let (text, report) = dump_report(engine, options(engine), &context(), &[date_times()]);
+        let set = text
+            .find("SET time_zone = '+00:00';\n")
+            .expect("time zone set");
+        assert!(set < text.find("INSERT").unwrap(), "{text}");
+        assert!(
+            text.ends_with(
+                "INSERT INTO `export` (`at`, `at_ns`, `at_tz`, `clock`) VALUES\n\
+                 ('2024-01-02 10:00:00.003333', '2024-01-02 10:00:00.123456', \
+                 '2024-01-02 10:00:00.5', '10:00:00.123456');\n\
+                 SET time_zone = @oxbase_time_zone;\n"
+            ),
+            "{engine}:\n{text}"
+        );
+        let warnings = report.warnings.join("\n");
+        assert!(
+            warnings.contains("2 date-time values had more than 6 fractional"),
+            "{engine}: {warnings}"
+        );
+    }
+
+    // PostgreSQL keeps the dialect's literals (it rounds extra digits itself).
+    let text = dump(
+        Engine::Postgres,
+        options(Engine::Postgres),
+        &context(),
+        &[date_times()],
+    );
+    assert!(!text.contains("CAST("), "{text}");
+    assert!(!text.contains("time_zone"), "{text}");
+    assert!(text.contains("'2024-01-02 10:00:00.003333'"), "{text}");
+    assert!(text.contains("'2024-01-02T10:00:00.500+00:00'"), "{text}");
+}
+
+#[test]
+fn server_maintained_columns_are_not_inserted() {
+    use oxbase_mssql::extras;
+
+    let mut table = TableDef::new(ObjectRef::table(None, Some("dbo"), "versioned"));
+    let mut id = ColumnDef::new("id", DataType::INT64);
+    "bigint".clone_into(&mut id.native_type);
+    id.nullable = false;
+    id.identity = Some(IdentityDef {
+        always: false,
+        start: None,
+        increment: None,
+    });
+    let mut name = ColumnDef::new("name", DataType::Text);
+    "nvarchar(50)".clone_into(&mut name.native_type);
+    let mut rv = ColumnDef::new("rv", DataType::Binary { length: Some(8) });
+    "rowversion".clone_into(&mut rv.native_type);
+    rv.nullable = false;
+    rv.extras.insert(extras::ROW_VERSION, true);
+    let mut from = ColumnDef::new("valid_from", DataType::Timestamp { precision: Some(7) });
+    "datetime2(7)".clone_into(&mut from.native_type);
+    from.nullable = false;
+    from.extras.insert(extras::PERIOD, "row_start");
+    table.columns = vec![id, name, rv, from];
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", ArrowType::Int64, false),
+        Field::new("name", ArrowType::Utf8, true),
+        Field::new("rv", ArrowType::Binary, false),
+        Field::new(
+            "valid_from",
+            ArrowType::Timestamp(TimeUnit::Microsecond, None),
+            false,
+        ),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(vec![7])),
+            Arc::new(StringArray::from(vec!["a"])),
+            Arc::new(BinaryArray::from(vec![&b"\0\0\0\0\0\0\x07\xd1"[..]])),
+            Arc::new(TimestampMicrosecondArray::from(vec![micros(
+                2024, 1, 2, 3, 4, 5, 0,
+            )])),
+        ],
+    )
+    .unwrap();
+    let context = WriteContext {
+        dialects: Some(dialects()),
+        table: Some(table),
+        source_engine: Some(Engine::MsSql),
+    };
+    let options = SqlDumpOptions {
+        include_create: false,
+        ..SqlDumpOptions::new(Engine::MsSql)
+    };
+    let (text, report) = dump_report(Engine::MsSql, options, &context, &[batch]);
+    assert!(
+        text.ends_with(
+            "SET IDENTITY_INSERT [versioned] ON;\n\
+             INSERT INTO [versioned] ([id], [name]) VALUES\n(7, N'a');\n\
+             SET IDENTITY_INSERT [versioned] OFF;\n"
+        ),
+        "{text}"
+    );
+    for column in ["rv", "valid_from"] {
+        let note = format!("column {column} left out of the inserts");
+        assert!(text.contains(&format!("-- {note}")), "{text}");
+        assert!(
+            report.warnings.iter().any(|w| w.contains(&note)),
+            "{report:?}"
+        );
+    }
+}
+
+#[test]
+fn null_typed_columns_dump_null() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("n", ArrowType::Int64, true),
+        Field::new("nothing", ArrowType::Null, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2])),
+            Arc::new(NullArray::new(2)),
+        ],
+    )
+    .unwrap();
+    let options = SqlDumpOptions {
+        include_create: false,
+        ..SqlDumpOptions::new(Engine::Sqlite)
+    };
+    let text = dump(Engine::Sqlite, options, &context(), &[batch]);
+    assert!(
+        text.ends_with(
+            "INSERT INTO \"export\" (\"n\", \"nothing\") VALUES\n(1, NULL),\n(2, NULL);\n"
+        ),
+        "{text}"
+    );
 }

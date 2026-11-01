@@ -576,7 +576,30 @@ Streams record deviations from this file here, with the reason.
   `standard_conforming_strings = on`, the default since 9.1), not `E'...'`. PostgreSQL inserts
   into a `GENERATED ALWAYS` identity column carry `OVERRIDING SYSTEM VALUE` (the server refuses
   the values otherwise); generated columns are left out of same-engine `INSERT`s.
+- **SQL dump date-time literals** are spelled by the writer (`write/sql.rs`, `Temporal`) where
+  `Quoting::literal` (chrono `Display`) is not read by the target: SQL Server timestamps without
+  a zone are `CAST(N'yyyy-mm-ddThh:mm:ss.fffffff' AS datetime2(7))` (a `datetime` column refuses a
+  string with more than 3 fractional digits, and the driver reads `datetime` ticks as
+  `.003333`; datetime2 converts to every date-time type with rounding and ignores
+  `DATEFORMAT`), times and timestamps with a zone at most 7 digits; MySQL / MariaDB timestamps
+  with a zone are their UTC wall-clock time without an offset (MariaDB and MySQL before 8.0.19
+  read no offset), the dump wraps its statements in `SET time_zone = '+00:00'` (saved in
+  `@oxbase_time_zone` and restored at the end) when it has such a column, at most 6 digits.
+  Dropped digits are a report warning. This belongs in the dialects' `Quoting` (Design) once
+  they grow a dump-literal rule; the writer would then only call it.
+- **Server-maintained columns** of a same-engine table are left out of the `INSERT`s (with a
+  `--` note and a warning): generated columns, and every column the target's `DmlWriter`
+  refuses to write (`plan` of a one-column insert into a probe table returns `InvalidInput`):
+  SQL Server `rowversion` and system-versioned period columns. Identity columns are probed as
+  plain columns, because the dump writes them (`SET IDENTITY_INSERT` / `OVERRIDING SYSTEM
+  VALUE`).
+- **NULL**: a `Null`-typed column (`SELECT NULL`) is NULL in every row for every writer (Arrow's
+  `NullArray::is_null` is `false`). CSV warns when non-NULL text equals the NULL token (the
+  empty string with the default empty token).
 - **XLSX** time-of-day cells use the number format `hh:mm:ss`; dates outside 1900-9999 are text.
+  `Float32` / `Float16` values are written as the double of their shortest text (`0.1`, not
+  `0.10000000149011612`); digits below a millisecond (Excel's resolution) are a warning; numbers
+  written as text (beyond 2^53, long decimals, `-Infinity`) never get the formula guard.
 - **Round trips in `tests/write_*.rs`** read files back with the underlying crates (`csv`,
   `arrow-json`, `calamine`, `parquet`, and `rusqlite` executing the SQLite dump), because the
   readers are a parallel stream; read-stream round trips belong to the integration step.

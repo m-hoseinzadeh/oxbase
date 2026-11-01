@@ -232,3 +232,41 @@ fn empty_exports_are_valid_files() {
     write_all(&ndjson, &json(lines()), &WriteContext::default(), &[]).unwrap();
     assert_eq!(std::fs::read_to_string(&ndjson).unwrap(), "");
 }
+
+#[test]
+fn null_typed_columns_follow_the_null_option() {
+    use arrow_array::{Int64Array, NullArray};
+    use arrow_schema::{DataType, Field};
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("n", DataType::Int64, true),
+        Field::new("nothing", DataType::Null, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(vec![1])),
+            Arc::new(NullArray::new(1)),
+        ],
+    )
+    .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    for (explicit, expected) in [
+        (true, "{\"n\":1,\"nothing\":null}\n"),
+        (false, "{\"n\":1}\n"),
+    ] {
+        let path = dir.path().join(format!("{explicit}.ndjson"));
+        let options = JsonWriteOptions {
+            explicit_nulls: explicit,
+            ..lines()
+        };
+        write_all(
+            &path,
+            &json(options),
+            &WriteContext::default(),
+            std::slice::from_ref(&batch),
+        )
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+    }
+}

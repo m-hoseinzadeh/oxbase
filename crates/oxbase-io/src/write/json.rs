@@ -15,7 +15,8 @@ use arrow_schema::{DataType as ArrowType, Schema};
 use oxbase_types::{Error, Result};
 
 use super::cells::{
-    EXACT_DOUBLE_INT, JsonCells, arrow_error, float_at, int_at, push_json_string, push_pretty_json,
+    EXACT_DOUBLE_INT, JsonCells, arrow_error, float_at, int_at, null_at, push_json_string,
+    push_pretty_json,
 };
 use super::{Count, Tally, already_failed, io_error, plural};
 use crate::{JsonLayout, JsonWriteOptions, SinkFile, SinkReport, SinkWriter};
@@ -130,7 +131,7 @@ impl JsonSink {
             let mut first = true;
             for ((encoder, column), key) in encoders.iter_mut().zip(batch.columns()).zip(&self.keys)
             {
-                let null = column.is_null(row);
+                let null = null_at(column.as_ref(), row);
                 if null && !explicit {
                     continue;
                 }

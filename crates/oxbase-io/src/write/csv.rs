@@ -9,8 +9,8 @@ use arrow_array::RecordBatch;
 use arrow_schema::{DataType as ArrowType, Schema};
 use oxbase_types::{Error, Result};
 
-use super::cells::{TextForms, is_text, is_utc, normalize, normalized_schema};
-use super::{Tally, already_failed, io_error};
+use super::cells::{TextForms, is_text, is_utc, normalize, normalized_schema, null_at};
+use super::{Count, Tally, already_failed, io_error, plural};
 use crate::encoding::{EncodingWriter, bom_bytes};
 use crate::formula::needs_guard;
 use crate::{CsvWriteOptions, LineEnding, QuoteStyle, SinkFile, SinkReport, SinkWriter};
@@ -29,6 +29,8 @@ struct CsvSink {
     failed: bool,
     /// Columns whose timestamps had a non-UTC zone (written as UTC).
     zoned: BTreeSet<String>,
+    /// Non-NULL values whose text is the NULL token (a reader takes them for NULL).
+    like_null: Count,
 }
 
 fn ascii(what: &str, c: char) -> Result<u8> {
@@ -94,6 +96,7 @@ pub(crate) fn writer(
         rows: 0,
         failed: false,
         zoned: BTreeSet::new(),
+        like_null: Count::default(),
     };
     if options.header {
         for (field, slot) in schema.fields().iter().zip(sink.fields.iter_mut()) {
@@ -195,11 +198,14 @@ impl CsvSink {
             for (c, column) in batch.columns().iter().enumerate() {
                 let field = &mut self.fields[c];
                 field.clear();
-                if column.is_null(row) {
+                if null_at(column.as_ref(), row) {
                     field.push_str(&self.options.null_token);
                     continue;
                 }
                 self.forms.push_text(column.as_ref(), row, field)?;
+                if *field == self.options.null_token {
+                    self.like_null.add();
+                }
                 if guard[c] && needs_guard(field) {
                     field.insert(0, '\'');
                 }
@@ -239,11 +245,24 @@ impl SinkWriter for CsvSink {
         let encoded = this.out.into_inner().map_err(|e| io_error(e.error()))?;
         let tally = encoded.finish().map_err(|e| io_error(&e))?;
         let bytes = tally.into_file().commit()?;
-        let warnings = this
+        let mut warnings: Vec<String> = this
             .zoned
             .iter()
             .map(|c| format!("column {c}: timestamps with a time zone were written in UTC"))
             .collect();
+        let token = &this.options.null_token;
+        this.like_null.note(&mut warnings, |n| {
+            let shown = if token.is_empty() {
+                "empty".to_owned()
+            } else {
+                format!("'{token}'")
+            };
+            format!(
+                "{n} value{} equal to the NULL token ({shown}) cannot be told apart from NULL \
+                 when the file is read back",
+                plural(n)
+            )
+        });
         Ok(SinkReport {
             rows: this.rows,
             bytes,

@@ -7,28 +7,108 @@
 //! `OVERRIDING SYSTEM VALUE` for `GENERATED ALWAYS` identity columns (without it the server
 //! refuses the dump's values).
 
+use std::fmt::Write as _;
 use std::io::{BufWriter, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use arrow_array::{Array, RecordBatch};
-use arrow_schema::Schema;
-use oxbase_dialect::{BulkLimits, DdlContext, DdlGenerator, Quoting};
+use arrow_schema::{DataType as ArrowType, Schema};
+use chrono::{NaiveDateTime, NaiveTime, Timelike};
+use oxbase_dialect::{BulkLimits, DdlContext, DdlGenerator, DialectRegistry, DmlTarget, Quoting};
 use oxbase_types::{
-    ColumnDef, DataType, Engine, Error, Extras, ObjectDef, ObjectKind, ObjectRef, Result, Script,
-    ServerVersion, TableDef, Value,
+    ColumnDef, ColumnValue, DataType, Engine, Error, ErrorCategory, Extras, KeyKind, ObjectDef,
+    ObjectKind, ObjectRef, Result, RowEdit, RowKey, Script, ServerVersion, TableDef, Value,
 };
 
-use super::cells::{TextForms, normalize, normalized_schema};
-use super::{Tally, already_failed, io_error};
+use super::cells::{TextForms, normalize, normalized_schema, null_at};
+use super::{Count, Tally, already_failed, io_error, plural};
 use crate::sql_dump::default_version;
 use crate::{SinkFile, SinkReport, SinkWriter, SqlDumpOptions, WriteContext, logical_type};
+
+/// How date-time literals are spelled for the target.
+///
+/// `Quoting::literal` writes them with chrono's `Display` (up to 9 fractional digits, and an
+/// offset on timestamps with a zone), which not every target reads:
+/// - **SQL Server** refuses more than 3 fractional digits in a string converted to `datetime`
+///   (the driver reads `datetime` ticks as `…00:00.003333`) and more than 7 for any type, and
+///   reads `yyyy-mm-dd` per `DATEFORMAT` for `datetime`. Timestamps without a zone are written
+///   as `CAST(N'yyyy-mm-ddThh:mm:ss.fffffff' AS datetime2(7))`, which every date-time column
+///   type takes (rounded to its own precision); times and timestamps with a zone keep at most
+///   7 fractional digits.
+/// - **MySQL / MariaDB** do not read an offset in a date-time literal (MariaDB never, MySQL
+///   before 8.0.19), and a `TIMESTAMP` column reads the text in the session's time zone.
+///   Timestamps with a zone are written as their UTC wall-clock time without an offset, and the
+///   dump sets `time_zone = '+00:00'` for its statements; at most 6 fractional digits.
+/// - Everything else: `Quoting::literal` as it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Temporal {
+    Standard,
+    MySql,
+    MsSql,
+}
+
+impl Temporal {
+    fn for_engine(engine: Engine) -> Self {
+        match engine {
+            Engine::MySql | Engine::MariaDb => Self::MySql,
+            Engine::MsSql => Self::MsSql,
+            _ => Self::Standard,
+        }
+    }
+
+    /// Fractional-second digits the target keeps (`None`: no limit applied here).
+    fn digits(self) -> Option<u32> {
+        match self {
+            Self::Standard => None,
+            Self::MySql => Some(6),
+            Self::MsSql => Some(7),
+        }
+    }
+}
+
+/// Appends `.` and the first `digits` fractional digits of `nanos` without trailing zeros
+/// (nothing for a whole second). `true` when non-zero digits were dropped.
+fn push_fraction(nanos: u32, digits: u32, out: &mut String) -> bool {
+    // A leap second carries nanos >= 10^9; it is written as the last instant of the second.
+    let nanos = nanos.min(999_999_999);
+    let scale = 10_u32.pow(9 - digits);
+    let kept = nanos / scale;
+    if kept > 0 {
+        let width = usize::try_from(digits).unwrap_or(9);
+        let mut text = format!("{kept:0width$}");
+        while text.ends_with('0') {
+            text.pop();
+        }
+        out.push('.');
+        out.push_str(&text);
+    }
+    nanos % scale != 0
+}
+
+/// `yyyy-mm-dd<sep>hh:mm:ss[.f…]` with at most `digits` fractional digits; `true` when digits
+/// were dropped.
+fn push_datetime(t: &NaiveDateTime, sep: char, digits: u32, out: &mut String) -> bool {
+    let _ = write!(out, "{}{sep}{}", t.format("%Y-%m-%d"), t.format("%H:%M:%S"));
+    push_fraction(t.nanosecond(), digits, out)
+}
+
+/// `hh:mm:ss[.f…]` with at most `digits` fractional digits; `true` when digits were dropped.
+fn push_time(t: &NaiveTime, digits: u32, out: &mut String) -> bool {
+    let _ = write!(out, "{}", t.format("%H:%M:%S"));
+    push_fraction(t.nanosecond(), digits, out)
+}
 
 struct SqlSink {
     out: BufWriter<Tally>,
     bytes: Arc<AtomicU64>,
     quoting: Arc<dyn Quoting>,
     forms: TextForms,
+    temporal: Temporal,
+    /// Date-time values that had more fractional digits than the target keeps.
+    cut_fractions: Count,
+    /// Statements written after the inserts (MySQL: the session time zone restored).
+    epilogue: String,
     /// Batch columns written, in order (generated columns of a same-engine table are left out).
     written: Vec<usize>,
     columns: usize,
@@ -218,6 +298,65 @@ fn create_script(
     Ok(script)
 }
 
+/// Whether the target's grid writer refuses to write `column` of `table` (a column the server
+/// maintains: generated, SQL Server `rowversion` or period, ...). Identity and auto-increment
+/// columns are probed as plain columns, because the dump writes them on purpose
+/// (`SET IDENTITY_INSERT`, `OVERRIDING SYSTEM VALUE`). Only a refusal (`InvalidInput`) counts;
+/// any other error says nothing about the column.
+fn refused_by_writer(
+    dml: &dyn oxbase_dialect::DmlWriter,
+    table: &TableDef,
+    column: &ColumnDef,
+    version: &ServerVersion,
+) -> bool {
+    let mut probed = column.clone();
+    probed.identity = None;
+    probed.auto_increment = false;
+    let mut key_name = "oxbase_probe_key".to_owned();
+    while key_name == probed.name {
+        key_name.push('_');
+    }
+    let mut key_column = ColumnDef::new(key_name.clone(), DataType::INT64);
+    key_column.nullable = false;
+    let mut probe = TableDef::new(table.obj.clone());
+    probe.columns = vec![key_column, probed];
+    let key = RowKey::new(table.obj.clone(), KeyKind::Primary, vec![key_name]);
+    let edit = RowEdit::Insert {
+        values: vec![ColumnValue::new(column.name.clone(), Value::Null)],
+    };
+    let target = DmlTarget {
+        table: &probe,
+        key: &key,
+        version,
+        read_back: &[],
+    };
+    dml.plan(&edit, &target)
+        .is_err_and(|e| e.category() == ErrorCategory::InvalidInput)
+}
+
+/// Names of the columns of a same-engine `table` the server maintains itself (see
+/// [`refused_by_writer`]); generated columns always count, whether or not the target has a
+/// grid writer.
+fn maintained_columns(
+    dialects: &DialectRegistry,
+    target: Engine,
+    table: &TableDef,
+    version: &ServerVersion,
+) -> Vec<String> {
+    let dml = dialects.dml_writer(target).ok();
+    table
+        .columns
+        .iter()
+        .filter(|c| {
+            c.generated.is_some()
+                || dml
+                    .as_deref()
+                    .is_some_and(|dml| refused_by_writer(dml, table, c, version))
+        })
+        .map(|c| c.name.clone())
+        .collect()
+}
+
 /// The SQL dump writer over `file`.
 pub(crate) fn writer(
     file: SinkFile,
@@ -289,15 +428,28 @@ pub(crate) fn writer(
         sql.push_str(&ddl.drop_object(&table.obj, &ctx)?.to_sql(";"));
     }
 
-    // Columns written: all of the batch's, except generated columns of a same-engine table
-    // (the server computes them and refuses values).
+    // Columns written: all of the batch's, except the columns of a same-engine table the
+    // server maintains (it computes them and refuses values). Across engines the generated
+    // expressions and extras were cleared above, so every column is a plain one.
+    let maintained = if same_engine && matching.is_some() {
+        maintained_columns(dialects, target, &table, &version)
+    } else {
+        Vec::new()
+    };
     let written: Vec<usize> = schema
         .fields()
         .iter()
         .enumerate()
-        .filter(|(_, f)| table.column(f.name()).is_none_or(|c| c.generated.is_none()))
+        .filter(|(_, f)| !maintained.iter().any(|m| m == f.name()))
         .map(|(i, _)| i)
         .collect();
+    for name in &maintained {
+        if schema.field_with_name(name).is_ok() {
+            notes.push(format!(
+                "column {name} left out of the inserts: the server maintains its values"
+            ));
+        }
+    }
     let written_defs: Vec<&ColumnDef> = written
         .iter()
         .filter_map(|&i| table.column(schema.field(i).name()))
@@ -325,12 +477,26 @@ pub(crate) fn writer(
             .any(|c| c.identity.is_some() || c.auto_increment))
     .then(|| format!("SET IDENTITY_INSERT {qualified}"));
 
+    let temporal = Temporal::for_engine(target);
     let mut head = comment("Oxbase SQL dump");
     head.push_str(&comment(&format!("Target: {engine} {version}")));
     for note in &notes {
         head.push_str(&comment(note));
     }
     head.push('\n');
+    // MySQL / MariaDB: timestamps with a zone are written as UTC wall-clock times, which a
+    // `TIMESTAMP` column reads in the session's time zone.
+    let mut epilogue = String::new();
+    let zoned = schema
+        .fields()
+        .iter()
+        .any(|f| matches!(f.data_type(), ArrowType::Timestamp(_, Some(_))));
+    if temporal == Temporal::MySql && zoned && !written.is_empty() {
+        head.push_str(
+            "SET @oxbase_time_zone = @@session.time_zone;\nSET time_zone = '+00:00';\n\n",
+        );
+        epilogue.push_str("SET time_zone = @oxbase_time_zone;\n");
+    }
     if !sql.is_empty() {
         head.push_str(&sql);
         head.push('\n');
@@ -349,6 +515,9 @@ pub(crate) fn writer(
         bytes,
         quoting,
         forms: TextForms::default(),
+        temporal,
+        cut_fractions: Count::default(),
+        epilogue,
         written,
         columns: schema.fields().len(),
         insert,
@@ -365,8 +534,9 @@ pub(crate) fn writer(
 
 impl SqlSink {
     /// The literal of cell `row` of `array`: `Quoting::literal` of `cell_value`, or of the
-    /// value's text for Arrow types `cell_value` does not cover.
-    fn literal(&self, array: &dyn Array, row: usize) -> Result<String> {
+    /// value's text for Arrow types `cell_value` does not cover; date-time values as
+    /// [`Temporal`] says. The flag is `true` when fractional digits were dropped.
+    fn literal(&self, array: &dyn Array, row: usize) -> Result<(String, bool)> {
         let value = match oxbase_driver::cell_value(array, row) {
             Ok(v) => v,
             Err(Error::Unsupported { .. }) => {
@@ -376,7 +546,42 @@ impl SqlSink {
             }
             Err(e) => return Err(e),
         };
-        Ok(self.quoting.literal(&value))
+        Ok(self
+            .temporal_literal(&value)
+            .unwrap_or_else(|| (self.quoting.literal(&value), false)))
+    }
+
+    /// The target's spelling of a date-time `value` ([`Temporal`]) and whether fractional
+    /// digits were dropped; `None` when `Quoting::literal` is right.
+    fn temporal_literal(&self, value: &Value) -> Option<(String, bool)> {
+        let digits = self.temporal.digits()?;
+        let mut text = String::new();
+        let (cut, cast) = match (self.temporal, value) {
+            (Temporal::MsSql, Value::Timestamp(t)) => {
+                (push_datetime(t, 'T', digits, &mut text), true)
+            }
+            (Temporal::MsSql, Value::TimestampTz(t)) => {
+                let cut = push_datetime(&t.naive_local(), 'T', digits, &mut text);
+                text.push_str(&t.offset().to_string());
+                (cut, false)
+            }
+            (Temporal::MySql, Value::Timestamp(t)) => {
+                (push_datetime(t, ' ', digits, &mut text), false)
+            }
+            // The UTC wall-clock time; the dump runs with `time_zone = '+00:00'`.
+            (Temporal::MySql, Value::TimestampTz(t)) => {
+                (push_datetime(&t.naive_utc(), ' ', digits, &mut text), false)
+            }
+            (_, Value::Time(t)) => (push_time(t, digits, &mut text), false),
+            _ => return None,
+        };
+        let quoted = self.quoting.quote_str(&text);
+        let literal = if cast {
+            format!("CAST({quoted} AS datetime2(7))")
+        } else {
+            quoted
+        };
+        Some((literal, cut))
     }
 
     fn write_batch(&mut self, batch: &RecordBatch) -> Result<()> {
@@ -413,10 +618,14 @@ impl SqlSink {
                     line.push_str(", ");
                 }
                 let column = batch.column(c);
-                if column.is_null(row) {
+                if null_at(column.as_ref(), row) {
                     line.push_str("NULL");
                 } else {
-                    line.push_str(&self.literal(column.as_ref(), row)?);
+                    let (literal, cut) = self.literal(column.as_ref(), row)?;
+                    if cut {
+                        self.cut_fractions.add();
+                    }
+                    line.push_str(&literal);
                 }
             }
             line.push(')');
@@ -468,11 +677,20 @@ impl SinkWriter for SqlSink {
             tail.push_str(set);
             tail.push_str(" OFF;\n");
         }
+        tail.push_str(&this.epilogue);
         this.out
             .write_all(tail.as_bytes())
             .map_err(|e| io_error(&e))?;
         let tally = this.out.into_inner().map_err(|e| io_error(e.error()))?;
         let bytes = tally.into_file().commit()?;
+        let digits = this.temporal.digits().unwrap_or(9);
+        this.cut_fractions.note(&mut this.notes, |n| {
+            format!(
+                "{n} date-time value{} had more than {digits} fractional second digits; the \
+                 target keeps {digits}, so the rest were dropped",
+                plural(n)
+            )
+        });
         Ok(SinkReport {
             rows: this.rows,
             bytes,

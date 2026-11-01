@@ -322,3 +322,63 @@ fn bad_formats_are_refused_before_writing() {
     assert!(!path.exists());
     assert_eq!(parts(dir.path()), Vec::<String>::new());
 }
+
+#[test]
+fn null_typed_columns_and_values_that_look_like_null() {
+    use std::sync::Arc;
+
+    use arrow_array::{NullArray, RecordBatch, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
+
+    // `SELECT NULL` on MySQL and SQL Server gives a `Null`-typed column: every cell is NULL.
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("s", DataType::Utf8, true),
+        Field::new("nothing", DataType::Null, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(vec![Some(""), Some("\\N"), None])),
+            Arc::new(NullArray::new(3)),
+        ],
+    )
+    .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+
+    let path = dir.path().join("token.csv");
+    let options = CsvWriteOptions {
+        null_token: "\\N".to_owned(),
+        header: false,
+        ..CsvWriteOptions::default()
+    };
+    let report = write_all(
+        &path,
+        &csv(options),
+        &WriteContext::default(),
+        std::slice::from_ref(&batch),
+    )
+    .unwrap();
+    let text = String::from_utf8(std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(text, ",\\N\n\\N,\\N\n\\N,\\N\n");
+    assert_eq!(
+        report.warnings,
+        [
+            "1 value equal to the NULL token ('\\N') cannot be told apart from NULL when the \
+          file is read back"
+        ]
+    );
+
+    // With the default empty token, the empty string is the ambiguous one.
+    let path = dir.path().join("empty.csv");
+    let options = CsvWriteOptions {
+        header: false,
+        ..CsvWriteOptions::default()
+    };
+    let report = write_all(&path, &csv(options), &WriteContext::default(), &[batch]).unwrap();
+    assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
+    assert!(
+        report.warnings[0].starts_with("1 value equal to the NULL token (empty)"),
+        "{:?}",
+        report.warnings
+    );
+}

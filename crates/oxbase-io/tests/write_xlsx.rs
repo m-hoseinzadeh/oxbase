@@ -242,3 +242,47 @@ fn long_text_is_cut_to_the_cell_limit() {
     assert_eq!(cut.chars().count(), 32_767);
     assert_eq!(cell(&range, 2, 0), text("short"));
 }
+
+#[test]
+fn single_floats_and_sub_millisecond_times() {
+    use arrow_array::{Float32Array, Time64MicrosecondArray};
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("f", DataType::Float32, true),
+        Field::new(
+            "clock",
+            DataType::Time64(arrow_schema::TimeUnit::Microsecond),
+            true,
+        ),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Float32Array::from(vec![0.1_f32, 3.4e38])),
+            // 03:04:05.123456 and 03:04:05.123 (no digit below a millisecond).
+            Arc::new(Time64MicrosecondArray::from(vec![
+                11_045_123_456,
+                11_045_123_000,
+            ])),
+        ],
+    )
+    .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("floats.xlsx");
+    let report = write_all(
+        &path,
+        &xlsx(XlsxWriteOptions::default()),
+        &WriteContext::default(),
+        &[batch],
+    )
+    .unwrap();
+    let range = open(&path).worksheet_range("Sheet1").unwrap();
+    // The f32 0.1 is the double 0.1, not 0.10000000149011612.
+    assert_eq!(cell(&range, 1, 0), Data::Float(0.1));
+    assert_eq!(cell(&range, 2, 0), Data::Float(3.4e38));
+    let warnings = report.warnings.join("\n");
+    assert!(
+        warnings.contains("1 time or timestamp value had digits below a millisecond"),
+        "{warnings}"
+    );
+}

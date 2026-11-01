@@ -5,15 +5,16 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use arrow_array::cast::AsArray;
+use arrow_array::types::{Float16Type, Float32Type};
 use arrow_array::{Array, RecordBatch};
 use arrow_schema::{DataType as ArrowType, Schema};
-use chrono::{Datelike, NaiveDate};
+use chrono::{Datelike, NaiveDate, Timelike};
 use oxbase_types::{Error, Result};
 use rust_xlsxwriter::{Format, Workbook, Worksheet, XlsxError};
 
 use super::cells::{
     EXACT_DOUBLE_INT, TextForms, bytes_at, date_at, decimal_at, float_at, int_at, is_text, is_utc,
-    normalize, normalized_schema, push_hex, push_uuid, str_at, time_at, timestamp_at,
+    normalize, normalized_schema, null_at, push_hex, push_uuid, str_at, time_at, timestamp_at,
 };
 use super::{Count, Tally, already_failed, io_error, plural};
 use crate::formula::needs_guard;
@@ -54,6 +55,7 @@ struct Cells {
     cut_texts: Count,
     non_finite: Count,
     out_of_range: Count,
+    sub_millisecond: Count,
     zoned: BTreeSet<String>,
 }
 
@@ -115,6 +117,7 @@ pub(crate) fn writer(
             cut_texts: Count::default(),
             non_finite: Count::default(),
             out_of_range: Count::default(),
+            sub_millisecond: Count::default(),
             zoned: BTreeSet::new(),
         },
     };
@@ -173,13 +176,31 @@ fn exact_f64(v: i128) -> f64 {
     v as f64
 }
 
+/// A finite float cell as the double whose shortest text is the cell's own: a `Float32` /
+/// `Float16` `0.1` is written as `0.1`, not as the widened `0.10000000149011612`.
+fn float_cell(array: &dyn Array, index: usize) -> Option<f64> {
+    let single = match array.data_type() {
+        ArrowType::Float32 => array.as_primitive::<Float32Type>().value(index),
+        ArrowType::Float16 => array.as_primitive::<Float16Type>().value(index).to_f32(),
+        _ => return float_at(array, index),
+    };
+    format!("{single:?}").parse().ok()
+}
+
+/// `true` when `nanos` has digits below a millisecond (Excel keeps milliseconds).
+fn below_millisecond(nanos: u32) -> bool {
+    nanos % 1_000_000 != 0
+}
+
 impl Cells {
-    fn write_text(&mut self, ws: &mut Worksheet, row: u32, col: u16) -> Result<()> {
+    /// Writes `self.text` as a string cell; `number` marks the text of a number (an integer
+    /// beyond 2^53, a long decimal, `-Infinity`), which is never formula-guarded.
+    fn write_text(&mut self, ws: &mut Worksheet, row: u32, col: u16, number: bool) -> Result<()> {
         if fit_cell(&mut self.text) {
             self.cut_texts.add();
         }
         let text = std::mem::take(&mut self.text);
-        let result = if self.guard && needs_guard(&text) {
+        let result = if self.guard && !number && needs_guard(&text) {
             ws.write_string_with_format(row, col, text, &self.guarded)
         } else {
             ws.write_string(row, col, text)
@@ -198,102 +219,113 @@ impl Cells {
     ) -> Result<()> {
         self.text.clear();
         let t = array.data_type();
-        let written =
-            match t {
-                ArrowType::Null => return Ok(()),
-                ArrowType::Boolean => Some(done(ws.write_boolean(
-                    row,
-                    col,
-                    array.as_boolean().value(index),
-                ))),
-                _ if int_at(array, index).is_some() => {
-                    let v = int_at(array, index).unwrap_or_default();
-                    if v.abs() <= EXACT_DOUBLE_INT {
-                        Some(done(ws.write_number(row, col, exact_f64(v))))
-                    } else {
-                        self.big_numbers.add();
-                        self.text = v.to_string();
-                        None
-                    }
-                }
-                _ if float_at(array, index).is_some() => {
-                    let v = float_at(array, index).unwrap_or_default();
-                    if v.is_finite() {
-                        Some(done(ws.write_number(row, col, v)))
-                    } else {
-                        self.non_finite.add();
-                        self.forms.push_text(array, index, &mut self.text)?;
-                        None
-                    }
-                }
-                ArrowType::Decimal32(_, _)
-                | ArrowType::Decimal64(_, _)
-                | ArrowType::Decimal128(_, _)
-                | ArrowType::Decimal256(_, _) => {
-                    let text = decimal_at(array, index).unwrap_or_default();
-                    match text.parse::<f64>() {
-                        Ok(v) if significant_digits(&text) <= EXACT_DOUBLE_DIGITS => {
-                            Some(done(ws.write_number(row, col, v)))
-                        }
-                        _ => {
-                            self.long_decimals.add();
-                            self.text = text;
-                            None
-                        }
-                    }
-                }
-                ArrowType::Date32 | ArrowType::Date64 => match date_at(array, index) {
-                    Some(d) if excel_date_range(d) => {
-                        Some(done(ws.write_date_with_format(row, col, d, &self.date)))
-                    }
-                    _ => {
-                        self.out_of_range.add();
-                        self.forms.push_text(array, index, &mut self.text)?;
-                        None
-                    }
-                },
-                ArrowType::Timestamp(_, _) => match timestamp_at(array, index) {
-                    Some(v) if excel_date_range(v.date()) => Some(done(
-                        ws.write_datetime_with_format(row, col, v, &self.timestamp),
-                    )),
-                    _ => {
-                        self.out_of_range.add();
-                        self.forms.push_text(array, index, &mut self.text)?;
-                        None
-                    }
-                },
-                ArrowType::Time32(_) | ArrowType::Time64(_) => {
-                    if let Some(v) = time_at(array, index) {
-                        Some(done(ws.write_time_with_format(row, col, v, &self.time)))
-                    } else {
-                        self.forms.push_text(array, index, &mut self.text)?;
-                        None
-                    }
-                }
-                ArrowType::FixedSizeBinary(16) => {
-                    push_uuid(bytes_at(array, index).unwrap_or_default(), &mut self.text);
+        let number = t.is_numeric();
+        let written = match t {
+            ArrowType::Null => return Ok(()),
+            ArrowType::Boolean => Some(done(ws.write_boolean(
+                row,
+                col,
+                array.as_boolean().value(index),
+            ))),
+            _ if int_at(array, index).is_some() => {
+                let v = int_at(array, index).unwrap_or_default();
+                if v.abs() <= EXACT_DOUBLE_INT {
+                    Some(done(ws.write_number(row, col, exact_f64(v))))
+                } else {
+                    self.big_numbers.add();
+                    self.text = v.to_string();
                     None
                 }
-                ArrowType::Binary
-                | ArrowType::LargeBinary
-                | ArrowType::BinaryView
-                | ArrowType::FixedSizeBinary(_) => {
-                    self.text.push_str("0x");
-                    push_hex(bytes_at(array, index).unwrap_or_default(), &mut self.text);
-                    None
-                }
-                t if is_text(t) => {
-                    self.text.push_str(str_at(array, index).unwrap_or_default());
-                    None
-                }
-                _ => {
+            }
+            _ if float_at(array, index).is_some() => {
+                let v = float_cell(array, index).unwrap_or_default();
+                if v.is_finite() {
+                    Some(done(ws.write_number(row, col, v)))
+                } else {
+                    self.non_finite.add();
                     self.forms.push_text(array, index, &mut self.text)?;
                     None
                 }
-            };
+            }
+            ArrowType::Decimal32(_, _)
+            | ArrowType::Decimal64(_, _)
+            | ArrowType::Decimal128(_, _)
+            | ArrowType::Decimal256(_, _) => {
+                let text = decimal_at(array, index).unwrap_or_default();
+                match text.parse::<f64>() {
+                    Ok(v) if significant_digits(&text) <= EXACT_DOUBLE_DIGITS => {
+                        Some(done(ws.write_number(row, col, v)))
+                    }
+                    _ => {
+                        self.long_decimals.add();
+                        self.text = text;
+                        None
+                    }
+                }
+            }
+            ArrowType::Date32 | ArrowType::Date64 => match date_at(array, index) {
+                Some(d) if excel_date_range(d) => {
+                    Some(done(ws.write_date_with_format(row, col, d, &self.date)))
+                }
+                _ => {
+                    self.out_of_range.add();
+                    self.forms.push_text(array, index, &mut self.text)?;
+                    None
+                }
+            },
+            ArrowType::Timestamp(_, _) => match timestamp_at(array, index) {
+                Some(v) if excel_date_range(v.date()) => {
+                    if below_millisecond(v.nanosecond()) {
+                        self.sub_millisecond.add();
+                    }
+                    Some(done(ws.write_datetime_with_format(
+                        row,
+                        col,
+                        v,
+                        &self.timestamp,
+                    )))
+                }
+                _ => {
+                    self.out_of_range.add();
+                    self.forms.push_text(array, index, &mut self.text)?;
+                    None
+                }
+            },
+            ArrowType::Time32(_) | ArrowType::Time64(_) => {
+                if let Some(v) = time_at(array, index) {
+                    if below_millisecond(v.nanosecond()) {
+                        self.sub_millisecond.add();
+                    }
+                    Some(done(ws.write_time_with_format(row, col, v, &self.time)))
+                } else {
+                    self.forms.push_text(array, index, &mut self.text)?;
+                    None
+                }
+            }
+            ArrowType::FixedSizeBinary(16) => {
+                push_uuid(bytes_at(array, index).unwrap_or_default(), &mut self.text);
+                None
+            }
+            ArrowType::Binary
+            | ArrowType::LargeBinary
+            | ArrowType::BinaryView
+            | ArrowType::FixedSizeBinary(_) => {
+                self.text.push_str("0x");
+                push_hex(bytes_at(array, index).unwrap_or_default(), &mut self.text);
+                None
+            }
+            t if is_text(t) => {
+                self.text.push_str(str_at(array, index).unwrap_or_default());
+                None
+            }
+            _ => {
+                self.forms.push_text(array, index, &mut self.text)?;
+                None
+            }
+        };
         match written {
             Some(result) => result.map_err(xlsx_error),
-            None => self.write_text(ws, row, col),
+            None => self.write_text(ws, row, col, number),
         }
     }
 }
@@ -351,7 +383,7 @@ impl XlsxSink {
                 .worksheet_from_index(sheet)
                 .map_err(xlsx_error)?;
             for (col, array) in batch.columns().iter().enumerate() {
-                if array.is_null(index) {
+                if null_at(array.as_ref(), index) {
                     continue;
                 }
                 let col = u16::try_from(col).map_err(|_| Error::internal("too many columns"))?;
@@ -420,6 +452,13 @@ impl SinkWriter for XlsxSink {
         c.out_of_range.note(&mut warnings, |n| {
             format!(
                 "{n} date{} outside the years 1900-9999 were written as text",
+                plural(n)
+            )
+        });
+        c.sub_millisecond.note(&mut warnings, |n| {
+            format!(
+                "{n} time or timestamp value{} had digits below a millisecond, which Excel \
+                 does not keep; they were dropped",
                 plural(n)
             )
         });
