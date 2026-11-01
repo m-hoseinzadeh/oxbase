@@ -160,7 +160,7 @@ impl MsSqlBulkLoader {
             .zip(target.columns)
             .map(|(array, column)| {
                 DecimalShape::of(array.as_ref(), &column.data_type, &rows)
-                    .map(|shape| shape.padded_scale())
+                    .map(DecimalShape::padded_scale)
             })
             .collect();
         let mut w = SqlWriter::new(&BracketQuoting);

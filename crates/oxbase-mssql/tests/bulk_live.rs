@@ -905,10 +905,10 @@ async fn wide_decimals_and_row_counts_with_a_trigger() {
                 c.as_ref(),
                 &format!(
                     "CREATE TRIGGER {} ON {qualified} AFTER INSERT AS BEGIN \
-                     UPDATE t SET touched = touched + 1 FROM {qualified} AS t \
-                     JOIN inserted AS i ON i.id = t.id WHERE t.id = 1; \
-                     UPDATE t SET touched = touched + 1 FROM {qualified} AS t \
-                     JOIN inserted AS i ON i.id = t.id WHERE t.id = 1; END",
+                     UPDATE {qualified} SET touched = touched + 1 \
+                     WHERE id = 1 AND id IN (SELECT id FROM inserted); \
+                     UPDATE {qualified} SET touched = touched + 1 \
+                     WHERE id = 1 AND id IN (SELECT id FROM inserted); END",
                     f.qualified(&format!("{name}_tr"))
                 ),
             )
