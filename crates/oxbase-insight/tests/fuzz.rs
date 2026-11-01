@@ -132,6 +132,9 @@ fn check_outline(o: &Outline, text: &str) {
         if let Some(p) = q.parent {
             assert!(p < i, "parents come first: {text:?}");
         }
+        if let Some(p) = q.cte_parent {
+            assert!(p < i, "CTE owners come first: {text:?}");
+        }
         for (_, range) in &q.clauses {
             assert!(range.end <= text.len(), "{text:?}");
         }
@@ -470,9 +473,11 @@ fn context_on_a_ten_thousand_token_statement() {
             assert_eq!(ctx.expected, [oxbase_insight::Expected::Column]);
         });
         println!("{:?}: 10 000 tokens {elapsed:?}", dialect.engine);
-        // `docs/m6-contracts.md` §4.2: under 5 ms in a release build.
+        // `docs/m6-contracts.md` §4.2: under 5 ms in a release build. The debug limit is
+        // about 40 times that (debug code is 10 to 30 times slower), so a regression in the
+        // parser's complexity still fails the ordinary test run.
         let limit = if cfg!(debug_assertions) {
-            Duration::from_millis(500)
+            Duration::from_millis(200)
         } else {
             Duration::from_millis(5)
         };

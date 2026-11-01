@@ -150,8 +150,13 @@ impl Parser<'_> {
                 break;
             }
             let parent = self.queries[b].parent;
-            let kind = self.blocks[b].kind;
+            let kind = if self.queries[b].isolated {
+                BlockKind::Isolated
+            } else {
+                BlockKind::Nested
+            };
             block = self.new_block_with(parent, kind, Some(b));
+            self.blocks[block].set_first = Some((b, self.depth));
             self.block = Some(block);
         }
         self.block = Some(b);
@@ -404,7 +409,15 @@ impl Parser<'_> {
             self.mark(self.pos, SlotKind::Relation, clause);
         }
         let start = self.cur_start();
-        let pending = if self.at_punct(b'(') {
+        let pending = if self.at_word("ROWS")
+            && self.is_word(self.pos + 1, "FROM")
+            && self.is_punct(self.pos + 2, b'(')
+        {
+            // PostgreSQL `ROWS FROM (f(...), g(...))`: one relation of several functions.
+            self.pos += 2;
+            self.paren_list(clause);
+            Pending::Source(RelationSource::Function(Vec::new()))
+        } else if self.at_punct(b'(') {
             if !self.query_starts(self.pos + 1) {
                 // A parenthesised join: its relations belong to `b`.
                 if self.enter() {
@@ -528,6 +541,9 @@ impl Parser<'_> {
                     self.pos += 1;
                     self.skip_group();
                 }
+            } else if self.at_word("WITH") && self.is_word(self.pos + 1, "ORDINALITY") {
+                // PostgreSQL `f(...) WITH ORDINALITY`.
+                self.pos += 2;
             } else if self.at_word("INDEXED") && self.is_word(self.pos + 1, "BY") {
                 self.pos += 3;
             } else if self.at_word("NOT") && self.is_word(self.pos + 1, "INDEXED") {
@@ -606,8 +622,13 @@ impl Parser<'_> {
                 }),
                 "ORDER" => self.in_clause(Clause::OrderBy, |p| {
                     p.pos += 1;
+                    // After a set operation the ORDER BY sorts the whole result: its names are
+                    // the first branch's output columns.
+                    let saved = p.set_order;
+                    p.set_order = p.blocks[b].set_first.filter(|&(_, d)| d == p.depth);
                     p.expect_by(Clause::OrderBy);
                     p.order_list(Clause::OrderBy);
+                    p.set_order = saved;
                 }),
                 "LIMIT" | "OFFSET" | "FETCH" => self.in_clause(Clause::Limit, |p| {
                     p.pos += 1;

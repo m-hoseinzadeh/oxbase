@@ -355,6 +355,49 @@ const TABLE: &[(&[Engine], &str, &[Expected])] = &[
     (BRACKETS, "SELECT [Ord‸", &[C, F]),
     (MY, "SELECT \"Ord‸", &[]),
     (ANSI_QUOTES, "SELECT * FROM \"Ord‸", &[R, S]),
+    // Review fixes: ORDINALITY, pseudo relations, batches, compact literals.
+    (
+        PG,
+        "SELECT * FROM unnest(a) WITH ORDINALITY AS u(x, n) WHERE ‸",
+        &[C, F, K],
+    ),
+    (
+        PG,
+        "SELECT * FROM ROWS FROM (f(a), g(b)) AS r(x, y) WHERE ‸",
+        &[C, F, K],
+    ),
+    (
+        &[Engine::Postgres, Engine::Sqlite],
+        "INSERT INTO t (a, b) VALUES (1, 2) ON CONFLICT (a) DO UPDATE SET b = excluded.‸",
+        &[C],
+    ),
+    (
+        MY,
+        "INSERT INTO t (a, b) VALUES (1, 2) AS new ON DUPLICATE KEY UPDATE b = new.‸",
+        &[C],
+    ),
+    (MS, "UPDATE t SET a = 1 OUTPUT inserted.‸", &[C]),
+    (MS, "DELETE FROM t OUTPUT deleted.‸ WHERE a = 1", &[C]),
+    (
+        MS,
+        "GRANT CONNECT TO u\nSELECT * FROM a JOIN b ON ‸",
+        &[C, F, K],
+    ),
+    (
+        MS,
+        "SELECT a FROM t\nRAISERROR('x', 16, 1)\nSELECT * FROM ‸",
+        &[R, S],
+    ),
+    (
+        ALL,
+        "SELECT CASE WHEN a THEN'x' ELSE'y' END AS k, ‸ FROM t",
+        &[C, F, K],
+    ),
+    (
+        ALL,
+        "SELECT a FROM t UNION SELECT b FROM u ORDER BY ‸",
+        &[C, F, K],
+    ),
 ];
 
 #[test]
@@ -654,4 +697,142 @@ fn outline_is_attached() {
             .iter()
             .any(|r| r.parts.len() == 2 && r.parts[1].text == "total")
     );
+}
+
+#[test]
+fn ordinality_keeps_the_alias_and_its_columns() {
+    let ctx = at(
+        Engine::Postgres,
+        "SELECT * FROM unnest(a) WITH ORDINALITY AS u(x, n) WHERE ‸",
+    );
+    assert_eq!(ctx.clause, Clause::Where);
+    assert_eq!(scope(&ctx), ["u"]);
+    let columns: Vec<&str> = ctx.scope[0]
+        .column_aliases
+        .iter()
+        .map(|c| c.text.as_str())
+        .collect();
+    assert_eq!(columns, ["x", "n"]);
+    assert!(ctx.ctes.is_empty() || ctx.ctes.iter().all(|c| c.name.text != "ORDINALITY"));
+}
+
+#[test]
+fn pseudo_relations_answer_their_qualifier_only() {
+    for engine in [Engine::Postgres, Engine::Sqlite] {
+        let ctx = at(
+            engine,
+            "INSERT INTO t (a, b) VALUES (1, 2) ON CONFLICT (a) DO UPDATE SET b = excluded.‸",
+        );
+        assert_eq!(ctx.expected, [C], "{engine:?}");
+        assert_eq!(sources(&ctx), ["t"], "{engine:?}");
+        // Unqualified names do not see `excluded` (it would make every column ambiguous).
+        let ctx = at(
+            engine,
+            "INSERT INTO t (a, b) VALUES (1, 2) ON CONFLICT (a) DO UPDATE SET b = ‸",
+        );
+        assert_eq!(scope(&ctx), ["t"], "{engine:?}");
+        assert!(ctx.outline.queries[0].relations.len() == 1);
+    }
+    for engine in MY {
+        let ctx = at(
+            *engine,
+            "INSERT INTO t (a, b) VALUES (1, 2) AS new (x, y) ON DUPLICATE KEY UPDATE b = new.‸",
+        );
+        assert_eq!(ctx.expected, [C], "{engine:?}");
+        assert_eq!(sources(&ctx), ["t"], "{engine:?}");
+        let source = ctx.column_sources(IdentCase::Insensitive)[0].clone();
+        let columns: Vec<&str> = source
+            .column_aliases
+            .iter()
+            .map(|c| c.text.as_str())
+            .collect();
+        assert_eq!(columns, ["x", "y"]);
+        // The row alias is not usable before it is declared.
+        let ctx = at(*engine, "INSERT INTO t (a) SELECT new.‸ FROM u AS new2");
+        assert!(sources(&ctx).is_empty() || !sources(&ctx).contains(&"t".to_owned()));
+    }
+    let ctx = at(
+        Engine::MsSql,
+        "UPDATE t SET a = 1 OUTPUT inserted.‸, deleted.a",
+    );
+    assert_eq!(ctx.expected, [C]);
+    assert_eq!(sources(&ctx), ["t"]);
+    let ctx = at(
+        Engine::MsSql,
+        "UPDATE o SET a = 1 OUTPUT deleted.‸ FROM orders o JOIN items i ON i.oid = o.id",
+    );
+    assert_eq!(sources(&ctx), ["orders"]);
+    let ctx = at(
+        Engine::MsSql,
+        "UPDATE t SET a = 1 OUTPUT inserted.a WHERE ‸",
+    );
+    assert_eq!(scope(&ctx), ["t"]);
+    // Outside OUTPUT, `inserted` is an ordinary (unknown) qualifier.
+    let ctx = at(
+        Engine::MsSql,
+        "UPDATE t SET a = 1 OUTPUT inserted.a WHERE inserted.‸",
+    );
+    assert_eq!(sources(&ctx), Vec::<String>::new());
+}
+
+#[test]
+fn multi_table_update_and_set_operation_order_by() {
+    for engine in MY {
+        let ctx = at(*engine, "UPDATE a JOIN b ON b.id = a.id SET ‸");
+        assert_eq!(scope(&ctx), ["a", "b"], "{engine:?}");
+        assert_eq!(ctx.clause, Clause::UpdateSet);
+    }
+    for engine in ALL {
+        let ctx = at(
+            *engine,
+            "SELECT a, b AS c FROM t UNION SELECT x, y FROM u ORDER BY ‸",
+        );
+        assert_eq!(ctx.clause, Clause::OrderBy, "{engine:?}");
+        assert_eq!(scope(&ctx), ["(derived)"], "{engine:?}");
+        let RelationSource::Derived { columns, .. } = &ctx.scope[0].source else {
+            panic!("the set operation's output");
+        };
+        let names: Vec<&str> = columns.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(names, ["a", "c"], "{engine:?}");
+        // An ORDER BY inside a parenthesised branch is the branch's own.
+        let ctx = at(
+            *engine,
+            "(SELECT a FROM t) UNION (SELECT b FROM u ORDER BY ‸)",
+        );
+        assert_eq!(scope(&ctx), ["u"], "{engine:?}");
+        // With `*` in the first branch, its relations stand in.
+        let ctx = at(*engine, "SELECT * FROM t UNION SELECT * FROM u ORDER BY ‸");
+        assert_eq!(scope(&ctx), ["t"], "{engine:?}");
+        // A window's ORDER BY in a later branch keeps the branch scope.
+        let ctx = at(
+            *engine,
+            "SELECT a FROM t UNION SELECT row_number() OVER (ORDER BY ‸) FROM u",
+        );
+        assert_eq!(scope(&ctx), ["u"], "{engine:?}");
+    }
+}
+
+#[test]
+fn tsql_batches_end_headers_and_grants() {
+    let ctx = at(
+        Engine::MsSql,
+        "GRANT CONNECT TO u\nSELECT * FROM a JOIN b ON ‸",
+    );
+    assert_eq!(scope(&ctx), ["a", "b"]);
+    assert_eq!(ctx.clause, Clause::JoinOn);
+    let ctx = at(
+        Engine::MsSql,
+        "GRANT SELECT, INSERT ON t TO u\nSELECT * FROM a WHERE ‸",
+    );
+    assert_eq!(scope(&ctx), ["a"]);
+    let ctx = at(
+        Engine::MsSql,
+        "CREATE TRIGGER trg\nSELECT * FROM a JOIN b ON ‸",
+    );
+    assert_eq!(scope(&ctx), ["a", "b"]);
+    let ctx = at(
+        Engine::MsSql,
+        "SELECT a FROM t\nTHROW 50000, 'x', 1\nSELECT ‸ FROM u",
+    );
+    assert_eq!(scope(&ctx), ["u"]);
 }

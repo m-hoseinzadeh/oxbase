@@ -6,7 +6,7 @@ use std::ops::Range;
 use oxbase_sql::{SqlDialect, SqlToken, SqlTokenKind, ident_value, split, tokenize};
 use oxbase_types::IdentCase;
 
-use crate::outline::parse::{self, BlockKind, Parsed, Slot, SlotKind, same_name, words};
+use crate::outline::parse::{self, Parsed, Slot, SlotKind, same_name, words};
 use crate::outline::{Clause, Cte, Outline, RelationSource, ScopeRelation, StatementClass};
 use crate::{Dialect, Ident};
 
@@ -396,6 +396,7 @@ fn from_parse(
             .iter()
             .rposition(|s| s.range.start <= offset),
         only: None,
+        set_first: None,
     });
     let case = dialect.case_rules.relations;
     let class = match slot.stmt.and_then(|s| parsed.statements.get(s)) {
@@ -403,13 +404,18 @@ fn from_parse(
         None if slot.kind == SlotKind::Start => StatementClass::Empty,
         None => parsed.outline.class,
     };
-    let full_scope = scope_of(&parsed, slot.query);
-    let ctes = ctes_of(&parsed, slot.query);
+    let mut full_scope = scope_of(&parsed.outline, slot.query);
+    let ctes = ctes_of(&parsed.outline, slot.query);
     let qualified = lex.qualifier.len();
-    let scope = match &slot.only {
-        Some(only) if slot.kind == SlotKind::Columns && qualified == 0 => {
+    if qualified > 0 {
+        let pseudo = pseudo_relations(&parsed, slot.query, offset, &full_scope, case);
+        full_scope.extend(pseudo);
+    }
+    let scope = match (&slot.only, slot.set_first) {
+        (Some(only), _) if slot.kind == SlotKind::Columns && qualified == 0 => {
             vec![resolve_target(only, &full_scope, case)]
         }
+        (_, Some(first)) if qualified == 0 => set_output(&parsed.outline, first),
         _ => full_scope,
     };
     let matched = lex.qualifier.last().is_some_and(|q| {
@@ -476,44 +482,80 @@ fn keywords_for(dialect: &Dialect, list: &'static [&'static str]) -> Vec<&'stati
         .collect()
 }
 
-/// The relations visible in block `query`: its own, then its ancestors' (a CTE body, a derived
-/// table or an `INSERT ... SELECT` does not see its parent's own relations).
-fn scope_of(parsed: &Parsed, query: Option<usize>) -> Vec<ScopeRelation> {
-    let mut out = Vec::new();
-    let mut at = query;
-    let mut hidden = false;
-    while let Some(i) = at {
-        let Some(block) = parsed.outline.queries.get(i) else {
-            break;
-        };
-        if !hidden {
-            out.extend(block.relations.iter().cloned());
-        }
-        hidden = parsed
-            .blocks
-            .get(i)
-            .is_some_and(|b| b.kind == BlockKind::Isolated);
-        at = block.parent.filter(|&p| p < i);
-    }
-    out
+/// The relations visible in block `query` ([`Outline::visible_relations`]).
+fn scope_of(outline: &Outline, query: Option<usize>) -> Vec<ScopeRelation> {
+    query.map_or_else(Vec::new, |q| {
+        outline.visible_relations(q).into_iter().cloned().collect()
+    })
 }
 
-/// The CTEs visible in block `query`, innermost first.
-fn ctes_of(parsed: &Parsed, query: Option<usize>) -> Vec<Cte> {
-    let mut out = Vec::new();
+/// The CTEs visible in block `query`, innermost first ([`Outline::visible_ctes`]).
+fn ctes_of(outline: &Outline, query: Option<usize>) -> Vec<Cte> {
+    query.map_or_else(Vec::new, |q| {
+        outline
+            .visible_ctes(q)
+            .into_iter()
+            .map(|(_, cte)| cte.clone())
+            .collect()
+    })
+}
+
+/// The pseudo relations (`excluded`, a MySQL row alias, `inserted` / `deleted`) usable at
+/// `offset` in block `query` or a block it is nested in, with the DML target resolved through
+/// `scope` (`UPDATE o ... OUTPUT inserted.x FROM orders o`).
+fn pseudo_relations(
+    parsed: &Parsed,
+    query: Option<usize>,
+    offset: usize,
+    scope: &[ScopeRelation],
+    case: IdentCase,
+) -> Vec<ScopeRelation> {
+    let mut chain = Vec::new();
     let mut at = query;
     while let Some(i) = at {
-        let Some(block) = parsed.outline.queries.get(i) else {
+        if chain.contains(&i) {
             break;
-        };
-        out.extend(block.ctes.iter().cloned());
-        at = parsed
-            .blocks
-            .get(i)
-            .and_then(|b| b.cte_parent)
-            .filter(|&p| p < i);
+        }
+        chain.push(i);
+        at = parsed.outline.queries.get(i).and_then(|q| q.parent);
     }
-    out
+    parsed
+        .pseudo
+        .iter()
+        .filter(|p| chain.contains(&p.query) && p.valid.start <= offset && offset <= p.valid.end)
+        .map(|p| {
+            let target = ScopeRelation {
+                alias: None,
+                ..p.relation.clone()
+            };
+            ScopeRelation {
+                alias: p.relation.alias.clone(),
+                column_aliases: p.relation.column_aliases.clone(),
+                ..resolve_target(&target, scope, case)
+            }
+        })
+        .collect()
+}
+
+/// The scope of the `ORDER BY` of a set operation: the output of its first branch `first`, as
+/// one unnamed derived relation (the first branch's own relations when its output is not
+/// known: `SELECT *`).
+fn set_output(outline: &Outline, first: usize) -> Vec<ScopeRelation> {
+    let Some(block) = outline.queries.get(first) else {
+        return Vec::new();
+    };
+    if block.star || block.output.is_empty() {
+        return scope_of(outline, Some(first));
+    }
+    vec![ScopeRelation {
+        source: RelationSource::Derived {
+            query: first,
+            columns: block.output.clone(),
+        },
+        alias: None,
+        column_aliases: Vec::new(),
+        range: block.range.clone(),
+    }]
 }
 
 /// The DML target a column slot refers to: when it is a bare name that another relation in

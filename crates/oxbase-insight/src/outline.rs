@@ -131,6 +131,13 @@ pub struct QueryBlock {
     pub range: Range<usize>,
     /// The block this one is nested in (`None` for the statement's top block).
     pub parent: Option<usize>,
+    /// The block does not see its parent's own relations: a CTE body, a derived table without
+    /// `LATERAL`, the query of `INSERT ... SELECT`. Relations further out stay visible
+    /// (correlation with an enclosing query).
+    pub isolated: bool,
+    /// The block whose CTEs are visible next: the parent, or for a later branch of a set
+    /// operation the first branch, which owns the `WITH`.
+    pub cte_parent: Option<usize>,
     /// CTEs defined by this block's `WITH`.
     pub ctes: Vec<Cte>,
     /// Relations of its `FROM` / `JOIN`s / DML target, in text order.
@@ -231,31 +238,47 @@ impl Outline {
     }
 
     /// The relations visible in block `query`: its own, then its ancestors' (correlated
-    /// subqueries), innermost first.
+    /// subqueries), innermost first. The parent of an isolated block ([`QueryBlock::isolated`]) is
+    /// skipped (a derived table does not see the relations next to it); blocks further out
+    /// count.
     pub fn visible_relations(&self, query: usize) -> Vec<&ScopeRelation> {
         let mut out = Vec::new();
         let mut at = Some(query);
+        let mut hidden = false;
+        let mut steps = 0;
         while let Some(i) = at {
             let Some(block) = self.queries.get(i) else {
                 break;
             };
-            out.extend(block.relations.iter());
+            if !hidden {
+                out.extend(block.relations.iter());
+            }
+            hidden = block.isolated;
             at = block.parent;
+            steps += 1;
+            if steps > self.queries.len() {
+                break;
+            }
         }
         out
     }
 
-    /// The CTEs visible in block `query` (its own and its ancestors'), innermost first, as
-    /// (owning block, index) pairs.
+    /// The CTEs visible in block `query` (its own, then those of the blocks reached through
+    /// [`QueryBlock::cte_parent`]), innermost first, as (owning block, index) pairs.
     pub fn visible_ctes(&self, query: usize) -> Vec<(usize, &Cte)> {
         let mut out = Vec::new();
         let mut at = Some(query);
+        let mut steps = 0;
         while let Some(i) = at {
             let Some(block) = self.queries.get(i) else {
                 break;
             };
             out.extend(block.ctes.iter().map(|c| (i, c)));
-            at = block.parent;
+            at = block.cte_parent;
+            steps += 1;
+            if steps > self.queries.len() {
+                break;
+            }
         }
         out
     }
@@ -276,6 +299,8 @@ mod tests {
         QueryBlock {
             range,
             parent,
+            isolated: false,
+            cte_parent: parent,
             ctes: vec![Cte {
                 name: Ident {
                     text: format!("c_{rel}"),
@@ -339,6 +364,31 @@ mod tests {
             .collect();
         assert_eq!(names, ["inner", "outer"]);
         assert_eq!(o.visible_ctes(1)[1].0, 0);
+        // An isolated block (a derived table) skips its parent's relations, not those further
+        // out; a later set-operation branch sees the first branch's CTEs.
+        let mut o = o;
+        o.queries.push(block(60..70, Some(1), "derived"));
+        o.queries[2].isolated = true;
+        o.queries.push(block(80..90, None, "branch"));
+        o.queries[3].cte_parent = Some(0);
+        let names = |o: &Outline, q| -> Vec<String> {
+            o.visible_relations(q)
+                .iter()
+                .map(|r| match &r.source {
+                    RelationSource::Named(p) => p[0].text.clone(),
+                    other => format!("{other:?}"),
+                })
+                .collect()
+        };
+        assert_eq!(names(&o, 2), ["derived", "outer"]);
+        assert_eq!(names(&o, 3), ["branch"]);
+        let ctes: Vec<usize> = o.visible_ctes(3).iter().map(|(q, _)| *q).collect();
+        assert_eq!(ctes, [3, 0]);
+        // A cycle in a hand-built outline does not loop.
+        o.queries[0].parent = Some(1);
+        o.queries[0].cte_parent = Some(1);
+        assert!(o.visible_relations(1).len() <= 5);
+        assert!(o.visible_ctes(1).len() <= 5);
         assert_eq!(o.ref_at(53).map(NameRef::range), Some(50..53));
         assert_eq!(o.ref_at(54), None);
         assert_eq!(Outline::empty(3..3).class, StatementClass::Empty);

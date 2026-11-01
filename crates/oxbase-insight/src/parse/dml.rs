@@ -3,7 +3,8 @@
 
 use super::expr::ExprMode;
 use super::words;
-use super::{BlockKind, Parser, SlotKind, Tk};
+use super::{BlockKind, Parser, Pseudo, SlotKind, Tk};
+use crate::Ident;
 use crate::outline::{Clause, RefRole, RelationSource, ScopeRelation};
 
 impl Parser<'_> {
@@ -50,13 +51,22 @@ impl Parser<'_> {
         } else if self.query_starts(self.pos) {
             self.query(Some(b), BlockKind::Isolated);
         }
-        // MySQL row alias: `AS new [(a, b)]`.
+        let pseudo_from = self.pseudo.len();
+        // MySQL row alias: `AS new [(a, b)]`, usable in `ON DUPLICATE KEY UPDATE`.
         if self.eat_word("AS") {
             self.mark(self.pos, SlotKind::Nothing, Clause::NewName);
-            if self.is_any_name(self.pos) {
-                self.pos += 1;
-            }
-            if self.at_punct(b'(') {
+            if self.is_any_name(self.pos)
+                && let Some(alias) = self.single()
+            {
+                self.push_path(&alias, RefRole::Definition, Clause::NewName);
+                let columns = if self.at_punct(b'(') {
+                    self.definition_list()
+                } else {
+                    Vec::new()
+                };
+                let name = alias.parts.into_iter().next();
+                self.push_pseudo(b, target.as_ref(), name, columns);
+            } else if self.at_punct(b'(') {
                 self.skip_group();
             }
         }
@@ -68,7 +78,7 @@ impl Parser<'_> {
         if self.at_word("ON") {
             self.pos += 1;
             if self.eat_word("CONFLICT") {
-                self.on_conflict(target.as_ref());
+                self.on_conflict(b, target.as_ref());
             } else if self.eat_word("DUPLICATE") {
                 self.eat_word("KEY");
                 self.eat_word("UPDATE");
@@ -76,6 +86,42 @@ impl Parser<'_> {
             }
         }
         self.dml_tail(b);
+        self.end_pseudo(pseudo_from);
+    }
+
+    /// Records a pseudo relation named `name` for the DML target `target` of block `b`, usable
+    /// from the current token on (until [`Parser::end_pseudo`]).
+    fn push_pseudo(
+        &mut self,
+        b: usize,
+        target: Option<&ScopeRelation>,
+        name: Option<Ident>,
+        column_aliases: Vec<Ident>,
+    ) {
+        let (Some(target), Some(name)) = (target, name) else {
+            return;
+        };
+        let start = self.cur_start();
+        self.pseudo.push(Pseudo {
+            query: b,
+            relation: ScopeRelation {
+                source: target.source.clone(),
+                alias: Some(name),
+                column_aliases,
+                range: target.range.clone(),
+            },
+            valid: start..usize::MAX,
+        });
+    }
+
+    /// Ends the pseudo relations recorded since index `from` at the last consumed token.
+    fn end_pseudo(&mut self, from: usize) {
+        let end = self.prev_end();
+        for p in self.pseudo.iter_mut().skip(from) {
+            if p.valid.end == usize::MAX {
+                p.valid.end = end.max(p.valid.start);
+            }
+        }
     }
 
     /// The table of an `INSERT` with an optional `AS alias` (no bare alias: the next word
@@ -118,7 +164,7 @@ impl Parser<'_> {
 
     /// `ON CONFLICT [(cols) [WHERE ...] | ON CONSTRAINT c] DO NOTHING | DO UPDATE SET ...
     /// [WHERE ...]` after `CONFLICT`.
-    fn on_conflict(&mut self, target: Option<&ScopeRelation>) {
+    fn on_conflict(&mut self, b: usize, target: Option<&ScopeRelation>) {
         if self.at_punct(b'(') {
             self.column_list(target, Clause::Other);
         }
@@ -141,6 +187,12 @@ impl Parser<'_> {
             Clause::Other,
         );
         if self.eat_word("UPDATE") {
+            // `excluded` names the row proposed for insertion.
+            let excluded = Ident {
+                text: "excluded".to_owned(),
+                quoted: false,
+            };
+            self.push_pseudo(b, target, Some(excluded), Vec::new());
             self.mark(self.pos, SlotKind::Keywords(&["SET"]), Clause::Other);
             if self.eat_word("SET") {
                 self.in_clause(Clause::UpdateSet, |p| p.assignments(target));
@@ -162,7 +214,11 @@ impl Parser<'_> {
                 p.joins(b);
             }
         });
-        let target = self.queries[b].relations.first().cloned();
+        // MySQL multi-table `UPDATE a JOIN b SET ...` assigns columns of any of them.
+        let target = match self.queries[b].relations.as_slice() {
+            [one] => Some(one.clone()),
+            _ => None,
+        };
         self.mark(self.pos, SlotKind::Keywords(&["SET"]), Clause::UpdateTarget);
         if self.at_word("SET") {
             self.in_clause(Clause::UpdateSet, |p| {
@@ -405,10 +461,19 @@ impl Parser<'_> {
         if !self.at_word("OUTPUT") {
             return;
         }
-        self.in_clause(Clause::SelectList, |p| {
-            p.pos += 1;
-            p.select_list(b);
-        });
+        self.pos += 1;
+        // `inserted` / `deleted` name the rows after and before the change.
+        let pseudo_from = self.pseudo.len();
+        let target = self.queries[b].relations.first().cloned();
+        for name in ["inserted", "deleted"] {
+            let name = Ident {
+                text: name.to_owned(),
+                quoted: false,
+            };
+            self.push_pseudo(b, target.as_ref(), Some(name), Vec::new());
+        }
+        self.in_clause(Clause::SelectList, |p| p.select_list(b));
+        self.end_pseudo(pseudo_from);
         if self.eat_word("INTO") {
             self.mark(self.pos, SlotKind::Nothing, Clause::NewName);
             if self

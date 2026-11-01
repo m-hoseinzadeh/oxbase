@@ -126,7 +126,7 @@ fn push_merged(out: &mut Vec<Tok>, tok: Tok, bytes: &[u8]) {
 fn merged_kind(prev: Tok, next: Tok, before_touches: bool, bytes: &[u8]) -> Option<Tk> {
     let (a, b) = (prev.kind, next.kind);
     if a == Tk::Word && b == Tk::Str {
-        return Some(Tk::Str);
+        return is_literal_prefix(&bytes[prev.start..prev.end]).then_some(Tk::Str);
     }
     if a == Tk::Punct(b':') && b == Tk::Punct(b':') {
         return Some(Tk::Cast);
@@ -151,6 +151,16 @@ fn merged_kind(prev: Tok, next: Tok, before_touches: bool, bytes: &[u8]) -> Opti
         _ => false,
     };
     number.then_some(Tk::Num)
+}
+
+/// A word that is part of the string literal it touches: `N'x'`, `X'ff'`, `B'01'`, `E'x'`
+/// (any case) and MySQL charset introducers (`_utf8mb4'x'`). Keywords never are
+/// (`THEN'x'`, `LIKE'%a'`).
+fn is_literal_prefix(word: &[u8]) -> bool {
+    matches!(
+        word,
+        [b'N' | b'n' | b'X' | b'x' | b'B' | b'b' | b'E' | b'e'] | [b'_', _, ..]
+    )
 }
 
 /// Grammar differences between dialects that are not word lists.
@@ -180,17 +190,30 @@ pub(crate) enum BlockKind {
     /// the relations of its parent are visible (correlation).
     Nested,
     /// A CTE body, a derived table or the query of `INSERT ... SELECT`: its parent's relations
-    /// are not visible, those further out are.
+    /// are not visible, those further out are ([`QueryBlock::isolated`]).
     Isolated,
 }
 
 /// Parser facts about a query block that the public [`QueryBlock`] does not carry.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct BlockInfo {
-    pub(crate) kind: BlockKind,
-    /// The block whose CTEs are visible next (the parent, or for a later branch of a set
-    /// operation the first branch, which owns the `WITH`).
-    pub(crate) cte_parent: Option<usize>,
+#[derive(Debug, Clone, Copy, Default)]
+struct BlockInfo {
+    /// For a later branch of a set operation: the first branch and the group depth the set
+    /// operation is at (an `ORDER BY` / `LIMIT` there applies to the whole set operation).
+    set_first: Option<(usize, usize)>,
+}
+
+/// A relation that only a qualifier reaches, in part of a statement: PostgreSQL / SQLite
+/// `excluded` in `ON CONFLICT ... DO UPDATE`, the MySQL row alias of `INSERT ... AS new` in
+/// `ON DUPLICATE KEY UPDATE`, T-SQL `inserted` / `deleted` in `OUTPUT`. Not part of the
+/// outline: it would make unqualified names look ambiguous.
+#[derive(Debug, Clone)]
+pub(crate) struct Pseudo {
+    /// The DML block it belongs to.
+    pub(crate) query: usize,
+    /// Its source is the DML target's; its alias the pseudo name.
+    pub(crate) relation: ScopeRelation,
+    /// Where it may be used.
+    pub(crate) valid: Range<usize>,
 }
 
 /// One statement found in the parsed range (a T-SQL batch or a routine body holds several).
@@ -235,14 +258,15 @@ pub(crate) struct Slot {
     /// For [`SlotKind::Columns`]: the one relation the columns come from (`INSERT INTO t (`,
     /// `UPDATE t SET`).
     pub(crate) only: Option<ScopeRelation>,
+    /// In the `ORDER BY` of a set operation: its first branch, whose output names the columns.
+    pub(crate) set_first: Option<usize>,
 }
 
 /// The result of [`parse`].
 #[derive(Debug, Clone)]
 pub(crate) struct Parsed {
     pub(crate) outline: Outline,
-    /// Per query block of the outline.
-    pub(crate) blocks: Vec<BlockInfo>,
+    pub(crate) pseudo: Vec<Pseudo>,
     pub(crate) statements: Vec<StmtInfo>,
     pub(crate) slot: Option<Slot>,
 }
@@ -270,9 +294,11 @@ pub(crate) fn parse(
         depth: 0,
         queries: Vec::new(),
         blocks: Vec::new(),
+        pseudo: Vec::new(),
         refs: Vec::new(),
         statements: Vec::new(),
         cte_scope: Vec::new(),
+        set_order: None,
         cursor,
         slot: None,
         block: None,
@@ -331,10 +357,13 @@ pub(crate) struct Parser<'a> {
     depth: usize,
     queries: Vec<QueryBlock>,
     blocks: Vec<BlockInfo>,
+    pseudo: Vec<Pseudo>,
     refs: Vec<NameRef>,
     statements: Vec<StmtInfo>,
     /// CTEs in scope while parsing, as (owning block, index), innermost last.
     cte_scope: Vec<(usize, usize)>,
+    /// While parsing the `ORDER BY` of a set operation: its first branch and group depth.
+    set_order: Option<(usize, usize)>,
     /// The cursor's token index.
     cursor: Option<usize>,
     slot: Option<Slot>,
@@ -364,7 +393,7 @@ impl<'a> Parser<'a> {
                 queries: self.queries,
                 refs: self.refs,
             },
-            blocks: self.blocks,
+            pseudo: self.pseudo,
             statements: self.statements,
             slot: self.slot,
         }
@@ -465,7 +494,8 @@ impl<'a> Parser<'a> {
     }
 
     /// A token that can be a bare name here: a quoted identifier, or a word that is not
-    /// reserved, starts no clause and is no operator.
+    /// reserved, starts no clause and is no operator (nor, in batches, starts a statement:
+    /// `SELECT a FROM t` + newline + `THROW ...`).
     fn is_name(&self, i: usize) -> bool {
         match self.tok(i) {
             Some(t) if t.kind == Tk::Quoted => true,
@@ -474,6 +504,7 @@ impl<'a> Parser<'a> {
                 !self.lang.is_reserved(w)
                     && !words::contains(words::STOP, w)
                     && !words::contains(words::OPERATORS, w)
+                    && !(self.grammar.batches && words::contains(words::STRONG, w))
             }
             _ => false,
         }
@@ -529,6 +560,10 @@ impl<'a> Parser<'a> {
                 query: self.block,
                 stmt: self.stmt,
                 only: only.cloned(),
+                set_first: self
+                    .set_order
+                    .filter(|&(_, depth)| depth == self.depth)
+                    .map(|(first, _)| first),
             });
         }
     }
@@ -631,13 +666,15 @@ impl<'a> Parser<'a> {
         self.queries.push(QueryBlock {
             range: start..start,
             parent,
+            isolated: kind == BlockKind::Isolated,
+            cte_parent,
             ctes: Vec::new(),
             relations: Vec::new(),
             output: Vec::new(),
             star: false,
             clauses: Vec::new(),
         });
-        self.blocks.push(BlockInfo { kind, cte_parent });
+        self.blocks.push(BlockInfo::default());
         self.queries.len() - 1
     }
 
@@ -804,6 +841,17 @@ mod tests {
                 Tk::Word,
             ]
         );
+        // Keywords touching a string stay keywords.
+        let compact = kinds(
+            SqlDialect::Postgres,
+            "CASE WHEN a THEN'x' ELSE'y' END, x LIKE'%a', X'ff', b'01'",
+        );
+        let got: Vec<(Tk, &str)> = compact.iter().map(|(k, s)| (*k, s.as_str())).collect();
+        assert!(got.contains(&(Tk::Word, "THEN")), "{got:?}");
+        assert!(got.contains(&(Tk::Word, "ELSE")), "{got:?}");
+        assert!(got.contains(&(Tk::Word, "LIKE")), "{got:?}");
+        assert!(got.contains(&(Tk::Str, "X'ff'")), "{got:?}");
+        assert!(got.contains(&(Tk::Str, "b'01'")), "{got:?}");
         let ms = kinds(SqlDialect::TSql, "N'x' @v #t [a b]");
         let got: Vec<Tk> = ms.iter().map(|(k, _)| *k).collect();
         assert_eq!(got, [Tk::Str, Tk::Param, Tk::Word, Tk::Quoted]);

@@ -617,3 +617,148 @@ fn incomplete_statements_give_partial_outlines() {
     let e = outline(&dialect, "SELECT 1", 5..2);
     assert_eq!(e.class, StatementClass::Empty);
 }
+
+#[test]
+fn ordinality_and_rows_from_keep_the_statement_whole() {
+    let o = parse(
+        Engine::Postgres,
+        "SELECT * FROM unnest(a) WITH ORDINALITY AS u(x, n) WHERE x > 1 ORDER BY n",
+    );
+    assert_eq!(o.class, StatementClass::Select);
+    assert_eq!(o.queries.len(), 1, "{:?}", o.queries);
+    assert!(
+        o.queries.iter().all(|q| q.ctes.is_empty()),
+        "no phantom CTE"
+    );
+    assert_eq!(relations(&o, 0), ["unnest=u"]);
+    let aliases: Vec<&str> = o.queries[0].relations[0]
+        .column_aliases
+        .iter()
+        .map(|c| c.text.as_str())
+        .collect();
+    assert_eq!(aliases, ["x", "n"]);
+    let clauses: Vec<Clause> = o.queries[0].clauses.iter().map(|(c, _)| *c).collect();
+    assert!(clauses.contains(&Clause::Where), "{clauses:?}");
+    assert!(clauses.contains(&Clause::OrderBy), "{clauses:?}");
+    assert!(refs(&o).contains(&"col:x".to_owned()));
+
+    let o = parse(
+        Engine::Postgres,
+        "SELECT * FROM ROWS FROM (generate_series(1, 2), unnest(b)) WITH ORDINALITY AS r(a, b, n) WHERE a > 0",
+    );
+    assert_eq!(o.queries.len(), 1);
+    assert_eq!(relations(&o, 0), ["=r"]);
+    let all = refs(&o);
+    assert!(all.contains(&"fn:generate_series".to_owned()), "{all:?}");
+    assert!(all.contains(&"fn:unnest".to_owned()), "{all:?}");
+    assert!(all.contains(&"col:a".to_owned()), "{all:?}");
+}
+
+#[test]
+fn visible_helpers_follow_isolation_and_cte_owners() {
+    for engine in ALL {
+        // A later set-operation branch sees the CTEs of the WITH before the first branch.
+        let o = parse(
+            engine,
+            "WITH c AS (SELECT 1 AS a) SELECT a FROM t UNION ALL SELECT a FROM c",
+        );
+        let branch = o
+            .queries
+            .iter()
+            .position(|q| {
+                q.relations
+                    .iter()
+                    .any(|r| matches!(r.source, RelationSource::Cte { .. }))
+            })
+            .expect("the branch reading c");
+        assert_ne!(branch, 0, "{engine:?}");
+        let ctes: Vec<&str> = o
+            .visible_ctes(branch)
+            .iter()
+            .map(|(_, c)| c.name.text.as_str())
+            .collect();
+        assert_eq!(ctes, ["c"], "{engine:?}");
+        assert_eq!(o.queries[branch].cte_parent, Some(0));
+        assert!(o.visible_relations(branch).len() == 1, "{engine:?}");
+
+        // A derived table does not see the relations next to it.
+        let o = parse(
+            engine,
+            "SELECT * FROM t1 JOIN (SELECT id FROM t2) d ON d.id = t1.id",
+        );
+        let RelationSource::Derived { query, .. } = &o.queries[0].relations[1].source else {
+            panic!("a derived table");
+        };
+        assert!(o.queries[*query].isolated);
+        assert!(!o.queries[0].isolated);
+        let names: Vec<String> = o
+            .visible_relations(*query)
+            .iter()
+            .map(|r| match &r.source {
+                RelationSource::Named(p) => p[0].text.clone(),
+                _ => "?".to_owned(),
+            })
+            .collect();
+        assert_eq!(names, ["t2"], "{engine:?}");
+
+        // ... but sees an enclosing query's (correlation from a scalar subquery).
+        let o = parse(
+            engine,
+            "SELECT (SELECT 1 FROM (SELECT x FROM t3) d2) FROM t1",
+        );
+        let derived = o
+            .queries
+            .iter()
+            .position(|q| q.isolated)
+            .expect("the derived block");
+        let names: Vec<String> = o
+            .visible_relations(derived)
+            .iter()
+            .map(|r| match &r.source {
+                RelationSource::Named(p) => p[0].text.clone(),
+                _ => "?".to_owned(),
+            })
+            .collect();
+        assert_eq!(names, ["t3", "t1"], "{engine:?}");
+    }
+}
+
+#[test]
+fn compact_literals_and_batch_boundaries() {
+    for engine in ALL {
+        let o = parse(
+            engine,
+            "SELECT CASE WHEN a THEN'x' ELSE'y' END AS k, b FROM t WHERE c LIKE'%a'",
+        );
+        assert_eq!(output(&o, 0), ["k", "b"], "{engine:?}");
+        assert_eq!(relations(&o, 0), ["t"], "{engine:?}");
+        assert!(refs(&o).contains(&"col:c".to_owned()), "{engine:?}");
+    }
+    // T-SQL: THROW / RAISERROR start statements, never aliases.
+    let o = parse(Engine::MsSql, "SELECT a FROM t\nTHROW 50000, 'x', 1");
+    assert_eq!(relations(&o, 0), ["t"]);
+    let o = parse(Engine::MsSql, "SELECT a\nRAISERROR('x', 16, 1)");
+    assert_eq!(output(&o, 0), ["a"]);
+    // A GRANT does not swallow the next statement of the batch.
+    let o = parse(
+        Engine::MsSql,
+        "GRANT SELECT, INSERT ON t TO u WITH GRANT OPTION\nSELECT * FROM a JOIN b ON b.id = a.id",
+    );
+    assert!(refs(&o).contains(&"rel:t".to_owned()));
+    assert_eq!(o.queries.len(), 1);
+    assert_eq!(relations(&o, 0), ["a", "b"]);
+    let o = parse(Engine::MsSql, "GRANT CONNECT TO u\nSELECT * FROM a");
+    assert_eq!(relations(&o, 0), ["a"]);
+    // A trigger header without ON ends at the next statement.
+    let o = parse(
+        Engine::MsSql,
+        "CREATE TRIGGER trg\nSELECT * FROM a JOIN b ON 1 = 1",
+    );
+    assert_eq!(relations(&o, 0), ["a", "b"]);
+    let o = parse(
+        Engine::MsSql,
+        "CREATE TRIGGER trg ON t WITH ENCRYPTION AFTER INSERT, UPDATE AS SELECT * FROM inserted",
+    );
+    assert_eq!(o.class, StatementClass::CreateRoutine);
+    assert_eq!(relations(&o, 0), ["inserted"]);
+}

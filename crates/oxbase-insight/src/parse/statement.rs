@@ -689,7 +689,7 @@ impl Parser<'_> {
             "TRIGGER" => self.trigger_header(),
             "EVENT" => {
                 while let Some(t) = self.peek() {
-                    if t.kind == Tk::Punct(b';') {
+                    if t.kind == Tk::Punct(b';') || self.strong_stop() {
                         break;
                     }
                     self.pos += 1;
@@ -809,7 +809,8 @@ impl Parser<'_> {
     /// (also T-SQL `ON t {AFTER | FOR} events AS`).
     fn trigger_header(&mut self) {
         while let Some(t) = self.peek() {
-            if t.kind == Tk::Punct(b';') {
+            // In a batch, `ON t` follows the name; a statement keyword first ends the header.
+            if t.kind == Tk::Punct(b';') || self.strong_stop() {
                 return;
             }
             if self.eat_word("ON") {
@@ -827,6 +828,16 @@ impl Parser<'_> {
                         self.pos += 1;
                         return;
                     }
+                    if self.at_word("EXECUTE") && self.is_word(self.pos + 1, "AS") {
+                        // T-SQL `WITH EXECUTE AS CALLER`.
+                        self.pos += 2;
+                        continue;
+                    }
+                    if self.at_word("WITH") && !self.is_punct(self.pos + 1, b'(') {
+                        // T-SQL `WITH ENCRYPTION` and the like (not a statement here).
+                        self.pos += 1;
+                        continue;
+                    }
                     if self.at_word("EXECUTE") {
                         self.pos += 1;
                         if self.at_word("FUNCTION") || self.at_word("PROCEDURE") {
@@ -841,7 +852,7 @@ impl Parser<'_> {
                         || self.is_word(self.pos.wrapping_sub(1), "OF")
                         || self.is_word(self.pos.wrapping_sub(1), "OR")
                         || self.is_punct(self.pos.wrapping_sub(1), b',');
-                    if !event && self.word_in(self.pos, words::BODY_START) {
+                    if !event && (self.word_in(self.pos, words::BODY_START) || self.strong_stop()) {
                         return;
                     }
                     self.pos += 1;
@@ -1167,29 +1178,63 @@ impl Parser<'_> {
         }
     }
 
-    /// `GRANT ... ON [TABLE] t TO ...` and `REVOKE` / `DENY`.
+    /// `GRANT ... ON [TABLE] t TO ...` and `REVOKE` / `DENY`. The privileges may be statement
+    /// words (`GRANT SELECT, INSERT ON t`), so the scan stops at `ON`, `TO` or `FROM`.
     fn grant(&mut self) {
         self.pos += 1;
         while let Some(t) = self.peek() {
             if t.kind == Tk::Punct(b';') {
                 return;
             }
+            if self.at_word("TO") || self.at_word("FROM") {
+                self.grant_tail();
+                return;
+            }
             if self.eat_word("ON") {
                 break;
             }
-            self.pos += 1;
+            if t.kind == Tk::Punct(b'(') {
+                self.skip_group();
+            } else {
+                self.pos += 1;
+            }
         }
         self.eat_word("TABLE");
         if self.word_in(
             self.pos,
             &["DATABASE", "FUNCTION", "PROCEDURE", "SCHEMA", "SEQUENCE"],
         ) || self.at_word("ALL")
+            || self.tok(self.pos + 1).is_some_and(|t| t.kind == Tk::Cast)
         {
-            self.skip_statement(false);
+            // Not a table (T-SQL `ON SCHEMA::s`, `ON OBJECT::t`).
+            self.grant_tail();
             return;
         }
         self.object_names(None, SlotKind::Relation, RefRole::Relation);
-        self.skip_statement(false);
+        self.grant_tail();
+    }
+
+    /// The rest of a `GRANT`: principals and options up to `;`, or in a batch up to the next
+    /// statement (`WITH GRANT OPTION` is no statement).
+    fn grant_tail(&mut self) {
+        let start = self.pos;
+        while let Some(t) = self.peek() {
+            if t.kind == Tk::Punct(b';') {
+                return;
+            }
+            if self.at_word("WITH") && self.is_word(self.pos + 1, "GRANT") {
+                self.pos += 2;
+                continue;
+            }
+            if self.pos > start && self.strong_stop() {
+                return;
+            }
+            if t.kind == Tk::Punct(b'(') {
+                self.skip_group();
+            } else {
+                self.pos += 1;
+            }
+        }
     }
 
     /// `COMMENT ON TABLE t | COLUMN t.c | ... IS '...'`.
