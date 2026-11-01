@@ -444,7 +444,7 @@ fn missing_designer_roles_lists_what_m3_needs() {
 
 #[test]
 fn bulk_loader_falls_back_to_multi_row_inserts() {
-    use oxbase_dialect::{BulkLimits, BulkLoader, BulkMethod};
+    use oxbase_dialect::{BulkLimits, BulkMethod};
 
     let mut reg = DialectRegistry::new();
     let v = ServerVersion::new(16, 0, 0);
