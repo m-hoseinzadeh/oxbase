@@ -555,4 +555,28 @@ the `miniz_oxide` backend (already in the graph), `zip` 9.2.1 (MIT, `deflate` on
 
 ## 13. Deviations (as built)
 
-None yet. Streams record deviations from this file here, with the reason.
+Streams record deviations from this file here, with the reason.
+
+### write stream
+
+- **Writer code lives in `crates/oxbase-io/src/write/`** (`csv`, `json`, `xlsx`, `parquet`, `sql`,
+  shared `cells`); the `writer` functions of the format modules only delegate, so the read and
+  write streams do not edit the same lines.
+- **SQL dump across engines** also leaves out check constraints and partial / expression
+  indexes (their expressions are the source engine's SQL; MySQL even stores checks with
+  backticks), index prefix lengths, and identity details (an identity column becomes a plain
+  auto-increment column, which every target can declare). Each is a `--` note in the header and
+  a `SinkReport` warning.
+- **SQL dump types**: when the target's `DdlGenerator` refuses the table, columns whose type the
+  target cannot declare get a fallback (UUID → `char(36)`, e.g. MySQL; anything else → text),
+  then comments are dropped if the target refuses them (SQLite); each with a note.
+- **SQL dump names** are unqualified unless `SqlDumpOptions::table` says otherwise (the source
+  table's database / schema are dropped, so a dump loads into the current one).
+- **PostgreSQL literals** are standard strings from `PgQuoting` (`'a\b'`, relying on
+  `standard_conforming_strings = on`, the default since 9.1), not `E'...'`. PostgreSQL inserts
+  into a `GENERATED ALWAYS` identity column carry `OVERRIDING SYSTEM VALUE` (the server refuses
+  the values otherwise); generated columns are left out of same-engine `INSERT`s.
+- **XLSX** time-of-day cells use the number format `hh:mm:ss`; dates outside 1900-9999 are text.
+- **Round trips in `tests/write_*.rs`** read files back with the underlying crates (`csv`,
+  `arrow-json`, `calamine`, `parquet`, and `rusqlite` executing the SQLite dump), because the
+  readers are a parallel stream; read-stream round trips belong to the integration step.

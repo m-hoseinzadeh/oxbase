@@ -62,6 +62,5 @@ pub fn writer(
     schema: SchemaRef,
     options: &ParquetWriteOptions,
 ) -> Result<Box<dyn SinkWriter>> {
-    let _ = (file, schema, options);
-    unimplemented!("m5: write")
+    crate::write::parquet::writer(file, schema, options)
 }

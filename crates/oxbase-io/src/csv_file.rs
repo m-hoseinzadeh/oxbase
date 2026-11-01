@@ -73,6 +73,5 @@ pub fn writer(
     schema: SchemaRef,
     options: &CsvWriteOptions,
 ) -> Result<Box<dyn SinkWriter>> {
-    let _ = (file, schema, options);
-    unimplemented!("m5: write")
+    crate::write::csv::writer(file, &schema, options)
 }

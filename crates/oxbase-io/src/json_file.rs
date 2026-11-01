@@ -66,6 +66,5 @@ pub fn writer(
     schema: SchemaRef,
     options: &JsonWriteOptions,
 ) -> Result<Box<dyn SinkWriter>> {
-    let _ = (file, schema, options);
-    unimplemented!("m5: write")
+    crate::write::json::writer(file, &schema, options)
 }

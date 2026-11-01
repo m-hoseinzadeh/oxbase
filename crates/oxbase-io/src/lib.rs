@@ -70,6 +70,7 @@ mod sink;
 mod source;
 pub mod sql_dump;
 mod types;
+mod write;
 pub mod xlsx_file;
 
 pub use options::{

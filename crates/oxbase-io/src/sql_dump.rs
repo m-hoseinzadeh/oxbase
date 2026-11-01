@@ -55,8 +55,7 @@ pub fn writer(
     options: &SqlDumpOptions,
     context: &WriteContext,
 ) -> Result<Box<dyn SinkWriter>> {
-    let _ = (file, schema, options, context);
-    unimplemented!("m5: write")
+    crate::write::sql::writer(file, &schema, options, context)
 }
 
 #[cfg(test)]

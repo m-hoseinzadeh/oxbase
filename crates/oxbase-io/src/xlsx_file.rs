@@ -75,6 +75,5 @@ pub fn writer(
     schema: SchemaRef,
     options: &XlsxWriteOptions,
 ) -> Result<Box<dyn SinkWriter>> {
-    let _ = (file, schema, options);
-    unimplemented!("m5: write")
+    crate::write::xlsx::writer(file, &schema, options)
 }

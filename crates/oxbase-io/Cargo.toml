@@ -38,3 +38,10 @@ tracing.workspace = true
 [dev-dependencies]
 pretty_assertions.workspace = true
 tokio.workspace = true
+# Writer tests (tests/write_*.rs): SQL dumps through each engine's real dialect cells, and the
+# SQLite dump executed on an in-memory database.
+oxbase-pg.workspace = true
+oxbase-mysql.workspace = true
+oxbase-sqlite.workspace = true
+oxbase-mssql.workspace = true
+rusqlite.workspace = true
