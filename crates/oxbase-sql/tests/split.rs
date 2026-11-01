@@ -464,16 +464,181 @@ fn tsql_go_batches() {
         "SELECT 1; SELECT 2\nGO\nSELECT 3\ngo 2 -- again\nSELECT 'x\nGO\ny'\n",
         &["SELECT 1; SELECT 2", "SELECT 3", "SELECT 'x\nGO\ny'"],
     );
+    // `GO` with other text on its line is not a separator.
     case(TSQL, "SELECT 1 GO", &["SELECT 1 GO"]);
-    case(TSQL, "  GO  \nSELECT 1\r\nGO\r\n", &["SELECT 1"]);
     case(TSQL, "SELECT 1\nGOTO x", &["SELECT 1\nGOTO x"]);
+    case(
+        TSQL,
+        "SELECT 1\nGO x\nSELECT 2",
+        &["SELECT 1\nGO x\nSELECT 2"],
+    );
+    case(
+        TSQL,
+        "SELECT 1\n/* c */ GO\nSELECT 2",
+        &["SELECT 1\n/* c */ GO\nSELECT 2"],
+    );
+    // Indented, any case, CRLF, a count, a trailing comment.
+    case(TSQL, "  GO  \nSELECT 1\r\nGO\r\n", &["SELECT 1"]);
+    case(
+        TSQL,
+        "SELECT 1\n\tGo\nSELECT 2\ngO 10\nSELECT 3\nGO -- next\nSELECT 4\ngo--x\n",
+        &["SELECT 1", "SELECT 2", "SELECT 3", "SELECT 4"],
+    );
+    // Not inside strings, identifiers or (nested) comments.
     case(TSQL, "SELECT [a\nGO\n]]b]", &["SELECT [a\nGO\n]]b]"]);
+    case(TSQL, "SELECT \"a\nGO\nb\"", &["SELECT \"a\nGO\nb\""]);
+    case(TSQL, "SELECT N'a\nGO\nb'", &["SELECT N'a\nGO\nb'"]);
     case(TSQL, "/* /* */\nGO\n */ SELECT 1", &["SELECT 1"]);
     case(
         TSQL,
-        "SELECT N'a;b'; SELECT 2",
-        &["SELECT N'a;b'; SELECT 2"],
+        "SELECT 1 -- GO\nGO\n-- only a comment\nGO\n",
+        &["SELECT 1 -- GO"],
     );
+    // Only separators, comments and `;`: nothing.
+    case(TSQL, "GO\nGO 2\n-- c\n/* d */\nGO", &[]);
+    case(
+        TSQL,
+        ";;  ;\n-- only a comment;\n/* and; this */\nGO\n;",
+        &[],
+    );
+    // A `GO` line ends a batch even inside an unclosed block.
+    case(
+        TSQL,
+        "BEGIN\n  SELECT 1;\nGO\nSELECT 2",
+        &["BEGIN\n  SELECT 1;", "SELECT 2"],
+    );
+}
+
+#[test]
+fn tsql_semicolons_never_split_a_batch() {
+    // `docs/m4-contracts.md` §6 and §8.3: one batch, two result sets on the server.
+    case(
+        TSQL,
+        "SELECT 1 AS a; SELECT 2 AS b",
+        &["SELECT 1 AS a; SELECT 2 AS b"],
+    );
+    // The batch's trailing `;` stays (`MERGE` needs it); leading `;` and comments do not.
+    case(
+        TSQL,
+        "-- lead;\n; /* lead; /* nested; */ */ ;SELECT 1 /* in; */ -- tail;\n;\nGO\nMERGE t USING s ON t.a = s.a WHEN MATCHED THEN DELETE;",
+        &[
+            "SELECT 1 /* in; */ -- tail;\n;",
+            "MERGE t USING s ON t.a = s.a WHEN MATCHED THEN DELETE;",
+        ],
+    );
+    // Variables, #temp tables, control flow and modules: the whole batch, as the server
+    // must see it.
+    for batch in [
+        "DECLARE @x int = 1;\nSELECT @x;",
+        "CREATE TABLE #t (a int); INSERT INTO #t VALUES (1); SELECT a FROM #t",
+        "INSERT INTO t DEFAULT VALUES; SELECT SCOPE_IDENTITY(), @@ROWCOUNT, ROWCOUNT_BIG()",
+        "IF NOT EXISTS (SELECT 1 FROM t) RETURN; DROP TABLE t;",
+        "IF 1 = 1 SELECT 1;\nELSE SELECT 2;",
+        "BEGIN TRY\n  SELECT 1/0;\nEND TRY\nBEGIN CATCH\n  SELECT ERROR_MESSAGE();\nEND CATCH;",
+        "BEGIN TRANSACTION; UPDATE t SET a = 1; COMMIT TRANSACTION;",
+        "SET ANSI_NULLS ON;\nSET QUOTED_IDENTIFIER ON;\nGO",
+        "CREATE PROCEDURE dbo.p @a int = 1\nAS\nBEGIN\n  SET NOCOUNT ON;\n  SELECT @a;\nEND;",
+        "create proc p as select 1; select 2",
+        "CREATE OR ALTER FUNCTION dbo.f (@x int) RETURNS TABLE AS RETURN (SELECT @x AS x);",
+        "CREATE TRIGGER trg ON t AFTER INSERT AS\nBEGIN\n  UPDATE t SET n = n + 1;\nEND",
+        "ALTER VIEW v AS WITH c AS (SELECT 1 AS a) SELECT a FROM c;",
+    ] {
+        let expected = batch.strip_suffix("\nGO").unwrap_or(batch);
+        case(
+            TSQL,
+            &format!("{batch}\nGO\nSELECT 9"),
+            &[expected, "SELECT 9"],
+        );
+    }
+}
+
+#[test]
+fn tsql_strings_identifiers_and_comments() {
+    case(
+        TSQL,
+        "SELECT N'it''s; ok', 'x;y', n'z;'\nGO\nSELECT 2",
+        &["SELECT N'it''s; ok', 'x;y', n'z;'", "SELECT 2"],
+    );
+    // A backslash is an ordinary character.
+    case(
+        TSQL,
+        "SELECT 'a\\'\nGO\nSELECT 2",
+        &["SELECT 'a\\'", "SELECT 2"],
+    );
+    case(
+        TSQL,
+        "SELECT [a;b]]c] FROM [x\nGO\ny]\nGO\nSELECT \"q;\"\"r\"",
+        &["SELECT [a;b]]c] FROM [x\nGO\ny]", "SELECT \"q;\"\"r\""],
+    );
+    case(
+        TSQL,
+        "SELECT #t.a, @@VERSION, [begin], [end] FROM #t\nGO",
+        &["SELECT #t.a, @@VERSION, [begin], [end] FROM #t"],
+    );
+    // Unterminated constructs run to the end, across `GO` lines.
+    case(
+        TSQL,
+        "SELECT 'abc;\nGO\nSELECT 2",
+        &["SELECT 'abc;\nGO\nSELECT 2"],
+    );
+    case(TSQL, "SELECT [abc;\nGO\n", &["SELECT [abc;\nGO\n"]);
+    case(
+        TSQL,
+        "SELECT 1; /* a /* b */\nGO\n",
+        &["SELECT 1; /* a /* b */\nGO\n"],
+    );
+}
+
+#[test]
+fn tsql_statement_kinds() {
+    let kinds = |sql| {
+        split(TSQL, sql)
+            .into_iter()
+            .map(|s| s.kind)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        kinds(
+            "select 1\nGO\nWITH c AS (SELECT 1) SELECT * FROM c\nGO\nexec p\nGO\nEXECUTE p\nGO\nVALUES (1)\nGO\n(SELECT 1)"
+        ),
+        [StatementKind::Query; 6]
+    );
+    assert_eq!(
+        kinds(
+            "UPDATE t SET a = 1; SELECT @@ROWCOUNT\nGO\nDECLARE @x int; SELECT @x\nGO\nCREATE PROCEDURE p AS SELECT 1"
+        ),
+        [StatementKind::Other; 3]
+    );
+}
+
+#[test]
+fn tsql_ranges_positions_and_statement_at() {
+    let sql = "SELECT N'é😀;';\nGO\nSELECT [日本;語];  SELECT 3\n";
+    let s = checked_split(TSQL, sql);
+    assert_eq!(s.len(), 2);
+    assert_eq!(s[0].text, "SELECT N'é😀;';");
+    // The batch owns its `GO` line.
+    assert_eq!((s[0].range.clone(), s[0].segment_end), (0..18, 21));
+    assert_eq!(s[1].start, Position { line: 3, column: 1 });
+    assert_eq!(s[1].text, "SELECT [日本;語];  SELECT 3");
+    assert_eq!(
+        s[1].end,
+        Position {
+            line: 3,
+            column: 25
+        }
+    );
+    // "Run current statement" runs the whole `GO` batch around the cursor.
+    let at = |offset| statement_at(TSQL, sql, offset).map(|s| s.text);
+    assert_eq!(at(0).as_deref(), Some("SELECT N'é😀;';"));
+    assert_eq!(at(19).as_deref(), Some("SELECT N'é😀;';"));
+    assert_eq!(at(21).as_deref(), Some("SELECT N'é😀;';"));
+    assert_eq!(at(22).as_deref(), Some("SELECT [日本;語];  SELECT 3"));
+    assert_eq!(
+        at(sql.len()).as_deref(),
+        Some("SELECT [日本;語];  SELECT 3")
+    );
+    assert_eq!(statement_at(TSQL, "GO\n-- c\nGO", 4), None);
 }
 
 #[test]
@@ -593,5 +758,21 @@ fn statement_kinds() {
     assert_eq!(
         kinds(SQLITE, "PRAGMA table_info(t); DELETE FROM t"),
         [Query, Other]
+    );
+    assert_eq!(
+        kinds(
+            TSQL,
+            "SELECT 1\nGO\nwith c as (select 1 as a) select * from c\nGO\nEXEC sp_who\nGO\n\
+             execute p\nGO\n(SELECT 1)\nGO\nUPDATE t SET a = 1\nGO\nSHOW x\nGO\nN'x'"
+        ),
+        [Query, Query, Query, Query, Query, Other, Other, Other]
+    );
+    // A batch's kind is its first keyword's.
+    assert_eq!(
+        kinds(
+            TSQL,
+            "DECLARE @x int = 1; SELECT @x\nGO\nSELECT @x = 1; SELECT @x\nGO\nUPDATE t SET a = 1; SELECT 1"
+        ),
+        [Other, Query, Other]
     );
 }

@@ -29,6 +29,12 @@ const MYSQL_CHUNK: &str = "SELECT 'a\\';b', `c;d` FROM t; # c;\n\
     INSERT INTO t VALUES (\"x;y\", 'é');\n\
     CREATE PROCEDURE p() BEGIN IF 1 THEN SELECT 1; END IF; END;\n";
 
+/// Two statements: two `GO` batches (`;` never splits a T-SQL batch).
+const TSQL_CHUNK: &str = "SELECT N'it''s; fine', [col;x]]y] FROM t; -- note; here\n\
+    /* block; /* nested */ */ INSERT INTO t VALUES ('a;b', N'données 😀');\n\
+    CREATE PROCEDURE p AS BEGIN TRY SELECT 1; END TRY BEGIN CATCH SELECT 2; END CATCH;\nGO\n\
+    DECLARE @x int = 1; IF @x = 1 SELECT @x; ELSE SELECT 0;\ngo\n";
+
 /// The shortest of `runs` timings of `f`.
 fn best_of(runs: usize, mut f: impl FnMut()) -> Duration {
     (0..runs)
@@ -65,6 +71,7 @@ fn ten_megabytes_split_fast() {
         10 << 20,
         limit,
     );
+    timed_split(SqlDialect::TSql, TSQL_CHUNK, 2, 10 << 20, limit);
 }
 
 #[test]
@@ -78,6 +85,7 @@ fn one_megabyte_splits_in_well_under_100_ms() {
         1 << 20,
         limit,
     );
+    timed_split(SqlDialect::TSql, TSQL_CHUNK, 2, 1 << 20, limit);
 }
 
 #[test]
@@ -102,6 +110,15 @@ fn one_huge_statement_and_one_huge_literal() {
     );
     let redacted = redact_secrets(SqlDialect::Postgres, &body);
     assert!(redacted.contains("PASSWORD ''***''") && !redacted.contains("''x''"));
+    // T-SQL: one 4 MB batch (no `GO` line), and redaction over a large script.
+    let (sql, _) = script("DECLARE @v int = 1; SELECT @v; ", 4 << 20);
+    assert_eq!(split(SqlDialect::TSql, &sql).len(), 1);
+    let (sql, _) = script(
+        "ALTER LOGIN l WITH PASSWORD = N'x'\nGO\nSELECT 'pwd=y';\n",
+        2 << 20,
+    );
+    let redacted = redact_secrets(SqlDialect::TSql, &sql);
+    assert!(redacted.contains("PASSWORD = N'***'") && !redacted.contains("N'x'"));
     let elapsed = started.elapsed();
-    assert!(elapsed < limit * 2, "took {elapsed:?}");
+    assert!(elapsed < limit * 3, "took {elapsed:?}");
 }

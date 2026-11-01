@@ -3,9 +3,11 @@
 //! - random scripts built from syntax fragments and random characters never panic and always
 //!   produce well-formed statements (ordered, non-overlapping, exact text, trimmed, positions
 //!   equal to `position_at`); `statement_at` and `redact_secrets` never panic either;
-//! - scripts of plain words, whitespace and `;` split exactly like a naive `;` split;
+//! - scripts of plain words, whitespace and `;` split exactly like a naive `;` split (T-SQL:
+//!   one statement, since only `GO` lines end a batch);
 //! - joining well-formed statements (with quotes, comments and bodies that hide `;`) with
-//!   terminators gives exactly those statements back.
+//!   terminators gives exactly those statements back (T-SQL: batches of statements joined
+//!   with `;`, separated by `GO` lines, come back one per batch).
 
 use std::borrow::Cow;
 
@@ -192,6 +194,22 @@ const FRAGMENTS: &[&str] = &[
     "\nGO\n",
     "GO",
     "\ngo 3 -- x\n",
+    "TRY",
+    "CATCH",
+    "TRAN",
+    "CONVERSATION",
+    "ALTER",
+    "VIEW",
+    "DECLARE",
+    "@x",
+    "@@ROWCOUNT",
+    "SCOPE_IDENTITY",
+    "sp_addlogin",
+    "@pwd",
+    "PWDENCRYPT",
+    "\"",
+    "N'",
+    "[a]]",
     "PASSWORD",
     "IDENTIFIED",
     "BY",
@@ -257,6 +275,9 @@ fn adversarial_inputs() {
         "DELIMITER ".repeat(300),
         "\nDELIMITER a\n".repeat(100) + "aaa",
         "\nGO".repeat(300),
+        format!("BEGIN TRY {}", "BEGIN CATCH END TRY ;".repeat(300)),
+        format!("IF 1 = 1 SELECT 1{}", "; ELSE".repeat(300)),
+        "CREATE PROCEDURE p AS SELECT 1;\nGO\n".repeat(300),
         "😀".repeat(300),
     ];
     for input in &inputs {
@@ -303,6 +324,24 @@ fn plain_words_split_like_a_naive_semicolon_split() {
                 .collect();
             assert_eq!(got, expected, "{dialect:?} seed {seed}: {script:?}");
         }
+        // T-SQL: `;` never splits; leading `;` and whitespace are not part of the batch.
+        let content = script.trim_start_matches(|c| c == ';' || is_space_char(c));
+        let text = content.trim_end_matches(is_space_char);
+        let start = script.len() - content.len();
+        let tsql_expected: Vec<_> = if text.is_empty() {
+            Vec::new()
+        } else {
+            vec![(
+                start..start + text.len(),
+                start + text.len(),
+                text.to_owned(),
+            )]
+        };
+        let got: Vec<_> = check(TSQL, &script, &mut rng)
+            .into_iter()
+            .map(|s| (s.range, s.segment_end, s.text))
+            .collect();
+        assert_eq!(got, tsql_expected, "TSql seed {seed}: {script:?}");
     }
 }
 
@@ -356,20 +395,29 @@ fn atoms(dialect: SqlDialect) -> &'static [&'static str] {
             "x", "1", "'a;''b'", "\"c;\"", "`d;`", "[e;f]", "/* ; */", "-- ;\n", "é😀", "?1",
             ":name", "(", ")", "#", r"'\'",
         ],
+        // `;` never ends a T-SQL statement: only `GO` lines do.
         SqlDialect::TSql => &[
+            ";",
+            "@v",
+            "DECLARE",
             "x",
             "1",
             "'a;b'",
+            "'it''s;'",
             "[x;y]]z]",
-            "N'é'",
-            "/* /* GO */ */",
-            "-- c\n",
-            ";",
-            "\"q\"",
-            "@v",
+            "N'é;'",
+            "/* /* GO; */ */",
+            "-- c;\n",
+            "\"q;\"\"\"",
             "#t",
-            "GOTO",
+            "@@VERSION",
+            "GOx",
             "(",
+            ")",
+            r"'a\'",
+            "BEGIN SELECT 1; END",
+            "CASE WHEN 1 = 1 THEN 'a;' ELSE 'b' END",
+            "é😀",
         ],
     }
 }
@@ -399,9 +447,24 @@ fn compound_statements(dialect: SqlDialect) -> &'static [&'static str] {
             "BEGIN",
             "END",
         ],
-        SqlDialect::TSql => &["BEGIN SELECT 1; END"],
+        SqlDialect::TSql => &[
+            "BEGIN SELECT 1; END",
+            "BEGIN TRY SELECT 1; END TRY BEGIN CATCH SELECT 2; END CATCH",
+            "IF 1 = 1 SELECT 1;\nELSE SELECT 2",
+            "BEGIN TRANSACTION",
+            "WHILE 1 = 0 BEGIN BREAK; END",
+        ],
     }
 }
+
+/// T-SQL statements that must be alone in (or last in) their batch on the server; the
+/// splitter treats them like any other text.
+const TSQL_MODULES: &[&str] = &[
+    "CREATE PROCEDURE p @a int AS BEGIN SET NOCOUNT ON; SELECT @a; END;",
+    "create or alter view v as select 1 as a; select 2",
+    "ALTER FUNCTION f () RETURNS int AS BEGIN RETURN 1; END",
+    "DECLARE @x int = 1; SELECT @x",
+];
 
 /// A statement as written in the script (it may end with the line feed of a line comment).
 fn random_statement(dialect: SqlDialect, rng: &mut Rng) -> String {
@@ -430,21 +493,20 @@ fn joined_statements_split_back() {
     for seed in 0..1500 {
         let mut rng = Rng::new(seed);
         for dialect in ALL {
+            if dialect == TSQL {
+                tsql_joined_batches_split_back(seed, &mut rng, SEPARATORS, GO_SEPARATORS);
+                continue;
+            }
             let count = 1 + rng.below(6);
             let statements: Vec<String> = (0..count)
                 .map(|_| random_statement(dialect, &mut rng))
                 .collect();
             let expected: Vec<&str> = statements.iter().map(String::as_str).map(trim).collect();
-            let separators = if dialect == TSQL {
-                GO_SEPARATORS
-            } else {
-                SEPARATORS
-            };
             let mut script = String::new();
             for (i, statement) in statements.iter().enumerate() {
                 script.push_str(statement);
                 if i + 1 < count || rng.below(2) == 0 {
-                    script.push_str(rng.pick(separators));
+                    script.push_str(rng.pick(SEPARATORS));
                 }
             }
             let texts: Vec<String> = check(dialect, &script, &mut rng)
@@ -469,6 +531,54 @@ fn joined_statements_split_back() {
             }
         }
     }
+}
+
+/// T-SQL: batches (statements joined with `;`, which never splits) separated by `GO` lines
+/// split back into exactly those batches.
+fn tsql_joined_batches_split_back(
+    seed: u64,
+    rng: &mut Rng,
+    separators: &[&str],
+    go_separators: &[&str],
+) {
+    let count = 1 + rng.below(5);
+    let batches: Vec<String> = (0..count)
+        .map(|_| {
+            let mut batch = String::new();
+            let statements = 1 + rng.below(3);
+            for i in 0..statements {
+                if i > 0 {
+                    batch.push_str(rng.pick(separators));
+                }
+                if rng.below(6) == 0 {
+                    batch.push_str(rng.pick(TSQL_MODULES));
+                } else {
+                    batch.push_str(&random_statement(TSQL, rng));
+                }
+            }
+            if rng.below(3) == 0 {
+                // A batch's own trailing `;` stays in its text.
+                batch.push(';');
+            }
+            batch
+        })
+        .collect();
+    let expected: Vec<&str> = batches.iter().map(String::as_str).map(trim).collect();
+    let mut script = String::new();
+    if rng.below(4) == 0 {
+        script.push_str(rng.pick(go_separators).trim_start_matches('\n'));
+    }
+    for (i, batch) in batches.iter().enumerate() {
+        script.push_str(batch);
+        if i + 1 < count || rng.below(2) == 0 {
+            script.push_str(rng.pick(go_separators));
+        }
+    }
+    let texts: Vec<String> = check(TSQL, &script, rng)
+        .into_iter()
+        .map(|s| s.text)
+        .collect();
+    assert_eq!(texts, expected, "TSql seed {seed}: {script:?}");
 }
 
 /// Statements holding one secret, written `{s}`; each is a single statement in its dialect.
@@ -512,7 +622,26 @@ fn secret_templates(dialect: SqlDialect) -> Vec<&'static str> {
             "ATTACH 'f.db' AS a KEY '{s}'",
             "ATTACH 'file:f.db?key={s}' AS a",
         ][..],
-        SqlDialect::TSql => &["ALTER LOGIN l WITH PASSWORD = N'{s}'"][..],
+        SqlDialect::TSql => &[
+            "ALTER LOGIN l WITH PASSWORD = N'{s}'",
+            "CREATE LOGIN l WITH PASSWORD = '{s}' MUST_CHANGE, CHECK_POLICY = ON",
+            "CREATE LOGIN l WITH PASSWORD = 0x{s} HASHED",
+            "CREATE DATABASE SCOPED CREDENTIAL c WITH IDENTITY = 'u', SECRET = '{s}'",
+            "OPEN MASTER KEY DECRYPTION BY PASSWORD = N'{s}'",
+            "EXEC sp_addlinkedsrvlogin @rmtsrvname = N'x', @rmtuser = N'u', @rmtpassword = N'{s}'",
+            "EXEC ('ALTER LOGIN l WITH PASSWORD = ''{s}''')",
+            "SELECT * FROM OPENROWSET('MSOLEDBSQL', 'Server=x;Uid=u;Pwd={s};', 'SELECT 1')",
+            "CREATE LOGIN l WITH PASSWORD = \"{s}\"",
+            "CREATE CREDENTIAL c WITH IDENTITY = 'u', SECRET = \"{s}\"",
+            "DECLARE @NewPwd nvarchar(128) = N'{s}'",
+            "DECLARE @password AS varchar(max) = '{s}', @n int = 1",
+            "EXEC sp_addlogin N'l', N'{s}', 'db'",
+            "EXEC sys.sp_password NULL, '{s}', 'l'",
+            "EXEC sp_addlinkedsrvlogin 'srv', 'false', NULL, 'u', '{s}'",
+            "EXEC sp_approlepassword @rolename = 'r', @newpwd = '{s}'",
+            "SELECT PWDCOMPARE(N'{s}', password_hash) FROM sys.sql_logins",
+            "ALTER SERVICE MASTER KEY WITH NEW_ACCOUNT = 'a', NEW_PASSWORD = '{s}'",
+        ][..],
     });
     templates
 }

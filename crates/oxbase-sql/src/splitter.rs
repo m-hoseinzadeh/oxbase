@@ -10,6 +10,9 @@
 //! - [`Blocks`], which counts the compound bodies in which `;` does not end the statement
 //!   (PostgreSQL `BEGIN ATOMIC`, MySQL/MariaDB stored programs, SQLite trigger bodies).
 //!
+//! T-SQL ([`SqlDialect::TSql`]) has no terminator and no [`Blocks`]: only a `GO` line ends a
+//! statement (one statement = one batch), and `;` is ordinary content.
+//!
 //! Positions are computed incrementally (statement offsets only grow), so the whole split is
 //! linear in the length of the script.
 //!
@@ -40,6 +43,9 @@ const QUERY_WORDS: [&[u8]; 11] = [
     b"CALL",
     b"FETCH",
 ];
+
+/// T-SQL first keywords of statements that probably return rows.
+const TSQL_QUERY_WORDS: [&[u8]; 5] = [b"SELECT", b"WITH", b"EXEC", b"EXECUTE", b"VALUES"];
 
 struct Splitter<'a> {
     rules: Rules,
@@ -174,11 +180,19 @@ impl<'a> Splitter<'a> {
                     self.end = tok.end;
                 }
             }
+            // T-SQL: a `;` before any content of the batch is an empty statement.
+            TokenKind::Punct
+                if self.rules.dialect == SqlDialect::TSql
+                    && self.start.is_none()
+                    && bytes[tok.start] == b';' =>
+            {
+                self.at_line_start = false;
+            }
             _ => {
                 self.at_line_start = false;
                 if self.start.is_none() {
                     self.start = Some(tok.start);
-                    self.kind = statement_kind(bytes, tok);
+                    self.kind = statement_kind(self.rules.dialect, bytes, tok);
                 }
                 self.end = tok.end;
                 if self.blocks.active() {
@@ -218,11 +232,16 @@ impl<'a> Splitter<'a> {
 }
 
 /// [`StatementKind`] from the first content token.
-fn statement_kind(bytes: &[u8], tok: Token) -> StatementKind {
+fn statement_kind(dialect: SqlDialect, bytes: &[u8], tok: Token) -> StatementKind {
     let query = match tok.kind {
         TokenKind::Word => {
             let word = &bytes[tok.start..tok.end];
-            QUERY_WORDS.iter().any(|k| word.eq_ignore_ascii_case(k))
+            let words: &[&[u8]] = if dialect == SqlDialect::TSql {
+                &TSQL_QUERY_WORDS
+            } else {
+                &QUERY_WORDS
+            };
+            words.iter().any(|k| word.eq_ignore_ascii_case(k))
         }
         TokenKind::Punct => bytes[tok.start] == b'(',
         _ => false,

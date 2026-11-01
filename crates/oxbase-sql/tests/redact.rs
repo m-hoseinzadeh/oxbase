@@ -295,11 +295,176 @@ fn sqlite_keys() {
 
 #[test]
 fn tsql_passwords() {
-    redacts(
+    let cases = [
+        (
+            "ALTER LOGIN app WITH PASSWORD = N'pw'",
+            "ALTER LOGIN app WITH PASSWORD = N'***'",
+        ),
+        (
+            "CREATE LOGIN app WITH PASSWORD = 'pw' MUST_CHANGE, CHECK_POLICY = ON, DEFAULT_DATABASE = [db]",
+            "CREATE LOGIN app WITH PASSWORD = '***' MUST_CHANGE, CHECK_POLICY = ON, DEFAULT_DATABASE = [db]",
+        ),
+        (
+            "ALTER LOGIN app WITH PASSWORD = N'new' OLD_PASSWORD = N'old'",
+            "ALTER LOGIN app WITH PASSWORD = N'***' OLD_PASSWORD = N'***'",
+        ),
+        (
+            "CREATE LOGIN app WITH PASSWORD = 0x0200A1B2C3 HASHED",
+            "CREATE LOGIN app WITH PASSWORD = '***' HASHED",
+        ),
+        (
+            "CREATE USER u WITH PASSWORD = 'pw', DEFAULT_SCHEMA = dbo",
+            "CREATE USER u WITH PASSWORD = '***', DEFAULT_SCHEMA = dbo",
+        ),
+        (
+            "create application role r with password = 'pw'",
+            "create application role r with password = '***'",
+        ),
+        (
+            "CREATE MASTER KEY ENCRYPTION BY PASSWORD = N'pw'",
+            "CREATE MASTER KEY ENCRYPTION BY PASSWORD = N'***'",
+        ),
+        (
+            "OPEN MASTER KEY DECRYPTION BY PASSWORD = 'pw'",
+            "OPEN MASTER KEY DECRYPTION BY PASSWORD = '***'",
+        ),
+        (
+            "CREATE CERTIFICATE c ENCRYPTION BY PASSWORD = 'pw' WITH SUBJECT = 'kept'",
+            "CREATE CERTIFICATE c ENCRYPTION BY PASSWORD = '***' WITH SUBJECT = 'kept'",
+        ),
+        (
+            "CREATE DATABASE SCOPED CREDENTIAL c WITH IDENTITY = 'SHARED ACCESS SIGNATURE', SECRET = 'sv=2022&sig=abc'",
+            "CREATE DATABASE SCOPED CREDENTIAL c WITH IDENTITY = 'SHARED ACCESS SIGNATURE', SECRET = '***'",
+        ),
+        (
+            "CREATE CREDENTIAL c WITH IDENTITY = N'user', SECRET = N'pw'",
+            "CREATE CREDENTIAL c WITH IDENTITY = N'user', SECRET = N'***'",
+        ),
+        (
+            "BACKUP DATABASE d TO DISK = 'd.bak' WITH MEDIAPASSWORD = 'pw'",
+            "BACKUP DATABASE d TO DISK = 'd.bak' WITH MEDIAPASSWORD = '***'",
+        ),
+        (
+            "CREATE SYMMETRIC KEY k WITH KEY_SOURCE = 'phrase', ALGORITHM = AES_256 ENCRYPTION BY PASSWORD = 'pw'",
+            "CREATE SYMMETRIC KEY k WITH KEY_SOURCE = '***', ALGORITHM = AES_256 ENCRYPTION BY PASSWORD = '***'",
+        ),
+        (
+            "EXEC sp_addlinkedsrvlogin @rmtsrvname = N'srv', @useself = 'false', @rmtuser = N'u', @rmtpassword = N'pw'",
+            "EXEC sp_addlinkedsrvlogin @rmtsrvname = N'srv', @useself = 'false', @rmtuser = N'u', @rmtpassword = N'***'",
+        ),
+        (
+            "DECLARE @Password nvarchar(50); SET @Password = N'pw'; EXEC sp_addlogin @loginame = 'l', @passwd = 'pw2'",
+            "DECLARE @Password nvarchar(50); SET @Password = N'***'; EXEC sp_addlogin @loginame = 'l', @passwd = '***'",
+        ),
+        // Dynamic SQL: inside a literal, `PASSWORD = <value>` is also a connection-string
+        // value (rule 2), so the whole quoted value becomes `***`.
+        (
+            "EXEC ('CREATE LOGIN l WITH PASSWORD = ''pw''')",
+            "EXEC ('CREATE LOGIN l WITH PASSWORD = ***')",
+        ),
+        (
+            "EXEC sp_executesql N'ALTER LOGIN l WITH PASSWORD = N''pw'''",
+            "EXEC sp_executesql N'ALTER LOGIN l WITH PASSWORD = ***'",
+        ),
+        // Other nested SQL is redacted as SQL; its quotes come back doubled.
+        (
+            "EXEC (N'CREATE CREDENTIAL c WITH IDENTITY = ''u'', SECRET = ''pw''')",
+            "EXEC (N'CREATE CREDENTIAL c WITH IDENTITY = ''u'', SECRET = ''***''')",
+        ),
+        // Connection strings (OPENROWSET, linked servers).
+        (
+            "SELECT * FROM OPENROWSET('MSOLEDBSQL', 'Server=s;Uid=u;Pwd=pw;', 'SELECT 1')",
+            "SELECT * FROM OPENROWSET('MSOLEDBSQL', 'Server=s;Uid=u;Pwd=***;', 'SELECT 1')",
+        ),
+        (
+            "EXEC sp_addlinkedserver @server = N'S', @provstr = N'Server=x;Password=pw'",
+            "EXEC sp_addlinkedserver @server = N'S', @provstr = N'Server=x;Password=***'",
+        ),
+        // `"..."` is a string under `SET QUOTED_IDENTIFIER OFF`.
+        (
+            "SET QUOTED_IDENTIFIER OFF; CREATE LOGIN l WITH PASSWORD = \"S3cret!\"",
+            "SET QUOTED_IDENTIFIER OFF; CREATE LOGIN l WITH PASSWORD = '***'",
+        ),
+        (
+            "CREATE CREDENTIAL c WITH IDENTITY = 'u', SECRET = \"pw\"",
+            "CREATE CREDENTIAL c WITH IDENTITY = 'u', SECRET = '***'",
+        ),
+        (
+            "ALTER SERVICE MASTER KEY WITH NEW_ACCOUNT = 'acct', NEW_PASSWORD = 'pw'",
+            "ALTER SERVICE MASTER KEY WITH NEW_ACCOUNT = 'acct', NEW_PASSWORD = '***'",
+        ),
+        // Declared variables: a type (and its size) may sit before `=`.
+        (
+            "DECLARE @password nvarchar(50) = N'pw'",
+            "DECLARE @password nvarchar(50) = N'***'",
+        ),
+        (
+            "DECLARE @n int = 1, @AdminPwd AS [nvarchar](max) = 'pw', @m int = 2",
+            "DECLARE @n int = 1, @AdminPwd AS [nvarchar](max) = '***', @m int = 2",
+        ),
+        (
+            "DECLARE @secret sys.sysname = N'pw', @k decimal(10, 2) = 1",
+            "DECLARE @secret sys.sysname = N'***', @k decimal(10, 2) = 1",
+        ),
+        // Named and positional arguments of system procedures.
+        (
+            "EXEC sp_password @old = 'a', @new = 'b', @loginame = 'l'",
+            "EXEC sp_password @old = '***', @new = '***', @loginame = 'l'",
+        ),
+        (
+            "EXEC sp_approlepassword @rolename = 'r', @newpwd = 'pw'",
+            "EXEC sp_approlepassword @rolename = 'r', @newpwd = '***'",
+        ),
+        (
+            "EXEC sp_addlogin 'l', 'pw', 'db'",
+            "EXEC sp_addlogin 'l', '***', 'db'",
+        ),
+        (
+            "EXEC sys.sp_password NULL, N'pw', 'l'",
+            "EXEC sys.sp_password NULL, N'***', 'l'",
+        ),
+        (
+            "EXEC sp_setapprole 'r', N'pw'; SELECT 'kept'",
+            "EXEC sp_setapprole 'r', N'***'; SELECT 'kept'",
+        ),
+        (
+            "EXEC master.dbo.sp_addlinkedsrvlogin 'srv', 'false', NULL, 'u', 'pw'",
+            "EXEC master.dbo.sp_addlinkedsrvlogin 'srv', 'false', NULL, 'u', '***'",
+        ),
+        (
+            "EXEC sp_change_users_login 'Auto_Fix', 'u', NULL, 'pw'",
+            "EXEC sp_change_users_login 'Auto_Fix', 'u', NULL, '***'",
+        ),
+        (
+            "EXEC sp_executesql @stmt, N'@pwd sysname', @pwd = N'pw'",
+            "EXEC sp_executesql @stmt, N'@pwd sysname', @pwd = N'***'",
+        ),
+        (
+            "SELECT PWDENCRYPT(N'pw'), PWDCOMPARE('pw2', password_hash) FROM sys.sql_logins",
+            "SELECT PWDENCRYPT(N'***'), PWDCOMPARE('***', password_hash) FROM sys.sql_logins",
+        ),
+        // Multi-byte text and several batches.
+        (
+            "SELECT N'é😀'\nGO\nALTER LOGIN [ü] WITH PASSWORD = N'密码'\nGO",
+            "SELECT N'é😀'\nGO\nALTER LOGIN [ü] WITH PASSWORD = N'***'\nGO",
+        ),
+    ];
+    for (sql, expected) in cases {
+        redacts(TSQL, sql, expected);
+    }
+    keeps(TSQL, "SELECT [password] FROM t WHERE x = 'a'");
+    keeps(TSQL, "SELECT * FROM t WHERE password = @password");
+    keeps(TSQL, "-- ALTER LOGIN l WITH PASSWORD = 'x'\nSELECT 1");
+    keeps(TSQL, "/* /* PASSWORD = 'x' */ PASSWORD = 'y' */ SELECT 'z'");
+    keeps(
         TSQL,
-        "ALTER LOGIN app WITH PASSWORD = N'pw'",
-        "ALTER LOGIN app WITH PASSWORD = N'***'",
+        "SELECT 0x0102 AS b; UPDATE t SET h = 0xAB WHERE k = 'x'",
     );
+    keeps(TSQL, "SELECT @@VERSION, N'x', [a]]b]");
+    keeps(TSQL, "IF @pwd IS NULL SELECT 'kept'");
+    keeps(TSQL, "SELECT \"kept\" FROM t WHERE @password = [x]");
+    keeps(TSQL, "EXEC sp_addlogin @l, @p; SELECT 'kept', 'too'");
+    keeps(TSQL, "EXEC sp_addlogin @loginame = 'l'");
 }
 
 #[test]
