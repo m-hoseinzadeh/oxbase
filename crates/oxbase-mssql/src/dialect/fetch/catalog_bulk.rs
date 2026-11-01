@@ -149,6 +149,14 @@ fn quoted(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
+/// A `"schema"."name"` entry.
+fn qualified(schema: &str, name: &str) -> String {
+    let mut out = quoted(schema);
+    out.push('.');
+    out.push_str(&quoted(name));
+    out
+}
+
 /// The bound `@P1`-`@P5` of a scope; `default_schema` stands in for relations without one.
 fn scope_params(scope: &CatalogScope, default_schema: &str) -> Vec<Value> {
     let schemas: String = scope.schemas.iter().flatten().map(|s| quoted(s)).collect();
@@ -158,7 +166,7 @@ fn scope_params(scope: &CatalogScope, default_schema: &str) -> Vec<Value> {
         .flatten()
         .map(|r| {
             let schema = r.schema.as_deref().unwrap_or(default_schema);
-            format!("{}.{}", quoted(schema), quoted(&r.name))
+            qualified(schema, &r.name)
         })
         .collect();
     let limit = i64::try_from(scope.max_columns.saturating_add(1)).unwrap_or(i64::MAX);
@@ -328,13 +336,15 @@ impl CatalogReader for MsSqlCatalogReader {
             b.relations.insert((schema, name), index);
         }
 
-        let mut read = 0_usize;
-        for row in query(c, COLUMNS, &params, &cancel).await?.iter() {
+        for (read, row) in query(c, COLUMNS, &params, &cancel)
+            .await?
+            .iter()
+            .enumerate()
+        {
             if read >= scope.max_columns {
                 snap.truncated = true;
                 break;
             }
-            read += 1;
             let schema = row.string("schema_name")?;
             let rel = row.string("rel")?;
             let column = CatalogColumn {

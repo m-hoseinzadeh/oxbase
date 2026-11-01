@@ -54,9 +54,17 @@ fn column_pragma(v: &ServerVersion) -> &'static str {
     }
 }
 
-/// What a scope asks of one database: `None` = nothing; `Some(None)` = everything;
-/// `Some(Some(list))` = the relations of `list`.
-fn scope_for(scope: &CatalogScope, database: &str) -> Option<Option<String>> {
+/// What a scope asks of one database.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Wanted {
+    Nothing,
+    Everything,
+    /// The relations of this `"name"` list.
+    Relations(String),
+}
+
+/// What `scope` asks of `database`.
+fn scope_for(scope: &CatalogScope, database: &str) -> Wanted {
     if scope.is_full()
         || scope
             .schemas
@@ -64,7 +72,7 @@ fn scope_for(scope: &CatalogScope, database: &str) -> Option<Option<String>> {
             .flatten()
             .any(|s| s.eq_ignore_ascii_case(database))
     {
-        return Some(None);
+        return Wanted::Everything;
     }
     let list: String = scope
         .relations
@@ -78,7 +86,11 @@ fn scope_for(scope: &CatalogScope, database: &str) -> Option<Option<String>> {
         })
         .map(|r| quoted(&r.name))
         .collect();
-    (!list.is_empty()).then_some(Some(list))
+    if list.is_empty() {
+        Wanted::Nothing
+    } else {
+        Wanted::Relations(list)
+    }
 }
 
 /// The SQLite catalog reader. See the module docs.
@@ -121,14 +133,12 @@ impl CatalogReader for SqliteCatalogReader {
 
         let mut columns_read = 0_usize;
         for database in &databases {
-            let Some(filter) = scope_for(scope, &database.name) else {
-                continue;
+            let (all, list) = match scope_for(scope, &database.name) {
+                Wanted::Nothing => continue,
+                Wanted::Everything => (1, String::new()),
+                Wanted::Relations(list) => (0, list),
             };
             let from = format!("{}.{table}", AnsiQuoting.quote_ident(&database.name));
-            let (all, list) = match filter {
-                None => (1, String::new()),
-                Some(list) => (0, list),
-            };
             let params = [Value::Int(all), Value::Text(list.clone())];
             let mut schema = CatalogSchema::new(database.name.as_str());
             let mut index: HashMap<String, usize> = HashMap::new();
@@ -181,13 +191,11 @@ impl CatalogReader for SqliteCatalogReader {
                 // A view over a dropped table fails the pragma: read tables only.
                 Err(_) => cat.rows(&columns_sql("'table'"), &column_params).await?,
             };
-            let mut read = 0_usize;
-            for row in rows {
-                if read >= remaining {
-                    snap.truncated = true;
-                    break;
-                }
-                read += 1;
+            if rows.len() > remaining {
+                snap.truncated = true;
+            }
+            let read = rows.len().min(remaining);
+            for row in rows.into_iter().take(remaining) {
                 let Some(&i) = index.get(&row.string(0).to_ascii_lowercase()) else {
                     continue;
                 };
@@ -274,13 +282,13 @@ mod tests {
 
     #[test]
     fn scopes_pick_databases_and_relations() {
-        assert_eq!(scope_for(&CatalogScope::full(), "main"), Some(None));
+        assert_eq!(scope_for(&CatalogScope::full(), "main"), Wanted::Everything);
         let schemas = CatalogScope {
             schemas: Some(vec!["AUX".into()]),
             ..CatalogScope::full()
         };
-        assert_eq!(scope_for(&schemas, "aux"), Some(None));
-        assert_eq!(scope_for(&schemas, "main"), None);
+        assert_eq!(scope_for(&schemas, "aux"), Wanted::Everything);
+        assert_eq!(scope_for(&schemas, "main"), Wanted::Nothing);
         let relations = CatalogScope {
             relations: Some(vec![
                 RelationName {
@@ -294,12 +302,15 @@ mod tests {
             ]),
             ..CatalogScope::full()
         };
-        assert_eq!(scope_for(&relations, "main"), Some(Some("\"t\"".into())));
+        assert_eq!(
+            scope_for(&relations, "main"),
+            Wanted::Relations("\"t\"".into())
+        );
         assert_eq!(
             scope_for(&relations, "aux"),
-            Some(Some("\"u\"\"v\"".into()))
+            Wanted::Relations("\"u\"\"v\"".into())
         );
-        assert_eq!(scope_for(&relations, "temp"), None);
+        assert_eq!(scope_for(&relations, "temp"), Wanted::Nothing);
     }
 
     #[test]

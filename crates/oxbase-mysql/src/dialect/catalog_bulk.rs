@@ -210,13 +210,12 @@ impl CatalogReader for MySqlCatalogReader {
         }
 
         let limit = i64::try_from(scope.max_columns.saturating_add(1)).unwrap_or(i64::MAX);
-        let mut read = 0_usize;
-        for row in query(c, COLUMNS, &filter_params(Some(Value::Int(limit))), &cancel).await? {
+        let columns = query(c, COLUMNS, &filter_params(Some(Value::Int(limit))), &cancel).await?;
+        for (read, row) in columns.into_iter().enumerate() {
             if read >= scope.max_columns {
                 snap.truncated = true;
                 break;
             }
-            read += 1;
             let Some(&i) = index.get(&row.string(0)) else {
                 continue;
             };

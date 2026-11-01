@@ -113,6 +113,7 @@ use oxbase_types::{BoundStatement, Engine, Error, ErrorCategory, Result, Value};
 
 use crate::history::{HistoryRecord, HistoryService};
 use crate::results::{AppendOutcome, ByteBudget, ResultStore, RunDir};
+use crate::schema_cache::{ChangeSource, SchemaChangeEvent, SchemaEvents};
 use crate::{CancellationToken, ConnectionManager, SessionHandle, SessionId};
 
 #[cfg(test)]
@@ -530,6 +531,8 @@ pub struct QueryService {
     config: QueryConfig,
     disk: Arc<ByteBudget>,
     registry: Arc<Registry>,
+    /// M6: where statements that changed the schema are announced to the schema cache.
+    schema_events: Option<SchemaEvents>,
 }
 
 /// Runs and editors of a service, shared with the run tasks.
@@ -620,7 +623,16 @@ impl QueryService {
             config,
             disk,
             registry: Arc::new(Registry::default()),
+            schema_events: None,
         }
+    }
+
+    /// M6: publishes a [`SchemaChangeEvent`] on `events` after each statement that succeeded
+    /// and that `oxbase_sql::schema_changes` reads as DDL, so the schema cache refreshes.
+    #[must_use]
+    pub fn with_schema_events(mut self, events: SchemaEvents) -> Self {
+        self.schema_events = Some(events);
+        self
     }
 
     pub fn manager(&self) -> &Arc<ConnectionManager> {
@@ -863,6 +875,7 @@ impl QueryService {
             history: Arc::clone(&self.history),
             rows_interval: self.config.rows_event_interval,
             tx,
+            schema_events: self.schema_events.clone(),
         };
         tokio::spawn(supervise(context));
         Ok(RunHandle {
@@ -1166,6 +1179,8 @@ struct RunContext {
     history: Arc<HistoryService>,
     rows_interval: Duration,
     tx: mpsc::Sender<RunEvent>,
+    /// M6: the schema-change bus, when the app wired one.
+    schema_events: Option<SchemaEvents>,
 }
 
 /// How a statement ended.
@@ -1274,6 +1289,7 @@ async fn execute(context: RunContext) {
         let elapsed_ms = millis(elapsed);
         match outcome {
             Outcome::Done { rows_affected, .. } => {
+                context.announce_schema_changes(&statement.text);
                 context
                     .emit(RunEvent::StatementDone {
                         statement_index: index,
@@ -1335,6 +1351,23 @@ async fn execute(context: RunContext) {
 }
 
 impl RunContext {
+    /// M6: publishes the schema changes `statement` (which succeeded) probably made.
+    fn announce_schema_changes(&self, statement: &str) {
+        let Some(events) = &self.schema_events else {
+            return;
+        };
+        let changes = oxbase_sql::schema_changes(self.dialect, statement);
+        if changes.is_empty() {
+            return;
+        }
+        events.publish(SchemaChangeEvent {
+            session: self.session().id(),
+            database: self.database.clone(),
+            source: ChangeSource::Query,
+            changes,
+        });
+    }
+
     /// The session statements run on now.
     fn session(&self) -> SessionHandle {
         lock(&self.session).clone()

@@ -13,6 +13,7 @@ use futures::stream::BoxStream;
 use oxbase_dialect::{BulkLoader, DialectRegistry, LoadColumn, LoadSession, LoadTarget};
 use oxbase_driver::{Connection, Tx};
 use oxbase_io::{ColumnSpec, SourceBatch, SourceReader};
+use oxbase_sql::DdlVerb;
 use oxbase_types::{BoundStatement, Error, Result, ScriptStep};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -24,6 +25,7 @@ use super::{
     Prepared, TargetMode, close_work_session, value_formats, work_session,
 };
 use crate::query::ErrorInfo;
+use crate::schema_cache::{ChangeSource, SchemaEvents, object_event};
 use crate::{CancellationToken, ConnectionManager, SessionGuard, SessionHandle};
 
 /// Opens the source (`oxbase_io::open`, or a test reader). Runs on a blocking thread.
@@ -60,6 +62,8 @@ pub(super) struct Job {
     pub token: CancellationToken,
     pub events: mpsc::Sender<ImportEvent>,
     pub running: Arc<Mutex<HashMap<ImportId, CancellationToken>>>,
+    /// M6: the schema-change bus, when the app wired one.
+    pub schema_events: Option<SchemaEvents>,
 }
 
 /// Counters and what happened to the table.
@@ -153,6 +157,7 @@ impl Job {
             .remove(&self.id);
         let ok = outcome.is_ok();
         let report = self.report(&st, ok, started);
+        self.announce(&st, &report);
         let event = match outcome {
             Ok(()) => ImportEvent::Finished { report },
             Err(e) if e.is_cancelled() || self.token.is_cancelled() => {
@@ -164,6 +169,27 @@ impl Job {
             },
         };
         let _ = self.events.send(event).await;
+    }
+
+    /// M6: tells the schema cache about the table the import created, replaced or dropped
+    /// again.
+    fn announce(&self, st: &State, report: &ImportReport) {
+        let Some(events) = &self.schema_events else {
+            return;
+        };
+        let p = &self.prepared;
+        if !p.plan.creates_table
+            || !(report.table_created || report.table_dropped || st.old_dropped)
+        {
+            return;
+        }
+        events.publish(object_event(
+            &self.dialects,
+            p.engine,
+            self.request.target.session,
+            ChangeSource::Import,
+            &[(DdlVerb::Create, &p.plan.table)],
+        ));
     }
 
     /// Everything on the work session: load, then clean up after a failure.

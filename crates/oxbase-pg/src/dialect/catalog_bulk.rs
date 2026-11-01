@@ -167,6 +167,14 @@ fn quoted(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
+/// A `"schema"."name"` entry.
+fn qualified(schema: &str, name: &str) -> String {
+    let mut out = quoted(schema);
+    out.push('.');
+    out.push_str(&quoted(name));
+    out
+}
+
 /// The bound `$1`-`$3` of a scope; `default_schema` stands in for relations without a schema.
 fn scope_params(scope: &CatalogScope, default_schema: &str) -> [Value; 3] {
     let schemas = scope.schemas.as_ref().map_or(Value::Null, |s| {
@@ -177,7 +185,7 @@ fn scope_params(scope: &CatalogScope, default_schema: &str) -> [Value; 3] {
             r.iter()
                 .map(|r| {
                     let schema = r.schema.as_deref().unwrap_or(default_schema);
-                    format!("{}.{}", quoted(schema), quoted(&r.name))
+                    qualified(schema, &r.name)
                 })
                 .collect(),
         )
@@ -316,13 +324,11 @@ impl CatalogReader for PgCatalogReader {
         let limit = i64::try_from(scope.max_columns.saturating_add(1)).unwrap_or(i64::MAX);
         let column_params = [system, schemas, relations, Value::Int(limit)];
         let columns = query(c, COLUMNS, &column_params, &cancel).await?;
-        let mut read = 0_usize;
-        for row in columns.iter() {
+        for (read, row) in columns.iter().enumerate() {
             if read >= scope.max_columns {
                 snap.truncated = true;
                 break;
             }
-            read += 1;
             let schema = row.string("schema_name")?;
             let rel = row.string("rel")?;
             let column = CatalogColumn {
