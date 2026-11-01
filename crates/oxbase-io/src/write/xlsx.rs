@@ -262,13 +262,14 @@ impl Cells {
                         None
                     }
                 },
-                ArrowType::Time32(_) | ArrowType::Time64(_) => match time_at(array, index) {
-                    Some(v) => Some(done(ws.write_time_with_format(row, col, v, &self.time))),
-                    None => {
+                ArrowType::Time32(_) | ArrowType::Time64(_) => {
+                    if let Some(v) = time_at(array, index) {
+                        Some(done(ws.write_time_with_format(row, col, v, &self.time)))
+                    } else {
                         self.forms.push_text(array, index, &mut self.text)?;
                         None
                     }
-                },
+                }
                 ArrowType::FixedSizeBinary(16) => {
                     push_uuid(bytes_at(array, index).unwrap_or_default(), &mut self.text);
                     None

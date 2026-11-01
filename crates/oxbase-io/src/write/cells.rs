@@ -705,7 +705,7 @@ mod tests {
         let naive = TimestampMicrosecondArray::from(vec![1_700_000_000_000_000]);
         assert_eq!(text(&forms, &naive, 0), "2023-11-14 22:13:20");
 
-        let uuid = FixedSizeBinaryArray::try_from_iter([[0xab_u8; 16]]).unwrap();
+        let uuid = FixedSizeBinaryArray::try_from_iter([[0xab_u8; 16]].into_iter()).unwrap();
         assert_eq!(
             text(&forms, &uuid, 0),
             "abababab-abab-abab-abab-abababababab"

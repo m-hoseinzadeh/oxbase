@@ -192,27 +192,26 @@ fn create_script(
             }
         }
     }
-    let script = match create(&candidate) {
-        Ok(script) => script,
-        Err(_) => {
-            let commented = candidate.comment.is_some()
-                || candidate.columns.iter().any(|c| c.comment.is_some());
-            if !commented {
-                return Err(first);
-            }
-            candidate.comment = None;
-            for column in &mut candidate.columns {
-                column.comment = None;
-            }
-            let Ok(script) = create(&candidate) else {
-                return Err(first);
-            };
-            changes.push(format!(
-                "comments left out: {} refused them",
-                target.display_name()
-            ));
-            script
+    let script = if let Ok(script) = create(&candidate) {
+        script
+    } else {
+        let commented =
+            candidate.comment.is_some() || candidate.columns.iter().any(|c| c.comment.is_some());
+        if !commented {
+            return Err(first);
         }
+        candidate.comment = None;
+        for column in &mut candidate.columns {
+            column.comment = None;
+        }
+        let Ok(script) = create(&candidate) else {
+            return Err(first);
+        };
+        changes.push(format!(
+            "comments left out: {} refused them",
+            target.display_name()
+        ));
+        script
     };
     notes.extend(changes);
     *table = candidate;
