@@ -42,6 +42,9 @@ const MAX_ROW_GROUP_BYTES: i64 = 4 * 1024 * 1024 * 1024;
 /// Fractional-second digits the load types keep (microseconds).
 const MAX_TIME_PRECISION: u8 = 6;
 
+/// The zone of zoned timestamps once read (an offset needs no time-zone database).
+const UTC_OFFSET: &str = "+00:00";
+
 struct Opened {
     file: File,
     metadata: ArrowReaderMetadata,
@@ -99,6 +102,41 @@ fn preview_type(field: &arrow_schema::Field) -> DataType {
             precision: precision.map(|p| p.min(MAX_TIME_PRECISION)),
         },
         other => other,
+    }
+}
+
+/// Timestamps with a named zone (`UTC`, `Europe/Paris`) as the same instants at `+00:00`.
+/// Arrow needs `chrono-tz` to display or cast a named zone, which oxbase does not build; the
+/// values are UTC instants either way.
+fn with_utc_offset(array: &ArrayRef) -> ArrayRef {
+    let ArrowType::Timestamp(unit, Some(_)) = array.data_type() else {
+        return Arc::clone(array);
+    };
+    match unit {
+        TimeUnit::Second => Arc::new(
+            array
+                .as_primitive::<TimestampSecondType>()
+                .clone()
+                .with_timezone(UTC_OFFSET),
+        ),
+        TimeUnit::Millisecond => Arc::new(
+            array
+                .as_primitive::<TimestampMillisecondType>()
+                .clone()
+                .with_timezone(UTC_OFFSET),
+        ),
+        TimeUnit::Microsecond => Arc::new(
+            array
+                .as_primitive::<TimestampMicrosecondType>()
+                .clone()
+                .with_timezone(UTC_OFFSET),
+        ),
+        TimeUnit::Nanosecond => Arc::new(
+            array
+                .as_primitive::<TimestampNanosecondType>()
+                .clone()
+                .with_timezone(UTC_OFFSET),
+        ),
     }
 }
 
@@ -182,7 +220,7 @@ pub(crate) fn preview(
             for (i, (field, array)) in schema.fields().iter().zip(batch.columns()).enumerate() {
                 nulls[i] += array.null_count();
                 if shown > 0 {
-                    let head = array.slice(0, shown);
+                    let head = with_utc_offset(&array.slice(0, shown));
                     columns.push(texts(field, head.as_ref()).map_err(|e| invalid(path, e))?);
                 }
             }
@@ -451,6 +489,7 @@ fn convert(
     target: &ArrowType,
     formats: &ValueFormats,
 ) -> std::result::Result<Converted, String> {
+    let array = &with_utc_offset(array);
     let source = array.data_type();
     if let ArrowType::Dictionary(_, values) = source {
         let plain =
