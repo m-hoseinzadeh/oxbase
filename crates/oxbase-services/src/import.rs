@@ -78,22 +78,35 @@
 //!
 //! Owner of the bodies: the **services** stream.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use oxbase_dialect::{BulkMethod, DialectRegistry};
-use oxbase_io::{ColumnSpec, PreviewLimits, ReadOptions, SourcePreview};
-use oxbase_types::{DataType, Error, ObjectRef, Result};
+use oxbase_dialect::{BulkMethod, DatabaseScope, DdlContext, DialectRegistry, LoadColumn};
+use oxbase_io::{ColumnSpec, PreviewLimits, ReadOptions, SourcePreview, ValueFormats};
+use oxbase_types::{
+    ColumnDef, DataType, Engine, Error, ErrorCategory, ObjectDef, ObjectKind, ObjectRef,
+    PrimaryKeyDef, Result, ScriptStep, ServerVersion, StepPhase, TableDef,
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::query::ErrorInfo;
 use crate::tree::TreeService;
-use crate::{CancellationToken, ConnectionManager, SessionId, check_cancelled};
+use crate::{CancellationToken, ConnectionManager, SessionHandle, SessionId, check_cancelled};
+
+mod convert;
+mod run;
+
+#[cfg(test)]
+pub(crate) mod live_tests;
+#[cfg(test)]
+pub(crate) mod testing;
+#[cfg(test)]
+mod tests;
 
 /// Identifies one import run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -425,8 +438,7 @@ impl Default for ImportConfig {
 /// (midnight); timestamp → date only with the note "time of day dropped"; timestamp ↔
 /// timestamp_tz (UTC); bool ↔ int (0 / 1); uuid ↔ text; binary ↔ text (hex `0x...`).
 pub fn conversion_note(from: &DataType, to: &DataType) -> Result<Option<String>> {
-    let _ = (from, to);
-    unimplemented!("m5: services")
+    convert::note(from, to)
 }
 
 /// Imports files into tables. See the module docs.
@@ -435,8 +447,8 @@ pub struct ImportService {
     tree: Arc<TreeService>,
     dialects: Arc<DialectRegistry>,
     config: ImportConfig,
-    /// Cancel tokens of the running imports.
-    running: Mutex<HashMap<ImportId, CancellationToken>>,
+    /// Cancel tokens of the running imports (shared with the run tasks, which remove theirs).
+    running: Arc<Mutex<HashMap<ImportId, CancellationToken>>>,
 }
 
 impl ImportService {
@@ -451,7 +463,7 @@ impl ImportService {
             tree,
             dialects,
             config,
-            running: Mutex::new(HashMap::new()),
+            running: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -488,34 +500,79 @@ impl ImportService {
 
     /// Checks `request` against the target and returns what a run would do (module docs,
     /// step 3). Runs nothing that changes the database.
-    #[allow(
-        clippy::unused_async,
-        reason = "skeleton: the services stream fills it in"
-    )]
     pub async fn plan(
         &self,
         source: &ImportSource,
         request: &ImportRequest,
         cancel: CancellationToken,
     ) -> Result<ImportPlan> {
-        let _ = (self, source, request, cancel);
-        unimplemented!("m5: services")
+        Ok(self.prepare(source, request, &cancel).await?.plan)
     }
 
     /// Starts importing `source` per `request` (module docs, step 4) and returns once the plan
     /// checks passed and the import is registered; events follow on the handle. Fails before
     /// starting like [`ImportService::plan`].
-    #[allow(
-        clippy::unused_async,
-        reason = "skeleton: the services stream fills it in"
-    )]
+    ///
+    /// The file is read with `request.options` (the app builds `source.options` from the same
+    /// request).
     pub async fn start(
         &self,
         source: ImportSource,
         request: ImportRequest,
     ) -> Result<ImportHandle> {
-        let _ = (self, source, request);
-        unimplemented!("m5: services")
+        let path = source.path.clone();
+        let options = request.options.clone();
+        let columns = request.columns.clone();
+        let batch_rows = self.config.batch_rows;
+        let open: run::Opener =
+            Box::new(move || oxbase_io::open(&path, &options, &columns, batch_rows));
+        self.start_with(&source, request, open).await
+    }
+
+    /// [`ImportService::start`] reading from `reader` instead of opening the file (tests:
+    /// in-memory sources and slow sources for cancel). `source.path` still sizes the
+    /// transaction policy.
+    #[cfg(test)]
+    pub(crate) async fn start_with_reader(
+        &self,
+        source: &ImportSource,
+        request: ImportRequest,
+        reader: Box<dyn oxbase_io::SourceReader>,
+    ) -> Result<ImportHandle> {
+        self.start_with(source, request, Box::new(move || Ok(reader)))
+            .await
+    }
+
+    async fn start_with(
+        &self,
+        source: &ImportSource,
+        request: ImportRequest,
+        open: run::Opener,
+    ) -> Result<ImportHandle> {
+        let token = CancellationToken::new();
+        let prepared = self.prepare(source, &request, &token).await?;
+        let id = ImportId::new();
+        let (events, receiver) = mpsc::channel(self.config.event_capacity.max(1));
+        self.running
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(id, token.clone());
+        let job = run::Job {
+            id,
+            prepared,
+            request,
+            manager: Arc::clone(&self.manager),
+            dialects: Arc::clone(&self.dialects),
+            config: self.config.clone(),
+            token,
+            events,
+            running: Arc::clone(&self.running),
+        };
+        tokio::spawn(job.run(open));
+        Ok(ImportHandle {
+            id,
+            events: receiver,
+        })
     }
 
     /// Cancels a running import. `false` when it is unknown or already ended.
@@ -536,10 +593,539 @@ impl ImportService {
             .unwrap_or_else(PoisonError::into_inner)
             .contains_key(&id)
     }
+
+    /// The plan checks of the module docs (step 3), and everything a run needs.
+    async fn prepare(
+        &self,
+        source: &ImportSource,
+        request: &ImportRequest,
+        cancel: &CancellationToken,
+    ) -> Result<Prepared> {
+        check_cancelled(cancel)?;
+        request.options.validate()?;
+        check_shape(request)?;
+        let session = request.target.session;
+        let base = self
+            .manager
+            .get(session)
+            .ok_or_else(|| Error::not_found(format!("no open session {session}")))?;
+        if base.summary().parent.is_some() {
+            return Err(Error::invalid_input(
+                "an import targets a base session, not a child session",
+            ));
+        }
+        let engine = base.summary().engine;
+        let version = base.info().server_version.clone();
+        let table = &request.target.table;
+        if table.kind != ObjectKind::Table || table.name.trim().is_empty() {
+            return Err(Error::invalid_input(format!(
+                "{} is not a table",
+                table.display_name()
+            )));
+        }
+        let total_bytes = file_size(&source.path)?;
+        let existing = match self.tree.load(session, table, cancel.clone()).await {
+            Ok(ObjectDef::Table(def)) => Some(def),
+            Ok(other) => {
+                return Err(Error::invalid_input(format!(
+                    "{} is not a table",
+                    other.object_ref().display_name()
+                )));
+            }
+            Err(e) if e.category() == ErrorCategory::NotFound => None,
+            Err(e) => return Err(e),
+        };
+        check_cancelled(cancel)?;
+
+        let mode = request.target.mode;
+        let creates = matches!(mode, TargetMode::Create | TargetMode::Replace);
+        let mut warnings = Vec::new();
+        let def = match mode {
+            TargetMode::Create if existing.is_some() => {
+                return Err(Error::invalid_input(format!(
+                    "{} already exists; append to it or replace it",
+                    table.display_name()
+                )));
+            }
+            TargetMode::Create | TargetMode::Replace => new_table(request)?,
+            TargetMode::Append | TargetMode::Truncate | TargetMode::DeleteAll => {
+                existing.clone().ok_or_else(|| {
+                    Error::not_found(format!(
+                        "{} does not exist; create it with the create mode",
+                        table.display_name()
+                    ))
+                })?
+            }
+        };
+        if !creates && !request.primary_key.is_empty() {
+            warnings.push(
+                "the primary key applies only when the import creates the table; it is ignored"
+                    .to_owned(),
+            );
+        }
+        let (columns, planned) = map_columns(request, &def)?;
+        check_required(&def, &columns)?;
+
+        let ddl = self.target_ddl(engine, &version, mode, table, &def, existing.is_some())?;
+        warnings.extend(ddl.warnings.iter().cloned());
+        let ddl_in_tx = ddl
+            .steps
+            .iter()
+            .all(|s| s.transactional && s.phase == StepPhase::Main);
+        let method = self.dialects.bulk_loader(engine)?.method(&version);
+        let commit_every = match request.transaction {
+            TransactionPolicy::Single => None,
+            TransactionPolicy::Batches { rows } => Some(rows.max(1)),
+            TransactionPolicy::Auto => (total_bytes > self.config.single_transaction_max_bytes)
+                .then_some(self.config.default_commit_rows.max(1)),
+        };
+        let existed = existing.is_some();
+        let destructive = match mode {
+            TargetMode::Truncate => !ddl_in_tx,
+            TargetMode::Replace => existed && (!ddl_in_tx || commit_every.is_some()),
+            TargetMode::Create | TargetMode::Append | TargetMode::DeleteAll => false,
+        };
+        if creates && !ddl_in_tx {
+            warnings.push(format!(
+                "{} commits each DDL statement at once: if the import fails or is cancelled, \
+                 the table it created is dropped",
+                engine.display_name()
+            ));
+        }
+        if mode == TargetMode::Truncate && !ddl_in_tx {
+            warnings.push(
+                "TRUNCATE commits at once: if the import fails or is cancelled, the table stays \
+                 empty"
+                    .to_owned(),
+            );
+        }
+        if mode == TargetMode::Replace && existed && destructive {
+            warnings.push(
+                "the old table is dropped for good before every row is in: if the import fails \
+                 or is cancelled, it is gone"
+                    .to_owned(),
+            );
+        }
+        let transactional_storage = match (&existing, creates) {
+            (Some(def), false) => match self.dialects.dml_writer(engine) {
+                Ok(writer) => writer.transactional(def),
+                Err(_) => true,
+            },
+            _ => true,
+        };
+        if !transactional_storage {
+            warnings.push(
+                "the table's storage does not support transactions: rows inserted before a \
+                 failure or a cancel stay in the table"
+                    .to_owned(),
+            );
+        }
+        let plan = ImportPlan {
+            table: table.clone(),
+            mode,
+            creates_table: creates,
+            ddl: ddl.steps.iter().map(|s| s.sql.clone()).collect(),
+            columns: planned,
+            method,
+            transaction: ResolvedTransaction { commit_every },
+            destructive,
+            warnings,
+        };
+        Ok(Prepared {
+            plan,
+            engine,
+            version,
+            ddl: ddl.steps,
+            drops: ddl.drops,
+            ddl_in_tx,
+            drop_new: ddl.drop_new,
+            columns,
+            total_bytes,
+            existed,
+            transactional_storage,
+        })
+    }
+
+    /// What runs before the rows go in, per target mode.
+    fn target_ddl(
+        &self,
+        engine: Engine,
+        version: &ServerVersion,
+        mode: TargetMode,
+        table: &ObjectRef,
+        def: &TableDef,
+        exists: bool,
+    ) -> Result<TargetDdl> {
+        let ctx = DdlContext::new(version);
+        let mut out = TargetDdl::default();
+        match mode {
+            TargetMode::Append => {}
+            TargetMode::Create | TargetMode::Replace => {
+                let generator = self.dialects.ddl(engine, ObjectKind::Table)?;
+                if mode == TargetMode::Replace && exists {
+                    let drop = generator.drop_object(table, &ctx)?;
+                    out.warnings.extend(drop.warnings.iter().cloned());
+                    out.steps.extend(drop.ordered().cloned());
+                    out.drops = out.steps.len();
+                }
+                let create = generator.create(&ObjectDef::Table(def.clone()), &ctx)?;
+                out.warnings.extend(create.warnings.iter().cloned());
+                out.steps.extend(create.ordered().cloned());
+                out.drop_new = generator
+                    .drop_object(table, &ctx)?
+                    .ordered()
+                    .cloned()
+                    .collect();
+            }
+            TargetMode::Truncate | TargetMode::DeleteAll => {
+                let quoting = self.dialects.quoting(engine)?;
+                let qualified = quoting.qualify(table);
+                // File databases (`Attached` scope) have no TRUNCATE statement.
+                let attached = self
+                    .dialects
+                    .tree_layout(engine)
+                    .is_ok_and(|layout| layout.scope == DatabaseScope::Attached);
+                let step = if mode == TargetMode::Truncate && !attached {
+                    let transactional_ddl = match self.dialects.capabilities(engine) {
+                        Ok(caps) => caps.designer(version).transactional_ddl,
+                        Err(_) => true,
+                    };
+                    let step = ScriptStep::new(format!("TRUNCATE TABLE {qualified}"))
+                        .described(format!("Empty table {}", table.name))
+                        .destructive();
+                    if transactional_ddl {
+                        step
+                    } else {
+                        step.non_transactional()
+                    }
+                } else {
+                    ScriptStep::new(format!("DELETE FROM {qualified}"))
+                        .described(format!("Delete every row of {}", table.name))
+                        .destructive()
+                };
+                out.steps.push(step);
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl fmt::Debug for ImportService {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ImportService")
+            .field("config", &self.config)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The DDL of a target mode.
+#[derive(Debug, Default)]
+struct TargetDdl {
+    steps: Vec<ScriptStep>,
+    /// The first `drops` steps drop the old table (replace).
+    drops: usize,
+    /// Drops the table the import creates (create / replace clean-up).
+    drop_new: Vec<ScriptStep>,
+    warnings: Vec<String>,
+}
+
+/// A checked request: the plan and what the run needs besides it.
+#[derive(Debug, Clone)]
+struct Prepared {
+    plan: ImportPlan,
+    engine: Engine,
+    version: ServerVersion,
+    /// DDL steps in execution order.
+    ddl: Vec<ScriptStep>,
+    /// The first `drops` steps of `ddl` drop the old table.
+    drops: usize,
+    /// Every DDL step can run inside the import's first transaction.
+    ddl_in_tx: bool,
+    /// Drops the table the import creates (clean-up after a failure).
+    drop_new: Vec<ScriptStep>,
+    /// Per load column: the source column index, its source type and the target column.
+    columns: Vec<(usize, DataType, LoadColumn)>,
+    total_bytes: u64,
+    /// The target table existed when the plan was made.
+    existed: bool,
+    /// A rollback undoes inserted rows (`DmlWriter::transactional`).
+    transactional_storage: bool,
+}
+
+/// The value formats a reader uses (text parsing in conversions).
+fn value_formats(options: &ReadOptions) -> ValueFormats {
+    match options {
+        ReadOptions::Csv(o) => o.formats.clone(),
+        ReadOptions::Json(o) => o.formats.clone(),
+        ReadOptions::Xlsx(o) => o.formats.clone(),
+        ReadOptions::Parquet(_) => ValueFormats::default(),
+    }
+}
+
+/// The size of the file to import; errors name the file's base name only.
+fn file_size(path: &Path) -> Result<u64> {
+    std::fs::metadata(path)
+        .as_ref()
+        .map(std::fs::Metadata::len)
+        .map_err(|e| Error::Io {
+            kind: e.kind().to_string(),
+            message: format!("{}: {e}", oxbase_io::file_label(path)),
+        })
+}
+
+/// Checks that need no database: columns, mapping indexes, target names.
+fn check_shape(request: &ImportRequest) -> Result<()> {
+    if request.columns.is_empty() {
+        return Err(Error::invalid_input("the file has no columns to import"));
+    }
+    for (pos, mapping) in request.mapping.iter().enumerate() {
+        if mapping.source >= request.columns.len() {
+            return Err(Error::invalid_input(format!(
+                "mapping {} names source column {}, the file has {}",
+                pos + 1,
+                mapping.source + 1,
+                request.columns.len()
+            )));
+        }
+        if mapping
+            .target
+            .as_deref()
+            .is_some_and(|t| t.trim().is_empty())
+        {
+            return Err(Error::invalid_input(format!(
+                "source column '{}' is mapped to an empty column name",
+                request.columns[mapping.source].name
+            )));
+        }
+    }
+    if !request.mapping.iter().any(|m| m.target.is_some()) {
+        return Err(Error::invalid_input(
+            "map at least one source column to a target column",
+        ));
+    }
+    Ok(())
+}
+
+/// The table create / replace mode makes: one column per mapping (type from the mapping, else
+/// the source's), `native_type` empty so the target dialect derives it, the primary key from
+/// the request.
+fn new_table(request: &ImportRequest) -> Result<TableDef> {
+    let mut def = TableDef::new(request.target.table.clone());
+    for mapping in &request.mapping {
+        let Some(name) = mapping.target.as_deref() else {
+            continue;
+        };
+        if def.column(name).is_some() {
+            return Err(Error::invalid_input(format!(
+                "column '{name}' is mapped more than once"
+            )));
+        }
+        let data_type = mapping
+            .data_type
+            .clone()
+            .unwrap_or_else(|| request.columns[mapping.source].data_type.clone());
+        def.columns.push(ColumnDef::new(name, data_type));
+    }
+    if !request.primary_key.is_empty() {
+        let mut seen = HashSet::new();
+        for key in &request.primary_key {
+            if !seen.insert(key.as_str()) {
+                return Err(Error::invalid_input(format!(
+                    "primary key column '{key}' is listed twice"
+                )));
+            }
+            let column = def
+                .columns
+                .iter_mut()
+                .find(|c| c.name == *key)
+                .ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "primary key column '{key}' is not one of the imported columns"
+                    ))
+                })?;
+            column.nullable = false;
+        }
+        def.primary_key = Some(PrimaryKeyDef {
+            name: None,
+            columns: request.primary_key.clone(),
+        });
+    }
+    Ok(def)
+}
+
+/// The column of `def` named `name`: exactly, else the only one equal ignoring ASCII case.
+fn find_column<'a>(def: &'a TableDef, name: &str) -> Option<&'a ColumnDef> {
+    def.column(name).or_else(|| {
+        let mut matches = def
+            .columns
+            .iter()
+            .filter(|c| c.name.eq_ignore_ascii_case(name));
+        let first = matches.next()?;
+        matches.next().is_none().then_some(first)
+    })
+}
+
+/// The load columns and plan columns of the mapping, checked against `def`.
+#[allow(
+    clippy::type_complexity,
+    reason = "a private pair of the two views of the same columns"
+)]
+fn map_columns(
+    request: &ImportRequest,
+    def: &TableDef,
+) -> Result<(Vec<(usize, DataType, LoadColumn)>, Vec<PlannedColumn>)> {
+    let mut seen = HashSet::new();
+    let mut columns = Vec::new();
+    let mut planned = Vec::new();
+    for mapping in &request.mapping {
+        let Some(target) = mapping.target.as_deref() else {
+            continue;
+        };
+        let spec = &request.columns[mapping.source];
+        let column = find_column(def, target).ok_or_else(|| {
+            Error::invalid_input(format!(
+                "{} has no column '{target}'",
+                def.obj.display_name()
+            ))
+        })?;
+        if !seen.insert(column.name.clone()) {
+            return Err(Error::invalid_input(format!(
+                "column '{}' is mapped more than once",
+                column.name
+            )));
+        }
+        if column.generated.is_some() {
+            return Err(Error::invalid_input(format!(
+                "column '{}' is generated: its values cannot be imported",
+                column.name
+            )));
+        }
+        if column.identity.as_ref().is_some_and(|i| i.always) {
+            return Err(Error::invalid_input(format!(
+                "column '{}' is an identity column GENERATED ALWAYS: the server makes its values",
+                column.name
+            )));
+        }
+        let Ok(conversion) = conversion_note(&spec.data_type, &column.data_type) else {
+            return Err(Error::invalid_input(format!(
+                "column '{}': there is no conversion from {} (source column '{}') to {}",
+                column.name, spec.data_type, spec.name, column.data_type
+            )));
+        };
+        planned.push(PlannedColumn {
+            source: mapping.source,
+            source_name: spec.name.clone(),
+            source_type: spec.data_type.clone(),
+            target: column.name.clone(),
+            target_type: column.data_type.clone(),
+            conversion,
+        });
+        columns.push((
+            mapping.source,
+            spec.data_type.clone(),
+            LoadColumn {
+                name: column.name.clone(),
+                data_type: column.data_type.clone(),
+                native_type: column.native_type.clone(),
+                nullable: column.nullable,
+            },
+        ));
+    }
+    if columns.is_empty() {
+        return Err(Error::invalid_input(
+            "map at least one source column to a target column",
+        ));
+    }
+    Ok((columns, planned))
+}
+
+/// Every NOT NULL column without a default (or a generated value) must be mapped.
+fn check_required(def: &TableDef, columns: &[(usize, DataType, LoadColumn)]) -> Result<()> {
+    let missing: Vec<&str> = def
+        .columns
+        .iter()
+        .filter(|c| {
+            !c.nullable
+                && c.default.is_none()
+                && !c.auto_increment
+                && c.identity.is_none()
+                && c.generated.is_none()
+                && !columns.iter().any(|(_, _, l)| l.name == c.name)
+        })
+        .map(|c| c.name.as_str())
+        .collect();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::invalid_input(format!(
+            "these NOT NULL columns have no default and no source column: {}",
+            missing.join(", ")
+        )))
+    }
+}
+
+/// A session an import or export works on: a dedicated child of the base session (closed
+/// afterwards), or the base itself when its children would not see its data (a private
+/// in-memory database).
+pub(crate) struct WorkSession {
+    pub handle: SessionHandle,
+    pub dedicated: bool,
+}
+
+/// Opens the [`WorkSession`] for base session `base` on `database` (ignored on engines whose
+/// databases are all visible from one session).
+pub(crate) async fn work_session(
+    manager: &ConnectionManager,
+    dialects: &DialectRegistry,
+    base: SessionId,
+    database: Option<&str>,
+    cancel: &CancellationToken,
+) -> Result<WorkSession> {
+    let handle = manager
+        .get(base)
+        .ok_or_else(|| Error::not_found(format!("no open session {base}")))?;
+    if !manager.children_share_data(base) {
+        return Ok(WorkSession {
+            handle,
+            dedicated: false,
+        });
+    }
+    let attached = dialects
+        .tree_layout(handle.summary().engine)
+        .is_ok_and(|layout| layout.scope == DatabaseScope::Attached);
+    let database = if attached { None } else { database };
+    let child = manager.open_child(base, database, cancel.clone()).await?;
+    Ok(WorkSession {
+        handle: child,
+        dedicated: true,
+    })
+}
+
+/// Closes a dedicated work session, waiting at most `wait` (the close goes on in the
+/// background after that).
+pub(crate) async fn close_work_session(
+    manager: &Arc<ConnectionManager>,
+    session: WorkSession,
+    wait: Duration,
+) {
+    if !session.dedicated {
+        return;
+    }
+    let manager = Arc::clone(manager);
+    let id = session.handle.id();
+    drop(session);
+    let closing = tokio::spawn(async move {
+        if let Err(e) = manager.close(id).await
+            && e.category() != ErrorCategory::NotFound
+        {
+            tracing::debug!(session = %id, error = %e, "closing a work session failed");
+        }
+    });
+    let _ = tokio::time::timeout(wait, closing).await;
 }
 
 #[cfg(test)]
-mod tests {
+mod shape_tests {
     use super::*;
     use oxbase_io::CsvReadOptions;
     use pretty_assertions::assert_eq;
