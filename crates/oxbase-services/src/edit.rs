@@ -41,6 +41,14 @@
 //!    ("the row was changed or deleted by someone else"). The first failure or conflict rolls
 //!    everything back: that edit gets its status and error, the ones that ran before it
 //!    [`EditStatus::RolledBack`], the rest [`EditStatus::NotRun`].
+//!
+//!    **Tables that cannot roll back.** When the engine's `DmlWriter` says the table is not
+//!    transactional (`DmlWriter::transactional`: MySQL / MariaDB `MyISAM`, `MEMORY`, ...),
+//!    [`Editability::transactional`] is `false` with [`warnings::NOT_TRANSACTIONAL`], and
+//!    every write is kept as soon as it runs. An apply that stops then reports the edits that
+//!    ran before the stop as [`EditStatus::Applied`] (recorded in the overlay, with the
+//!    [`warnings::KEPT`] warning), never as rolled back; `committed` stays `false` because
+//!    not every edit was applied.
 //! 4. **Commit**, then report every edit [`EditStatus::Applied`] with its row read back
 //!    (`RETURNING` or the writer's read-back query) as edit texts in result-column order. The
 //!    service keeps these values as an overlay of the (immutable) result store: later edits,
@@ -95,6 +103,17 @@ pub mod reasons {
     pub const KEY_NOT_IN_RESULT: &str = "the result does not include every key column";
     /// The engine registered no `DmlWriter`.
     pub const ENGINE: &str = "editing is not available for this database engine yet";
+}
+
+/// Warnings [`Editability::warning`] and [`EditOutcome::warning`] use (the UI may match on them).
+pub mod warnings {
+    /// [`Editability::warning`] of a table whose writes cannot be rolled back.
+    pub const NOT_TRANSACTIONAL: &str = "this table's storage engine does not support \
+        transactions: each change is saved as it runs, and changes saved before a failing one \
+        are kept";
+    /// [`EditOutcome::warning`] of an edit that ran before a failure on such a table.
+    pub const KEPT: &str = "saved and kept although a later change failed (this table's \
+        storage engine cannot roll back)";
 }
 
 /// How the UI edits one column.
@@ -185,6 +204,17 @@ pub struct Editability {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key: Option<RowKey>,
     pub columns: Vec<EditColumn>,
+    /// `false` when the table's writes cannot be rolled back (`DmlWriter::transactional`): an
+    /// apply that stops keeps the edits that ran before it (module docs).
+    #[serde(default = "yes")]
+    pub transactional: bool,
+    /// Shown with the grid, for example [`warnings::NOT_TRANSACTIONAL`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
+}
+
+fn yes() -> bool {
+    true
 }
 
 /// What the user typed into a cell.
@@ -308,7 +338,7 @@ impl PendingChanges {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum EditStatus {
-    /// Committed.
+    /// Committed (on a table that cannot roll back: written and kept).
     Applied,
     /// The key matched no row or more than one row; everything was rolled back.
     Conflict,
@@ -344,7 +374,8 @@ pub struct EditOutcome {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ApplyReport {
-    /// Everything was committed (all outcomes `applied`).
+    /// Everything was committed (all outcomes `applied`). `false` with some outcomes `applied`
+    /// only on a table that cannot roll back ([`Editability::transactional`]).
     pub committed: bool,
     /// One per pending edit, same order.
     pub outcomes: Vec<EditOutcome>,
@@ -595,6 +626,8 @@ impl EditService {
                 read_only_reason: Some(reasons::NOT_TABLE_DATA.to_owned()),
                 key: None,
                 columns,
+                transactional: true,
+                warning: None,
             });
         };
         Ok(self.analyse(run, &source))
@@ -643,6 +676,7 @@ impl EditService {
             .map(|r| r.rows)
             .ok_or_else(|| Error::invalid_input("the table data has no result to edit"))?;
         let writer = self.dialects.dml_writer(source.engine)?;
+        let transactional = writer.transactional(def);
         let names: Vec<String> = editability.columns.iter().map(|c| c.name.clone()).collect();
 
         // 1-2. Validate and plan everything before touching the database.
@@ -705,13 +739,20 @@ impl EditService {
                 });
                 break;
             }
-            match execute_plan(tx.as_ref(), &p.plan, &cancel).await {
+            match execute_plan(tx.as_ref(), &p.plan, !transactional, &cancel).await {
                 Ok(done) if done.affected == 1 => executed.push(done),
                 Ok(done) => {
+                    let mut error = conflict_error(done.affected);
+                    if !transactional && done.affected > 1 {
+                        error = Error::invalid_input(format!(
+                            "{error}; this table's storage engine cannot roll back, so the \
+                             change was kept on those rows: reload the data"
+                        ));
+                    }
                     stop = Some(Stop {
                         index,
                         status: EditStatus::Conflict,
-                        error: conflict_error(done.affected),
+                        error,
                     });
                     break;
                 }
@@ -730,11 +771,48 @@ impl EditService {
                 tracing::debug!(category = %e.category(), "rolling back table edits failed");
             }
             drop(guard);
-            return Ok(rolled_back(&prepared, &stop));
+            if transactional {
+                return Ok(rolled_back(&prepared, &stop));
+            }
+            // The writes that ran are kept: report and remember them as applied.
+            let mut overlay = lock(&source.overlay);
+            return Ok(kept_before_stop(
+                &mut overlay,
+                &Written {
+                    def,
+                    names: &names,
+                    stored_rows,
+                },
+                prepared,
+                executed,
+                &stop,
+            ));
         }
         if let Err(error) = tx.commit().await {
-            // The server refused the commit: nothing was kept.
             drop(guard);
+            if !transactional {
+                // Every write was kept as it ran, whatever ending the transaction says.
+                tracing::debug!(
+                    category = %error.category(),
+                    "ending a non-transactional apply failed"
+                );
+                let mut overlay = lock(&source.overlay);
+                let written = Written {
+                    def,
+                    names: &names,
+                    stored_rows,
+                };
+                let outcomes = prepared
+                    .into_iter()
+                    .zip(executed)
+                    .map(|(p, done)| written.record(&mut overlay, p, done))
+                    .collect();
+                return Ok(ApplyReport {
+                    committed: true,
+                    outcomes,
+                });
+            }
+            // The server refused the commit: nothing was kept.
             let last = prepared.len() - 1;
             let error = Error::sql(
                 None::<String>,
@@ -760,10 +838,15 @@ impl EditService {
 
         // 4. Committed: remember what the rows look like now.
         let mut overlay = lock(&source.overlay);
+        let written = Written {
+            def,
+            names: &names,
+            stored_rows,
+        };
         let outcomes = prepared
             .into_iter()
             .zip(executed)
-            .map(|(p, done)| record_applied(&mut overlay, def, &names, stored_rows, p, done))
+            .map(|(p, done)| written.record(&mut overlay, p, done))
             .collect();
         Ok(ApplyReport {
             committed: true,
@@ -884,6 +967,8 @@ impl EditService {
             read_only_reason: Some(reason.to_owned()),
             key,
             columns,
+            transactional: true,
+            warning: None,
         };
         let Some(def) = &source.def else {
             let columns = result_columns
@@ -926,6 +1011,12 @@ impl EditService {
             }
         };
         let editable = reason.is_none();
+        let transactional = self
+            .dialects
+            .dml_writer(source.engine)
+            .ok()
+            .is_none_or(|writer| writer.transactional(def));
+        let warning = (!transactional).then(|| warnings::NOT_TRANSACTIONAL.to_owned());
         let columns = names
             .iter()
             .enumerate()
@@ -944,6 +1035,8 @@ impl EditService {
                 read_only_reason: None,
                 key,
                 columns,
+                transactional,
+                warning,
             },
         }
     }
@@ -1160,8 +1253,54 @@ fn rolled_back(prepared: &[Prepared], stop: &Stop) -> ApplyReport {
     }
 }
 
-/// Runs one plan inside the transaction: the write, then its read-back.
-async fn execute_plan(tx: &dyn Tx, plan: &DmlPlan, cancel: &CancellationToken) -> Result<Executed> {
+/// The report of an apply on a table that cannot roll back which stopped at `stop`: the edits
+/// that ran before it were kept, so they are recorded in the overlay and reported applied.
+fn kept_before_stop(
+    overlay: &mut Overlay,
+    written: &Written<'_>,
+    prepared: Vec<Prepared>,
+    executed: Vec<Executed>,
+    stop: &Stop,
+) -> ApplyReport {
+    let mut executed = executed.into_iter();
+    let outcomes = prepared
+        .into_iter()
+        .enumerate()
+        .map(|(index, p)| match index.cmp(&stop.index) {
+            std::cmp::Ordering::Less => match executed.next() {
+                Some(done) => {
+                    let mut report = written.record(overlay, p, done);
+                    report.warning = Some(match report.warning.take() {
+                        Some(earlier) => format!("{}; {earlier}", warnings::KEPT),
+                        None => warnings::KEPT.to_owned(),
+                    });
+                    report
+                }
+                None => outcome(
+                    EditStatus::Failed,
+                    Some(&Error::internal("an edit before the failure has no result")),
+                    p.row,
+                ),
+            },
+            std::cmp::Ordering::Equal => outcome(stop.status, Some(&stop.error), p.row),
+            std::cmp::Ordering::Greater => outcome(EditStatus::NotRun, None, p.row),
+        })
+        .collect();
+    ApplyReport {
+        committed: false,
+        outcomes,
+    }
+}
+
+/// Runs one plan inside the transaction: the write, then its read-back. With `keep_write`
+/// (a table that cannot roll back) a read-back that fails after a successful write is not an
+/// error: the write is kept either way, so the edit is reported applied without its row.
+async fn execute_plan(
+    tx: &dyn Tx,
+    plan: &DmlPlan,
+    keep_write: bool,
+    cancel: &CancellationToken,
+) -> Result<Executed> {
     let stream = tx
         .execute(&plan.write.sql, &plan.write.params, cancel.clone())
         .await?;
@@ -1184,10 +1323,20 @@ async fn execute_plan(tx: &dyn Tx, plan: &DmlPlan, cancel: &CancellationToken) -
         && !plan.returning
         && let Some(read_back) = &plan.read_back
     {
-        let stream = tx
-            .execute(&read_back.sql, &read_back.params, cancel.clone())
-            .await?;
-        row = first_row(&collect(stream).await?);
+        let read = async {
+            let stream = tx
+                .execute(&read_back.sql, &read_back.params, cancel.clone())
+                .await?;
+            collect(stream).await
+        }
+        .await;
+        match read {
+            Ok(read) => row = first_row(&read),
+            Err(error) if keep_write && !error.is_cancelled() => {
+                tracing::debug!(category = %error.category(), "reading a kept row back failed");
+            }
+            Err(error) => return Err(error),
+        }
     }
     Ok(Executed { affected, row })
 }
@@ -1229,6 +1378,27 @@ fn row_of(batch: &RecordBatch, def: &TableDef, names: &[String]) -> OverlayRow {
         values,
         texts,
         known,
+    }
+}
+
+/// What recording an applied edit needs: the table, the result columns and the stored rows.
+struct Written<'a> {
+    def: &'a TableDef,
+    names: &'a [String],
+    stored_rows: u64,
+}
+
+impl Written<'_> {
+    /// Records an applied edit in the overlay and reports it.
+    fn record(&self, overlay: &mut Overlay, prepared: Prepared, done: Executed) -> EditOutcome {
+        record_applied(
+            overlay,
+            self.def,
+            self.names,
+            self.stored_rows,
+            prepared,
+            done,
+        )
     }
 }
 

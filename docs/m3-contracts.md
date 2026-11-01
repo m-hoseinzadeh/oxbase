@@ -194,6 +194,10 @@ fn plan(&self, edit: &RowEdit, target: &DmlTarget<'_>) -> Result<DmlPlan>;
   rows returned when `returning`, else the summed `RowsAffected`; anything but 1 is a
   conflict and rolls everything back. The **mysql** stream sets `CLIENT_FOUND_ROWS` on every
   connection so an `UPDATE` reports matched rows (a no-op update counts 1), with a live test.
+- **Non-transactional tables:** `DmlWriter::transactional(&TableDef) -> bool` (default `true`).
+  MySQL / MariaDB answer from the table's `storage_engine` extra: only InnoDB (XtraDB), NDB,
+  RocksDB and TokuDB are transactional; MyISAM, MEMORY, ARCHIVE, Aria, CSV, MERGE and any other
+  engine keep each write as it runs (a table loaded without its engine counts as InnoDB).
 
 ## 4. Filter, sort and table data (`oxbase_dialect::sql`)
 
@@ -221,7 +225,9 @@ binding.
   are all NOT NULL plain columns and which has no predicate; every key column must be in the
   result. Read-only reasons are the constants of `edit::reasons` (not table data, no key, view,
   key not in result, engine). Columns: generated and `GENERATED ALWAYS` identity columns are
-  read-only cells with a reason; `InputKind` from the column type.
+  read-only cells with a reason; `InputKind` from the column type. `transactional: false` and
+  `warning = edit::warnings::NOT_TRANSACTIONAL` when the writer says the table cannot roll back
+  (shown as a note above the grid).
 - **Pending changes** (UI buffer, sent whole): `PendingChanges {edits: [update {row, cells} |
   insert {cells} | delete {row}]}`, `CellEdit {column, input: null | default | text {text}}`.
   At most one update or delete per row; a cell edit replaces that column's input; deleting a
@@ -234,6 +240,11 @@ binding.
   `conflict`; first failure or conflict rolls back everything (that edit `failed` /
   `conflict`, earlier ones `rolledBack`, later ones `notRun`); after commit every edit is
   `applied` with its row read back as edit texts. Refused while the run is still running.
+  On a non-transactional table the edits that ran before the failure or conflict were kept:
+  they are reported `applied` with `warning = edit::warnings::KEPT` and recorded in the overlay
+  (never `rolledBack`), `committed = false`; a read-back that fails after a kept write is not a
+  failure (the edit is `applied` without values). The UI folds every `applied` outcome into
+  its state, keeps only the other edits in the buffer and says how many changes were saved.
   Applied values overlay the immutable result store (later edits, forms, keys use them);
   inserted rows get row numbers after the stored rows; deleted rows refuse later edits. State
   is dropped when the run is closed.
@@ -418,8 +429,11 @@ PostgreSQL fixture is a Linux container that Windows runners cannot start (waive
    `check_expression`; the preview shows exactly what runs.
 4. **Optimistic concurrency:** each update / delete affects exactly one row or the whole apply
    rolls back.
-5. **Transactional apply:** grid edits always in one transaction; DDL in one transaction when
-   the engine allows (PostgreSQL, SQLite), else step by step with the preview saying so.
+5. **Transactional apply:** grid edits always in one transaction; on a table whose storage
+   cannot roll back (MySQL / MariaDB MyISAM, MEMORY, ...) the grid says so up front and an
+   apply that stops reports the edits it already wrote as `applied` (kept), never as rolled
+   back. DDL in one transaction when the engine allows (PostgreSQL, SQLite), else step by step
+   with the preview saying so.
 6. **Destructive changes** are flagged per step and need `confirmDestructive`.
 7. **SQLite rebuild safety:** §6.4; never leaves foreign keys off.
 8. **Read-only reasons** are explicit; only table data with a key is editable.

@@ -55,6 +55,7 @@ import { IDLE_RUN, isActive, rowCountLabel, runReducer } from "../results/runSta
 import { CellEditor } from "./CellEditor";
 import {
   type AppliedState,
+  appliedCount,
   cellEditable,
   changesSummary,
   duplicateCells,
@@ -516,10 +517,18 @@ export function TableDataPanel({ editorId, sessionId, table }: TableDataParams) 
       setProblems(folded.problems);
       resetForms();
       const warnings = report.outcomes.flatMap((o) => (o.warning ? [o.warning] : []));
+      const saved = appliedCount(report);
       if (report.committed) {
         setNotice(
           `Saved ${plural(sent.edits.length, "change", "changes")}.${warnings.length ? ` ${warnings.join(" ")}` : ""}`,
         );
+      } else if (saved > 0) {
+        // A table that cannot roll back: the changes before the failing one were kept.
+        setApplyError(
+          `Saved ${saved} of ${plural(sent.edits.length, "change", "changes")}; the rest were not saved. This table's storage engine cannot roll back, so the saved changes were kept.`,
+        );
+      } else if (editability?.transactional === false) {
+        setApplyError("Nothing was saved.");
       } else {
         setApplyError("Nothing was saved: the changes were rolled back.");
       }
@@ -781,6 +790,11 @@ export function TableDataPanel({ editorId, sessionId, table }: TableDataParams) 
       {readOnlyReason ? (
         <div className="banner banner--info" role="status" data-testid="read-only-banner">
           <strong>Read-only:</strong> {readOnlyReason}
+        </div>
+      ) : null}
+      {!readOnlyReason && editability?.warning ? (
+        <div className="banner banner--info" role="status" data-testid="edit-warning-banner">
+          <strong>Note:</strong> {editability.warning}
         </div>
       ) : null}
       {notice ? (

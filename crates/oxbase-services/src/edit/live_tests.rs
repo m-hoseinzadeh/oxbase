@@ -9,6 +9,9 @@
 //! - update / insert / delete through `EditService` in one transaction, with read-back of the
 //!   generated column;
 //! - a row deleted by another session makes the edit a conflict and rolls the batch back;
+//! - MySQL / MariaDB: on an `ENGINE=MyISAM` table (no transactions) the grid warns, and the
+//!   edits that ran before a conflict are reported applied (and are in the table), not rolled
+//!   back;
 //! - the `[m3]` seed tables, when the engine's init script created them: `m3_edit_uq` keyed by
 //!   `code`, `m3_edit_nokey` and `m3_edit_view` read-only.
 //!
@@ -539,6 +542,12 @@ async fn edit_steps(live: &Live, table: &ObjectRef, q: &str) -> std::result::Res
     if !e.editable {
         return Err(format!("not editable: {:?}", e.read_only_reason));
     }
+    if !e.transactional || e.warning.is_some() {
+        return Err(format!(
+            "the scratch table is not transactional: {:?}",
+            e.warning
+        ));
+    }
     let key = e.key.clone().unwrap();
     if key.columns != ["id"] || key.kind != KeyKind::Primary {
         return Err(format!("key: {key:?}"));
@@ -661,6 +670,137 @@ async fn edit_steps(live: &Live, table: &ObjectRef, q: &str) -> std::result::Res
     Ok(())
 }
 
+/// MySQL / MariaDB: a `MyISAM` table cannot roll back, so an apply that stops at a conflict
+/// reports (and keeps) the edits that ran before it.
+async fn non_transactional_cycle(key: &'static str, engine: Engine) {
+    let live = Live::connect(key, engine, false).await;
+    let table = live.table(&format!("m3_svc_{}_m", live.token));
+    let q = live.qualified(&table);
+    live.drop_table(&table).await;
+    live.sql(&format!(
+        "CREATE TABLE {q} (id int PRIMARY KEY, code varchar(20) NOT NULL, amount int) \
+         ENGINE=MyISAM"
+    ))
+    .await;
+    live.sql(&format!(
+        "INSERT INTO {q} (id, code, amount) VALUES (1, 'a', 1), (2, 'b', 2), (3, 'c', 3)"
+    ))
+    .await;
+    let result = non_transactional_steps(&live, &table, &q).await;
+    live.drop_table(&table).await;
+    if let Err(message) = result {
+        panic!("{key}: {message}");
+    }
+    report(&format!("{key}: MyISAM table edits kept and reported ok"));
+}
+
+async fn non_transactional_steps(
+    live: &Live,
+    table: &ObjectRef,
+    q: &str,
+) -> std::result::Result<(), String> {
+    let engine = live
+        .rows(&format!(
+            "SELECT ENGINE FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() \
+             AND TABLE_NAME = '{}'",
+            table.name
+        ))
+        .await;
+    if engine != [vec![Some("MyISAM".to_owned())]] {
+        return Err(format!("the scratch table's engine: {engine:?}"));
+    }
+    let mut request = TableDataQuery::new(table.clone());
+    request.sort = vec![SortKey::asc("id")];
+    let run = open(live, "myisam", request).await;
+    let e = live
+        .edit
+        .begin(run, CancellationToken::new())
+        .await
+        .map_err(|e| format!("begin: {e}"))?;
+    if !e.editable || e.transactional {
+        return Err(format!("editability: {e:?}"));
+    }
+    if e.warning.as_deref() != Some(warnings::NOT_TRANSACTIONAL) {
+        return Err(format!("warning: {:?}", e.warning));
+    }
+    let amount = e.columns.iter().position(|c| c.name == "amount").unwrap();
+    // Another session deletes 'b' after it was loaded.
+    live.sql(&format!("DELETE FROM {q} WHERE id = 2")).await;
+    let report = live
+        .edit
+        .apply(
+            run,
+            &PendingChanges {
+                edits: vec![
+                    update(0, "amount", "10"),
+                    update(1, "amount", "20"),
+                    update(2, "amount", "30"),
+                ],
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .map_err(|e| format!("apply: {e}"))?;
+    let statuses: Vec<EditStatus> = report.outcomes.iter().map(|o| o.status).collect();
+    if report.committed
+        || statuses
+            != [
+                EditStatus::Applied,
+                EditStatus::Conflict,
+                EditStatus::NotRun,
+            ]
+    {
+        return Err(format!("report: {report:?}"));
+    }
+    let kept = &report.outcomes[0];
+    if kept.warning.as_deref() != Some(warnings::KEPT)
+        || kept.values.as_ref().and_then(|v| v[amount].as_deref()) != Some("10")
+    {
+        return Err(format!("kept edit: {kept:?}"));
+    }
+    let rows = live
+        .rows(&format!("SELECT id, amount FROM {q} ORDER BY id"))
+        .await;
+    let expected = [
+        vec![Some("1".to_owned()), Some("10".to_owned())],
+        vec![Some("3".to_owned()), Some("3".to_owned())],
+    ];
+    if rows != expected {
+        return Err(format!("rows after the stopped apply: {rows:?}"));
+    }
+    // The kept value is in the overlay: the form shows it.
+    let form = live
+        .edit
+        .row_form(run, 0, 0)
+        .await
+        .map_err(|e| format!("form: {e}"))?;
+    if form.fields[amount].text.as_deref() != Some("10") {
+        return Err(format!("form: {form:?}"));
+    }
+    // Retrying the rest (without the deleted row) commits.
+    let report = live
+        .edit
+        .apply(
+            run,
+            &PendingChanges {
+                edits: vec![update(2, "amount", "30")],
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .map_err(|e| format!("retry: {e}"))?;
+    if !report.committed {
+        return Err(format!("retry: {report:?}"));
+    }
+    let rows = live
+        .rows(&format!("SELECT amount FROM {q} WHERE id = 3"))
+        .await;
+    if rows != [vec![Some("30".to_owned())]] {
+        return Err(format!("rows after the retry: {rows:?}"));
+    }
+    Ok(())
+}
+
 /// The `[m3]` seed tables, when the engine's init script created them.
 async fn seed_tables(key: &'static str, engine: Engine) {
     let live = Live::connect(key, engine, false).await;
@@ -775,6 +915,9 @@ per_engine! {
     mysql_table_data_edits_and_conflicts => edit_cycle("mysql", Engine::MySql);
     mariadb_table_data_edits_and_conflicts => edit_cycle("mariadb", Engine::MariaDb);
     sqlite_table_data_edits_and_conflicts => edit_cycle("sqlite", Engine::Sqlite);
+    mysql_myisam_edits_are_kept_not_rolled_back => non_transactional_cycle("mysql", Engine::MySql);
+    mariadb_myisam_edits_are_kept_not_rolled_back =>
+        non_transactional_cycle("mariadb", Engine::MariaDb);
     postgres_seed_tables => seed_tables("postgres", Engine::Postgres);
     mysql_seed_tables => seed_tables("mysql", Engine::MySql);
     mariadb_seed_tables => seed_tables("mariadb", Engine::MariaDb);

@@ -365,12 +365,18 @@ impl Fetcher for Tables {
 }
 
 /// Writes with PostgreSQL quoting; reads back with `READBACK <key>` (an insert's key is 100),
-/// or with `RETURNING *` when `returning`.
+/// or with `RETURNING *` when `returning`. `transactional = false` plays a table whose writes
+/// cannot be rolled back (MySQL `MyISAM`).
 struct ToyWriter {
     returning: bool,
+    transactional: bool,
 }
 
 impl DmlWriter for ToyWriter {
+    fn transactional(&self, _table: &TableDef) -> bool {
+        self.transactional
+    }
+
     fn plan(&self, edit: &RowEdit, target: &DmlTarget<'_>) -> Result<DmlPlan> {
         let quoting = PgQuoting;
         let mut w = SqlWriter::new(&quoting);
@@ -453,6 +459,15 @@ struct Harness {
 
 /// `writer`: register a DML writer (`Some(returning)`), or none.
 async fn harness(writer: Option<bool>) -> Harness {
+    harness_with(writer.map(|returning| ToyWriter {
+        returning,
+        transactional: true,
+    }))
+    .await
+}
+
+/// `writer`: the DML writer to register, or none.
+async fn harness_with(writer: Option<ToyWriter>) -> Harness {
     let state = Shared::default();
     let mut drivers = DriverRegistry::new();
     drivers.register(Arc::new(TableDriver {
@@ -480,8 +495,8 @@ async fn harness(writer: Option<bool>) -> Harness {
     dialects.register_fetcher(Engine::Postgres, ObjectKind::Table, Arc::new(Tables));
     dialects.register_fetcher(Engine::Postgres, ObjectKind::View, Arc::new(Tables));
     dialects.register_quoting(Engine::Postgres, Arc::new(PgQuoting));
-    if let Some(returning) = writer {
-        dialects.register_dml_writer(Engine::Postgres, Arc::new(ToyWriter { returning }));
+    if let Some(writer) = writer {
+        dialects.register_dml_writer(Engine::Postgres, Arc::new(writer));
     }
     let dialects = Arc::new(dialects);
     let spill = tempfile::tempdir().unwrap();
@@ -1049,6 +1064,84 @@ async fn a_conflict_rolls_the_whole_apply_back() {
     // Nothing was kept: the rows can still be edited.
     let report = h.apply(run, vec![PendingEdit::Delete { row: 2 }]).await;
     assert!(report.committed);
+}
+
+#[tokio::test]
+async fn edits_before_a_conflict_on_a_non_transactional_table_are_kept() {
+    let h = harness_with(Some(ToyWriter {
+        returning: false,
+        transactional: false,
+    }))
+    .await;
+    let run = h.open("t").await;
+    let e = h.edit.begin(run, CancellationToken::new()).await.unwrap();
+    assert!(e.editable);
+    assert!(!e.transactional);
+    assert_eq!(e.warning.as_deref(), Some(warnings::NOT_TRANSACTIONAL));
+    let json = serde_json::to_value(&e).unwrap();
+    assert_eq!(json["transactional"], false);
+
+    // The second update matches no row (someone else deleted it): the first one stays written.
+    lock(&h.state).affected.extend([1, 0]);
+    let report = h
+        .apply(
+            run,
+            vec![
+                update(0, "code", "x"),
+                update(1, "code", "y"),
+                PendingEdit::Delete { row: 2 },
+            ],
+        )
+        .await;
+    assert!(!report.committed);
+    assert_eq!(
+        statuses(&report),
+        [
+            EditStatus::Applied,
+            EditStatus::Conflict,
+            EditStatus::NotRun
+        ]
+    );
+    let kept = &report.outcomes[0];
+    assert_eq!(kept.row, Some(0));
+    assert_eq!(kept.values, Some(texts(&["1", "read", "42"])));
+    assert_eq!(kept.warning.as_deref(), Some(warnings::KEPT));
+    assert!(
+        !report
+            .outcomes
+            .iter()
+            .any(|o| o.status == EditStatus::RolledBack)
+    );
+    // The kept row is in the overlay: the form shows it as read back.
+    let form = h.edit.row_form(run, 0, 0).await.unwrap();
+    assert_eq!(form.fields[1].text.as_deref(), Some("read"));
+
+    // Two rows matched: a conflict whose message says the change was kept.
+    lock(&h.state).affected.push_back(2);
+    let report = h.apply(run, vec![PendingEdit::Delete { row: 2 }]).await;
+    assert_eq!(statuses(&report), [EditStatus::Conflict]);
+    let message = &report.outcomes[0].error.as_ref().unwrap().message;
+    assert!(message.contains("cannot roll back"), "{message}");
+
+    // A server error on the first edit: nothing ran before it, nothing is reported kept.
+    let report = h
+        .apply(run, vec![update(1, "code", "FAIL"), update(2, "code", "z")])
+        .await;
+    assert_eq!(statuses(&report), [EditStatus::Failed, EditStatus::NotRun]);
+    // A clean apply commits as usual.
+    let report = h.apply(run, vec![update(1, "code", "y")]).await;
+    assert!(report.committed);
+    assert_eq!(statuses(&report), [EditStatus::Applied]);
+    assert_eq!(report.outcomes[0].warning, None);
+}
+
+#[tokio::test]
+async fn transactional_tables_have_no_warning() {
+    let h = harness(Some(false)).await;
+    let run = h.open("t").await;
+    let e = h.edit.begin(run, CancellationToken::new()).await.unwrap();
+    assert!(e.transactional);
+    assert_eq!(e.warning, None);
 }
 
 #[tokio::test]

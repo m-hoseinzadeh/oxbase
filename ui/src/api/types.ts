@@ -505,6 +505,13 @@ export interface Editability {
   readOnlyReason?: string;
   key?: RowKey;
   columns: EditColumn[];
+  /**
+   * `false` when the table's writes cannot be rolled back (MySQL / MariaDB `MyISAM`, ...): an
+   * apply that stops keeps, and reports `applied`, the edits that ran before it.
+   */
+  transactional: boolean;
+  /** Shown with the grid (for example why a failed apply may still have saved changes). */
+  warning?: string;
 }
 
 /** What the user typed into a cell: NULL, the column default (new rows only), or text. */
@@ -539,6 +546,7 @@ export interface EditOutcome {
 }
 
 export interface ApplyReport {
+  /** Every edit was applied. `false` with some `applied` only on a non-transactional table. */
   committed: boolean;
   /** One per pending edit, same order. */
   outcomes: EditOutcome[];

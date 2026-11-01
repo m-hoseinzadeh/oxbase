@@ -9,6 +9,7 @@ import {
   setNewCell,
 } from "../../api";
 import {
+  appliedCount,
   changesSummary,
   duplicateCells,
   editLabel,
@@ -129,6 +130,33 @@ describe("edit model", () => {
     expect(problemOf(folded.problems, changes, { type: "row", row: 4 })?.status).toBe("notRun");
     expect(editLabel(changes, changes.edits[1] as never)).toBe("New row 1");
     expect(editLabel(changes, changes.edits[2] as never)).toBe("Delete row 5");
+  });
+
+  it("folds the kept edits of a stopped apply on a table that cannot roll back", () => {
+    const changes = buffer();
+    const report = {
+      committed: false,
+      outcomes: [
+        { status: "applied" as const, row: 0, values: ["1", "bob"], warning: "kept" },
+        { status: "applied" as const, row: 5, values: ["9", null], warning: "kept" },
+        { status: "conflict" as const, row: 4 },
+        { status: "notRun" as const },
+      ],
+    };
+    const folded = foldReport(changes, report, NOTHING_APPLIED, 5);
+    expect(appliedCount(report)).toBe(2);
+    expect(folded.applied.values.get(0)).toEqual(["1", "bob"]);
+    expect(folded.applied.values.get(5)).toEqual(["9", null]);
+    expect(folded.applied.extraRows).toBe(1);
+    // The kept edits left the buffer; the conflicting and unrun ones stay.
+    expect(folded.changes.edits).toEqual([changes.edits[2], changes.edits[3]]);
+    expect(folded.problems.map((p) => [p.index, p.status])).toEqual([
+      [2, "conflict"],
+      [3, "notRun"],
+    ]);
+    const newRow = { type: "new" as const, edit: 1, ordinal: 1 };
+    expect(problemOf(folded.problems, folded.changes, newRow)?.status).toBe("notRun");
+    expect(rowStatus(folded.changes, folded.applied, { type: "row", row: 4 })).toBe("deleted");
   });
 
   it("reports conflicts with their meaning", () => {

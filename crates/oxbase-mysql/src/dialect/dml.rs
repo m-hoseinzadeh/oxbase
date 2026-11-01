@@ -25,6 +25,7 @@ use oxbase_dialect::{
 };
 use oxbase_types::{
     BoundStatement, ColumnDef, ColumnValue, DataType, Error, Result, RowEdit, TableDef, Value,
+    props,
 };
 
 use super::caps::Features;
@@ -132,6 +133,25 @@ impl DmlWriter for MySqlDmlWriter {
             }
         }
     }
+
+    /// Only tables on a transactional storage engine (`InnoDB`, NDB, `RocksDB`, `TokuDB`)
+    /// roll back; `MyISAM`, `MEMORY`, `ARCHIVE`, `Aria`, `CSV`, `MERGE` and other engines keep
+    /// each write as it runs. A table loaded without its engine is taken as transactional (the
+    /// server default, `InnoDB`).
+    fn transactional(&self, table: &TableDef) -> bool {
+        table
+            .extras
+            .get(&props::STORAGE_ENGINE)
+            .and_then(Value::as_str)
+            .is_none_or(is_transactional_engine)
+    }
+}
+
+/// `true` for a storage engine whose writes a `ROLLBACK` undoes.
+fn is_transactional_engine(engine: &str) -> bool {
+    const TRANSACTIONAL: [&str; 6] = ["InnoDB", "XtraDB", "NDB", "ndbcluster", "RocksDB", "TokuDB"];
+    let engine = engine.trim();
+    TRANSACTIONAL.iter().any(|t| t.eq_ignore_ascii_case(engine))
 }
 
 /// `true` for a `BIT(n)` column.
@@ -625,5 +645,33 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn only_tables_on_transactional_engines_roll_back() {
+        let writer = MySqlDmlWriter { mariadb: false };
+        let mut t = table();
+        // Loaded without its engine: the server default (InnoDB).
+        assert!(writer.transactional(&t));
+        for (engine, transactional) in [
+            ("InnoDB", true),
+            ("innodb", true),
+            ("ndbcluster", true),
+            ("RocksDB", true),
+            ("MyISAM", false),
+            ("MEMORY", false),
+            ("ARCHIVE", false),
+            ("Aria", false),
+            ("CSV", false),
+            ("MRG_MyISAM", false),
+        ] {
+            t.extras.insert(props::STORAGE_ENGINE, engine);
+            assert_eq!(writer.transactional(&t), transactional, "{engine}");
+            assert_eq!(
+                MySqlDmlWriter { mariadb: true }.transactional(&t),
+                transactional,
+                "{engine}"
+            );
+        }
     }
 }

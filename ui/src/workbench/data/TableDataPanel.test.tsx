@@ -112,6 +112,7 @@ const EDITABLE: Editability = {
   resultIndex: 0,
   table: TABLE,
   editable: true,
+  transactional: true,
   key: { table: TABLE, kind: "primary", columns: ["id"] },
   columns: [
     {
@@ -419,6 +420,41 @@ describe("TableDataPanel", () => {
     fireEvent.click(screen.getByRole("button", { name: "Discard" }));
     expect(screen.queryByTestId("apply-errors")).not.toBeInTheDocument();
     expect(screen.getByTestId("cell-0-name")).toHaveTextContent("stored");
+  });
+
+  it("warns on a table that cannot roll back and keeps what an apply saved", async () => {
+    editability = {
+      ...EDITABLE,
+      transactional: false,
+      warning: "this table's storage engine does not support transactions",
+    };
+    applyReport = () => ({
+      committed: false,
+      outcomes: [
+        { status: "applied", row: 0, values: ["1", "x", null], warning: "kept" },
+        { status: "conflict", row: 1 },
+      ],
+    });
+    await renderPanel();
+    expect(await screen.findByTestId("edit-warning-banner")).toHaveTextContent(
+      "Note: this table's storage engine does not support transactions",
+    );
+    for (const row of [0, 1]) {
+      const overlay = await openCell(row, "name");
+      const input = within(overlay).getByRole("textbox", { name: "name" });
+      fireEvent.change(input, { target: { value: row === 0 ? "x" : "y" } });
+      fireEvent.keyDown(input, { key: "Enter" });
+    }
+
+    fireEvent.click(screen.getByRole("button", { name: "Apply (2)" }));
+    const errors = await screen.findByTestId("apply-errors");
+    expect(errors).toHaveTextContent("Saved 1 of 2 changes; the rest were not saved");
+    expect(errors).not.toHaveTextContent("rolled back");
+    expect(errors).toHaveTextContent("Row 2: Conflict");
+    // The saved edit left the buffer; the conflicting one stays.
+    expect(screen.getByRole("button", { name: "Apply (1)" })).toBeEnabled();
+    expect(screen.getByTestId("cell-0-name")).toHaveTextContent("x");
+    expect(screen.getByTestId("cell-1-name")).toHaveAttribute("data-highlight", "error");
   });
 
   it("shows an apply that failed as a whole", async () => {

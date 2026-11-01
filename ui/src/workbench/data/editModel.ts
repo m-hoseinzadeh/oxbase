@@ -150,8 +150,10 @@ export interface FoldedApply {
 }
 
 /**
- * Folds an `edit_apply` report: a commit moves the buffer into the applied state; a rollback
- * keeps the buffer and reports each edit's status (failed and conflicting edits first).
+ * Folds an `edit_apply` report. Applied edits move from the buffer into the applied state: all
+ * of them after a commit; after a stopped apply only on a table that cannot roll back
+ * (`Editability.transactional === false`), whose earlier writes were kept. Every other edit stays
+ * in the buffer and the report's status of each is listed (failed and conflicting edits first).
  */
 export function foldReport(
   changes: PendingChanges,
@@ -159,39 +161,52 @@ export function foldReport(
   applied: AppliedState,
   stored: number,
 ): FoldedApply {
-  if (report.committed) {
-    const values = new Map(applied.values);
-    const deleted = new Set(applied.deleted);
-    let extra = applied.extraRows;
-    report.outcomes.forEach((outcome, i) => {
-      const edit = changes.edits[i];
-      if (!edit) return;
-      const row = outcome.row ?? (edit.op === "insert" ? undefined : edit.row);
-      if (row === undefined) return;
-      if (edit.op === "delete") {
-        deleted.add(row);
-        values.delete(row);
-        return;
-      }
-      if (outcome.values) values.set(row, outcome.values);
-      if (row >= stored) extra = Math.max(extra, row - stored + 1);
-    });
-    return { applied: { values, deleted, extraRows: extra }, changes: emptyChanges, problems: [] };
-  }
+  const values = new Map(applied.values);
+  const deleted = new Set(applied.deleted);
+  let extra = applied.extraRows;
+  let foldedAny = false;
+  const remaining: PendingEdit[] = [];
   const problems: EditProblem[] = [];
-  report.outcomes.forEach((outcome, index) => {
-    const edit = changes.edits[index];
-    if (!edit || outcome.status === "applied") return;
-    problems.push({
-      edit,
-      index,
-      status: outcome.status,
-      message: statusText(outcome.status, outcome.error?.message),
-    });
+  changes.edits.forEach((edit, index) => {
+    const outcome = report.outcomes[index];
+    if (!outcome) {
+      remaining.push(edit);
+      return;
+    }
+    if (outcome.status !== "applied") {
+      remaining.push(edit);
+      problems.push({
+        edit,
+        index,
+        status: outcome.status,
+        message: statusText(outcome.status, outcome.error?.message),
+      });
+      return;
+    }
+    foldedAny = true;
+    const row = outcome.row ?? (edit.op === "insert" ? undefined : edit.row);
+    if (row === undefined) return;
+    if (edit.op === "delete") {
+      deleted.add(row);
+      values.delete(row);
+      return;
+    }
+    if (outcome.values) values.set(row, outcome.values);
+    if (row >= stored) extra = Math.max(extra, row - stored + 1);
   });
   const rank = (s: EditStatus) => (s === "failed" || s === "conflict" ? 0 : 1);
   problems.sort((a, b) => rank(a.status) - rank(b.status) || a.index - b.index);
-  return { applied, changes, problems };
+  if (!foldedAny) return { applied, changes, problems };
+  return {
+    applied: { values, deleted, extraRows: extra },
+    changes: remaining.length === 0 ? emptyChanges : { edits: remaining },
+    problems,
+  };
+}
+
+/** How many edits of an apply report were applied. */
+export function appliedCount(report: ApplyReport): number {
+  return report.outcomes.filter((o) => o.status === "applied").length;
 }
 
 /** How an edit is named in messages: "Row 4", "New row 2", "Delete row 7". */

@@ -36,7 +36,7 @@ use async_trait::async_trait;
 use oxbase_driver::{CancellationToken, Connection};
 use oxbase_types::{
     ObjectDef, ObjectKind, ObjectRef, ObjectSummary, PropId, PropertyDiff, Result, RowEdit, Script,
-    ServerVersion,
+    ServerVersion, TableDef,
 };
 
 pub use capability::{DesignerCapabilities, Support};
@@ -189,4 +189,13 @@ pub trait Capabilities: Send + Sync {
 pub trait DmlWriter: Send + Sync {
     /// The statement(s) for `edit` on `target`.
     fn plan(&self, edit: &RowEdit, target: &DmlTarget<'_>) -> Result<DmlPlan>;
+
+    /// `true` when writes to `table` take part in transactions, so a rollback undoes them.
+    /// `false` for storage that keeps every write as soon as it runs (MySQL / MariaDB tables
+    /// on `MyISAM`, `MEMORY`, `ARCHIVE`, ...): the edit service then reports writes that ran
+    /// before a failure as applied instead of rolled back. Defaults to `true`.
+    fn transactional(&self, table: &TableDef) -> bool {
+        let _ = table;
+        true
+    }
 }
