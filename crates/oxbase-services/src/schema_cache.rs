@@ -21,7 +21,13 @@
 //!    (or after any statement of a script that ran `sp_rename`, dynamic SQL, ...). The cache
 //!    service subscribes and refreshes the named relations (a partial read merged with
 //!    `SchemaCache::merge`), or the whole cache when a change has no name or is not about a
-//!    table or view. Refreshes coalesce for 300 ms.
+//!    table or view. Refreshes coalesce for 300 ms. An unqualified name is read in every
+//!    schema that has it (and, for a `CREATE`, every schema), since the editor's session may
+//!    resolve it differently; a created name the read still cannot find means the statement
+//!    ran elsewhere (MySQL `USE other`), so the whole cache is read and the profile's other
+//!    caches are marked stale. DDL inside an editor's open transaction is published again
+//!    when the transaction ends ([`SchemaEvents::statement_succeeded`]), since the cache's
+//!    own session cannot see it before the `COMMIT`.
 //! 4. **Memory.** At most [`SchemaCacheConfig::max_caches`] caches stay in memory (least
 //!    recently used are dropped; their snapshots stay on disk). A build that exceeds
 //!    `CatalogScope::max_columns` keeps what it read and is marked truncated.
@@ -37,7 +43,7 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Utc};
 use oxbase_dialect::{CatalogScope, DatabaseScope, DialectRegistry, RelationName};
 use oxbase_schema_cache::{SchemaCache, codec};
-use oxbase_sql::{DdlObject, DdlVerb, NamePart, SchemaChange};
+use oxbase_sql::{DdlObject, DdlVerb, NamePart, SchemaChange, SqlDialect};
 use oxbase_store::{SchemaCacheRepository, StoredSnapshot};
 use oxbase_types::{Error, ErrorCategory, ObjectKind, ObjectRef, Result};
 use serde::{Deserialize, Serialize};
@@ -209,18 +215,46 @@ pub struct SchemaChangeEvent {
 /// The broadcast channel schema changes are published on. Cheap to clone; a publish with no
 /// subscriber is dropped silently, and a slow subscriber loses the oldest events (it then
 /// refreshes everything: `broadcast::error::RecvError::Lagged`).
+///
+/// It also remembers the changes the query service announced on each session since that
+/// session's last `COMMIT` / `ROLLBACK` ([`SchemaEvents::statement_succeeded`]): DDL run inside
+/// an explicit transaction is invisible to the cache's own session until it commits, so the
+/// changes are published again when the transaction ends.
 #[derive(Clone)]
 pub struct SchemaEvents {
     tx: broadcast::Sender<SchemaChangeEvent>,
+    open: Arc<Mutex<HashMap<OpenKey, OpenChanges>>>,
+}
+
+/// A session and the database its changes ran in.
+type OpenKey = (SessionId, Option<String>);
+
+/// Changes announced on a session and not yet followed by a transaction end.
+#[derive(Debug, Clone, Default)]
+struct OpenChanges {
+    changes: Vec<SchemaChange>,
+    /// Too many to keep: refresh everything.
+    everything: bool,
 }
 
 impl SchemaEvents {
     /// Events kept for a subscriber that has not read them yet.
     pub const CAPACITY: usize = 256;
 
+    /// Changes remembered per session until its transaction ends; beyond that the session's
+    /// transaction end refreshes everything.
+    const MAX_OPEN_CHANGES: usize = 64;
+
+    /// Sessions with remembered changes; beyond that the oldest memory is dropped (it only
+    /// costs a missed refresh after a `COMMIT`).
+    const MAX_OPEN_SESSIONS: usize = 256;
+
     pub fn new() -> Self {
         let (tx, _) = broadcast::channel(Self::CAPACITY);
-        Self { tx }
+        Self {
+            tx,
+            open: Arc::default(),
+        }
     }
 
     /// Publishes `event` to every current subscriber.
@@ -230,6 +264,80 @@ impl SchemaEvents {
 
     pub fn subscribe(&self) -> broadcast::Receiver<SchemaChangeEvent> {
         self.tx.subscribe()
+    }
+
+    /// What the query service calls after each statement that succeeded on `session` (in
+    /// `database`, when it knows it): publishes the changes `oxbase_sql::schema_changes` reads
+    /// in `statement` and remembers them for the session; after a transaction end (`COMMIT`,
+    /// `END`, `ROLLBACK`, `ABORT`) publishes the remembered changes again, since a cache build
+    /// that ran while the transaction was open could not see them.
+    pub fn statement_succeeded(
+        &self,
+        session: SessionId,
+        database: Option<String>,
+        dialect: SqlDialect,
+        statement: &str,
+    ) {
+        let found = oxbase_sql::schema_changes(dialect, statement);
+        if !found.is_empty() {
+            self.remember((session, database.clone()), &found);
+            self.publish(SchemaChangeEvent {
+                session,
+                database,
+                source: ChangeSource::Query,
+                changes: found,
+            });
+            return;
+        }
+        let Some(end) = changes::transaction_end(dialect, statement) else {
+            return;
+        };
+        let held: Vec<(OpenKey, OpenChanges)> = {
+            let mut open = lock(&self.open);
+            let keys: Vec<OpenKey> = open.keys().filter(|k| k.0 == session).cloned().collect();
+            keys.into_iter()
+                .filter_map(|k| {
+                    let v = if end == changes::TransactionEnd::Whole {
+                        open.remove(&k)?
+                    } else {
+                        open.get(&k)?.clone()
+                    };
+                    Some((k, v))
+                })
+                .collect()
+        };
+        for ((session, database), held) in held {
+            self.publish(SchemaChangeEvent {
+                session,
+                database,
+                source: ChangeSource::Query,
+                changes: if held.everything {
+                    Vec::new()
+                } else {
+                    held.changes
+                },
+            });
+        }
+    }
+
+    fn remember(&self, key: OpenKey, changes: &[SchemaChange]) {
+        let mut open = lock(&self.open);
+        if !open.contains_key(&key) && open.len() >= Self::MAX_OPEN_SESSIONS {
+            open.clear();
+        }
+        let entry = open.entry(key).or_default();
+        if entry.everything {
+            return;
+        }
+        for change in changes {
+            if !entry.changes.contains(change) {
+                entry.changes.push(change.clone());
+            }
+        }
+        if entry.changes.len() > Self::MAX_OPEN_CHANGES {
+            entry.changes.clear();
+            entry.everything = true;
+        }
     }
 }
 
@@ -277,13 +385,9 @@ struct Core {
     shutdown: CancellationToken,
     /// The subscription taken in `new`, until the listener task takes it over.
     receiver: Mutex<Option<broadcast::Receiver<SchemaChangeEvent>>>,
-}
-
-/// What a build reads.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BuildKind {
-    Full,
-    Partial,
+    /// Bumped by `forget_profile` (always locked inside `entries`): a build that started
+    /// before keeps neither its cache nor its snapshot.
+    epochs: Mutex<HashMap<Uuid, u64>>,
 }
 
 /// One key's cache and bookkeeping.
@@ -295,13 +399,18 @@ struct Entry {
     used: u64,
     /// The persisted snapshot was looked for and there is none (or it was unreadable).
     disk_checked: bool,
-    building: Option<BuildKind>,
-    /// Finished builds (successful or not) and whether the last one succeeded.
-    builds_finished: u64,
-    last_build_ok: bool,
+    /// Builds queued on `build_lock` or running, and how many of them are full builds.
+    builds: u32,
+    full_builds: u32,
+    /// Finished full builds (successful or not) and whether the last one succeeded (refreshes
+    /// that join a full build wait for the count to move).
+    fulls_finished: u64,
+    last_full_ok: bool,
     last_build_ms: Option<u64>,
     last_error: Option<Error>,
     last_failure: Option<Instant>,
+    /// The engine has no catalog reader: `ensure` never retries.
+    no_reader: bool,
     /// Change events seen; a build clears `dirty` only when none arrived while it ran.
     changes: u64,
     dirty: bool,
@@ -323,7 +432,27 @@ struct Pending {
     session: SessionId,
     /// `None`: the whole database.
     relations: Option<Vec<RelationName>>,
+    /// Unqualified names a change created (`changes::Plan::expect`).
+    expect: Vec<NamePart>,
 }
+
+impl Entry {
+    /// Nothing worth keeping: no names, no build, no pending refresh or stale mark, no
+    /// failure to rest after, and no task holding its locks.
+    fn idle(&self) -> bool {
+        self.cache.is_none()
+            && self.builds == 0
+            && self.pending.is_none()
+            && !self.dirty
+            && !self.no_reader
+            && self.last_failure.is_none_or(|t| t.elapsed() >= RETRY_AFTER)
+            && Arc::strong_count(&self.build_lock) == 1
+            && Arc::strong_count(&self.load_lock) == 1
+    }
+}
+
+/// Entries kept per cache allowed in memory before idle ones are pruned.
+const ENTRIES_PER_CACHE: usize = 4;
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
@@ -354,6 +483,7 @@ impl SchemaCacheService {
             clock: AtomicU64::new(0),
             shutdown: CancellationToken::new(),
             receiver: Mutex::new(Some(events.subscribe())),
+            epochs: Mutex::new(HashMap::new()),
         });
         // Listen right away when there is a runtime; otherwise on the first async call.
         Core::start_listener(&core);
@@ -422,16 +552,14 @@ impl SchemaCacheService {
                 None => true,
                 Some(cache) => entry.dirty || self.core.is_old(cache),
             };
-            let resting = entry
-                .last_failure
-                .is_some_and(|t| t.elapsed() < RETRY_AFTER)
+            let resting = entry.no_reader
                 || entry
-                    .last_error
-                    .as_ref()
-                    .is_some_and(|e| e.category() == ErrorCategory::Unsupported);
-            let start = due && !resting && entry.building.is_none() && entry.pending.is_none();
+                    .last_failure
+                    .is_some_and(|t| t.elapsed() < RETRY_AFTER);
+            let start = due && !resting && entry.builds == 0 && entry.pending.is_none();
             if start {
-                entry.building = Some(BuildKind::Full);
+                entry.builds += 1;
+                entry.full_builds += 1;
             }
             start
         };
@@ -440,9 +568,8 @@ impl SchemaCacheService {
             let key = key.clone();
             let cancel = self.core.shutdown.child_token();
             tokio::spawn(async move {
-                let _ = core
-                    .build(&key, base, CatalogScope::full(), cancel, true)
-                    .await;
+                let scope = core.catalog_scope(&RefreshScope::Full);
+                let _ = core.build(&key, base, scope, cancel, true).await;
             });
         }
         Ok(self.core.status(&key))
@@ -462,12 +589,12 @@ impl SchemaCacheService {
         let key = self.core.key_for(session, database.as_deref())?;
         let base = self.core.base_of(session);
         let scope = self.core.catalog_scope(&scope);
-        // A full refresh asked for while a full build runs joins that build.
+        // A full refresh asked for while a full build is queued or runs joins it.
         let joining = scope.is_full().then(|| {
             let mut entries = lock(&self.core.entries);
             let entry = entries.entry(key.clone()).or_default();
             entry.base = Some(base);
-            (entry.building == Some(BuildKind::Full)).then_some(entry.builds_finished)
+            (entry.full_builds > 0).then_some(entry.fulls_finished)
         });
         if let Some(Some(finished)) = joining {
             let done = Arc::clone(
@@ -483,7 +610,7 @@ impl SchemaCacheService {
                     let (over, ok) = lock(&self.core.entries)
                         .get(&key)
                         .map_or((true, false), |e| {
-                            (e.builds_finished > finished, e.last_build_ok)
+                            (e.fulls_finished > finished, e.last_full_ok)
                         });
                     if over {
                         return Ok(ok);
@@ -519,7 +646,21 @@ impl SchemaCacheService {
 
     /// Drops the caches and persisted snapshots of a profile (when it is deleted).
     pub async fn forget_profile(&self, profile_id: Uuid) -> Result<()> {
-        lock(&self.core.entries).retain(|k, _| k.profile_id != profile_id);
+        let woken: Vec<Arc<tokio::sync::Notify>> = {
+            let mut entries = lock(&self.core.entries);
+            *lock(&self.core.epochs).entry(profile_id).or_default() += 1;
+            let woken = entries
+                .iter()
+                .filter(|(k, _)| k.profile_id == profile_id)
+                .map(|(_, e)| Arc::clone(&e.done))
+                .collect();
+            entries.retain(|k, _| k.profile_id != profile_id);
+            woken
+        };
+        // Refreshes waiting to join a build of these keys see them gone.
+        for done in woken {
+            done.notify_waiters();
+        }
         self.repo.delete(profile_id, None).await?;
         Ok(())
     }
@@ -662,7 +803,10 @@ impl Core {
             return Some(cache.clone());
         }
         entry.disk_checked = true;
-        let cache = decoded?;
+        let Some(cache) = decoded else {
+            Self::evict(&mut entries, key, self.config.max_caches);
+            return None;
+        };
         entry.cache = Some(cache.clone());
         entry.source = Some(CacheSource::Disk);
         entry.used = self.tick();
@@ -670,8 +814,16 @@ impl Core {
         Some(cache)
     }
 
-    /// Drops the least recently used caches beyond `max` (never `keep`).
+    /// Drops the least recently used caches beyond `max` (never `keep`), then idle entries
+    /// when there are many.
     fn evict(entries: &mut HashMap<CacheKey, Entry>, keep: &CacheKey, max: usize) {
+        Self::evict_caches(entries, keep, max);
+        if entries.len() > max.max(1) * ENTRIES_PER_CACHE {
+            entries.retain(|k, e| k == keep || !e.idle());
+        }
+    }
+
+    fn evict_caches(entries: &mut HashMap<CacheKey, Entry>, keep: &CacheKey, max: usize) {
         loop {
             let loaded = entries.values().filter(|e| e.cache.is_some()).count();
             if loaded <= max.max(1) {
@@ -700,7 +852,7 @@ impl Core {
             return CacheStatus::missing(key.clone());
         };
         let mut status = CacheStatus::missing(key.clone());
-        status.building = entry.building.is_some() || entry.pending.is_some();
+        status.building = entry.builds > 0 || entry.pending.is_some();
         status.last_build_ms = entry.last_build_ms;
         status.last_error.clone_from(&entry.last_error);
         status.source = entry.source;
@@ -719,7 +871,8 @@ impl Core {
     }
 
     /// Builds (`scope` full) or refreshes (partial) the cache of `key` on a child of `base`,
-    /// one build per key at a time. `marked`: the caller already set `building`.
+    /// one build per key at a time. `marked`: the caller already counted the build (`ensure`:
+    /// a full one).
     async fn build(
         &self,
         key: &CacheKey,
@@ -728,25 +881,23 @@ impl Core {
         cancel: CancellationToken,
         marked: bool,
     ) -> Result<CacheStatus> {
-        if let Err(e) = crate::check_cancelled(&cancel) {
-            if marked {
-                self.finish(key, None, false);
-            }
-            return Err(e);
-        }
-        let (build_lock, set_here) = {
+        let counted_full = scope.is_full();
+        let build_lock = {
             let mut entries = lock(&self.entries);
             let entry = entries.entry(key.clone()).or_default();
-            let set_here = !marked && entry.building.is_none();
-            if set_here {
-                entry.building = Some(if scope.is_full() {
-                    BuildKind::Full
-                } else {
-                    BuildKind::Partial
-                });
+            if !marked {
+                entry.builds += 1;
+                if counted_full {
+                    entry.full_builds += 1;
+                }
             }
-            (Arc::clone(&entry.build_lock), set_here)
+            Arc::clone(&entry.build_lock)
         };
+        let done = |elapsed: Option<u64>, ok: bool| self.finish(key, counted_full, elapsed, ok);
+        if let Err(e) = crate::check_cancelled(&cancel) {
+            done(None, false);
+            return Err(e);
+        }
         let guard = match crate::until_cancelled(&cancel, async {
             Ok(build_lock.lock_owned().await)
         })
@@ -754,23 +905,15 @@ impl Core {
         {
             Ok(guard) => guard,
             Err(e) => {
-                if (set_here || marked)
-                    && let Some(entry) = lock(&self.entries).get_mut(key)
-                {
-                    entry.building = None;
-                }
+                done(None, false);
                 return Err(e);
             }
         };
-        let (seen, current) = {
+        let (seen, current, epoch) = {
             let mut entries = lock(&self.entries);
+            let epoch = self.epoch(key.profile_id);
             let entry = entries.entry(key.clone()).or_default();
-            entry.building = Some(if scope.is_full() {
-                BuildKind::Full
-            } else {
-                BuildKind::Partial
-            });
-            (entry.changes, entry.cache.clone())
+            (entry.changes, entry.cache.clone(), epoch)
         };
         // A partial refresh needs names to merge into (memory or disk), else it reads all.
         let current = match current {
@@ -788,35 +931,55 @@ impl Core {
             .await;
         let elapsed = millis(started.elapsed());
         let result = match outcome {
+            // The profile was deleted while the build ran: keep nothing.
+            Ok(_) if !self.same_epoch(key.profile_id, epoch) => {
+                done(None, false);
+                Err(Error::not_found("this connection profile was deleted"))
+            }
             Ok(cache) => {
                 self.persist(key, &cache).await;
-                {
+                let kept = {
                     let mut entries = lock(&self.entries);
-                    let entry = entries.entry(key.clone()).or_default();
-                    entry.cache = Some(cache);
-                    entry.source = Some(CacheSource::Live);
-                    entry.used = self.tick();
-                    entry.disk_checked = true;
-                    entry.last_build_ms = Some(elapsed);
-                    entry.last_error = None;
-                    entry.last_failure = None;
-                    if entry.changes == seen {
-                        entry.dirty = false;
+                    let kept = self.epoch(key.profile_id) == epoch;
+                    if kept {
+                        let entry = entries.entry(key.clone()).or_default();
+                        entry.cache = Some(cache);
+                        entry.source = Some(CacheSource::Live);
+                        entry.used = self.tick();
+                        entry.disk_checked = true;
+                        entry.last_build_ms = Some(elapsed);
+                        entry.last_error = None;
+                        entry.last_failure = None;
+                        entry.no_reader = false;
+                        if entry.changes == seen {
+                            entry.dirty = false;
+                        }
+                        Self::evict(&mut entries, key, self.config.max_caches);
                     }
-                    Self::evict(&mut entries, key, self.config.max_caches);
+                    kept
+                };
+                if kept {
+                    done(Some(elapsed), true);
+                    Ok(self.status(key))
+                } else {
+                    // `forget_profile` ran during the save: its delete may have come first.
+                    let _ = self.repo.delete(key.profile_id, Some(&key.database)).await;
+                    done(None, false);
+                    Err(Error::not_found("this connection profile was deleted"))
                 }
-                self.finish(key, Some(elapsed), true);
-                Ok(self.status(key))
             }
             Err(e) => {
                 if !e.is_cancelled() {
                     tracing::debug!(category = %e.category(), "schema cache build failed");
+                    let no_reader = self.lacks_reader(base);
                     let mut entries = lock(&self.entries);
-                    let entry = entries.entry(key.clone()).or_default();
-                    entry.last_error = Some(e.clone());
-                    entry.last_failure = Some(Instant::now());
+                    if let Some(entry) = entries.get_mut(key) {
+                        entry.last_error = Some(e.clone());
+                        entry.last_failure = Some(Instant::now());
+                        entry.no_reader = no_reader;
+                    }
                 }
-                self.finish(key, None, false);
+                done(None, false);
                 Err(e)
             }
         };
@@ -824,13 +987,40 @@ impl Core {
         result
     }
 
-    /// Marks the end of a build of `key`.
-    fn finish(&self, key: &CacheKey, elapsed: Option<u64>, ok: bool) {
+    /// `forget_profile` generation of `profile` (call with `entries` locked when the answer
+    /// must hold until the lock is released).
+    fn epoch(&self, profile: Uuid) -> u64 {
+        lock(&self.epochs)
+            .get(&profile)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    fn same_epoch(&self, profile: Uuid, epoch: u64) -> bool {
+        let _entries = lock(&self.entries);
+        self.epoch(profile) == epoch
+    }
+
+    /// `true` when the engine of `base` has no catalog reader (a build can never succeed).
+    fn lacks_reader(&self, base: SessionId) -> bool {
+        self.manager
+            .get(base)
+            .is_some_and(|h| self.dialects.catalog_reader(h.summary().engine).is_err())
+    }
+
+    /// Marks the end of a build of `key` counted in `build` (`full`: counted as a full one).
+    fn finish(&self, key: &CacheKey, full: bool, elapsed: Option<u64>, ok: bool) {
         let mut entries = lock(&self.entries);
-        let entry = entries.entry(key.clone()).or_default();
-        entry.building = None;
-        entry.builds_finished += 1;
-        entry.last_build_ok = ok;
+        // Gone when `forget_profile` dropped it meanwhile.
+        let Some(entry) = entries.get_mut(key) else {
+            return;
+        };
+        entry.builds = entry.builds.saturating_sub(1);
+        if full {
+            entry.full_builds = entry.full_builds.saturating_sub(1);
+            entry.fulls_finished += 1;
+            entry.last_full_ok = ok;
+        }
         if elapsed.is_some() {
             entry.last_build_ms = elapsed;
         }
@@ -935,7 +1125,14 @@ impl Core {
         };
         let base = self.base_of(event.session);
         let current = lock(&self.entries).get(&key).and_then(|e| e.cache.clone());
-        let plan = changes::plan(current.as_ref(), &event.changes);
+        let rules = changes::NameRules {
+            qualifier_is_database: self.manager.get(base).is_some_and(|h| {
+                self.dialects
+                    .tree_layout(h.summary().engine)
+                    .is_ok_and(|l| l.scope == DatabaseScope::Catalog)
+            }),
+        };
+        let plan = changes::plan(current.as_ref(), rules, &event.changes);
         for database in &plan.other_databases {
             let other = CacheKey {
                 profile_id: key.profile_id,
@@ -948,8 +1145,21 @@ impl Core {
         }
         match plan.refresh {
             Refresh::Nothing => {}
-            Refresh::Everything => self.schedule(&key, base, None),
-            Refresh::Relations(relations) => self.schedule(&key, base, Some(relations)),
+            Refresh::Everything => self.schedule(&key, base, None, Vec::new()),
+            Refresh::Relations(relations) => {
+                self.schedule(&key, base, Some(relations), plan.expect);
+            }
+        }
+    }
+
+    /// Marks every other cache of `key`'s profile stale (a change went to a database this
+    /// service cannot tell: MySQL `USE other` in an editor).
+    fn mark_profile_stale(&self, key: &CacheKey) {
+        for (k, e) in lock(&self.entries).iter_mut() {
+            if k.profile_id == key.profile_id && k != key {
+                e.dirty = true;
+                e.changes += 1;
+            }
         }
     }
 
@@ -961,7 +1171,7 @@ impl Core {
             .collect();
         for (key, base) in keys {
             match base {
-                Some(base) => self.schedule(&key, base, None),
+                Some(base) => self.schedule(&key, base, None, Vec::new()),
                 None => {
                     if let Some(e) = lock(&self.entries).get_mut(&key) {
                         e.dirty = true;
@@ -973,12 +1183,14 @@ impl Core {
     }
 
     /// Marks `key` stale and queues a refresh (`None` = everything) that runs after the
-    /// coalescing window.
+    /// coalescing window. `expect`: unqualified names a change created; when the refresh finds
+    /// none of them, everything is read again and the profile's other caches are marked stale.
     fn schedule(
         self: &Arc<Self>,
         key: &CacheKey,
         base: SessionId,
         relations: Option<Vec<RelationName>>,
+        expect: Vec<NamePart>,
     ) {
         let spawn = {
             let mut entries = lock(&self.entries);
@@ -986,11 +1198,18 @@ impl Core {
             entry.dirty = true;
             entry.changes += 1;
             entry.base = Some(base);
-            if entry.cache.is_none() {
-                // Nothing in memory to refresh: the next `ensure` reads it again.
+            if entry.cache.is_none() && entry.builds == 0 {
+                // Nothing in memory to refresh and no build that could miss the change: the
+                // next `ensure` reads it again.
                 entry.disk_checked = false;
                 return;
             }
+            // With no names yet (the first build is running), read everything after it.
+            let (relations, expect) = if entry.cache.is_none() {
+                (None, Vec::new())
+            } else {
+                (relations, expect)
+            };
             if let Some(pending) = &mut entry.pending {
                 pending.session = base;
                 match (&mut pending.relations, relations) {
@@ -1000,14 +1219,23 @@ impl Core {
                                 have.push(r);
                             }
                         }
+                        for n in expect {
+                            if !pending.expect.contains(&n) {
+                                pending.expect.push(n);
+                            }
+                        }
                     }
-                    (have, _) => *have = None,
+                    (have, _) => {
+                        *have = None;
+                        pending.expect.clear();
+                    }
                 }
                 false
             } else {
                 entry.pending = Some(Pending {
                     session: base,
                     relations,
+                    expect,
                 });
                 true
             }
@@ -1036,10 +1264,34 @@ impl Core {
                 max_columns: core.config.max_columns,
                 ..CatalogScope::full()
             };
+            let partial = !scope.is_full();
             let cancel = core.shutdown.child_token();
-            let _ = core
-                .build(&key, pending.session, scope, cancel, false)
+            let built = core
+                .build(&key, pending.session, scope, cancel.clone(), false)
                 .await;
+            if !partial || pending.expect.is_empty() || built.is_err() {
+                return;
+            }
+            let lost = lock(&core.entries)
+                .get(&key)
+                .and_then(|e| e.cache.clone())
+                .is_some_and(|c| !changes::missing(&c, &pending.expect).is_empty());
+            if lost {
+                // Created where the partial read did not look: read everything.
+                core.mark_profile_stale(&key);
+                let _ = core
+                    .build(
+                        &key,
+                        pending.session,
+                        CatalogScope {
+                            max_columns: core.config.max_columns,
+                            ..CatalogScope::full()
+                        },
+                        cancel,
+                        false,
+                    )
+                    .await;
+            }
         });
     }
 }

@@ -214,6 +214,49 @@ async fn a_broken_view_does_not_hide_the_tables() {
     assert!(main.relations.iter().any(|r| r.name == "broken"));
 }
 
+#[tokio::test]
+async fn implicit_foreign_keys_follow_the_key_order() {
+    let (_dir, c) = seeded().await;
+    // The key lists `b` before `a`, against the column order.
+    run(
+        c.as_ref(),
+        "CREATE TABLE kparent (a INTEGER NOT NULL, b INTEGER NOT NULL, PRIMARY KEY (b, a))",
+    )
+    .await;
+    run(
+        c.as_ref(),
+        "CREATE TABLE kchild (x INTEGER, y INTEGER, FOREIGN KEY (x, y) REFERENCES kparent)",
+    )
+    .await;
+    let full = read(c.as_ref(), &CatalogScope::full()).await;
+    let child = full
+        .schemas
+        .iter()
+        .flat_map(|s| &s.relations)
+        .find(|r| r.name == "kchild")
+        .unwrap();
+    assert_eq!(child.foreign_keys[0].columns, ["x", "y"]);
+    assert_eq!(child.foreign_keys[0].ref_columns, ["b", "a"]);
+    // A partial read of the child alone still resolves the parent's key.
+    let scope = CatalogScope {
+        relations: Some(vec![RelationName {
+            schema: Some("main".into()),
+            name: "kchild".into(),
+        }]),
+        ..CatalogScope::full()
+    };
+    let part = read(c.as_ref(), &scope).await;
+    let rels: Vec<&str> = part
+        .schemas
+        .iter()
+        .flat_map(|s| s.relations.iter().map(|r| r.name.as_str()))
+        .collect();
+    assert_eq!(rels, ["kchild"]);
+    let fk = &part.schemas[0].relations[0].foreign_keys[0];
+    assert_eq!(fk.ref_table, "kparent");
+    assert_eq!(fk.ref_columns, ["b", "a"]);
+}
+
 #[test]
 fn the_reader_is_registered() {
     let mut reg = DialectRegistry::new();

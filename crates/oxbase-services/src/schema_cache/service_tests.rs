@@ -660,3 +660,170 @@ async fn engines_without_a_reader_fail_once() {
     assert_eq!(status.state, CacheState::Failed);
     assert!(!status.building);
 }
+
+#[test]
+fn transaction_ends_republish_the_changes_they_held() {
+    let events = SchemaEvents::new();
+    let mut rx = events.subscribe();
+    let pg = oxbase_sql::SqlDialect::Postgres;
+    let session = SessionId::new();
+    let other = SessionId::new();
+    let db = Some("app".to_owned());
+    // Plain statements publish nothing.
+    events.statement_succeeded(session, db.clone(), pg, "BEGIN");
+    events.statement_succeeded(session, db.clone(), pg, "INSERT INTO t VALUES (1)");
+    assert!(rx.try_recv().is_err());
+    events.statement_succeeded(session, db.clone(), pg, "CREATE TABLE t (id int)");
+    let created = rx.try_recv().unwrap();
+    assert_eq!(created.source, ChangeSource::Query);
+    assert_eq!(created.changes.len(), 1);
+    // Another session's COMMIT does not touch this session's changes.
+    events.statement_succeeded(other, db.clone(), pg, "COMMIT");
+    assert!(rx.try_recv().is_err());
+    // A savepoint rollback republishes and keeps them; the COMMIT republishes and forgets.
+    events.statement_succeeded(session, db.clone(), pg, "ROLLBACK TO SAVEPOINT s");
+    assert_eq!(rx.try_recv().unwrap().changes, created.changes);
+    events.statement_succeeded(session, db.clone(), pg, "commit");
+    let again = rx.try_recv().unwrap();
+    assert_eq!(
+        (again.session, again.database.clone(), again.changes.clone()),
+        (session, db.clone(), created.changes.clone())
+    );
+    events.statement_succeeded(session, db.clone(), pg, "COMMIT");
+    assert!(rx.try_recv().is_err());
+    // Too many changes in one transaction: its end refreshes everything.
+    for i in 0..=SchemaEvents::MAX_OPEN_CHANGES {
+        events.statement_succeeded(
+            session,
+            db.clone(),
+            pg,
+            &format!("CREATE TABLE t{i} (id int)"),
+        );
+        rx.try_recv().unwrap();
+    }
+    events.statement_succeeded(session, db, pg, "END");
+    assert_eq!(rx.try_recv().unwrap().changes.len(), 0);
+}
+
+#[tokio::test]
+async fn changes_during_the_first_build_are_read_after_it() {
+    let h = harness(config()).await;
+    h.server.with(|s| s.delay = Duration::from_millis(200));
+    let first = h.service.ensure(h.session, None).await.unwrap();
+    assert!(first.building);
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    h.service.invalidate(&SchemaChangeEvent {
+        session: h.session,
+        database: None,
+        source: ChangeSource::Query,
+        changes: oxbase_sql::schema_changes(
+            oxbase_sql::SqlDialect::Postgres,
+            "CREATE TABLE public.late (id int)",
+        ),
+    });
+    let started = Instant::now();
+    loop {
+        let status = h.service.status(h.session, None).await.unwrap();
+        if status.state == CacheState::Ready && !status.building {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "still {status:?}; reads {:?}",
+            h.server.reads()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let reads = h.server.reads();
+    assert_eq!(reads.len(), 2, "{reads:?}");
+    assert!(
+        reads[1].1.is_full(),
+        "no names to merge into yet: read everything"
+    );
+}
+
+#[tokio::test]
+async fn a_profile_forgotten_during_a_build_keeps_nothing() {
+    let h = harness(config()).await;
+    h.server.with(|s| s.delay = Duration::from_millis(200));
+    let key = h.key();
+    let forget = async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        h.service.forget_profile(key.profile_id).await.unwrap();
+    };
+    let (built, ()) = tokio::join!(h.refresh(RefreshScope::Full), forget);
+    assert_eq!(built.unwrap_err().category(), ErrorCategory::NotFound);
+    assert!(h.repo.load(key.profile_id, "app").await.unwrap().is_none());
+    assert!(h.service.cache(&key).await.is_none());
+    let status = h.service.status(h.session, None).await.unwrap();
+    assert_eq!(status.state, CacheState::Missing);
+    assert!(!status.building);
+}
+
+#[tokio::test]
+async fn creates_the_partial_read_cannot_find_refresh_everything() {
+    let h = harness(config()).await;
+    h.refresh(RefreshScope::Full).await.unwrap();
+    h.service
+        .refresh(
+            h.session,
+            Some("other".into()),
+            RefreshScope::Full,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    // `ghost` was created where this cache does not look (`USE other`, another search path).
+    h.service.invalidate(&SchemaChangeEvent {
+        session: h.session,
+        database: None,
+        source: ChangeSource::Query,
+        changes: oxbase_sql::schema_changes(
+            oxbase_sql::SqlDialect::Postgres,
+            "CREATE TABLE ghost (id int)",
+        ),
+    });
+    let started = Instant::now();
+    while h.server.reads().len() < 4 {
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            h.server.reads()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let reads = h.server.reads();
+    assert_eq!(reads[2].0, "app");
+    assert!(reads[2].1.relations.is_some(), "the partial read first");
+    assert_eq!(reads[3].0, "app");
+    assert!(reads[3].1.is_full(), "then everything");
+    let other = h
+        .service
+        .status(h.session, Some("other".into()))
+        .await
+        .unwrap();
+    assert_eq!(
+        other.state,
+        CacheState::Stale,
+        "the other database may have it"
+    );
+}
+
+#[tokio::test]
+async fn idle_entries_are_pruned() {
+    let h = harness(SchemaCacheConfig {
+        max_caches: 1,
+        ..config()
+    })
+    .await;
+    let profile = h.key().profile_id;
+    for i in 0..20 {
+        let key = CacheKey {
+            profile_id: profile,
+            database: format!("db{i}"),
+        };
+        assert!(h.service.cache(&key).await.is_none());
+    }
+    let entries = lock(&h.service.core.entries).len();
+    assert!(entries <= ENTRIES_PER_CACHE + 1, "{entries} entries");
+}

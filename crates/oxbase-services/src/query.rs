@@ -113,7 +113,7 @@ use oxbase_types::{BoundStatement, Engine, Error, ErrorCategory, Result, Value};
 
 use crate::history::{HistoryRecord, HistoryService};
 use crate::results::{AppendOutcome, ByteBudget, ResultStore, RunDir};
-use crate::schema_cache::{ChangeSource, SchemaChangeEvent, SchemaEvents};
+use crate::schema_cache::SchemaEvents;
 use crate::{CancellationToken, ConnectionManager, SessionHandle, SessionId};
 
 #[cfg(test)]
@@ -627,8 +627,10 @@ impl QueryService {
         }
     }
 
-    /// M6: publishes a [`SchemaChangeEvent`] on `events` after each statement that succeeded
-    /// and that `oxbase_sql::schema_changes` reads as DDL, so the schema cache refreshes.
+    /// M6: publishes a [`SchemaChangeEvent`](crate::schema_cache::SchemaChangeEvent) on
+    /// `events` after each statement that succeeded and that `oxbase_sql::schema_changes` reads
+    /// as DDL, and again after the `COMMIT` / `ROLLBACK` that follows it, so the schema cache
+    /// refreshes (`SchemaEvents::statement_succeeded`).
     #[must_use]
     pub fn with_schema_events(mut self, events: SchemaEvents) -> Self {
         self.schema_events = Some(events);
@@ -1351,21 +1353,19 @@ async fn execute(context: RunContext) {
 }
 
 impl RunContext {
-    /// M6: publishes the schema changes `statement` (which succeeded) probably made.
+    /// M6: tells the schema cache about `statement`, which succeeded: the schema changes it
+    /// probably made, or the end of a transaction that may have held some
+    /// (`SchemaEvents::statement_succeeded`).
     fn announce_schema_changes(&self, statement: &str) {
         let Some(events) = &self.schema_events else {
             return;
         };
-        let changes = oxbase_sql::schema_changes(self.dialect, statement);
-        if changes.is_empty() {
-            return;
-        }
-        events.publish(SchemaChangeEvent {
-            session: self.session().id(),
-            database: self.database.clone(),
-            source: ChangeSource::Query,
-            changes,
-        });
+        events.statement_succeeded(
+            self.session().id(),
+            self.database.clone(),
+            self.dialect,
+            statement,
+        );
     }
 
     /// The session statements run on now.

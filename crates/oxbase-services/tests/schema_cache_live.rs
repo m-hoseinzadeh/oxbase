@@ -3,8 +3,9 @@
 //! - a full build on a session of its own finds a table created in an editor;
 //! - the snapshot persisted in the app database is reloaded by a new service (a restart)
 //!   without any catalog read;
-//! - editor DDL (`CREATE TABLE`, `DROP TABLE` run through `QueryService`) and a designer apply
-//!   reach the cache within `[m6] invalidation_limit_ms` of finishing;
+//! - editor DDL (`CREATE TABLE`, `DROP TABLE` run through `QueryService`), a `CREATE TABLE`
+//!   inside an explicit transaction (committed by a later run), a designer apply and an import
+//!   that creates its table reach the cache within `[m6] invalidation_limit_ms` of finishing;
 //! - `forget_profile` drops the caches and the snapshots.
 //!
 //! `#[ignore]`d: `cargo test -p oxbase-services --test schema_cache_live -- --include-ignored`.
@@ -15,15 +16,20 @@ use std::time::{Duration, Instant};
 
 use futures::FutureExt;
 use oxbase_designer::{DesignColumn, TableDesign};
+use oxbase_io::{ColumnSpec, CsvReadOptions, ReadOptions};
 use oxbase_net::ssh::RusshTunnelProvider;
 use oxbase_services::designer::{DesignApplyOptions, DesignerService};
 use oxbase_services::history::HistoryService;
+use oxbase_services::import::{
+    ColumnMapping, ConversionOptions, ErrorPolicy, ImportConfig, ImportEvent, ImportRequest,
+    ImportService, ImportSource, ImportTarget, TargetMode, TransactionPolicy,
+};
 use oxbase_services::query::{
     EditorId, QueryConfig, QueryService, RunEvent, RunOptions, RunTarget,
 };
 use oxbase_services::schema_cache::{
-    CacheKey, CacheSource, CacheState, RefreshScope, SchemaCacheConfig, SchemaCacheService,
-    SchemaEvents,
+    COALESCE, CacheKey, CacheSource, CacheState, RefreshScope, SchemaCacheConfig,
+    SchemaCacheService, SchemaEvents,
 };
 use oxbase_services::tree::TreeService;
 use oxbase_services::{
@@ -81,18 +87,20 @@ fn token() -> String {
 
 struct Live {
     key: &'static str,
+    engine: Engine,
     manager: Arc<ConnectionManager>,
     caches: SchemaCacheService,
     repo: Arc<MemorySchemaCacheRepository>,
     query: QueryService,
     designer: DesignerService,
+    import: ImportService,
     session: SessionId,
     /// Where tables live: the catalog and schema of an `ObjectRef`.
     catalog: String,
     schema: Option<String>,
     prefix: String,
     limit: Duration,
-    _dir: tempfile::TempDir,
+    dir: tempfile::TempDir,
 }
 
 impl Live {
@@ -170,6 +178,13 @@ impl Live {
             Arc::clone(&manager),
             Arc::clone(&dialects),
         ));
+        let import = ImportService::new(
+            Arc::clone(&manager),
+            Arc::clone(&tree),
+            Arc::clone(&dialects),
+            ImportConfig::default(),
+        )
+        .with_schema_events(events.clone());
         let designer =
             DesignerService::new(Arc::clone(&manager), tree, dialects).with_schema_events(events);
         let (catalog, schema) = match engine {
@@ -185,17 +200,19 @@ impl Live {
         );
         Self {
             key,
+            engine,
             manager,
             caches,
             repo,
             query,
             designer,
+            import,
             session: base.id(),
             catalog,
             schema,
             prefix: format!("{}{}_", s(m6, "scratch_prefix"), token()),
             limit,
-            _dir: dir,
+            dir,
         }
     }
 
@@ -306,7 +323,7 @@ fn column(name: &str, data_type: DataType, nullable: bool) -> DesignColumn {
 
 async fn scenario(key: &'static str, engine: Engine) {
     let live = Live::connect(key, engine).await;
-    let names = ["a", "b", "c"].map(|n| format!("{}{n}", live.prefix));
+    let names = ["a", "b", "c", "d", "e"].map(|n| format!("{}{n}", live.prefix));
     let outcome = std::panic::AssertUnwindSafe(steps(&live, &names))
         .catch_unwind()
         .await;
@@ -322,9 +339,9 @@ async fn scenario(key: &'static str, engine: Engine) {
     ));
 }
 
-async fn steps(live: &Live, names: &[String; 3]) {
+async fn steps(live: &Live, names: &[String; 5]) {
     let key = live.key;
-    let [a, b, c] = names;
+    let [a, b, c, d, e] = names;
     live.run(&format!(
         "CREATE TABLE {a} (id INT NOT NULL PRIMARY KEY, name VARCHAR(20))"
     ))
@@ -449,6 +466,79 @@ async fn steps(live: &Live, names: &[String; 3]) {
     let status = live.caches.status(live.session, None).await.unwrap();
     assert_eq!(status.state, CacheState::Ready, "{key}");
     assert!(!status.building, "{key}");
+
+    // Editor DDL inside an explicit transaction, committed by a later run: the refresh that
+    // runs before the COMMIT cannot see the table (transactional DDL), the COMMIT brings it.
+    let begin = match live.engine {
+        Engine::MySql | Engine::MariaDb => "START TRANSACTION",
+        _ => "BEGIN TRANSACTION",
+    };
+    live.run(begin).await;
+    live.run(&format!("CREATE TABLE {d} (id INT NOT NULL PRIMARY KEY)"))
+        .await;
+    tokio::time::sleep(COALESCE + Duration::from_millis(700)).await;
+    live.run("COMMIT").await;
+    let took = live
+        .wait_for(d, true, "editor CREATE TABLE committed by a later run")
+        .await;
+    assert!(took <= live.limit, "{key}: {} ms", took.as_millis());
+
+    // An import that creates its table.
+    let csv = live.dir.path().join("m6-import.csv");
+    std::fs::write(&csv, "id,label\n1,one\n2,two\n").unwrap();
+    let request = ImportRequest {
+        options: ReadOptions::Csv(CsvReadOptions::default()),
+        columns: vec![
+            ColumnSpec::new("id", DataType::Text),
+            ColumnSpec::new("label", DataType::Text),
+        ],
+        mapping: vec![
+            ColumnMapping {
+                source: 0,
+                target: Some("id".into()),
+                data_type: Some(DataType::INT64),
+            },
+            ColumnMapping {
+                source: 1,
+                target: Some("label".into()),
+                data_type: Some(DataType::VarChar { length: Some(20) }),
+            },
+        ],
+        target: ImportTarget {
+            session: live.session,
+            table: live.table(e),
+            mode: TargetMode::Create,
+        },
+        primary_key: vec!["id".into()],
+        conversion: ConversionOptions::default(),
+        errors: ErrorPolicy::Stop,
+        transaction: TransactionPolicy::Auto,
+    };
+    let source = ImportSource {
+        path: csv,
+        options: request.options.clone(),
+    };
+    let mut handle = live
+        .import
+        .start(source, request)
+        .await
+        .unwrap_or_else(|err| panic!("{key}: import did not start: {err}"));
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(120), handle.events.recv())
+            .await
+            .unwrap_or_else(|_| panic!("{key}: the import stalled"))
+            .unwrap_or_else(|| panic!("{key}: the import ended without a terminal event"));
+        match event {
+            ImportEvent::Finished { report } => {
+                assert!(report.table_created, "{key}: {report:?}");
+                break;
+            }
+            other if other.is_terminal() => panic!("{key}: import: {other:?}"),
+            _ => {}
+        }
+    }
+    let took = live.wait_for(e, true, "import create").await;
+    assert!(took <= live.limit, "{key}: {} ms", took.as_millis());
 
     // Forget the profile.
     let profile = live.cache_key().profile_id;

@@ -11,8 +11,40 @@
 
 use oxbase_dialect::{CatalogScope, RelationName};
 use oxbase_schema_cache::{NamePart, SchemaCache};
-use oxbase_sql::{DdlObject, DdlVerb, SchemaChange};
+use oxbase_sql::{DdlObject, DdlVerb, SchemaChange, SqlDialect, SqlTokenKind};
 use oxbase_types::CatalogSnapshot;
+
+/// How a statement ends a transaction ([`transaction_end`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum TransactionEnd {
+    /// `COMMIT`, `END`, `ROLLBACK`, `ABORT` (with `WORK` / `TRAN` / `TRANSACTION`): the
+    /// transaction is over.
+    Whole,
+    /// `ROLLBACK TO [SAVEPOINT] s`, T-SQL `ROLLBACK TRAN name`, `... AND CHAIN`: it may go on.
+    Partial,
+}
+
+/// Whether `statement` ends a transaction (lexical; a false positive only costs a refresh).
+pub(super) fn transaction_end(dialect: SqlDialect, statement: &str) -> Option<TransactionEnd> {
+    let mut words = oxbase_sql::tokenize(dialect, statement).filter_map(|t| {
+        if t.kind == SqlTokenKind::Word {
+            Some(t.text(statement).to_ascii_uppercase())
+        } else {
+            None
+        }
+    });
+    let first = words.next()?;
+    if !matches!(first.as_str(), "COMMIT" | "END" | "ROLLBACK" | "ABORT") {
+        return None;
+    }
+    // Anything after the optional noise word (a savepoint, a transaction name, AND CHAIN).
+    let rest = words.any(|w| !matches!(w.as_str(), "WORK" | "TRAN" | "TRANSACTION"));
+    Some(if rest && matches!(first.as_str(), "ROLLBACK" | "ABORT") {
+        TransactionEnd::Partial
+    } else {
+        TransactionEnd::Whole
+    })
+}
 
 /// What to read again.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -32,7 +64,24 @@ pub(super) struct Plan {
     /// Other databases of the same profile a change named (`db.schema.table`): their caches
     /// are marked stale.
     pub other_databases: Vec<String>,
+    /// Unqualified names a change created: when the partial read finds none of them in any
+    /// schema, the statement ran somewhere this cache does not know (another `search_path`,
+    /// MySQL `USE other`), and the service refreshes everything and marks the profile's other
+    /// caches stale.
+    pub expect: Vec<NamePart>,
 }
+
+/// How [`plan`] reads names of the engine.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct NameRules {
+    /// A two-part name's qualifier is a database (MySQL, MariaDB: `DatabaseScope::Catalog`),
+    /// so `other.t` names a table of another database's cache.
+    pub qualifier_is_database: bool,
+}
+
+/// An unqualified `CREATE` is looked for in every schema of the cache up to this many schemas;
+/// beyond that it refreshes everything.
+const MAX_CREATE_SCHEMAS: usize = 64;
 
 /// The stored spelling of a name part under `case` (quoted parts are exact).
 fn stored(part: &NamePart, case: oxbase_types::IdentCase) -> String {
@@ -67,25 +116,29 @@ fn push(out: &mut Vec<RelationName>, schema: &str, name: String) {
     }
 }
 
-/// The relations `name` (as written) stands for in `cache`, into `out`. `false` when the name
-/// cannot be read (the caller refreshes everything).
+/// The relations `name` (as written) stands for in `cache`, into `out`. With `verb` `CREATE`
+/// or `RENAME` (either name of a rename) the change may make a relation of that name, so an
+/// unqualified name is read in every schema; `CREATE` names are also expected to exist
+/// afterwards ([`Plan::expect`]). `false` when the name cannot be read (the caller refreshes everything).
 fn targets(
     cache: &SchemaCache,
+    rules: NameRules,
     name: &[NamePart],
+    verb: DdlVerb,
     out: &mut Vec<RelationName>,
-    others: &mut Vec<String>,
+    plan: &mut Plan,
 ) -> bool {
     let snap = cache.snapshot();
-    let rules = cache.case_rules();
+    let case = cache.case_rules();
     let (schema, last) = match name {
         [last] => (None, last),
         [schema, last] => (Some(schema), last),
         [database, schema, last] => {
             if let Some(other) = other_database(snap, database) {
-                others.push(other);
+                plan.other_databases.push(other);
                 return true;
             }
-            if !rules
+            if !case
                 .schemas
                 .matches(&database.text, database.quoted, &snap.database)
             {
@@ -104,16 +157,21 @@ fn targets(
                     .unwrap_or_default(),
             ]
         } else {
-            if let Some(other) = other_database(snap, part) {
-                others.push(other);
+            if rules.qualifier_is_database
+                && let Some(other) = other_database(snap, part)
+            {
+                plan.other_databases.push(other);
                 return true;
             }
-            vec![stored(part, rules.schemas)]
+            vec![stored(part, case.schemas)]
         }
     } else {
+        // The editor's session may resolve unqualified names differently than the cache's
+        // (another `search_path`): every schema that has the name is read again.
         let mut schemas: Vec<String> = cache
             .resolve_relation(std::slice::from_ref(last))
             .into_iter()
+            .chain(cache.relations_named(last))
             .filter_map(|id| cache.schema(id.schema).map(|s| s.name.clone()))
             .collect();
         let default = snap
@@ -121,12 +179,29 @@ fn targets(
             .clone()
             .or_else(|| snap.search_path.first().cloned())
             .or_else(|| snap.schemas.first().map(|s| s.name.clone()));
-        if let Some(default) = default
-            && !schemas.contains(&default)
-        {
-            schemas.push(default);
+        schemas.extend(default);
+        if matches!(verb, DdlVerb::Create | DdlVerb::Rename) {
+            let user: Vec<&str> = snap
+                .schemas
+                .iter()
+                .filter(|s| !s.system)
+                .map(|s| s.name.as_str())
+                .collect();
+            if user.len() > MAX_CREATE_SCHEMAS {
+                return false;
+            }
+            schemas.extend(user.into_iter().map(str::to_owned));
+            if verb == DdlVerb::Create && !plan.expect.contains(last) {
+                plan.expect.push(last.clone());
+            }
         }
-        schemas
+        let mut unique = Vec::with_capacity(schemas.len());
+        for s in schemas {
+            if !unique.contains(&s) {
+                unique.push(s);
+            }
+        }
+        unique
     };
     for schema in &schemas {
         let qualified = [
@@ -141,14 +216,18 @@ fn targets(
                 push(out, schema, rel.name.clone());
             }
         }
-        push(out, schema, stored(last, rules.relations));
+        push(out, schema, stored(last, case.relations));
     }
     true
 }
 
 /// The refresh `changes` call for on the cache `current` of `database`. Without a cache in
 /// memory (`None`) any change means "everything" (there is nothing to merge into).
-pub(super) fn plan(current: Option<&SchemaCache>, changes: &[SchemaChange]) -> Plan {
+pub(super) fn plan(
+    current: Option<&SchemaCache>,
+    rules: NameRules,
+    changes: &[SchemaChange],
+) -> Plan {
     let mut out = Plan::default();
     if changes.is_empty() {
         out.refresh = Refresh::Everything;
@@ -175,7 +254,7 @@ pub(super) fn plan(current: Option<&SchemaCache>, changes: &[SchemaChange]) -> P
                     name.splice(0..0, q.iter().cloned());
                 }
                 qualifier = (name.len() > 1).then(|| name[..name.len() - 1].to_vec());
-                if !targets(cache, &name, &mut relations, &mut out.other_databases) {
+                if !targets(cache, rules, &name, change.verb, &mut relations, &mut out) {
                     full = true;
                 }
             }
@@ -183,6 +262,7 @@ pub(super) fn plan(current: Option<&SchemaCache>, changes: &[SchemaChange]) -> P
         }
     }
     out.refresh = if full {
+        out.expect.clear();
         Refresh::Everything
     } else if relations.is_empty() {
         Refresh::Nothing
@@ -190,6 +270,14 @@ pub(super) fn plan(current: Option<&SchemaCache>, changes: &[SchemaChange]) -> P
         Refresh::Relations(relations)
     };
     out
+}
+
+/// The names of `expect` that `cache` has in no schema.
+pub(super) fn missing<'a>(cache: &SchemaCache, expect: &'a [NamePart]) -> Vec<&'a NamePart> {
+    expect
+        .iter()
+        .filter(|n| cache.relations_named(n).is_empty())
+        .collect()
 }
 
 /// The scope to merge a partial read with: `scope` plus every relation the reader returned
@@ -281,16 +369,23 @@ mod tests {
         let cache = pg();
         let p = plan(
             Some(&cache),
+            NameRules::default(),
             &[change(
                 DdlVerb::Alter,
                 DdlObject::Table,
                 &[part("ORDERS", false)],
             )],
         );
-        assert_eq!(p.refresh, Refresh::Relations(vec![rel("public", "orders")]));
+        // Every schema that has the name: the editor's search path may differ.
+        assert_eq!(
+            p.refresh,
+            Refresh::Relations(vec![rel("public", "orders"), rel("sales", "orders")])
+        );
+        assert_eq!(p.expect.len(), 0, "{p:?}");
 
         let p = plan(
             Some(&cache),
+            NameRules::default(),
             &[change(
                 DdlVerb::Create,
                 DdlObject::Table,
@@ -302,6 +397,7 @@ mod tests {
         // Quoted names keep their case; existing matches come first.
         let p = plan(
             Some(&cache),
+            NameRules::default(),
             &[change(
                 DdlVerb::Drop,
                 DdlObject::Table,
@@ -316,6 +412,7 @@ mod tests {
         let cache = pg();
         let p = plan(
             Some(&cache),
+            NameRules::default(),
             &[
                 change(
                     DdlVerb::Alter,
@@ -331,6 +428,7 @@ mod tests {
         );
         let p = plan(
             Some(&cache),
+            NameRules::default(),
             &[change(
                 DdlVerb::Create,
                 DdlObject::Function,
@@ -338,14 +436,19 @@ mod tests {
             )],
         );
         assert_eq!(p.refresh, Refresh::Everything);
-        assert_eq!(plan(Some(&cache), &[]).refresh, Refresh::Everything);
+        assert_eq!(
+            plan(Some(&cache), NameRules::default(), &[]).refresh,
+            Refresh::Everything
+        );
         let p = plan(
             Some(&cache),
+            NameRules::default(),
             &[change(DdlVerb::Rename, DdlObject::Other, &[])],
         );
         assert_eq!(p.refresh, Refresh::Everything);
         let p = plan(
             Some(&cache),
+            NameRules::default(),
             &[change(
                 DdlVerb::Create,
                 DdlObject::Index,
@@ -356,6 +459,7 @@ mod tests {
         assert_eq!(
             plan(
                 None,
+                NameRules::default(),
                 &[change(
                     DdlVerb::Create,
                     DdlObject::Table,
@@ -372,6 +476,7 @@ mod tests {
         let cache = pg();
         let p = plan(
             Some(&cache),
+            NameRules::default(),
             &[change(
                 DdlVerb::Drop,
                 DdlObject::Table,
@@ -386,6 +491,7 @@ mod tests {
         assert_eq!(p.other_databases, vec!["other".to_owned()]);
         let p = plan(
             Some(&cache),
+            NameRules::default(),
             &[change(
                 DdlVerb::Drop,
                 DdlObject::Table,
@@ -420,8 +526,12 @@ mod tests {
         snap.default_schema = Some(db.clone());
         snap.databases = vec![db.clone(), "elsewhere".into()];
         let cache = SchemaCache::new(snap);
+        let mysql = NameRules {
+            qualifier_is_database: true,
+        };
         let p = plan(
             Some(&cache),
+            mysql,
             &[change(
                 DdlVerb::Create,
                 DdlObject::Table,
@@ -429,8 +539,10 @@ mod tests {
             )],
         );
         assert_eq!(p.refresh, Refresh::Relations(vec![rel(&db, "NewOne")]));
+        assert_eq!(p.expect, [part("NewOne", false)]);
         let p = plan(
             Some(&cache),
+            mysql,
             &[change(
                 DdlVerb::Create,
                 DdlObject::Table,
@@ -441,6 +553,84 @@ mod tests {
             (p.refresh, p.other_databases),
             (Refresh::Nothing, vec!["elsewhere".into()])
         );
+    }
+
+    #[test]
+    fn two_part_names_are_schemas_where_the_engine_has_schemas() {
+        // PostgreSQL: `other.t` is a schema `other` of this database, even though a database
+        // of that name exists.
+        let cache = pg();
+        let p = plan(
+            Some(&cache),
+            NameRules::default(),
+            &[change(
+                DdlVerb::Create,
+                DdlObject::Table,
+                &[part("other", false), part("t", false)],
+            )],
+        );
+        assert_eq!(p.refresh, Refresh::Relations(vec![rel("other", "t")]));
+        assert_eq!(p.other_databases.len(), 0);
+        assert_eq!(p.expect.len(), 0, "qualified names are not expected");
+    }
+
+    #[test]
+    fn unqualified_creates_are_read_in_every_schema() {
+        let cache = pg();
+        let p = plan(
+            Some(&cache),
+            NameRules::default(),
+            &[change(
+                DdlVerb::Create,
+                DdlObject::Table,
+                &[part("Fresh", false)],
+            )],
+        );
+        assert_eq!(
+            p.refresh,
+            Refresh::Relations(vec![rel("public", "fresh"), rel("sales", "fresh")])
+        );
+        assert_eq!(p.expect, [part("Fresh", false)]);
+        assert_eq!(missing(&cache, &p.expect).len(), 1);
+        // An existing name is found; a full refresh drops the expectation.
+        assert_eq!(missing(&cache, &[part("ORDERS", false)]).len(), 0);
+        let p = plan(
+            Some(&cache),
+            NameRules::default(),
+            &[
+                change(DdlVerb::Create, DdlObject::Table, &[part("x", false)]),
+                change(DdlVerb::Create, DdlObject::Schema, &[part("s", false)]),
+            ],
+        );
+        assert_eq!(p.refresh, Refresh::Everything);
+        assert_eq!(p.expect.len(), 0);
+    }
+
+    #[test]
+    fn transaction_ends_are_recognized() {
+        use TransactionEnd::{Partial, Whole};
+        let pg = SqlDialect::Postgres;
+        for (sql, end) in [
+            ("COMMIT", Some(Whole)),
+            ("commit work;", Some(Whole)),
+            ("END", Some(Whole)),
+            ("/* done */ ROLLBACK", Some(Whole)),
+            ("ABORT TRANSACTION", Some(Whole)),
+            ("ROLLBACK TO SAVEPOINT s1", Some(Partial)),
+            ("rollback to s1", Some(Partial)),
+            ("COMMIT AND CHAIN", Some(Whole)),
+            ("ROLLBACK AND CHAIN", Some(Partial)),
+            ("BEGIN", None),
+            ("SELECT 'COMMIT'", None),
+            ("CREATE TABLE commit_log (id int)", None),
+            ("", None),
+        ] {
+            assert_eq!(transaction_end(pg, sql), end, "{sql}");
+        }
+        let ms = SqlDialect::TSql;
+        assert_eq!(transaction_end(ms, "COMMIT TRAN"), Some(Whole));
+        assert_eq!(transaction_end(ms, "ROLLBACK TRANSACTION"), Some(Whole));
+        assert_eq!(transaction_end(ms, "ROLLBACK TRAN save1"), Some(Partial));
     }
 
     #[test]

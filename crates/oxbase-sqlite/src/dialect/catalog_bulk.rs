@@ -195,15 +195,21 @@ impl CatalogReader for SqliteCatalogReader {
                 snap.truncated = true;
             }
             let read = rows.len().min(remaining);
+            // Primary key columns per relation with their position in the key.
+            let mut keys: HashMap<usize, Vec<(i64, String)>> = HashMap::new();
             for row in rows.into_iter().take(remaining) {
                 let Some(&i) = index.get(&row.string(0).to_ascii_lowercase()) else {
                     continue;
                 };
+                let pk = row.int(4).unwrap_or_default();
+                if pk > 0 {
+                    keys.entry(i).or_default().push((pk, row.string(1)));
+                }
                 schema.relations[i].columns.push(CatalogColumn {
                     name: row.string(1),
                     native_type: row.string(2),
                     nullable: !row.flag(3),
-                    primary_key: row.int(4).is_some_and(|pk| pk > 0),
+                    primary_key: pk > 0,
                 });
             }
             columns_read += read;
@@ -248,23 +254,44 @@ impl CatalogReader for SqliteCatalogReader {
                     ref_columns: to.into_iter().collect(),
                 });
             }
-            // `REFERENCES parent` without columns means the parent's primary key.
+            // `REFERENCES parent` without columns means the parent's primary key, in key order.
+            // A parent outside a partial scope is looked up with one more query.
+            let mut outside: Vec<String> = implicit
+                .iter()
+                .map(|&(rel, fk)| schema.relations[rel].foreign_keys[fk].ref_table.clone())
+                .filter(|parent| !index.contains_key(&parent.to_ascii_lowercase()))
+                .collect();
+            outside.sort_unstable_by_key(|p| p.to_ascii_lowercase());
+            outside.dedup_by_key(|p| p.to_ascii_lowercase());
+            let mut outside_keys: HashMap<String, Vec<(i64, String)>> = HashMap::new();
+            if !outside.is_empty() {
+                let list: String = outside.iter().map(String::as_str).map(quoted).collect();
+                let pk_sql = format!(
+                    "SELECT m.name, p.name, p.pk FROM {from} m JOIN {pragma}(m.name, ?2) p \
+                     WHERE m.type = 'table' AND p.pk > 0 \
+                       AND instr(lower(?1), lower('\"' || replace(m.name, '\"', '\"\"') || '\"')) > 0"
+                );
+                let pk_params = [Value::Text(list), Value::Text(database.name.clone())];
+                for row in cat.rows(&pk_sql, &pk_params).await? {
+                    outside_keys
+                        .entry(row.string(0).to_ascii_lowercase())
+                        .or_default()
+                        .push((row.int(2).unwrap_or_default(), row.string(1)));
+                }
+            }
             for (rel, fk) in implicit {
                 let parent = schema.relations[rel].foreign_keys[fk]
                     .ref_table
                     .to_ascii_lowercase();
-                let pk: Vec<String> = index
+                let mut pk = index
                     .get(&parent)
-                    .map(|&p| {
-                        schema.relations[p]
-                            .columns
-                            .iter()
-                            .filter(|c| c.primary_key)
-                            .map(|c| c.name.clone())
-                            .collect()
-                    })
+                    .and_then(|p| keys.get(p))
+                    .or_else(|| outside_keys.get(&parent))
+                    .cloned()
                     .unwrap_or_default();
-                schema.relations[rel].foreign_keys[fk].ref_columns = pk;
+                pk.sort_by_key(|(position, _)| *position);
+                schema.relations[rel].foreign_keys[fk].ref_columns =
+                    pk.into_iter().map(|(_, name)| name).collect();
             }
             snap.schemas.push(schema);
         }
