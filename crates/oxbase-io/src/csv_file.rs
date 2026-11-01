@@ -5,8 +5,10 @@
 //! - The file is decoded with [`crate::encoding::DecodingReader`] (encoding from
 //!   [`CsvReadOptions::encoding`], `Auto` resolved with [`crate::encoding::resolve`] on the first
 //!   64 KiB; a BOM is removed) and parsed with the `csv` crate (`flexible(true)`, so ragged rows
-//!   reach the reader, which applies [`CsvReadOptions::allow_ragged`]). `\r\n` and `\n` always
-//!   end rows; with [`LineEnding::Cr`](crate::LineEnding::Cr) a lone `\r` does too.
+//!   reach the reader, which applies [`CsvReadOptions::allow_ragged`]). `\r\n`, `\n` and a
+//!   lone `\r` end rows whatever [`crate::LineEnding`] says (as built: the `csv` crate's CRLF
+//!   terminator is the only one that keeps a quoted field ending in `\r` intact; a lone `\r`
+//!   inside an *unquoted* field splits the row). Blank lines are skipped.
 //! - Quoted fields may hold the delimiter, quotes (doubled or escaped) and line ends. A
 //!   multi-line field is one value; row numbers count records, not lines.
 //! - Values matching [`CsvReadOptions::null_tokens`] are NULL. Other text is parsed as its
@@ -52,8 +54,7 @@ pub fn preview(
     limits: PreviewLimits,
     cancel: &CancellationToken,
 ) -> Result<SourcePreview> {
-    let _ = (path, options, limits, cancel);
-    unimplemented!("m5: read")
+    crate::read::delimited::preview(path, options, limits, cancel)
 }
 
 /// Opens a delimited file for reading (see [`crate::open`]).
@@ -63,8 +64,7 @@ pub fn open(
     columns: &[ColumnSpec],
     batch_rows: usize,
 ) -> Result<Box<dyn SourceReader>> {
-    let _ = (path, options, columns, batch_rows);
-    unimplemented!("m5: read")
+    crate::read::delimited::open(path, options, columns, batch_rows)
 }
 
 /// The delimited-text writer over `file` (see [`crate::create_writer`]).

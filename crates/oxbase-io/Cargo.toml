@@ -34,7 +34,13 @@ serde_json.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+# read stream: inspects XLSX zip entries before calamine opens them (decompressed-size caps
+# against zip bombs). Same version and features as calamine's own dependency, so the lockfile
+# gains no crate. To hoist into [workspace.dependencies].
+zip = { version = "9.2.1", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 pretty_assertions.workspace = true
 tokio.workspace = true
+# read stream: the sample-file expectations in tests/fixtures.toml [m5.files].
+toml.workspace = true

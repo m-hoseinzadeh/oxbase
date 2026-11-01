@@ -66,6 +66,7 @@ pub mod infer;
 pub mod json_file;
 mod options;
 pub mod parquet_file;
+mod read;
 mod sink;
 mod source;
 pub mod sql_dump;

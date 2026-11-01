@@ -45,8 +45,7 @@ pub fn preview(
     limits: PreviewLimits,
     cancel: &CancellationToken,
 ) -> Result<SourcePreview> {
-    let _ = (path, options, limits, cancel);
-    unimplemented!("m5: read")
+    crate::read::json_rows::preview(path, options, limits, cancel)
 }
 
 /// Opens a JSON file for reading (see [`crate::open`]).
@@ -56,8 +55,7 @@ pub fn open(
     columns: &[ColumnSpec],
     batch_rows: usize,
 ) -> Result<Box<dyn SourceReader>> {
-    let _ = (path, options, columns, batch_rows);
-    unimplemented!("m5: read")
+    crate::read::json_rows::open(path, options, columns, batch_rows)
 }
 
 /// The JSON writer over `file` (see [`crate::create_writer`]).
