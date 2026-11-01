@@ -501,10 +501,11 @@ impl<'a> Parser<'a> {
             Some(t) if t.kind == Tk::Quoted => true,
             Some(t) if t.kind == Tk::Word => {
                 let w = self.tok_text(t);
-                !self.lang.is_reserved(w)
-                    && !words::contains(words::STOP, w)
-                    && !words::contains(words::OPERATORS, w)
-                    && !(self.grammar.batches && words::contains(words::STRONG, w))
+                let statement_word = self.grammar.batches && words::contains(words::STRONG, w);
+                !(statement_word
+                    || self.lang.is_reserved(w)
+                    || words::contains(words::STOP, w)
+                    || words::contains(words::OPERATORS, w))
             }
             _ => false,
         }
