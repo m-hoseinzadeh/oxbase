@@ -697,8 +697,7 @@ mod tests {
         let text = report.render();
         assert_eq!(
             line_starting(&text, "ENGINE    connect"),
-            "ENGINE    connect       tls           ssh           tls_over_ssh  cancel        \
-             stream_200k"
+            "ENGINE    connect  tls      ssh      tls_over_ssh  cancel   stream_200k"
         );
         assert!(
             text.lines()
