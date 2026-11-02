@@ -12,7 +12,7 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
-# `Engine`, for `SqlDialect::for_engine`. No other dependency: the splitter is hand-written.
+# `Engine`, for `SqlDialect::for_engine`. No other dependency: the lexer and splitter are hand-written.
 oxbase-types.workspace = true
 
 [dev-dependencies]

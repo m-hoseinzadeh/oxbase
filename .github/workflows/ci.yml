@@ -326,6 +326,74 @@ jobs:
         if: always()
         run: bash scripts/ci-fixtures.sh down
 
+  # M6 exit check (docs/m6-contracts.md §5): completion p95 at most 50 ms on the 5 000-table x
+  # 20-column synthetic cache over 240 cursor positions (crates/oxbase-insight/tests/
+  # complete_perf.rs prints p50 / p95 / max per scenario), in a release-like build (`--profile
+  # perf`); OXBASE_REQUIRE_M6_PERF=1 turns a budget overrun into a failure. Then the live
+  # 5k-table PostgreSQL variant (crates/oxbase-services/tests/schema_cache_perf.rs: catalog
+  # build, reload and completion through InsightService). Full lane, plus the fast lane of the
+  # perf, complete, cache and integration branches.
+  insight-perf:
+    name: Insight perf (5k-table completion)
+    if: >-
+      !startsWith(github.ref, 'refs/heads/wip/')
+      || endsWith(github.ref, '-perf')
+      || endsWith(github.ref, '-complete')
+      || endsWith(github.ref, '-cache')
+      || endsWith(github.ref, '-integrate')
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      OXBASE_REQUIRE_M6_PERF: "1"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: perf
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build the completion perf test (perf profile)
+        run: cargo test -p oxbase-insight --profile perf --locked --test complete_perf --no-run
+
+      - name: Completion latency on the synthetic 5k-table cache (perf profile)
+        run: cargo test -p oxbase-insight --profile perf --locked --test complete_perf -- --ignored --nocapture
+
+      # The same check in the release profile itself (thin LTO): the perf profile above is
+      # the slower, conservative one the contract names; both must stay within budget.
+      - name: Completion latency on the synthetic 5k-table cache (release)
+        run: cargo test -p oxbase-insight --release --locked --test complete_perf -- --ignored --nocapture
+
+      # The other §5 budgets (diagnose 1 MiB within 100 ms, format 100 KiB within 200 ms) and
+      # the formatter / diagnostics property counts, printed. One test at a time, so the timed
+      # runs do not share the runner's cores with the other tests of the binary.
+      - name: Diagnostics and formatter budgets and properties (perf profile)
+        run: cargo test -p oxbase-insight --profile perf --locked --test diagnose --test format -- --include-ignored --nocapture --test-threads=1
+
+      - name: Build the live perf test (perf profile)
+        run: cargo test -p oxbase-services --profile perf --locked --test schema_cache_perf --no-run
+
+      - name: Generate fixture TLS PKI and SSH keys
+        run: bash scripts/fixtures-certs.sh
+
+      - name: Start the PostgreSQL fixture
+        run: bash scripts/ci-fixtures.sh up postgres
+
+      - name: Completion latency on a live 5k-table PostgreSQL schema
+        run: cargo test -p oxbase-services --profile perf --locked --test schema_cache_perf -- --ignored --nocapture
+
+      - name: Dump fixture logs
+        if: failure()
+        run: bash scripts/ci-fixtures.sh logs postgres
+
+      - name: Tear down database fixtures
+        if: always()
+        run: bash scripts/ci-fixtures.sh down
+
   # The built app driven through its real webview (docs/m3-contracts.md §9, ui/e2e/README.md):
   # a debug app serving ui/dist, tauri-driver in front of WebKitWebDriver under Xvfb, the
   # PostgreSQL fixture only. Full lane, plus the fast lane of the e2e, app and integration
@@ -397,12 +465,14 @@ jobs:
         run: bash scripts/e2e-fixtures.sh up
 
       # M3: the table-data edit step is mandatory (a skip fails the job). M5: so is the
-      # import / export step (the debug app's --e2e-file-dir hook, ui/e2e/README.md).
+      # import / export step (the debug app's --e2e-file-dir hook, ui/e2e/README.md). M6: so is
+      # the code-insight step (completion, diagnostics, format, IPC latency).
       - name: Webview smoke test
         env:
           OXBASE_E2E_OUT: ${{ runner.temp }}/e2e
           OXBASE_E2E_REQUIRE_EDIT: "1"
           OXBASE_E2E_REQUIRE_M5: "1"
+          OXBASE_E2E_REQUIRE_M6: "1"
         run: bash scripts/e2e-smoke.sh
 
       - name: Upload e2e results

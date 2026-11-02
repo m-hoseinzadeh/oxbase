@@ -4053,6 +4053,21 @@ dependencies = [
 [[package]]
 name = "oxbase-insight"
 version = "0.0.1"
+dependencies = [
+ "oxbase-dialect",
+ "oxbase-mssql",
+ "oxbase-mysql",
+ "oxbase-pg",
+ "oxbase-schema-cache",
+ "oxbase-sql",
+ "oxbase-sqlite",
+ "oxbase-types",
+ "pretty_assertions",
+ "serde",
+ "serde_json",
+ "tokio-util",
+ "toml 1.1.8+spec-1.1.0",
+]
 
 [[package]]
 name = "oxbase-io"
@@ -4200,6 +4215,13 @@ version = "0.0.1"
 [[package]]
 name = "oxbase-schema-cache"
 version = "0.0.1"
+dependencies = [
+ "oxbase-dialect",
+ "oxbase-sql",
+ "oxbase-types",
+ "pretty_assertions",
+ "serde_json",
+]
 
 [[package]]
 name = "oxbase-services"
@@ -4215,11 +4237,13 @@ dependencies = [
  "oxbase-designer",
  "oxbase-dialect",
  "oxbase-driver",
+ "oxbase-insight",
  "oxbase-io",
  "oxbase-mssql",
  "oxbase-mysql",
  "oxbase-net",
  "oxbase-pg",
+ "oxbase-schema-cache",
  "oxbase-sql",
  "oxbase-sqlite",
  "oxbase-store",

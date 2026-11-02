@@ -97,6 +97,19 @@
 //!
 //! Both take file *paths*; turning the app's opaque file handles into paths is the app's job.
 //!
+//! # M6: code insight
+//!
+//! Contracts in `docs/m6-contracts.md`:
+//!
+//! - [`schema_cache::SchemaCacheService`] keeps one `oxbase_schema_cache::SchemaCache` per
+//!   (profile, database): from the app database at startup, built on its own child session
+//!   with the engine's `CatalogReader`, refreshed on [`schema_cache::SchemaEvents`] the
+//!   designer, import and query services publish.
+//! - [`insight::InsightService`] answers the editor's completion, diagnostics, hover and
+//!   format requests (UTF-16 payloads, newest-request-wins [`insight::RequestGate`]).
+//! - [`snippets::SnippetService`] lists built-in and user snippets and saves / deletes the
+//!   user's.
+//!
 //! **Sessions.** A session opened with [`ConnectionManager::open`] is a *base* session: the
 //! object tree reads metadata through it. Query editors never run on a base session; each
 //! editor gets a *child* session ([`ConnectionManager::open_child`]) with the same resolved
@@ -134,9 +147,12 @@ pub mod edit;
 pub mod export;
 pub mod history;
 pub mod import;
+pub mod insight;
 pub mod profiles;
 pub mod query;
 pub mod results;
+pub mod schema_cache;
+pub mod snippets;
 pub mod tree;
 
 pub use dialects::default_dialects;

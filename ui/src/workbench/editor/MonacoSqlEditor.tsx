@@ -1,5 +1,7 @@
 /** {@link SqlEditor} on Monaco. Loaded lazily by `SqlEditor`. */
 import { useEffect, useRef } from "react";
+import { hasInsight } from "./insight/controller";
+import { attachInsight, type InsightAttachment } from "./insight/monacoInsight";
 import { monaco } from "./monacoSetup";
 import type { SqlEditorProps } from "./SqlEditor";
 
@@ -16,6 +18,7 @@ export default function MonacoSqlEditor({
   readOnly,
   value,
   testId,
+  insight,
 }: SqlEditorProps) {
   const host = useRef<HTMLDivElement>(null);
   const editor = useRef<monaco.editor.IStandaloneCodeEditor | null>(null);
@@ -23,6 +26,11 @@ export default function MonacoSqlEditor({
   const command = useRef(onCommand);
   command.current = onCommand;
   const initial = useRef({ value: value ?? initialValue, language, readOnly: readOnly ?? false });
+  // Insight reads the latest target (engine, connection, database) on every request.
+  const insightProps = useRef(insight);
+  insightProps.current = insight;
+  const insightEditorId = insight?.editorId ?? null;
+  const attachment = useRef<InsightAttachment | null>(null);
 
   useEffect(() => {
     const element = host.current;
@@ -41,8 +49,36 @@ export default function MonacoSqlEditor({
       ariaLabel: ariaLabel ?? "SQL editor",
       readOnly: initial.current.readOnly,
       domReadOnly: initial.current.readOnly,
+      // With insight the core offers the names; plain words of the text would only add noise.
+      ...(insightEditorId
+        ? {
+            wordBasedSuggestions: "off" as const,
+            quickSuggestions: {
+              other: "on" as const,
+              comments: "off" as const,
+              strings: "off" as const,
+            },
+            suggest: { showWords: false, filterGraceful: true },
+          }
+        : {}),
     });
     editor.current = instance;
+    if (insightEditorId !== null) {
+      attachment.current = attachInsight(instance, {
+        editorId: insightEditorId,
+        target: () => {
+          const current = insightProps.current;
+          if (!current || !hasInsight(current.engine)) return null;
+          return {
+            engine: current.engine,
+            sessionId: current.sessionId,
+            database: current.database,
+          };
+        },
+        onCacheState: (state) => insightProps.current?.onCacheState?.(state),
+        onFormat: (outcome) => insightProps.current?.onFormat?.(outcome),
+      });
+    }
     instance.addAction({
       id: "oxbase.runCurrent",
       label: "Run selection or current statement",
@@ -82,6 +118,20 @@ export default function MonacoSqlEditor({
         instance.revealRangeInCenterIfOutsideViewport(range);
       },
       focus: () => instance.focus(),
+      insertSnippet: (body) => {
+        instance.focus();
+        const snippets = instance.getContribution("snippetController2") as unknown as {
+          insert(template: string): void;
+        } | null;
+        if (snippets) snippets.insert(body);
+        else instance.trigger("oxbase", "type", { text: body });
+      },
+      ...(attachment.current
+        ? {
+            format: () =>
+              attachment.current?.format() ?? Promise.resolve({ status: "unavailable" as const }),
+          }
+        : {}),
     };
 
     const media = window.matchMedia?.("(prefers-color-scheme: dark)");
@@ -89,12 +139,24 @@ export default function MonacoSqlEditor({
     media?.addEventListener("change", onScheme);
     return () => {
       media?.removeEventListener("change", onScheme);
+      attachment.current?.dispose();
+      attachment.current = null;
       editorRef.current = null;
       editor.current = null;
       instance.getModel()?.dispose();
       instance.dispose();
     };
-  }, [editorRef, ariaLabel]);
+  }, [editorRef, ariaLabel, insightEditorId]);
+
+  // A new engine, connection, database or cache generation: diagnose again.
+  const engine = insight?.engine ?? null;
+  const sessionId = insight?.sessionId ?? null;
+  const database = insight?.database ?? null;
+  const generation = insight?.generation ?? null;
+  useEffect(() => {
+    void [engine, sessionId, database, generation];
+    attachment.current?.controller.scheduleDiagnostics();
+  }, [engine, sessionId, database, generation]);
 
   // The connection's engine can change the grammar without recreating the editor.
   useEffect(() => {

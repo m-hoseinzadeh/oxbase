@@ -81,6 +81,25 @@ import / export step (step 9) once the integrator turns it on.
      warning. With `OXBASE_E2E_REQUIRE_M5=1` (the integrator sets it once the app, services,
      read and write streams are merged) a skip or a failure fails the run.
 
+10. **Code insight (M6)** (docs/m6-contracts.md §5, §9):
+    - One `insight_complete` call through IPC for `SELECT * FROM cust` must answer and, within
+      30 s (the schema cache may still be building), list the fixture table `customers`.
+    - In a new query editor it types `SELECT * FROM cust`; Monaco's suggest widget must list
+      `customers` (Ctrl+Space asks again when typing did not open it). It logs the time from the
+      last key to the list (WebDriver polling included) and the `insight_complete` IPC times the
+      typing caused.
+    - It then times 50 `insight_complete` calls through IPC (`window.__TAURI_INTERNALS__`) and
+      fails when the p95 exceeds `OXBASE_E2E_INSIGHT_P95_LIMIT_MS` (default 150 ms, IPC and
+      JSON included); every answer must have items. p50 / p95 / max (and the core's own time
+      from `elapsedUs`) go to the log, the summary and `e2e-perf.json` (`m6`).
+    - Until the M6 streams are merged (core insight, schema cache), any failure of this step is
+      a skip with a warning. With `OXBASE_E2E_REQUIRE_M6=1` (the integrator sets it in the
+      webview job) a skip or a failure fails the run.
+    - UI hooks: the editor is the last visible `[data-testid=sql-editor]`; the list is Monaco's
+      `.suggest-widget` rows (their `aria-label`). The query editor's toolbar also has
+      `format-button`, `snippets-button`, `schema-cache-status` (`data-state` = `ready`,
+      `stale`, `missing`, `building`, `failed`, ...) and `schema-cache-refresh`.
+
 ### The M5 file hook (app stream)
 
 What the test expects from the app, in **debug builds only** (`#[cfg(debug_assertions)]`, so a

@@ -1,0 +1,224 @@
+/* --- M6 code insight: schema cache indicator, snippet manager, editor decorations -------- */
+
+.schema-cache {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  margin-left: var(--space-2);
+  white-space: nowrap;
+}
+
+.schema-cache__status {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  color: var(--color-fg-muted);
+  cursor: default;
+}
+
+.schema-cache__dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--color-fg-faint);
+  flex: none;
+}
+
+.schema-cache__status[data-state="ready"] .schema-cache__dot {
+  background: var(--color-success);
+}
+
+.schema-cache__status[data-state="stale"] .schema-cache__dot,
+.schema-cache__status[data-state="building"] .schema-cache__dot {
+  background: var(--color-accent);
+}
+
+.schema-cache__status[data-state="building"] .schema-cache__dot {
+  animation: schema-cache-pulse 1.2s ease-in-out infinite;
+}
+
+.schema-cache__status[data-state="failed"] .schema-cache__dot,
+.schema-cache__status[data-state="error"] .schema-cache__dot {
+  background: var(--color-danger);
+}
+
+.schema-cache__refresh {
+  min-width: 26px;
+}
+
+@keyframes schema-cache-pulse {
+  50% {
+    opacity: 0.35;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .schema-cache__status[data-state="building"] .schema-cache__dot {
+    animation: none;
+  }
+}
+
+/* Hints: a dotted underline over the whole range (Monaco itself draws three dots only). */
+.monaco-editor .insight-hint {
+  text-decoration: underline dotted var(--color-fg-faint);
+  text-decoration-thickness: 1px;
+  text-underline-offset: 3px;
+}
+
+/* Completion icons: tables, views and columns stand out from keywords and functions. */
+.monaco-editor .suggest-widget .codicon-symbol-struct::before,
+.monaco-editor .suggest-widget .codicon-symbol-interface::before {
+  color: var(--engine-postgres);
+}
+
+.monaco-editor .suggest-widget .codicon-symbol-field::before {
+  color: var(--color-accent);
+}
+
+.monaco-editor .suggest-widget .codicon-symbol-folder::before,
+.monaco-editor .suggest-widget .codicon-symbol-module::before {
+  color: var(--engine-mariadb);
+}
+
+/* --- snippet manager -------------------------------------------------------------------- */
+
+.modal--snippets {
+  width: min(860px, calc(100vw - 32px));
+  height: min(620px, calc(100vh - 32px));
+}
+
+.modal--snippets .modal__body {
+  flex: 1;
+  min-height: 0;
+  padding: 0;
+}
+
+.snippets {
+  display: flex;
+  height: 100%;
+  min-height: 0;
+}
+
+.snippets__lists {
+  flex: 0 0 260px;
+  overflow: auto;
+  padding: var(--space-2);
+  border-right: 1px solid var(--color-border);
+  background: var(--color-bg-subtle);
+}
+
+.snippets__heading {
+  margin: var(--space-2) var(--space-1) var(--space-1);
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--color-fg-muted);
+}
+
+.snippets__list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.snippets__item {
+  display: flex;
+  width: 100%;
+  font: inherit;
+  color: inherit;
+  text-align: left;
+  border: none;
+  background: none;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-2);
+  padding: var(--space-1) var(--space-2);
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.snippets__item:hover {
+  background: var(--color-bg-muted);
+}
+
+.snippets__item--active,
+.snippets__item--active:hover {
+  background: var(--color-accent);
+  color: var(--color-accent-fg);
+}
+
+.snippets__item:focus-visible {
+  outline: 2px solid var(--color-focus);
+  outline-offset: -2px;
+}
+
+.snippets__name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.snippets__prefix {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  opacity: 0.8;
+}
+
+.snippets__detail {
+  flex: 1;
+  min-width: 0;
+  overflow: auto;
+  padding: var(--space-4);
+}
+
+.snippets__form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.snippets__body,
+.snippets__preview {
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.snippets__body {
+  resize: vertical;
+  min-height: 140px;
+}
+
+.snippets__preview {
+  margin: 0;
+  padding: var(--space-3);
+  white-space: pre-wrap;
+  background: var(--color-bg-subtle);
+  border: 1px solid var(--color-border);
+  border-radius: 4px;
+}
+
+.snippets__title {
+  margin: 0 0 var(--space-1);
+  font-size: 14px;
+}
+
+.snippets__engines {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2) var(--space-4);
+  margin: 0;
+  padding: 0;
+  border: none;
+}
+
+.snippets__engines legend {
+  padding: 0;
+  margin-bottom: var(--space-1);
+  font-weight: 500;
+}
+
+.snippets__empty {
+  margin: var(--space-1);
+  color: var(--color-fg-muted);
+}

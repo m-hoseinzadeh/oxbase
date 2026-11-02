@@ -63,10 +63,13 @@
 
 mod bulk;
 mod caps;
+mod catalog_bulk;
 mod compare;
 mod ddl;
 mod dml;
 mod fetch;
+// M6: keywords, functions and types for code insight.
+mod language;
 mod rows;
 mod sql;
 mod types;
@@ -80,6 +83,7 @@ use oxbase_dialect::{
 use oxbase_types::{Engine, ObjectKind, PropId, ServerVersion};
 
 pub use bulk::PgBulkLoader;
+pub use catalog_bulk::PgCatalogReader;
 pub use compare::{PgComparator, PgRules, canonical_type, normalize_def, normalize_expression};
 
 pub use fetch::{
@@ -129,6 +133,10 @@ pub fn register(reg: &mut DialectRegistry) {
     reg.register_quoting(engine, Arc::new(PgQuoting));
     // M5: import bulk loads with COPY ... FROM STDIN (bulk.rs).
     reg.register_bulk_loader(engine, Arc::new(PgBulkLoader));
+    // M6: the schema cache reads the whole catalog in a fixed number of queries.
+    reg.register_catalog_reader(engine, Arc::new(PgCatalogReader));
+    // M6: language data for code insight (language.rs).
+    reg.register_language(engine, language::LANGUAGE);
     reg.mark_not_applicable_except(engine, &APPLICABLE);
 }
 

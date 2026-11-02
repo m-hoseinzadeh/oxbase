@@ -664,3 +664,131 @@ mysql = "SELECT COUNT(*), SUM(id), SUM(qty), COUNT(note), SUM(CHAR_LENGTH(note))
 mariadb = "SELECT COUNT(*), SUM(id), SUM(qty), COUNT(note), SUM(CHAR_LENGTH(note)), SUM(CAST(amount * 100 AS SIGNED)) FROM {table}"
 sqlite = "SELECT count(*), sum(id), sum(qty), count(note), sum(length(note)), sum(CAST(round(amount * 100) AS INTEGER)) FROM {table}"
 mssql = "SELECT COUNT_BIG(*), SUM(CAST(id AS bigint)), SUM(CAST(qty AS bigint)), COUNT_BIG(note), SUM(CAST(DATALENGTH(note) / 2 AS bigint)), SUM(CAST(amount * 100 AS bigint)) FROM {table}"
+
+# --- M6: code insight (docs/m6-contracts.md §5, §9, §11) ------------------------------------
+[m6]
+# Catalog reader and cache live tests create scratch objects with this prefix and a random
+# token (m6_t_<token>_customer, ..._order, ..._summary, ...), drop them in a guard, and drop
+# stale ones older than stale_after_secs.
+scratch_prefix = "m6_t_"
+stale_after_secs = 3600
+# Invalidation: a designer apply, an import create or an editor DDL statement must be in the
+# cache this soon after it finished.
+invalidation_limit_ms = 2000
+
+# Where each engine's live tests work. Each creates: a parent table (2-column primary key, a
+# column whose name needs quotes), a child table with a foreign key to it, a view, a routine
+# (PostgreSQL / MySQL / MariaDB / SQL Server), a sequence (PostgreSQL, MariaDB, SQL Server) and
+# a user type (PostgreSQL enum, SQL Server alias type).
+[m6.postgres]
+database = "oxbase_test"
+schema = "public"
+
+[m6.mysql]
+database = "oxbase_test"
+
+[m6.mariadb]
+database = "oxbase_test"
+
+[m6.mssql]
+database = "oxbase_test"
+schema = "dbo"
+
+[m6.sqlite]
+# A fresh temp database file per test (like [m2.sqlite]).
+database = "main"
+
+# The 5k-table live variant (PostgreSQL only) and the latency limits of both perf tests.
+[m6.perf]
+schema = "m6_perf"
+tables = 5000
+columns_per_table = 20
+# Release (`--profile perf`) limits.
+build_limit_ms = 15000
+reload_limit_ms = 3000
+complete_p95_ms = 50
+cancel_limit_ms = 5
+warmup = 20
+iterations = 200
+limit = 200
+
+# Cursor texts shared by the synthetic and the live perf tests. `<|>` marks the cursor;
+# `{table}` / `{table2}` are two relations of the cache with a foreign key from {table2} to
+# {table}; `{schema}` is a schema other than the default one. `expect` is a completion kind
+# at least one returned item must have. `repeat` prepends that many copies of a 3-line filler
+# statement (a long script before the cursor).
+[[m6.perf.scenarios]]
+name = "statement-start"
+text = "<|>"
+expect = "keyword"
+
+[[m6.perf.scenarios]]
+name = "from-empty"
+text = "SELECT * FROM <|>"
+expect = "table"
+
+[[m6.perf.scenarios]]
+name = "from-prefix"
+text = "SELECT * FROM cust<|>"
+expect = "table"
+
+[[m6.perf.scenarios]]
+name = "from-fuzzy"
+text = "SELECT * FROM cstord<|>"
+expect = "table"
+
+[[m6.perf.scenarios]]
+name = "schema-qualified"
+text = "SELECT * FROM {schema}.<|>"
+expect = "table"
+
+[[m6.perf.scenarios]]
+name = "select-list-prefix"
+text = "SELECT cr<|> FROM {table} t"
+expect = "column"
+
+[[m6.perf.scenarios]]
+name = "qualified-column"
+text = "SELECT t.<|> FROM {table} t JOIN {table2} u ON u.id = t.id"
+expect = "column"
+
+[[m6.perf.scenarios]]
+name = "join-target"
+text = "SELECT * FROM {table} a JOIN <|>"
+expect = "table"
+
+[[m6.perf.scenarios]]
+name = "join-on"
+text = "SELECT * FROM {table} a JOIN {table2} b ON <|>"
+expect = "column"
+
+[[m6.perf.scenarios]]
+name = "where-unqualified"
+text = "SELECT * FROM {table} a, {table2} b WHERE <|>"
+expect = "column"
+
+[[m6.perf.scenarios]]
+name = "insert-columns"
+text = "INSERT INTO {table} (<|>"
+expect = "column"
+
+[[m6.perf.scenarios]]
+name = "update-set"
+text = "UPDATE {table} SET <|>"
+expect = "column"
+
+[[m6.perf.scenarios]]
+name = "cte-columns"
+text = "WITH x AS (SELECT id, created_at FROM {table}) SELECT x.<|> FROM x"
+expect = "column"
+
+[[m6.perf.scenarios]]
+name = "function-prefix"
+text = "SELECT get_<|> FROM {table}"
+expect = "function"
+
+[[m6.perf.scenarios]]
+name = "long-script"
+text = "SELECT t.<|> FROM {table} t"
+expect = "column"
+repeat = 500

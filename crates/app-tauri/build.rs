@@ -48,6 +48,17 @@ const COMMANDS: &[&str] = &[
     "import_cancel",
     "export_run",
     "export_cancel",
+    // M6 code insight (src/insight.rs).
+    "insight_complete",
+    "insight_diagnose",
+    "insight_hover",
+    "insight_close_editor",
+    "format_sql",
+    "schema_cache_refresh",
+    "schema_cache_status",
+    "snippet_list",
+    "snippet_save",
+    "snippet_delete",
 ];
 
 fn main() {

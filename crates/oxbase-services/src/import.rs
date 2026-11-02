@@ -105,6 +105,7 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::query::ErrorInfo;
+use crate::schema_cache::SchemaEvents;
 use crate::tree::TreeService;
 use crate::{CancellationToken, ConnectionManager, SessionHandle, SessionId, check_cancelled};
 
@@ -460,6 +461,8 @@ pub struct ImportService {
     config: ImportConfig,
     /// Cancel tokens of the running imports (shared with the run tasks, which remove theirs).
     running: Arc<Mutex<HashMap<ImportId, CancellationToken>>>,
+    /// M6: where created tables are announced to the schema cache.
+    schema_events: Option<SchemaEvents>,
 }
 
 impl ImportService {
@@ -475,7 +478,16 @@ impl ImportService {
             dialects,
             config,
             running: Arc::new(Mutex::new(HashMap::new())),
+            schema_events: None,
         }
+    }
+
+    /// M6: publishes a [`SchemaChangeEvent`](crate::schema_cache::SchemaChangeEvent) on
+    /// `events` when an import created (or replaced) its target table.
+    #[must_use]
+    pub fn with_schema_events(mut self, events: SchemaEvents) -> Self {
+        self.schema_events = Some(events);
+        self
     }
 
     pub fn manager(&self) -> &Arc<ConnectionManager> {
@@ -590,6 +602,7 @@ impl ImportService {
             token,
             events,
             running: Arc::clone(&self.running),
+            schema_events: self.schema_events.clone(),
         };
         tokio::spawn(job.run(open));
         Ok(ImportHandle {

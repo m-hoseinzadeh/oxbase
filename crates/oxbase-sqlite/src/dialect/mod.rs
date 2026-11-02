@@ -56,10 +56,13 @@
 mod bulk;
 mod caps;
 mod catalog;
+mod catalog_bulk;
 mod compare;
 mod ddl;
 mod dml;
 mod fetch;
+// M6: keywords, functions and types for code insight.
+mod language;
 mod parse;
 mod types;
 
@@ -74,6 +77,7 @@ use oxbase_types::{Engine, ObjectKind, PropId, ServerVersion, props};
 
 pub use bulk::SqliteBulkLoader;
 pub use caps::designer_capabilities;
+pub use catalog_bulk::SqliteCatalogReader;
 pub use compare::SqliteRules;
 pub use ddl::{REBUILD_SUFFIX, SqliteDdl};
 pub use dml::SqliteDmlWriter;
@@ -231,6 +235,10 @@ pub fn register(reg: &mut DialectRegistry) {
         .register_dml_writer(engine, dml)
         // M5: import bulk loads as batched multi-row INSERTs (bulk.rs).
         .register_bulk_loader(engine, Arc::new(SqliteBulkLoader::new()))
+        // M6: the schema cache reads each database's catalog in a fixed number of queries.
+        .register_catalog_reader(engine, Arc::new(SqliteCatalogReader))
+        // M6: language data for code insight (language.rs).
+        .register_language(engine, language::LANGUAGE)
         .mark_not_applicable_except(engine, APPLICABLE);
 }
 

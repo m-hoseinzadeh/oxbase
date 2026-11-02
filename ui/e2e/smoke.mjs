@@ -24,6 +24,10 @@
 //                             sets it when the checkout has the M3 table-data UI and fixtures
 //   OXBASE_E2E_REQUIRE_M5     1: the M5 import / export step must run and pass; without it a
 //                             missing file hook or a failure of that step is a skip (warning)
+//   OXBASE_E2E_REQUIRE_M6     1: the M6 code-insight step must pass; without it any failure of
+//                             that step (core insight or schema cache not built yet) is a skip
+//   OXBASE_E2E_INSIGHT_P95_LIMIT_MS  p95 bound of 50 `insight_complete` calls through IPC
+//                             (default 150, docs/m6-contracts.md §5)
 //   GITHUB_STEP_SUMMARY       if set, a Markdown summary is appended to it
 
 import { createReadStream } from "node:fs";
@@ -46,6 +50,9 @@ const config = {
   cancelLimitMs: Number(env.OXBASE_E2E_CANCEL_LIMIT_MS || 2000),
   requireEdit: /^(1|true|yes)$/i.test(env.OXBASE_E2E_REQUIRE_EDIT || ""),
   requireM5: /^(1|true|yes)$/i.test(env.OXBASE_E2E_REQUIRE_M5 || ""),
+  requireM6: /^(1|true|yes)$/i.test(env.OXBASE_E2E_REQUIRE_M6 || ""),
+  insightP95LimitMs: Number(env.OXBASE_E2E_INSIGHT_P95_LIMIT_MS || 150),
+  insightSamples: 50,
   rows: 1_000_000,
   probeSamples: 60,
   pageSize: 200,
@@ -204,12 +211,14 @@ const report = {
   application: config.application,
   requireEdit: config.requireEdit,
   requireM5: config.requireM5,
+  requireM6: config.requireM6,
   query: null,
   pageLatency: null,
   scroll: [],
   cancel: null,
   edit: null,
   m5: null,
+  m6: null,
   steps: results,
   pageErrors: [],
 };
@@ -235,6 +244,7 @@ class Fatal extends Error {}
 /** Which env var makes a skip of a step a failure (the M3 edit step by default). */
 const EDIT_GATE = { required: config.requireEdit, env: "OXBASE_E2E_REQUIRE_EDIT" };
 const M5_GATE = { required: config.requireM5, env: "OXBASE_E2E_REQUIRE_M5" };
+const M6_GATE = { required: config.requireM6, env: "OXBASE_E2E_REQUIRE_M6" };
 
 async function step(name, fn, gate = EDIT_GATE) {
   const started = Date.now();
@@ -1471,6 +1481,171 @@ async function importExportSteps(table) {
 
 // ---------------------------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------------------------
+// M6 code insight (docs/m6-contracts.md §5, §9): completion in a fresh query editor lists a
+// fixture table after `SELECT * FROM cust`, and 50 `insight_complete` calls through IPC stay
+// under a p95 bound. Until the core insight and schema cache land (integration), every failure
+// is a skip; OXBASE_E2E_REQUIRE_M6=1 makes it a failure.
+
+const INSIGHT_TABLE = "customers";
+const INSIGHT_PREFIX = "SELECT * FROM cust";
+
+/** The visible query editor that was opened last. */
+const LAST_EDITOR =
+  "const all = Array.from(document.querySelectorAll('[data-testid=\"sql-editor\"]'))" +
+  "  .filter((e) => e.offsetParent !== null);" +
+  "return all.length ? all[all.length - 1] : null;";
+
+/** The rows of the open suggest widget under the last editor, as text. */
+const SUGGESTIONS =
+  "const all = Array.from(document.querySelectorAll('[data-testid=\"sql-editor\"]'))" +
+  "  .filter((e) => e.offsetParent !== null);" +
+  "const host = all.length ? all[all.length - 1] : null;" +
+  "const root = host ? (host.closest('.query-editor') || document) : document;" +
+  "const widgets = Array.from(root.querySelectorAll('.suggest-widget'))" +
+  "  .concat(Array.from(document.querySelectorAll('.overflowingContentWidgets .suggest-widget')));" +
+  "for (const w of widgets) {" +
+  "  if (!w.classList.contains('visible') && getComputedStyle(w).display === 'none') continue;" +
+  "  const rows = Array.from(w.querySelectorAll('.monaco-list-row'))" +
+  "    .map((r) => (r.getAttribute('aria-label') || r.textContent || '').trim());" +
+  "  if (rows.length) return rows; }" +
+  "return null;";
+
+/** One `insight_complete` call per sample through the webview's IPC, timed in the page. */
+const INSIGHT_PROBE = `
+const [text, samples, done] = arguments;
+(async () => {
+  const T = window.__TAURI_INTERNALS__;
+  const sessions = await T.invoke("list_open_connections");
+  if (!sessions.length) throw new Error("no open connection");
+  const out = [];
+  const editorId = "e2e-insight-probe-" + Date.now().toString(36);
+  for (let i = 0; i < samples; i += 1) {
+    const request = { editorId, seq: i + 1, engine: sessions[0].engine, sessionId: sessions[0].id,
+      database: null, text, offset: text.length };
+    const t0 = performance.now();
+    const answer = await T.invoke("insight_complete", { request, limit: 200, requestId: null });
+    const t1 = performance.now();
+    out.push({ ms: t1 - t0, items: answer.items.length, cache: answer.cache,
+      coreUs: answer.elapsedUs, labels: i === samples - 1 || i === 0
+        ? answer.items.slice(0, 50).map((it) => it.label) : null });
+  }
+  await T.invoke("insight_close_editor", { editorId }).catch(() => {});
+  return out;
+})().then(done, (e) => done({ error: String(e && e.message || (e && e.category) || e) }));`;
+
+async function insightProbe(samples) {
+  const out = await wd.executeAsync(INSIGHT_PROBE, INSIGHT_PREFIX, samples);
+  if (out && !Array.isArray(out) && out.error) throw new Error(`insight_complete: ${out.error}`);
+  return out;
+}
+
+async function insightStep() {
+  try {
+    return await insightChecks();
+  } catch (error) {
+    if (config.requireM6 || error instanceof SkipStep) throw error;
+    throw new SkipStep(`code insight is not complete in this build: ${error.message}`);
+  }
+}
+
+async function insightChecks() {
+  report.m6 = { table: INSIGHT_TABLE, prefix: INSIGHT_PREFIX };
+  // 1. The core answers at all (fails fast while the insight service is a skeleton). The
+  //    first answer may come before the schema cache is built: wait for the table to show up.
+  const first = await waitFor(
+    `insight_complete to list ${INSIGHT_TABLE}`,
+    async () => {
+      const [answer] = await insightProbe(1).catch((error) => {
+        throw new Fatal(error.message);
+      });
+      if (answer?.labels?.includes(INSIGHT_TABLE)) return answer;
+      return null;
+    },
+    { timeoutMs: 30_000, intervalMs: 1000 },
+  );
+  report.m6.cache = first.cache;
+  // 2. Through the UI: type the prefix into a new query editor; the suggest widget must list
+  //    the table. Monaco asks on typing; Ctrl+Space asks again if the widget did not open.
+  const button = await locate("newQuery");
+  if (!button) throw new Error("no New query button");
+  await wd.click(button);
+  const host = await waitFor("a new SQL editor", () => wd.executeElement(LAST_EDITOR), {
+    timeoutMs: 60_000,
+  });
+  const textarea = await waitFor("the editor's text area", () =>
+    wd.executeElement("return arguments[0].querySelector('textarea');", host),
+  );
+  await wd.click(host).catch(() => wd.execute("arguments[0].focus();", textarea));
+  await wd.sendKeys(textarea, INSIGHT_PREFIX.slice(0, -1));
+  await sleep(300);
+  const t0 = await wd.execute("return performance.now();");
+  await wd.sendKeys(textarea, INSIGHT_PREFIX.slice(-1));
+  const listed = (rows) => rows?.some((r) => r.toLowerCase().includes(INSIGHT_TABLE)) ?? false;
+  let rows = await waitFor(
+    "the completion list",
+    async () => {
+      const r = await wd.execute(SUGGESTIONS);
+      return listed(r) ? r : null;
+    },
+    { timeoutMs: 5_000, intervalMs: 50 },
+  ).catch(() => null);
+  let how = "typing";
+  if (!rows) {
+    how = "Ctrl+Space";
+    await wd.chord(Keys.control, " ");
+    rows = await waitFor(
+      `${INSIGHT_TABLE} in the completion list`,
+      async () => {
+        const r = await wd.execute(SUGGESTIONS);
+        return listed(r) ? r : null;
+      },
+      { timeoutMs: 10_000, intervalMs: 50 },
+    );
+  }
+  const t1 = await wd.execute("return performance.now();");
+  const ipc = await wd.execute(
+    "return window.__e2e.ipc.filter((e) => e.cmd === 'insight_complete' && e.start >= arguments[0]" +
+      " && e.end !== null).map((e) => e.end - e.start);",
+    t0,
+  );
+  await wd.sendKeys(textarea, Keys.escape);
+  report.m6.ui = {
+    trigger: how,
+    msToList: Math.round(t1 - t0),
+    rows: rows.slice(0, 10),
+    ipcMs: stats(ipc),
+  };
+  log(
+    `completion list after ${how}: ${Math.round(t1 - t0)} ms (WebDriver polling included); ` +
+      `insight_complete IPC ${JSON.stringify(stats(ipc))}`,
+  );
+  // 3. 50 calls through IPC: p95 under the bound (IPC and JSON included).
+  const samples = await insightProbe(config.insightSamples);
+  const ms = stats(samples.map((s) => s.ms));
+  const coreMs = stats(samples.map((s) => s.coreUs / 1000));
+  report.m6.ipc = {
+    limitMs: config.insightP95LimitMs,
+    totalMs: ms,
+    coreMs,
+    items: samples[0]?.items,
+  };
+  log(
+    `insight_complete x${samples.length} through IPC: ${JSON.stringify(ms)}; core ${JSON.stringify(coreMs)}`,
+  );
+  if (!samples.every((s) => s.items > 0))
+    throw new Error("an insight_complete answer had no items");
+  if (ms.p95 > config.insightP95LimitMs) {
+    throw new Error(
+      `insight_complete p95 ${ms.p95} ms through IPC is over ${config.insightP95LimitMs} ms`,
+    );
+  }
+  return (
+    `${INSIGHT_TABLE} listed ${Math.round(t1 - t0)} ms after typing (${how}); ` +
+    `IPC p50 ${ms.p50} / p95 ${ms.p95} ms (limit ${config.insightP95LimitMs}), core p95 ${coreMs.p95} ms`
+  );
+}
+
 function markdownSummary() {
   const lines = ["## Webview smoke (Linux)", ""];
   lines.push("| Step | Result | Time | Detail |", "|---|---|---|---|");
@@ -1484,7 +1659,7 @@ function markdownSummary() {
       "> **Warning:** a step was skipped (see its detail). `OXBASE_E2E_REQUIRE_EDIT=1` makes a " +
         "skip of the edit step fail (`scripts/e2e-smoke.sh` sets it when the checkout has the M3 " +
         "table-data UI and the M3 PostgreSQL fixture); `OXBASE_E2E_REQUIRE_M5=1` does the same " +
-        "for the M5 import / export step.",
+        "for the M5 import / export step and `OXBASE_E2E_REQUIRE_M6=1` for the M6 code-insight step.",
     );
   }
   const pl = report.pageLatency;
@@ -1541,6 +1716,14 @@ function markdownSummary() {
         ` (${m.exportBytes ?? "?"} bytes); table ${m.cleanedUp ? "dropped" : "NOT dropped"} afterwards.`,
     );
   }
+  if (report.m6?.ipc) {
+    const m = report.m6;
+    lines.push(
+      `M6: ${m.table} listed ${m.ui?.msToList ?? "?"} ms after typing "${m.prefix}" (${m.ui?.trigger ?? "?"});` +
+        ` insight_complete through IPC p50 ${m.ipc.totalMs.p50} / p95 ${m.ipc.totalMs.p95} ms` +
+        ` (limit ${m.ipc.limitMs}), core p95 ${m.ipc.coreMs.p95} ms, cache ${m.cache}.`,
+    );
+  }
   if (report.cancel) {
     lines.push(
       `Cancel: "Cancelled" ${report.cancel.ms} ms after Stop (limit ${config.cancelLimitMs} ms), ` +
@@ -1566,6 +1749,7 @@ async function main() {
       importExport,
       M5_GATE,
     );
+    await step("Completion lists a fixture table (M6 code insight)", insightStep, M6_GATE);
   }
 
   const failed = results.some((r) => r.status === "failed");

@@ -25,6 +25,11 @@
 //!   `export_run`, `export_cancel`). The webview never sends a file path. Contract:
 //!   `docs/m5-contracts.md` §6-7.
 //!
+//! * Code insight (M6, `src/insight.rs`): `insight_complete`, `insight_diagnose`,
+//!   `insight_hover`, `insight_close_editor`, `format_sql`, `schema_cache_refresh`,
+//!   `schema_cache_status`, `snippet_list`, `snippet_save` and `snippet_delete`. Contract:
+//!   `docs/m6-contracts.md` §7.
+//!
 //! Every fallible command rejects with [`error::CommandError`], serialized as
 //! `{ "category": "<snake_case ErrorCategory>", "message": "..." }`.
 //!
@@ -38,6 +43,7 @@ mod demo_page;
 mod designer;
 mod error;
 mod files;
+mod insight;
 mod profiles;
 mod transfer;
 mod workbench;
@@ -100,6 +106,7 @@ pub fn run() {
             app.manage(states.designer);
             app.manage(states.transfer);
             app.manage(states.files);
+            app.manage(states.insight);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -143,6 +150,16 @@ pub fn run() {
             transfer::import_cancel,
             transfer::export_run,
             transfer::export_cancel,
+            insight::insight_complete,
+            insight::insight_diagnose,
+            insight::insight_hover,
+            insight::insight_close_editor,
+            insight::format_sql,
+            insight::schema_cache_refresh,
+            insight::schema_cache_status,
+            insight::snippet_list,
+            insight::snippet_save,
+            insight::snippet_delete,
         ])
         .build(tauri::generate_context!())
         .expect("error while building the oxbase desktop shell");

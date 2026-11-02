@@ -59,8 +59,8 @@ crates/
   oxbase-mongo        mongodb crate + rquickjs mongo-shell subset
   oxbase-redis        redis crate (cluster, sentinel, TLS, pub/sub)
   oxbase-net          SSH tunnels (russh), TLS config (rustls), tunnel pool
-  oxbase-sql          lexer, statement splitter, dialect AST (sqlparser-rs), formatter
-  oxbase-insight      completion/diagnostics engine (tree-sitter + schema cache)
+  oxbase-sql          lexer, statement splitter, token API, formatter safety check
+  oxbase-insight      completion/diagnostics/formatter (tolerant parser + schema cache; M6)
   oxbase-schema-cache per-connection identifier cache, incremental refresh
   oxbase-designer     model edits → DDL preview/apply, per dialect
   oxbase-diff         structure compare + data compare/sync, script generation
@@ -147,7 +147,7 @@ Every milestone ships as a working app on all three platforms through CI. The "D
 | M3 | Grid editing (DmlWriter), filter and sort builder, form/JSON views; **table designer** with DDL preview for the 3 SQL engines | Round-trip conformance passes for table, column, index, FK and check |
 | M4 | **mssql** driver + dialect cells; editor, grid and designer parity | Conformance green on 5 engines |
 | M5 | Import/export: CSV, JSON, XLSX, Parquet, SQL dump; wizard with mapping and preview | 1 GB CSV import with progress; export of any result or table |
-| M6 | Code insight: tree-sitter context, schema-aware completion, diagnostics, formatter, snippets | Completion under 50 ms on a 5k-table schema |
+| M6 | Code insight: cursor context (tolerant parser; tree-sitter evaluated, see M6 contracts), schema-aware completion, diagnostics, formatter, snippets | Completion under 50 ms on a 5k-table schema |
 | M7 | **mongo** (document grid, tree/JSON view, find/aggregate builder, shell subset via rquickjs) and **redis** (key browser, typed editors, console, cluster/sentinel, pub/sub) | Browse, edit and query on both engines |
 | M8 | Data transfer (cross-engine type mapping), **structure sync**, **data sync**, backup/restore | Sync between PG↔PG, MySQL↔MySQL and MSSQL↔MSSQL produces correct scripts; transfer PG→MySQL works |
 | M9 | Jobs: batch jobs, scheduler (in-app + `oxbase-cli` for OS cron/Task Scheduler), email notifications, run logs | Scheduled export runs headless on all 3 OSes |
@@ -406,6 +406,64 @@ the interrupted transaction back (test fixed). Where the build differs from the 
 - The 1 GB check runs on PostgreSQL and MySQL only; at the SQL Server rates measured in CI
   (3 900 to 7 000 rows/s) the same file would take about 25 to 45 minutes.
 
+**M6 contracts (Design step, 2026-11-01).** `docs/m6-contracts.md` fixes the code insight
+contracts. Parsing: tree-sitter (`tree-sitter-sequel` 0.3.11: one generic grammar, no bracket
+identifiers or MySQL `#` comments, non-nesting comments, Latin-only identifiers, a 16.6 MB
+generated `parser.c`, error nodes instead of a usable context on incomplete SQL; T-SQL only in
+small forks) and `sqlparser` 0.63 (no error recovery) were evaluated against a hand-written
+**tolerant parser over the `oxbase-sql` lexer**, which M6 uses: one lexer for splitter, insight
+and formatter, every prefix of a statement gives an outline, no new dependency. `oxbase-sql`
+gains a public token API, the formatter's token-equivalence check and lexical DDL detection
+(`schema_changes`). The schema cache: a `CatalogSnapshot` per (profile, database) read by a
+new per-engine `CatalogReader` role in a fixed number of catalog queries, indexed by
+`oxbase-schema-cache` (case-insensitive prefix and fuzzy search, resolution under per-engine
+`CaseRules`, partial merges; under 64 MiB for 5 000 tables x 20 columns), persisted in the app
+database (migration 2, with user snippets) for instant startup, refreshed on schema-change
+events from the designer, import and editor DDL. Per-engine `SqlLanguage` data (keywords,
+reserved words, functions with signatures, types) is registered like the other cells.
+`oxbase-insight` defines `outline`, `context_at`, `complete`, `diagnose` (errors only for
+lexical certainties, everything catalog-related at most a warning), `hover`, `format` (output
+must pass the token-equivalence check) and built-in snippets; `oxbase-services` adds
+`SchemaCacheService`, `InsightService` (UTF-16 payloads, newest-request-wins gate) and
+`SnippetService`; ten Tauri commands. The exit check is a CI job `insight-perf`: a synthetic
+5k-table catalog (p95 ≤ 50 ms per scenario, `--profile perf`) and a live 5k-table PostgreSQL
+schema built through the real catalog. Six streams (cache, context, complete, diagnose, format,
+app) fill the skeletons.
+
+**M6 as built (notes, 2026-11-02).** The exit check passed in the CI job `insight-perf`
+(Linux, `OXBASE_REQUIRE_M6_PERF=1`; full-lane run 41364795338 on `milestone/m6` at eb62f80,
+green, Bundle run 41364798320 green): `context_at` + `complete` over 240 cursor positions of
+15 scenarios on a synthetic 5 000-table x 20-column catalog took p50 0.18 ms / p95 1.49 ms /
+max 1.97 ms in the perf profile (release: p95 1.51 ms), against 50 ms; on a live PostgreSQL
+schema of 5 000 tables x 20 columns read through the real catalog reader (524 ms, 18.2 MiB
+index, reload from the app database 43 ms) the same scenarios through `InsightService::complete`
+took p50 0.23 ms / p95 1.02 ms / max 1.47 ms; through Tauri IPC in the webview smoke test p95
+2 ms. Diagnostics: zero errors and warnings on the valid corpus (732 statements in four files
+covering the five dialects) with and without a cache, 1 MiB in 64 to 99 ms depending on the
+runner (budget 100 ms); the formatter kept token equivalence
+and idempotence on 54 810 generated inputs. The README (*Code insight (M6)*) has the rest of the
+numbers. Where the build differs from
+the text above or from `docs/m6-contracts.md` (its §12 lists the planned deviations):
+
+- No tree-sitter: a tolerant hand-written parser over the `oxbase-sql` lexer (contracts §2.1).
+  Completion reads the parser's outline and `context_at`; diagnostics and hover use their own
+  statement analyzer (`oxbase_insight::diagnose::analyze`) over the same tokens, so the "one
+  lexer" invariant holds but two structural readers of a statement exist.
+- The schema cache republishes DDL changes of an editor session when its transaction ends
+  (`COMMIT` / `ROLLBACK`), so DDL inside an explicit transaction reaches the cache after the
+  commit; an unqualified `CREATE` refreshes every schema with that name and falls back to a
+  full refresh when the new name is still missing. Deleting a profile drops its caches and
+  persisted snapshots (`delete_profile_and_caches`).
+- The perf tests time the real pipeline only (no hand-built contexts); the `insight-perf` job
+  also checks the diagnostics (1 MiB: 100 ms budget reported, 150 ms enforced, since CI
+  runners differ by about 1.7x) and formatter (100 KiB in 200 ms, enforced) budgets and runs
+  the live 5k-table PostgreSQL variant unconditionally. `diagnose` skips the DDL rescan of
+  statements that hold no DDL verb.
+- Diagnostics have three codes beyond the contract's first list: `syntax-error` and
+  `dialect-mismatch` (warning at most; hints where the reading is uncertain, such as a `GO`
+  line that may be an alias) and `missing-if-exists` (hint). They need no cache, so they also
+  appear without one (contracts §4.5, §12).
+
 Order of work: M0–M3 prove the architecture. M4 and M7 are where the per-database matrix gets tested for real. M8 and M10 reuse the Comparator and DdlGenerator cells and get much cheaper if M3 is done right.
 
 ## 7. Main risks
@@ -415,7 +473,7 @@ Order of work: M0–M3 prove the architecture. M4 and M7 are where the per-datab
 | Scope (this is Navicat parity, a multi-quarter effort) | Strict milestone exit criteria. M10–M12 can move to v1.1 without blocking the core. |
 | SQL Server through tiberius: no Windows integrated auth on Linux/macOS, gaps around bulk copy; no TLS backend we can use (aws-lc / OpenSSL), no INFO messages, no batch row counts, coarse result metadata (M4 evaluation) | SQL auth first (Entra later). oxbase does the TDS TLS itself (rustls + ring). The INFO / count / metadata gaps are accepted for M4; a TDS client of our own or upstream changes replace tiberius behind `MsSqlConnection` later. Bulk insert is tested with M5 import. |
 | Mongo shell compatibility | Support a defined subset (find, aggregate, CRUD, `db.*` helpers) and say so in the docs |
-| Autocomplete quality across dialects | tree-sitter for context plus a catalog-driven engine; measure on real schemas |
+| Autocomplete quality across dialects | A tolerant parser on the shared lexer for context (M6 chose it over tree-sitter) plus a catalog-driven engine; measured on a synthetic 5k-table catalog and a live 5k-table PostgreSQL schema |
 | Webview differences (WebKitGTK on Linux is the weakest) | Run CI smoke tests on each OS's webview; keep the canvas grid off DOM-heavy paths |
 | Type fidelity across engines (transfer/sync) | Per-pair type mapping tables, tested in the conformance suite |
 

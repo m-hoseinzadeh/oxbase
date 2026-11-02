@@ -1,6 +1,6 @@
 //! The app database (M2): one SQLite file in [`app_data_dir`] holding query history and app
-//! settings (PLAN.md §5). Later milestones add connections, job runs and the schema-cache
-//! snapshot as new migrations.
+//! settings (PLAN.md §5); from M6 also user snippets and schema-cache snapshots
+//! ([`crate::insight`]). Later milestones add connections and job runs as new migrations.
 //!
 //! # File and connection
 //!
@@ -78,10 +78,13 @@ pub struct Migration {
 /// Version 1 (M2): `settings` (key/value JSON) and `query_history`. Times are Unix
 /// milliseconds (UTC) so they sort as integers; ids are UUID text; `status` is
 /// [`HistoryStatus::as_str`](crate::HistoryStatus::as_str).
-pub const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    name: "settings and query history",
-    sql: "\
+///
+/// Version 2 (M6): `snippets` and `schema_cache_snapshots` ([`crate::insight`]).
+pub const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "settings and query history",
+        sql: "\
 CREATE TABLE settings (
     key   TEXT PRIMARY KEY NOT NULL,
     value TEXT NOT NULL
@@ -100,7 +103,33 @@ CREATE TABLE query_history (
 CREATE INDEX query_history_by_time ON query_history (started_at_ms DESC, id DESC);
 CREATE INDEX query_history_by_profile ON query_history (profile_id, started_at_ms DESC);
 ",
-}];
+    },
+    Migration {
+        version: 2,
+        name: "snippets and schema cache snapshots",
+        sql: "\
+CREATE TABLE snippets (
+    id            TEXT PRIMARY KEY NOT NULL,
+    name          TEXT NOT NULL,
+    prefix        TEXT NOT NULL,
+    body          TEXT NOT NULL,
+    description   TEXT NOT NULL DEFAULT '',
+    engines       TEXT NOT NULL DEFAULT '[]',
+    created_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL
+);
+CREATE INDEX snippets_by_prefix ON snippets (prefix, name);
+CREATE TABLE schema_cache_snapshots (
+    profile_id    TEXT NOT NULL,
+    database_name TEXT NOT NULL,
+    format        INTEGER NOT NULL,
+    saved_at_ms   INTEGER NOT NULL,
+    snapshot      BLOB NOT NULL,
+    PRIMARY KEY (profile_id, database_name)
+);
+",
+    },
+];
 
 /// Settings key under which [`HistorySettings`] are stored (JSON) in the `settings` table.
 pub const HISTORY_SETTINGS_KEY: &str = "history";
@@ -181,7 +210,7 @@ impl AppDb {
     }
 
     /// Runs `f` on the connection, on the blocking pool.
-    async fn with<T: Send + 'static>(
+    pub(crate) async fn with<T: Send + 'static>(
         &self,
         f: impl FnOnce(&mut Connection) -> Result<T> + Send + 'static,
     ) -> Result<T> {
@@ -262,7 +291,7 @@ fn applied_versions(conn: &Connection) -> Result<BTreeSet<u32>> {
 }
 
 #[allow(clippy::needless_pass_by_value)] // used with `map_err`
-fn db_error(e: rusqlite::Error) -> Error {
+pub(crate) fn db_error(e: rusqlite::Error) -> Error {
     if let rusqlite::Error::SqliteFailure(f, _) = &e
         && f.code == rusqlite::ErrorCode::ConstraintViolation
     {
@@ -546,10 +575,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = open(&dir).await;
         assert!(db.path().is_file());
-        assert_eq!(db.applied_migrations().await.unwrap(), [1]);
+        assert_eq!(db.applied_migrations().await.unwrap(), [1, 2]);
         drop(db);
         let db = open(&dir).await;
-        assert_eq!(db.applied_migrations().await.unwrap(), [1]);
+        assert_eq!(db.applied_migrations().await.unwrap(), [1, 2]);
         let mode: String = db
             .with(|c| {
                 c.query_row("PRAGMA journal_mode", [], |r| r.get(0))
@@ -576,7 +605,7 @@ mod tests {
         .unwrap();
         drop(db);
         let db = open(&dir).await;
-        assert_eq!(db.applied_migrations().await.unwrap(), [1, 99]);
+        assert_eq!(db.applied_migrations().await.unwrap(), [1, 2, 99]);
         // Settings and history still work.
         db.set_setting("k", &serde_json::json!({"a": 1}))
             .await
@@ -593,14 +622,15 @@ mod tests {
         migrate(&mut conn, MIGRATIONS).unwrap();
         let bad = [
             MIGRATIONS[0],
+            MIGRATIONS[1],
             Migration {
-                version: 2,
+                version: 3,
                 name: "broken",
                 sql: "CREATE TABLE half (a INTEGER); THIS IS NOT SQL;",
             },
         ];
         let err = migrate(&mut conn, &bad).unwrap_err();
-        assert!(err.to_string().contains("migration 2"), "{err}");
+        assert!(err.to_string().contains("migration 3"), "{err}");
         let tables: i64 = conn
             .query_row(
                 "SELECT count(*) FROM sqlite_master WHERE name = 'half'",
@@ -614,7 +644,7 @@ mod tests {
                 .unwrap()
                 .into_iter()
                 .collect::<Vec<_>>(),
-            [1]
+            [1, 2]
         );
     }
 

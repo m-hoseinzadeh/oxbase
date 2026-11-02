@@ -12,5 +12,14 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
+# M6: the catalog snapshot types and identifier case rules.
+oxbase-types.workspace = true
+# `NamePart` (a name as written) for resolution.
+oxbase-sql.workspace = true
+# `CatalogScope` for merging partial reads.
+oxbase-dialect.workspace = true
+# The persisted snapshot form (`codec`).
+serde_json.workspace = true
 
 [dev-dependencies]
+pretty_assertions.workspace = true

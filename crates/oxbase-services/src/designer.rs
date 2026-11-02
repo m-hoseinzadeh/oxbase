@@ -48,6 +48,7 @@ use oxbase_designer::{
 };
 use oxbase_dialect::{DatabaseScope, DesignerCapabilities, DialectRegistry};
 use oxbase_driver::{Collected, ResultSet, Tx, collect};
+use oxbase_sql::DdlVerb;
 use oxbase_types::{
     Engine, Error, ErrorCategory, ObjectDef, ObjectKind, ObjectRef, Result, Script, ScriptStep,
     ServerVersion, StepCheck, StepPhase, TableDef, TriggerDef,
@@ -56,6 +57,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::convert::cell_text;
 use crate::query::ErrorInfo;
+use crate::schema_cache::{ChangeSource, SchemaEvents, object_event};
 use crate::tree::TreeService;
 use crate::{
     CancellationToken, Connection, ConnectionManager, SessionHandle, SessionId, check_cancelled,
@@ -140,6 +142,8 @@ pub struct DesignerService {
     manager: Arc<ConnectionManager>,
     tree: Arc<TreeService>,
     dialects: Arc<DialectRegistry>,
+    /// M6: where applied changes are announced to the schema cache.
+    schema_events: Option<SchemaEvents>,
 }
 
 impl DesignerService {
@@ -152,7 +156,16 @@ impl DesignerService {
             manager,
             tree,
             dialects,
+            schema_events: None,
         }
+    }
+
+    /// M6: publishes a [`SchemaChangeEvent`](crate::schema_cache::SchemaChangeEvent) on
+    /// `events` after every apply, so the schema cache refreshes the table.
+    #[must_use]
+    pub fn with_schema_events(mut self, events: SchemaEvents) -> Self {
+        self.schema_events = Some(events);
+        self
     }
 
     pub fn manager(&self) -> &Arc<ConnectionManager> {
@@ -367,6 +380,26 @@ impl DesignerService {
             }
         }
         let mut outcome = outcome?;
+        if let Some(events) = &self.schema_events {
+            // M6: the cache reads the table (and its new name) again.
+            let mut changes: Vec<(DdlVerb, &ObjectRef)> = Vec::new();
+            match &design.original {
+                Some(original) => {
+                    changes.push((DdlVerb::Alter, &original.obj));
+                    if original.obj.name != design.table.name {
+                        changes.push((DdlVerb::Rename, &design.table));
+                    }
+                }
+                None => changes.push((DdlVerb::Create, &design.table)),
+            }
+            events.publish(object_event(
+                &self.dialects,
+                engine,
+                session,
+                ChangeSource::Designer,
+                &changes,
+            ));
+        }
 
         // 4. Reload what is there now.
         let reload = outcome.committed || !outcome.atomic;

@@ -7,6 +7,8 @@ use std::sync::Arc;
 use oxbase_types::{Engine, Error, ObjectKind, Result, ServerVersion};
 
 use crate::bulk::{BulkLimits, BulkLoader, InsertLoader};
+use crate::catalog::CatalogReader;
+use crate::language::SqlLanguage;
 use crate::{Capabilities, Comparator, DdlGenerator, DmlWriter, Fetcher, Quoting, TreeLayout};
 
 /// The kinds the M3 table designer and the round-trip conformance cells need a
@@ -224,6 +226,10 @@ struct EngineEntry {
     /// M5: the import bulk loader. Not an [`EngineRole`] either: an engine without one falls
     /// back to the generic [`InsertLoader`] (see [`DialectRegistry::bulk_loader`]).
     bulk: Option<Arc<dyn BulkLoader>>,
+    /// M6: the schema-cache catalog reader. Not an [`EngineRole`] either.
+    catalog: Option<Arc<dyn CatalogReader>>,
+    /// M6: keywords, functions, types and identifier rules for code insight. Data, not a role.
+    language: Option<Arc<SqlLanguage>>,
 }
 
 /// Holds every dialect implementation, keyed by (engine, object kind) for per-kind roles and by
@@ -270,6 +276,19 @@ struct EngineEntry {
 /// SQL Server TDS bulk load. Until an engine does, [`DialectRegistry::bulk_loader`] hands out
 /// an [`InsertLoader`] built from its [`Quoting`] and [`BulkLimits::for_engine`], so import
 /// works on every engine with a `Quoting`.
+///
+/// # Registration (M6)
+///
+/// Each SQL engine's `register` also adds (`docs/m6-contracts.md` §3.2, §4.4):
+///
+/// - its [`CatalogReader`] ([`DialectRegistry::register_catalog_reader`]), which the schema
+///   cache uses to read every name of a database in a few queries;
+/// - its [`SqlLanguage`] ([`DialectRegistry::register_language`]): keywords, reserved words,
+///   built-in functions, data types and identifier characters. Until it does,
+///   [`DialectRegistry::language`] hands out [`SqlLanguage::standard`].
+///
+/// [`DialectRegistry::missing_insight_roles`] must be empty for PostgreSQL, MySQL, MariaDB,
+/// SQLite and SQL Server at the end of M6.
 #[derive(Default, Clone)]
 pub struct DialectRegistry {
     cells: HashMap<(Engine, ObjectKind), Cell>,
@@ -348,6 +367,22 @@ impl DialectRegistry {
         loader: Arc<dyn BulkLoader>,
     ) -> &mut Self {
         self.engine_mut(engine).bulk = Some(loader);
+        self
+    }
+
+    /// Registers the schema-cache catalog reader of `engine` (M6), replacing an earlier one.
+    pub fn register_catalog_reader(
+        &mut self,
+        engine: Engine,
+        reader: Arc<dyn CatalogReader>,
+    ) -> &mut Self {
+        self.engine_mut(engine).catalog = Some(reader);
+        self
+    }
+
+    /// Registers the SQL language data of `engine` (M6), replacing earlier data.
+    pub fn register_language(&mut self, engine: Engine, language: SqlLanguage) -> &mut Self {
+        self.engine_mut(engine).language = Some(Arc::new(language));
         self
     }
 
@@ -455,6 +490,64 @@ impl DialectRegistry {
     /// `true` when `engine` registered a [`BulkLoader`] of its own (not the fallback).
     pub fn has_bulk_loader(&self, engine: Engine) -> bool {
         self.engines.get(&engine).is_some_and(|e| e.bulk.is_some())
+    }
+
+    /// The schema-cache catalog reader of `engine` (M6); `Error::Unsupported` when none is
+    /// registered.
+    pub fn catalog_reader(&self, engine: Engine) -> Result<Arc<dyn CatalogReader>> {
+        self.engines
+            .get(&engine)
+            .and_then(|e| e.catalog.clone())
+            .ok_or_else(|| {
+                Error::unsupported(format!(
+                    "{} cannot read its catalog for code insight",
+                    engine.display_name()
+                ))
+            })
+    }
+
+    /// `true` when `engine` registered a [`CatalogReader`].
+    pub fn has_catalog_reader(&self, engine: Engine) -> bool {
+        self.engines
+            .get(&engine)
+            .is_some_and(|e| e.catalog.is_some())
+    }
+
+    /// The SQL language data of `engine` (M6): the registered data, else
+    /// [`SqlLanguage::standard`]. Never fails, so insight works on every engine.
+    pub fn language(&self, engine: Engine) -> Arc<SqlLanguage> {
+        self.engines
+            .get(&engine)
+            .and_then(|e| e.language.clone())
+            .unwrap_or_else(|| Arc::new(SqlLanguage::standard()))
+    }
+
+    /// `true` when `engine` registered language data of its own (not the fallback).
+    pub fn has_language(&self, engine: Engine) -> bool {
+        self.engines
+            .get(&engine)
+            .is_some_and(|e| e.language.is_some())
+    }
+
+    /// What `engine` still lacks for M6 code insight: a description per missing
+    /// [`CatalogReader`] or [`SqlLanguage`], and every problem
+    /// [`SqlLanguage::validate`] finds in its data. Engine streams assert this is empty.
+    pub fn missing_insight_roles(&self, engine: Engine) -> Vec<String> {
+        let mut out = Vec::new();
+        if !self.has_catalog_reader(engine) {
+            out.push(format!("{engine}: no CatalogReader"));
+        }
+        if self.has_language(engine) {
+            out.extend(
+                self.language(engine)
+                    .validate()
+                    .into_iter()
+                    .map(|p| format!("{engine}: SqlLanguage: {p}")),
+            );
+        } else {
+            out.push(format!("{engine}: no SqlLanguage"));
+        }
+        out
     }
 
     /// The object-tree layout of `engine`; `Error::Unsupported` when none is registered.

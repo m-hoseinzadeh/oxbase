@@ -42,6 +42,8 @@ mod compare;
 mod ddl;
 mod dml;
 mod fetch;
+// M6: keywords, functions and types for code insight.
+mod language;
 
 use std::sync::Arc;
 
@@ -53,6 +55,7 @@ use oxbase_types::{Engine, ObjectKind};
 pub use bulk::MsSqlBulkLoader;
 pub use caps::MsSqlCapabilities;
 pub use compare::MsSqlRules;
+pub use fetch::catalog_bulk::MsSqlCatalogReader;
 
 /// Object kinds SQL Server has. `User`, `Role` and `Grant` exist but have no fetcher in M4.
 pub const APPLICABLE: [ObjectKind; 16] = [
@@ -94,6 +97,10 @@ pub fn register(reg: &mut DialectRegistry) {
     reg.register_quoting(engine, Arc::new(BracketQuoting));
     // M5: import bulk loads as batched multi-row INSERTs (bulk.rs, load stream).
     reg.register_bulk_loader(engine, Arc::new(MsSqlBulkLoader::new()));
+    // M6: the schema cache reads the whole catalog in a fixed number of queries.
+    reg.register_catalog_reader(engine, Arc::new(MsSqlCatalogReader));
+    // M6: language data for code insight (language.rs).
+    reg.register_language(engine, language::LANGUAGE);
     reg.mark_not_applicable_except(engine, &APPLICABLE);
 }
 
