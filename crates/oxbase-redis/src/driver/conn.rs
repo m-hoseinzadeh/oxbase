@@ -11,6 +11,7 @@ use oxbase_types::{Endpoint, Error, Result, ServerVersion, TlsMode};
 use redis::aio::{ConnectionLike, MultiplexedConnection};
 use redis::cluster::ClusterClientBuilder;
 use redis::cluster_async::ClusterConnection;
+use redis::cluster_read_routing::RandomReplicaStrategy;
 use redis::cluster_routing::{RoutingInfo, SingleNodeRoutingInfo};
 use redis::{
     AsyncConnectionConfig, Cmd, ConnectionAddr, ProtocolVersion, RedisConnectionInfo, RedisFuture,
@@ -955,7 +956,7 @@ impl ClusterSetup<'_> {
             .use_protocol(protocol);
         if self.options.read_from_replicas {
             // Read-only commands go to a random replica of their slot's shard.
-            builder = builder.read_from_replicas();
+            builder = builder.read_routing_strategy(RandomReplicaStrategy);
         }
         if let Some(user) = self
             .params
