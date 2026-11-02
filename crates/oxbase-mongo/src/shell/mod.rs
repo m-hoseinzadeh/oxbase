@@ -12,7 +12,7 @@
 //! | `db` | the current database: `db.<coll>` / `db.getCollection(name)`, `db.getName()`, `db.getSiblingDB(name)`, `db.getCollectionNames()`, `db.getCollectionInfos(filter?)`, `db.runCommand(doc)`, `db.adminCommand(doc)`, `db.createCollection(name, options?)`, `db.createView(name, source, pipeline)`, `db.dropDatabase()`, `db.stats()`, `db.version()` |
 //! | collection | `find(filter?, projection?)` → cursor, `findOne(filter?, projection?)`, `aggregate(pipeline, options?)` → cursor, `insertOne`, `insertMany`, `updateOne`, `updateMany`, `replaceOne`, `deleteOne`, `deleteMany`, `countDocuments(filter?)`, `estimatedDocumentCount()`, `distinct(field, filter?)`, `createIndex(keys, options?)`, `getIndexes()`, `dropIndex(name)`, `drop()`, `renameCollection(name)` |
 //! | cursor | `sort`, `limit`, `skip`, `project`, `hint`, `batchSize`, `maxTimeMS`, `toArray()`, `count()` (= `countDocuments` of its filter), `next()`, `hasNext()`, `forEach(fn)`, `map(fn)` |
-//! | helpers | `ObjectId(hex?)`, `ISODate(text?)` / `new Date(...)`, `NumberInt(n)`, `NumberLong(n or text)`, `NumberDecimal(text)`, `UUID(text?)`, `BinData(subtype, base64)`, `Timestamp(t, i)`, `MinKey()`, `MaxKey()`, `RegExp` literals; `print(...)` / `printjson(x)` (notices); `EJSON.stringify` / `EJSON.parse` |
+//! | helpers | `ObjectId(hex?)`, `ISODate(text?)` / `new Date(...)`, `NumberInt(n)`, `NumberLong(n or text)`, `NumberDecimal(text)`, `UUID(text?)`, `BinData(subtype, base64)`, `Timestamp(t, i)`, `MinKey()`, `MaxKey()`, `RegExp` literals; `print(...)` / `printjson(x)` / `console.log(...)` (notices); `EJSON.stringify` / `EJSON.parse`; `sleep(ms)` (at most 10 s, waiting time) |
 //! | commands | `use <db>`, `show dbs` / `show databases`, `show collections` / `show tables`, `show users`, `show roles` (`it` is not offered: results are pageable instead) |
 //!
 //! Anything else (`load`, `require`, `fetch`, `process`, `fs`, `quit`, `sleep` beyond 10 s,
@@ -28,19 +28,42 @@
 //! wrapper (`{$oid: ...}`, `{$date: ...}`, `{$numberDecimal: ...}`) are **not** converted:
 //! in the shell the helpers are the way to write typed values (as in mongosh).
 //!
+//! A whole-number double read from the server is a plain JavaScript number, so writing it
+//! back stores an int32 when it fits (as mongosh does): re-saving a read document can change
+//! such a field's type from `double` to `int`. Dates outside JavaScript's range (beyond
+//! ±8.64e15 ms), `undefined` and symbols stay opaque values that keep their Extended JSON, so
+//! they survive a read and a write unchanged.
+//!
+//! Writes check their arguments before any server call, like mongosh: `updateOne` /
+//! `updateMany` / `replaceOne` / `deleteOne` / `deleteMany` need a filter (`undefined` or
+//! `null` is a `TypeError`; `{}` means every document and the guard asks for it), and
+//! `updateOne` / `updateMany` need update operators (every key starting with `$`) or a
+//! non-empty pipeline. `skip`, `batchSize` and `maxTimeMS` take whole numbers of 0 or more.
+//! An `insertMany` that fails part-way says in its error how many documents went in.
+//!
 //! # Results
 //!
 //! The value of the last expression of a statement is its result:
 //!
-//! - a cursor (`find`, `aggregate`) streams as a document result set (columns inferred, plus
-//!   `$document`; `oxbase_dialect::document`) without being materialized in JavaScript;
-//! - a document or an array of documents: the same shape, from the values;
+//! - a cursor (`find`, `aggregate`) that the script has not read streams as a document result
+//!   set (columns inferred, plus `$document`; `oxbase_dialect::document`) without being
+//!   materialized in JavaScript: it becomes a find / aggregate request that the driver runs
+//!   (the statement's run then cancels, pages and limits it like any request). A cursor the
+//!   script already read from, or one a request cannot express (`db.aggregate(...)`, an
+//!   aggregate `hint`), is read to its end into a document result;
+//! - a document or an array of documents: the same shape, from the values (columns from the
+//!   first 1000 documents, at most 1000 of them, batches of 1000 rows; a warning says when a
+//!   field got no column or a value did not fit its column, the `$document` column has all);
 //! - write results (`insertOne`, `updateMany`, ...): `RowsAffected` (inserted / modified /
 //!   deleted count) plus a one-row result with the acknowledged fields (`insertedId`,
 //!   `matchedCount`, `modifiedCount`, `upsertedId`, `deletedCount`);
 //! - `show ...`: one result set (`name` column, and `sizeOnDisk` / `empty` for `show dbs`);
 //! - any other value: one row, column `value` (relaxed Extended JSON text, `arrow.json`);
-//! - `undefined` (declarations, assignments, loops): no result set.
+//! - `undefined` (declarations, assignments, loops): no result set;
+//! - `use x`: a notice `switched to db x`.
+//!
+//! `print` output comes first, as info notices, in order. A failing statement still reports
+//! what it printed before the error.
 //!
 //! # Sandbox
 //!
@@ -52,21 +75,34 @@
 //!   (default 10 s; time spent waiting for the server does not count). An interrupted script
 //!   ends the statement with `Error::Cancelled` (token) or `Error::Timeout` (limit); the
 //!   server operation it was waiting for is cancelled as in the driver docs.
+//! - **Iteration limit**: a script reads at most 100 000 documents into JavaScript per
+//!   statement (`toArray`, `forEach`, `next`, ...); a cursor *returned* as the statement's
+//!   value streams every document without that limit. `print` output is kept up to 1000 lines
+//!   or 1 MiB per statement.
+//! - **Errors** are deterministic: a JavaScript error ends the statement with
+//!   `Error::Sql { code: <error name, or the server's codeName>, message: "<message> (line
+//!   <n>)" }`, the line counted within the statement; server errors the script did not catch
+//!   keep their category (`Cancelled`, `Timeout`, `Connection`, `Sql` with the server's code).
+//!   Running out of memory is `Sql { code: "OutOfMemory" }` and resets the session (its
+//!   globals are gone).
 //! - **Threading**: QuickJS runtimes are not `Send`. Each [`ShellSession`] owns one dedicated
 //!   OS thread holding its runtime and context (started on first use, stopped when the session
-//!   drops); statements are sent to it over a channel; its host functions wait for the async
-//!   driver with `tokio::runtime::Handle::block_on` (legal there: it is not a runtime thread).
-//!   Globals (`var x = ...`) survive between statements of the same editor session.
+//!   drops); statements are sent to it over a channel; its host function spawns each server
+//!   call on the statement's tokio runtime and waits for the answer (it is not a runtime
+//!   thread, so it may block). Globals (`var x = ...`) survive between statements of the same
+//!   editor session.
 //!
 //! # Splitting ([`MongoShell::split`])
 //!
 //! A statement ends at a top-level `;` or at a newline where the text so far is complete
 //! (brackets balanced, not inside a string, template literal or comment, the line does not
 //! end with an operator, `.`, `,` or `=>`, and the next non-blank line does not start with
-//! `.`, `)`, `]`, `}`, `?`, `:` or a binary operator). `use x`, `show x` and `it` lines are
-//! statements of their own. Text whose first non-blank character is `{` is one request
-//! statement (the whole text; see the driver docs). Comments (`//`, `/* */`) before a
-//! statement are not part of it.
+//! `.`, `)`, `]`, `}`, `?`, `:`, a binary operator, `else`, `catch` or `finally`), and the
+//! statement is not a control head waiting for its body (`if (...)`, `for (...)`, a function
+//! head, `else`); a top-level `;` followed by `else` (or by the `while` of a `do` loop) does
+//! not end it either. `use x`, `show x` and `it` lines are statements of their own. Text whose
+//! first character after blanks and comments is `{` is one request statement (the rest of the
+//! text; see the driver docs). Comments (`//`, `/* */`) before a statement are not part of it.
 //!
 //! # Redaction and guards
 //!
@@ -77,18 +113,37 @@
 //! filter, `updateMany({}, ...)` and `renameCollection(..., true)`; it blocks nothing.
 
 use std::borrow::Cow;
+use std::sync::Mutex;
 use std::time::Duration;
 
+use futures::StreamExt;
 use oxbase_dialect::{ScriptLanguage, StatementGuard};
-use oxbase_driver::{CancellationToken, ResultStream};
+use oxbase_driver::{CancellationToken, Connection, ResultItem, ResultStream};
 use oxbase_sql::Statement;
-use oxbase_types::Result;
+use oxbase_types::{
+    AggregateRequest, DocumentQuery, Error, FindRequest, ObjectKind, ObjectRef, Result,
+};
+use serde_json::Value as Json;
 
 use crate::MongoConnection;
 use crate::options::MongoOptions;
 
+mod commands;
+mod host;
+mod lang;
+mod lex;
+mod rows;
+mod session;
+mod split;
+
+use self::host::{StatementEnv, to_bson, to_document};
+use self::session::{Job, Outcome, Worker};
+
 /// Default stack limit of the JavaScript runtime.
 pub const DEFAULT_STACK_BYTES: usize = 1024 * 1024;
+
+/// How long a cancelled statement waits for the session thread to wind down.
+const CANCEL_GRACE: Duration = Duration::from_millis(400);
 
 /// The mongo shell as an editor language. See the module docs.
 #[derive(Debug, Clone, Copy, Default)]
@@ -104,18 +159,15 @@ impl ScriptLanguage for MongoShell {
     }
 
     fn split(&self, text: &str) -> Vec<Statement> {
-        let _ = text;
-        unimplemented!("m7: shell")
+        split::split(text)
     }
 
     fn redact_secrets<'a>(&self, text: &'a str) -> Cow<'a, str> {
-        let _ = text;
-        unimplemented!("m7: shell")
+        lang::redact(text)
     }
 
     fn guard(&self, statement: &Statement) -> StatementGuard {
-        let _ = statement;
-        unimplemented!("m7: shell")
+        lang::guard(&statement.text)
     }
 }
 
@@ -147,11 +199,15 @@ impl ShellLimits {
 /// to create: the runtime thread starts on the first [`ShellSession::run`].
 pub struct ShellSession {
     limits: ShellLimits,
+    worker: Mutex<Option<Worker>>,
 }
 
 impl ShellSession {
     pub fn new(limits: ShellLimits) -> Self {
-        Self { limits }
+        Self {
+            limits,
+            worker: Mutex::new(None),
+        }
     }
 
     /// The limits every statement runs under.
@@ -162,40 +218,233 @@ impl ShellSession {
     /// Evaluates one shell statement against `connection` (its client, current database and
     /// operation comments) and streams its result (see the module docs, *Results*). `use x`
     /// changes `connection`'s current database.
-    #[allow(
-        clippy::unused_async,
-        reason = "m7 skeleton: the shell stream fills the body"
-    )]
     pub async fn run(
         &self,
         connection: &MongoConnection,
         statement: &str,
         cancel: CancellationToken,
     ) -> Result<ResultStream> {
-        let _ = (self, connection, statement, cancel);
-        unimplemented!("m7: shell")
+        if cancel.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        if statement.trim().is_empty() {
+            return Ok(futures::stream::empty().boxed());
+        }
+        if let Some((word, argument)) = split::command_line(statement) {
+            return commands::run(connection, word, argument, &cancel).await;
+        }
+        let comment = connection.next_comment();
+        let database = connection
+            .current_database()
+            .unwrap_or_else(|| "test".to_owned());
+        let env = StatementEnv {
+            client: connection.client().clone(),
+            comment: comment.clone(),
+            handle: tokio::runtime::Handle::current(),
+            cancel: cancel.clone(),
+        };
+        let (reply, mut outcome) = tokio::sync::oneshot::channel();
+        self.send(Job {
+            source: statement.to_owned(),
+            database,
+            env,
+            reply,
+        })?;
+        let outcome = tokio::select! {
+            biased;
+            r = &mut outcome => r.map_err(|_| Error::internal("the shell thread stopped"))?,
+            () = cancel.cancelled() => {
+                // The session thread sees the token too (interrupt handler, host waits); stop
+                // what the statement started on the server, then let the thread wind down.
+                let _ = connection.kill_operation(&comment).await;
+                let _ = tokio::time::timeout(CANCEL_GRACE, &mut outcome).await;
+                return Err(Error::Cancelled);
+            }
+        };
+        if cancel.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        if let Some(database) = &outcome.switched {
+            connection.set_current_database(database);
+        }
+        stream(connection, outcome, cancel).await
+    }
+
+    /// Sends `job` to the session thread, starting it (again) when needed.
+    fn send(&self, job: Job) -> Result<()> {
+        let mut worker = self
+            .worker
+            .lock()
+            .map_err(|_| Error::internal("the shell session is poisoned"))?;
+        let job = match worker.as_ref() {
+            Some(w) => match w.send(job) {
+                Ok(()) => return Ok(()),
+                Err(job) => job,
+            },
+            None => job,
+        };
+        let fresh = Worker::start(self.limits)?;
+        fresh
+            .send(job)
+            .map_err(|_| Error::internal("the shell thread did not start"))?;
+        *worker = Some(fresh);
+        Ok(())
+    }
+}
+
+/// What a statement's value turned into (see the module docs, *Results*).
+#[derive(Debug)]
+enum Output {
+    None,
+    Request(Box<DocumentQuery>),
+    Documents(Vec<bson::Document>),
+    Value(bson::Bson),
+    Write { affected: u64, row: bson::Document },
+}
+
+/// The result stream of a finished statement.
+async fn stream(
+    connection: &MongoConnection,
+    outcome: Outcome,
+    cancel: CancellationToken,
+) -> Result<ResultStream> {
+    let mut items: Vec<Result<ResultItem>> = outcome
+        .notices
+        .into_iter()
+        .map(|n| Ok(ResultItem::Notice(n)))
+        .collect();
+    let output = match outcome
+        .result
+        .and_then(|described| parse_output(&described))
+    {
+        Ok(output) => output,
+        Err(Error::Cancelled) => return Err(Error::Cancelled),
+        Err(e) if items.is_empty() => return Err(e),
+        Err(e) => {
+            items.push(Err(e));
+            return Ok(futures::stream::iter(items).boxed());
+        }
+    };
+    let set = match output {
+        Output::None => None,
+        Output::Request(query) => {
+            let text = serde_json::to_string(&query)
+                .map_err(|e| Error::internal(format!("shell request: {e}")))?;
+            return match Connection::execute(connection, &text, &[], cancel).await {
+                Ok(rest) => Ok(futures::stream::iter(items).chain(rest).boxed()),
+                Err(e) if items.is_empty() => Err(e),
+                Err(e) => {
+                    items.push(Err(e));
+                    Ok(futures::stream::iter(items).boxed())
+                }
+            };
+        }
+        Output::Documents(docs) => {
+            items.extend(rows::documents(&docs)?.into_items());
+            None
+        }
+        Output::Value(value) => Some(rows::value(&value)?),
+        Output::Write { affected, row } => {
+            items.push(Ok(ResultItem::RowsAffected(affected)));
+            items.extend(rows::documents(std::slice::from_ref(&row))?.into_items());
+            None
+        }
+    };
+    if let Some((schema, batch)) = set {
+        items.push(Ok(ResultItem::Schema(schema)));
+        items.push(Ok(ResultItem::Batch(batch)));
+    }
+    Ok(futures::stream::iter(items).boxed())
+}
+
+/// The prelude's description of a statement's value (`__oxbase_describe`).
+fn parse_output(text: &str) -> Result<Output> {
+    let value: Json =
+        serde_json::from_str(text).map_err(|e| Error::internal(format!("shell result: {e}")))?;
+    let kind = value.get("kind").and_then(Json::as_str).unwrap_or("none");
+    Ok(match kind {
+        "request" => Output::Request(Box::new(request(
+            value.get("request").unwrap_or(&Json::Null),
+        )?)),
+        "documents" => {
+            let docs = value
+                .get("docs")
+                .and_then(Json::as_array)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            Output::Documents(
+                docs.iter()
+                    .map(|d| to_document(d, "document"))
+                    .collect::<Result<Vec<_>>>()?,
+            )
+        }
+        "value" => Output::Value(to_bson(value.get("value").unwrap_or(&Json::Null), "value")?),
+        "write" => Output::Write {
+            affected: count(value.get("affected")).unwrap_or(0),
+            row: to_document(value.get("row").unwrap_or(&Json::Null), "write result")?,
+        },
+        _ => Output::None,
+    })
+}
+
+/// A non-negative whole JSON number.
+fn count(value: Option<&Json>) -> Option<u64> {
+    let n = value?.as_f64()?;
+    if !n.is_finite() || n < 0.0 {
+        return None;
+    }
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "checked: finite and non-negative; counts stay far below 2^53"
+    )]
+    let whole = n.min(9.0e15) as u64;
+    Some(whole)
+}
+
+/// The find / aggregate request of an unread cursor.
+fn request(r: &Json) -> Result<DocumentQuery> {
+    let text = |key: &str| {
+        r.get(key)
+            .and_then(Json::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| Error::internal(format!("shell request without {key}")))
+    };
+    let mut collection = ObjectRef::new(ObjectKind::Table, text("coll")?);
+    collection.catalog = Some(text("db")?);
+    let part = |key: &str| r.get(key).filter(|v| !v.is_null()).cloned();
+    let max_time_ms = count(r.get("maxTimeMS")).filter(|n| *n > 0);
+    match text("kind")?.as_str() {
+        "find" => {
+            let mut f = FindRequest::new(collection);
+            f.filter = part("filter");
+            f.projection = part("projection");
+            f.sort = part("sort");
+            f.skip = count(r.get("skip")).filter(|n| *n > 0);
+            f.limit = count(r.get("limit")).filter(|n| *n > 0);
+            f.hint = part("hint");
+            f.collation = part("collation");
+            f.max_time_ms = max_time_ms;
+            Ok(DocumentQuery::Find(f))
+        }
+        "aggregate" => {
+            let pipeline = r
+                .get("pipeline")
+                .and_then(Json::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let mut a = AggregateRequest::new(collection, pipeline);
+            a.allow_disk_use = r
+                .get("allowDiskUse")
+                .and_then(Json::as_bool)
+                .unwrap_or(false);
+            a.collation = part("collation");
+            a.max_time_ms = max_time_ms;
+            Ok(DocumentQuery::Aggregate(a))
+        }
+        other => Err(Error::internal(format!("shell request of kind {other}"))),
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use oxbase_driver::ConnectParams;
-    use oxbase_types::Engine;
-
-    #[test]
-    fn limits_follow_the_profile_options() {
-        let mut params = ConnectParams::network(Engine::MongoDb, "127.0.0.1");
-        params
-            .options
-            .insert(crate::options::SHELL_TIME_LIMIT_MS.into(), "0".into());
-        let options = MongoOptions::from_params(&params).unwrap();
-        let limits = ShellLimits::from_options(&options);
-        assert_eq!(limits.memory_bytes, 64 * 1024 * 1024);
-        assert_eq!(limits.stack_bytes, DEFAULT_STACK_BYTES);
-        assert_eq!(limits.time_limit, None);
-        let session = ShellSession::new(limits);
-        assert_eq!(session.limits(), limits);
-        assert_eq!(MongoShell.editor_language(), "javascript");
-    }
-}
+mod tests;
