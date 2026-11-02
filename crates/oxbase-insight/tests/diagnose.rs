@@ -429,8 +429,13 @@ fn syntax_of_another_dialect_is_a_warning() {
     assert_has(&f, DialectMismatch, Warning, "`id`");
     let f = found(Engine::Postgres, "SELECT id FROM orders LIMIT 5, 10", None);
     assert_has(&f, DialectMismatch, Warning, "LIMIT 5,");
-    let f = found(Engine::Postgres, "SELECT 1\nGO\nSELECT 2", None);
+    let f = found(Engine::Postgres, "SELECT 1;\nGO\nSELECT 2", None);
     assert_has(&f, DialectMismatch, Warning, "GO");
+    // After a name or a literal `GO` may be an alias: a hint only.
+    let f = found(Engine::Postgres, "SELECT 1\nGO\nSELECT 2", None);
+    assert_has(&f, DialectMismatch, Hint, "GO");
+    let f = found(Engine::Postgres, "SELECT * FROM orders\ngo", None);
+    assert_has(&f, DialectMismatch, Hint, "go");
     let f = found(Engine::Sqlite, "DELIMITER //\nSELECT 1//", None);
     assert_has(&f, DialectMismatch, Warning, "DELIMITER");
     let f = found(

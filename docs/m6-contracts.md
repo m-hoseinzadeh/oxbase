@@ -340,9 +340,14 @@ summary), CTE or alias (what it stands for). Keywords get none.
 | `wrong-argument-count` | warning | a built-in function with no overload accepting that count (and no cached routine of that name) |
 | `unknown-function` | hint | neither built in nor cached |
 | `missing-where` | warning | `UPDATE` / `DELETE` of a table without `WHERE` (not for `TRUNCATE`) |
+| `syntax-error` | warning | syntax wrong in all five dialects: two commas in a row, a comma right before a clause keyword or `)`, a clause out of order (`WHERE` after `GROUP BY`); **hint** for a clause left empty while typing, a list ending in a comma at the end of the text, and any finding in a statement the analyzer could not read with certainty |
+| `dialect-mismatch` | warning | syntax of another dialect: `LIMIT` on SQL Server, `TOP n` on PostgreSQL, `ILIKE` on MySQL, `::` outside PostgreSQL, backtick quotes on PostgreSQL / SQL Server, `LIMIT offset, count` outside MySQL / SQLite, a `DELIMITER` line outside MySQL / MariaDB, a `GO` line that starts a statement outside SQL Server; **hint** when the reading is uncertain (`TOP (n)`, `RETURNING` on MySQL, a `GO` line after a name, literal or `)`, where it may be an alias) |
+| `missing-if-exists` | hint | `DROP TABLE` / `DROP VIEW` without `IF EXISTS` |
 
-Without a cache only lexical findings and `missing-where` appear. Messages never quote string
-literal contents. Results are sorted by range start.
+`syntax-error`, `dialect-mismatch` and `missing-if-exists` were added by the diagnose stream
+(§12). Without a cache only lexical findings, `missing-where`, `syntax-error`,
+`dialect-mismatch` and `missing-if-exists` appear; the name checks need a cache. Messages never
+quote string literal contents. Results are sorted by range start.
 
 ### 4.6 Formatter (format stream)
 
@@ -516,3 +521,6 @@ foreign key between them; `{schema}` by a schema other than the default one).
   `oxbase-sql` gains no `sqlparser` AST in M6.
 - The formatter lives in `oxbase-insight` (PLAN §2 listed it under `oxbase-sql`); `oxbase-sql`
   holds its safety check.
+- `DiagnosticCode` (§4.5) gained `syntax-error` and `dialect-mismatch` (both capped at warning)
+  and `missing-if-exists` (hint) during the diagnose stream; they need no cache, so a
+  cache-less editor shows them too. `ui/src/api/insight.ts` carries the same union.

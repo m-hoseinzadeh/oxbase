@@ -459,6 +459,10 @@ the text above or from `docs/m6-contracts.md` (its §12 lists the planned deviat
   runners differ by about 1.7x) and formatter (100 KiB in 200 ms, enforced) budgets and runs
   the live 5k-table PostgreSQL variant unconditionally. `diagnose` skips the DDL rescan of
   statements that hold no DDL verb.
+- Diagnostics have three codes beyond the contract's first list: `syntax-error` and
+  `dialect-mismatch` (warning at most; hints where the reading is uncertain, such as a `GO`
+  line that may be an alias) and `missing-if-exists` (hint). They need no cache, so they also
+  appear without one (contracts §4.5, §12).
 
 Order of work: M0–M3 prove the architecture. M4 and M7 are where the per-database matrix gets tested for real. M8 and M10 reuse the Comparator and DdlGenerator cells and get much cheaper if M3 is done right.
 

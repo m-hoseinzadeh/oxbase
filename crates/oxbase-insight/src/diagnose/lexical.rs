@@ -131,10 +131,18 @@ pub(crate) fn directives(
                 || (t.kind(next) == Some(Kind::Word)
                     && has(words::STATEMENT_STARTS, &t.upper(next)));
             if alone && prev_ok && next_ok {
+                // After a name, a literal or `)` the word may be an alias (`FROM orders` then
+                // `go` on the next line is valid outside SQL Server), so only a `GO` that starts
+                // a statement is certain enough for a warning.
+                let severity = if statement_start {
+                    Severity::Warning
+                } else {
+                    Severity::Hint
+                };
                 out.push(Diagnostic::new(
                     DiagnosticCode::DialectMismatch,
                     tok.start..tok.end,
-                    Severity::Warning,
+                    severity,
                     format!(
                         "`GO` is the batch separator of SQL Server tools; {} does not understand it.",
                         feat.name

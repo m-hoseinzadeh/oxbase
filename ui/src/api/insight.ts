@@ -96,7 +96,10 @@ export type DiagnosticCode =
   | "unknown-schema"
   | "unknown-function"
   | "wrong-argument-count"
-  | "missing-where";
+  | "missing-where"
+  | "syntax-error"
+  | "dialect-mismatch"
+  | "missing-if-exists";
 
 export interface DiagnosticItem {
   range: Utf16Range;
