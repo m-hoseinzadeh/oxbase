@@ -926,7 +926,7 @@ mod tests {
         let items = run("KEYS nothing:*", Value::Array(vec![]));
         let (schema, batches) = table(&items);
         assert_eq!(names(&schema), ["#", "type", "value", "raw"]);
-        assert!(batches.is_empty());
+        assert_eq!(batches, Vec::<RecordBatch>::new());
     }
 
     #[test]

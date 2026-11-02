@@ -1082,7 +1082,7 @@ mod tests {
             cluster_masters(&slots),
             [15501, 15502, 15503].map(|p| Endpoint::new("127.0.0.1", p))
         );
-        assert!(cluster_masters(&Value::Nil).is_empty());
+        assert_eq!(cluster_masters(&Value::Nil), Vec::<Endpoint>::new());
     }
 
     #[test]
@@ -1105,7 +1105,7 @@ mod tests {
         let pairs = hello_pairs(resp2);
         assert_eq!(pairs[1].0, "id");
         assert_eq!(scalar_text(&pairs[1].1).as_deref(), Some("7"));
-        assert!(hello_pairs(Value::Nil).is_empty());
+        assert_eq!(hello_pairs(Value::Nil), Vec::new());
     }
 
     #[test]

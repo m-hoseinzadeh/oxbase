@@ -586,7 +586,7 @@ async fn replies_render_per_resp_type_and_command() {
         // Writes report rows affected.
         let out = run(&c, &format!("HSET {hash} f1 v1 f2 v2 f3 grüße")).await;
         assert_eq!(out.rows_affected, [3]);
-        assert!(out.result_sets.is_empty());
+        assert_eq!(out.result_sets.len(), 0);
         assert_eq!(
             run(&c, &format!("RPUSH {list} a b c")).await.rows_affected,
             [3]
@@ -761,7 +761,7 @@ async fn blocking_commands_cancel_within_2s_and_the_session_stays() {
     assert_ne!(hello(limited.as_ref(), "id").await, id_before);
     assert_eq!(limited.current_database().as_deref(), Some("2"));
     let out = run(limited.as_ref(), "PING").await;
-    assert!(out.notices.is_empty());
+    assert_eq!(out.notices, Vec::new());
     limited.close().await.unwrap();
     let _ = try_run(&admin, "ACL DELUSER", &[Value::Text(user)]).await;
     admin.close().await.unwrap();
@@ -987,7 +987,7 @@ async fn tls_through_the_ssh_tunnel_verifies_the_server_name() {
     };
     let mut full = TlsOptions::new(TlsMode::VerifyFull).with_ca_cert(ca_cert());
     if name != server.host {
-        full = full.with_server_name(&name);
+        full = full.with_server_name(name.as_str());
     }
     let c = Arc::new(connect(&through(params().with_tls(full), &tunnel, &ssh, &server)).await);
     assert!(c.tls_in_use());
@@ -1010,12 +1010,12 @@ async fn tls_through_the_ssh_tunnel_verifies_the_server_name() {
 #[tokio::test]
 #[ignore = "needs the redis cluster fixture (M7)"]
 async fn cluster_connects_and_routes_by_slot() {
-    let f = fixtures();
-    let ports: Vec<u16> = lookup(&f, &["m7", "redis_cluster", "ports"])
+    let fx = fixtures();
+    let ports: Vec<u16> = lookup(&fx, &["m7", "redis_cluster", "ports"])
         .and_then(toml::Value::as_array)
         .into_iter()
         .flatten()
-        .filter_map(|p| p.as_integer().and_then(|p| u16::try_from(p).ok()))
+        .filter_map(|n| n.as_integer().and_then(|n| u16::try_from(n).ok()))
         .collect();
     let Some(&first) = ports.first() else {
         panic!("fixtures.toml has no [m7.redis_cluster] ports");
@@ -1023,50 +1023,58 @@ async fn cluster_connects_and_routes_by_slot() {
     if !up_or_pending("the Redis cluster", first) {
         return;
     }
-    let host = s(&f, &["m7", "redis_cluster", "host"]);
+    let host = s(&fx, &["m7", "redis_cluster", "host"]);
     let nodes = ports[1..]
         .iter()
-        .map(|p| format!("{host}:{p}"))
+        .map(|node_port| format!("{host}:{node_port}"))
         .collect::<Vec<_>>()
         .join(",");
-    let mut p = ConnectParams::network(Engine::Redis, host.clone())
+    let mut profile = ConnectParams::network(Engine::Redis, host.clone())
         .with_port(first)
-        .with_user(s(&f, &["m7", "redis_cluster", "user"]))
-        .with_password(s(&f, &["m7", "redis_cluster", "password"]))
+        .with_user(s(&fx, &["m7", "redis_cluster", "user"]))
+        .with_password(s(&fx, &["m7", "redis_cluster", "password"]))
         .with_tls(TlsOptions::new(TlsMode::Disable));
-    p = with_option(p, options::MODE, "cluster");
-    p = with_option(p, options::NODES, &nodes);
-    let c = connect(&p).await;
-    assert!(c.is_cluster());
-    assert_eq!(c.current_database().as_deref(), Some("0"));
-    let masters = c.masters(&CancellationToken::new()).await.unwrap();
+    profile = with_option(profile, options::MODE, "cluster");
+    profile = with_option(profile, options::NODES, &nodes);
+    let conn = connect(&profile).await;
+    assert!(conn.is_cluster());
+    assert_eq!(conn.current_database().as_deref(), Some("0"));
+    let masters = conn.masters(&CancellationToken::new()).await.unwrap();
     assert_eq!(masters.len(), ports.len(), "{masters:?}");
 
     // Keys in different slots: every SET and GET is routed to its master.
-    let t = token();
-    for i in 0..20 {
-        let k = format!("oxbase:driver:t{t}:{i}");
-        run_with(&c, "SET", &[Value::Text(k.clone()), Value::Int(i)]).await;
-        assert_eq!(scalar(&c, &format!("GET {k}")).await, Some(i.to_string()));
+    let tok = token();
+    for index in 0..20 {
+        let name = format!("oxbase:driver:t{tok}:{index}");
+        run_with(
+            &conn,
+            "SET",
+            &[Value::Text(name.clone()), Value::Int(index)],
+        )
+        .await;
+        assert_eq!(
+            scalar(&conn, &format!("GET {name}")).await,
+            Some(index.to_string())
+        );
     }
     // A command on each master.
     let mut dbsize = 0;
     for node in &masters {
-        let v = c
+        let reply = conn
             .command_on(node, &redis::cmd("DBSIZE"), &CancellationToken::new())
             .await
             .unwrap();
-        let redis::Value::Int(n) = v else {
-            panic!("DBSIZE on {node}: {v:?}")
+        let redis::Value::Int(count) = reply else {
+            panic!("DBSIZE on {node}: {reply:?}")
         };
-        dbsize += n;
+        dbsize += count;
     }
     assert!(dbsize >= 20);
-    for i in 0..20 {
-        run(&c, &format!("DEL oxbase:driver:t{t}:{i}")).await;
+    for index in 0..20 {
+        run(&conn, &format!("DEL oxbase:driver:t{tok}:{index}")).await;
     }
-    assert!(try_run(&c, "SELECT 1", &[]).await.is_err());
-    c.close().await.unwrap();
+    assert!(try_run(&conn, "SELECT 1", &[]).await.is_err());
+    conn.close().await.unwrap();
 }
 
 #[tokio::test]
