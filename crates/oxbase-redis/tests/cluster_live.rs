@@ -315,7 +315,7 @@ async fn the_sentinel_master_is_browsed_and_read() {
         .list(&c, &ObjectRef::root(), CancellationToken::new())
         .await
         .unwrap();
-    assert!(!dbs.is_empty());
+    assert_eq!(dbs.first().map(|d| d.obj.name.as_str()), Some("0"));
     assert_eq!(
         dbs[0].extras.get(&extras::MODE),
         Some(&Value::Text("sentinel".into()))
