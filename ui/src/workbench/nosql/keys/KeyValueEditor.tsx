@@ -17,7 +17,7 @@ import {
   Trash2,
   TriangleAlert,
 } from "lucide-react";
-import { useCallback, useEffect, useReducer, useRef, useState } from "react";
+import { useEffect, useReducer, useRef, useState } from "react";
 import {
   type BinaryText,
   displayBinary,
@@ -27,7 +27,6 @@ import {
   type KeyInfo,
   keyApply,
   keyValueOpen,
-  queryCloseEditor,
   queryPage,
   utf8,
 } from "../../../api";
@@ -39,6 +38,7 @@ import { timedQueryPage } from "../../results/perf";
 import { ResultGrid } from "../../results/ResultGrid";
 import { type GridRowSelection, NO_ROWS } from "../../results/rowSelection";
 import { IDLE_RUN, isActive, rowCountLabel, runReducer } from "../../results/runState";
+import { closeEditorLater, editorReady } from "../editorClose";
 import {
   cellBinary,
   cellValue,
@@ -65,8 +65,32 @@ export interface KeyValueEditorProps {
   /** The editor session the value reads run on (not the scan's). */
   editorId: string;
   address: KeyAddress;
-  /** After an edit: the key's info, `null` when it was deleted; `renamed` for a rename. */
-  onChanged: (info: KeyInfo | null, renamed?: BinaryText) => void;
+  /** After an edit that committed. */
+  onChanged: (change: KeyChange) => void;
+}
+
+/** What an applied edit did to the key. */
+export type KeyChange =
+  | { kind: "changed"; info: KeyInfo | null }
+  | { kind: "renamed"; key: BinaryText; info: KeyInfo | null }
+  | { kind: "deleted" };
+
+/** The element in row `row` of a value page (`index` / `id` / `field` / `member` / ...). */
+function elementOf(get: (name: string) => unknown): ElementRow {
+  const out: ElementRow = {};
+  const index = get("index");
+  if (index !== null && index !== undefined) out.index = Number(index);
+  const id = get("id");
+  if (typeof id === "string") out.id = id;
+  for (const name of ["field", "member", "value"] as const) {
+    const v = cellBinary(get(name));
+    if (v) out[name] = v;
+  }
+  const score = get("score");
+  if (typeof score === "number") out.score = score;
+  const fields = get("fields");
+  if (typeof fields === "string") out.fields = fields;
+  return out;
 }
 
 type Confirm = { title: string; text: string; action: string; run: () => void };
@@ -115,27 +139,32 @@ export function KeyValueEditor({ sessionId, editorId, address, onChanged }: KeyV
     setElement(null);
     setStringValue(null);
     setOpenError(null);
-    keyValueOpen(sessionId, editorId, address, (event) => {
-      if (mine === seq.current) dispatch({ type: "event", event });
-    }).then(
-      (opened) => {
-        if (mine !== seq.current) return;
-        setInfo(opened.info);
-        dispatch({ type: "runId", runId: opened.runId });
-      },
-      (error) => {
-        if (mine !== seq.current) return;
-        const err = toCommandError(error);
-        setOpenError(err.category === "not_found" ? "This key no longer exists." : err.message);
-        dispatch({ type: "startFailed", error: err });
-      },
-    );
+    editorReady(editorId)
+      .then(() => {
+        if (mine !== seq.current) throw new Error("superseded");
+        return keyValueOpen(sessionId, editorId, address, (event) => {
+          if (mine === seq.current) dispatch({ type: "event", event });
+        });
+      })
+      .then(
+        (opened) => {
+          if (mine !== seq.current) return;
+          setInfo(opened.info);
+          dispatch({ type: "runId", runId: opened.runId });
+        },
+        (error) => {
+          if (mine !== seq.current) return;
+          const err = toCommandError(error);
+          setOpenError(err.category === "not_found" ? "This key no longer exists." : err.message);
+          dispatch({ type: "startFailed", error: err });
+        },
+      );
   }, [sessionId, editorId, address, reload]);
 
   useEffect(
     () => () => {
       seq.current += 1;
-      void queryCloseEditor(editorId).catch(() => {});
+      closeEditorLater(editorId);
       pagerRef.current?.pager.dispose();
     },
     [editorId],
@@ -203,35 +232,42 @@ export function KeyValueEditor({ sessionId, editorId, address, onChanged }: KeyV
     };
   }, [runId, result, done, keyType]);
 
-  /** The element of grid row `row`, read from the loaded page. */
-  const elementAt = useCallback(
-    (row: number): ElementRow | null => {
-      if (!pager || !result) return null;
-      const col = (name: string) => result.columns.findIndex((c) => c.name === name);
-      const get = (name: string) => {
-        const c = col(name);
-        if (c < 0) return null;
-        const ref = pager.cell(row, c);
-        return ref ? cellValue(ref.vector, ref.index) : undefined;
-      };
-      if (get(result.columns[0]?.name ?? "") === undefined) return null;
-      const out: ElementRow = {};
-      const index = get("index");
-      if (index !== null && index !== undefined) out.index = Number(index);
-      const id = get("id");
-      if (typeof id === "string") out.id = id;
-      for (const name of ["field", "member", "value"] as const) {
-        const v = cellBinary(get(name));
-        if (v) out[name] = v;
-      }
-      const score = get("score");
-      if (typeof score === "number") out.score = score;
-      const fields = get("fields");
-      if (typeof fields === "string") out.fields = fields;
-      return out;
-    },
-    [pager, result],
-  );
+  // The selected element: from the grid's loaded page, else read with one page request.
+  const [currentRow, setCurrentRow] = useState<ElementRow | null>(null);
+  const selectedIndex = selection.current;
+  useEffect(() => {
+    setCurrentRow(null);
+    if (selectedIndex === null || !pager || !result) return;
+    const columns = result.columns;
+    const col = (name: string) => columns.findIndex((c) => c.name === name);
+    const first = pager.cell(selectedIndex, 0);
+    if (first) {
+      setCurrentRow(
+        elementOf((name) => {
+          const c = col(name);
+          const ref = c < 0 ? null : pager.cell(selectedIndex, c);
+          return ref ? cellValue(ref.vector, ref.index) : null;
+        }),
+      );
+      return;
+    }
+    let alive = true;
+    pager.readRows(selectedIndex, 1).then(
+      (table) => {
+        if (!alive || table.numRows === 0) return;
+        setCurrentRow(
+          elementOf((name) => {
+            const c = table.schema.fields.findIndex((f) => f.name === name);
+            return c < 0 ? null : cellValue(table.getChildAt(c), 0);
+          }),
+        );
+      },
+      () => {},
+    );
+    return () => {
+      alive = false;
+    };
+  }, [selectedIndex, pager, result]);
 
   async function apply(edits: KeyEdit[], done: string, destructive = false): Promise<boolean> {
     setBusy(true);
@@ -252,11 +288,11 @@ export function KeyValueEditor({ sessionId, editorId, address, onChanged }: KeyV
       setNotice(done);
       const renamed = edits.find((e) => e.type === "rename");
       if (edits.some((e) => e.type === "delete")) {
-        onChanged(null);
+        onChanged({ kind: "deleted" });
       } else if (renamed?.type === "rename") {
-        onChanged(report.info ?? null, renamed.newKey);
+        onChanged({ kind: "renamed", key: renamed.newKey, info: report.info ?? null });
       } else {
-        onChanged(report.info ?? null);
+        onChanged({ kind: "changed", info: report.info ?? null });
         setReload((n) => n + 1);
       }
       return true;
@@ -285,8 +321,7 @@ export function KeyValueEditor({ sessionId, editorId, address, onChanged }: KeyV
   }
 
   function removeSelected(type: ElementType) {
-    const row = selection.current === null ? null : elementAt(selection.current);
-    const edit = row ? removeEdit(type, row) : null;
+    const edit = currentRow ? removeEdit(type, currentRow) : null;
     if (!edit) return;
     void apply([edit], "Removed.");
   }
@@ -302,7 +337,6 @@ export function KeyValueEditor({ sessionId, editorId, address, onChanged }: KeyV
 
   const active = isActive(run.status);
   const disabled = busy || active || !info;
-  const currentRow = selection.current === null ? null : elementAt(selection.current);
 
   return (
     <section className="key-editor" aria-label={`Key ${keyLabel}`} data-testid="key-editor">

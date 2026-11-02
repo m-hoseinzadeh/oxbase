@@ -26,7 +26,6 @@ import {
   keyInfo,
   keyScanOpen,
   queryCancel,
-  queryCloseEditor,
   type TreeNode,
   treeChildren,
 } from "../../../api";
@@ -37,6 +36,7 @@ import type { KeyBrowserParams } from "../../layout";
 import { ResultPager } from "../../results/pager";
 import { timedQueryPage } from "../../results/perf";
 import { IDLE_RUN, isActive, runReducer } from "../../results/runState";
+import { closeEditorLater, editorReady } from "../editorClose";
 import { KeyList, type KeyRow } from "./KeyList";
 import { KeyValueEditor } from "./KeyValueEditor";
 import { KEY_TYPE_LABEL, KEY_TYPES, prefixPattern } from "./keyModel";
@@ -109,6 +109,8 @@ export function KeyBrowserPanel({
       if (match.trim() !== "") req.pattern = match.trim();
       if (keyType !== "") req.keyType = keyType as Exclude<KeyType, "other">;
       dispatch({ type: "start", script: `SCAN 0 MATCH ${req.pattern ?? "*"}` });
+      await editorReady(editorId);
+      if (mine !== seq.current) return;
       try {
         const id = await keyScanOpen(sessionId, editorId, req, (event) => {
           if (mine === seq.current) dispatch({ type: "event", event });
@@ -133,12 +135,16 @@ export function KeyBrowserPanel({
     setPattern(match);
     void scan(database, match, type);
     if (initialKey) setSelected({ row: null, address: { database, key: initialKey } });
+    return () => {
+      // A remount (StrictMode, dockview moving the tab) scans again.
+      requestRef.current = undefined;
+    };
   }, [request]);
 
   useEffect(
     () => () => {
       seq.current += 1;
-      void queryCloseEditor(editorId).catch(() => {});
+      closeEditorLater(editorId);
       pagerRef.current?.pager.dispose();
     },
     [editorId],
@@ -453,14 +459,15 @@ export function KeyBrowserPanel({
               sessionId={sessionId}
               editorId={`${editorId}-value`}
               address={selected.address}
-              onChanged={(info, renamed) => {
-                if (info === null && !renamed) {
+              onChanged={(change) => {
+                if (change.kind === "deleted") {
                   setSelected(null);
                   void scan(database, pattern, type);
-                } else if (renamed) {
-                  setSelected({ row: null, address: { database, key: renamed } });
+                } else if (change.kind === "renamed") {
+                  setSelected({ row: null, address: { database, key: change.key } });
                   void scan(database, pattern, type);
-                } else if (info) {
+                } else if (change.info) {
+                  const info = change.info;
                   setSizes((m) => new Map(m).set(displayBinary(selected.address.key), info));
                 }
               }}
