@@ -4,8 +4,9 @@
 //! statement is complete: its last token is not an operator, `.`, `,` or `=>`, it is not the
 //! head of a control statement (`if (...)`, `for (...)`, `while (...)`, `else`, a function
 //! head, ...) waiting for its body, and the next significant token does not continue it (`.`,
-//! `)`, `]`, `}`, `?`, `:`, a binary operator, `else`, `catch`, `finally`). `use x`, `show x`
-//! and `it` lines are statements of their own. A script whose first non-blank character is
+//! `)`, `]`, `}`, `?`, `:`, a binary operator, `else`, `catch`, `finally`). A `;` followed by
+//! `else` (or by the `while` of a `do` loop) does not end it. `use x`, `show x` and `it` lines
+//! are statements of their own. A script whose first character after blanks and comments is
 //! `{` is one request statement.
 
 use std::ops::Range;
@@ -55,9 +56,25 @@ pub(super) fn command_line(text: &str) -> Option<(CommandWord, &str)> {
     plain.then_some((word, argument))
 }
 
+/// Where a JSON request starts: the offset of the first `{` when only blanks and comments
+/// (`//`, `/* */`) come before it.
+pub(super) fn request_start(text: &str) -> Option<usize> {
+    let mut rest = text;
+    loop {
+        let trimmed = rest.trim_start();
+        if let Some(after) = trimmed.strip_prefix("//") {
+            rest = after.find('\n').map_or("", |i| &after[i..]);
+        } else if let Some(after) = trimmed.strip_prefix("/*") {
+            rest = &after[after.find("*/")? + 2..];
+        } else {
+            return trimmed.starts_with('{').then(|| text.len() - trimmed.len());
+        }
+    }
+}
+
 pub(super) fn split(text: &str) -> Vec<Statement> {
-    if text.trim_start().starts_with('{') {
-        return trim_range(text, 0..text.len())
+    if let Some(at) = request_start(text) {
+        return trim_range(text, at..text.len())
             .map(|range| {
                 let kind = statement_kind(&text[range.clone()]);
                 vec![statement(text, range, text.len(), kind)]
@@ -110,8 +127,10 @@ impl<'a> Splitter<'a> {
                     }
                 }
                 Tok::Punct(b';') if self.lexer.depth() == 0 => {
-                    if self.current.is_some() {
+                    if self.current.is_some() && !self.else_follows() {
                         self.finish(range.end);
+                    } else if self.current.is_some() {
+                        self.token(tok, range);
                     }
                 }
                 Tok::Word if self.current.is_none() && self.lexer.depth() == 0 => {
@@ -170,7 +189,10 @@ impl<'a> Splitter<'a> {
         if tok == Tok::Punct(b'(') && depth_after == 1 {
             let previous = self.words[1].clone().map(|r| &text[r]);
             let before = self.words[0].clone().map(|r| &text[r]);
+            // The `while (...)` that ends a `do` loop is no head: nothing follows it.
+            let do_while = previous == Some("while") && current.first_word == "do";
             current.head_paren = current.last == Tok::Word
+                && !do_while
                 && (previous.is_some_and(|w| CONTROL_HEADS.contains(&w))
                     || before == Some("function")
                     || previous == Some("function"));
@@ -182,6 +204,19 @@ impl<'a> Splitter<'a> {
         if tok == Tok::Word {
             self.words = [self.words[1].take(), Some(range)];
         }
+    }
+
+    /// Whether the next significant token is `else` (`if (x) a(); else b()`: the `;` ends the
+    /// `if` branch, not the statement), or the `while` of a `do x(); while (y)`.
+    fn else_follows(&self) -> bool {
+        let do_loop = self.current.as_ref().is_some_and(|c| c.first_word == "do");
+        let mut ahead = self.lexer.clone();
+        ahead
+            .find(|(t, _)| *t != Tok::Newline)
+            .is_some_and(|(t, r)| {
+                let word = &self.text[r];
+                t == Tok::Word && (word == "else" || (do_loop && word == "while"))
+            })
     }
 
     /// Whether the statement read so far ends at the line break just read.
@@ -320,6 +355,20 @@ mod tests {
             ("x = 1 // ok\n", &["x = 1"]),
             ("a\n!b", &["a", "!b"]),
             ("a\n!== b", &["a\n!== b"]),
+            (
+                "if (x) a(); else b()\nc()",
+                &["if (x) a(); else b()", "c()"],
+            ),
+            (
+                "if (x) a();\nelse b(); c()",
+                &["if (x) a();\nelse b()", "c()"],
+            ),
+            ("x = 1; elsewhere()", &["x = 1", "elsewhere()"]),
+            ("do x(); while (y)\nz", &["do x(); while (y)", "z"]),
+            (
+                "do {\n  x()\n} while (y)\nz",
+                &["do {\n  x()\n} while (y)", "z"],
+            ),
         ];
         for (script, want) in cases {
             assert_eq!(texts(script), *want, "{script:?}");
@@ -334,6 +383,17 @@ mod tests {
         assert_eq!(s[0].text, script.trim());
         assert_eq!(s[0].kind, StatementKind::Query);
         assert_eq!(s[0].segment_end, script.len());
+
+        // Comments before the request are not part of it.
+        let script = "// q\n/* more */ {\"type\": \"find\"}\n";
+        let s = split(script);
+        assert_eq!(s.len(), 1);
+        assert_eq!(s[0].text, "{\"type\": \"find\"}");
+        assert_eq!(s[0].kind, StatementKind::Query);
+        assert_eq!(request_start(script), Some(16));
+        assert_eq!(request_start("/* open {"), None);
+        assert_eq!(request_start("// {\nx"), None);
+        assert_eq!(request_start("x {"), None);
     }
 
     #[test]

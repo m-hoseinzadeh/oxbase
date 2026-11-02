@@ -10,6 +10,7 @@ use oxbase_sql::StatementKind;
 use serde_json::Value as Json;
 
 use super::lex::{Tok, string_content, tokens};
+use super::split::request_start;
 
 /// What a redacted secret is replaced by.
 const REDACTED: &str = "***";
@@ -72,8 +73,8 @@ const DROP_COMMAND: &str = "the command deletes a database, a collection or inde
 /// Whether a statement probably returns documents (a hint for the run, which drops a query's
 /// stream at its row limit). JSON requests: `find` / `aggregate` are queries.
 pub(super) fn statement_kind(text: &str) -> StatementKind {
-    if text.trim_start().starts_with('{') {
-        let kind = serde_json::from_str::<Json>(text)
+    if let Some(at) = request_start(text) {
+        let kind = serde_json::from_str::<Json>(&text[at..])
             .ok()
             .and_then(|v| v.get("type").and_then(Json::as_str).map(str::to_owned));
         return match kind.as_deref() {
@@ -107,8 +108,8 @@ pub(super) fn statement_kind(text: &str) -> StatementKind {
 
 /// The guard of one statement (see the module docs of `shell`).
 pub(super) fn guard(text: &str) -> StatementGuard {
-    if text.trim_start().starts_with('{') {
-        return request_guard(text);
+    if let Some(at) = request_start(text) {
+        return request_guard(&text[at..]);
     }
     let toks = tokens(text);
     let at = |i: usize| -> Option<(Tok, &str)> {

@@ -4,9 +4,12 @@
 //! `show users`) use the document layout of `oxbase_dialect::document`: `_id` first, then the
 //! fields by first appearance, one typed column per single BSON type, relaxed Extended JSON
 //! text (`arrow.json`) for nested, other and mixed values (an explicit `null` is the text
-//! `null` there, a missing field NULL), and the `$document` column last. All values are known
-//! here, so every column fits every row. Cursors returned by a statement do not come through
-//! here: they stream through the driver's request path.
+//! `null` there, a missing field NULL), and the `$document` column last. As in the driver,
+//! the columns come from the first [`SAMPLE`] documents and there are at most [`MAX_COLUMNS`]
+//! of them (a script can build documents with any number of fields); a later value that does
+//! not fit its column is NULL there, and both losses are reported as warnings (the document
+//! column keeps everything). Rows come in batches of [`BATCH_ROWS`]. Cursors returned by a
+//! statement do not come through here: they stream through the driver's request path.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -22,7 +25,7 @@ use bson::{Bson, Document};
 use oxbase_dialect::document::{
     DOCUMENT_COLUMN, META_BSON_TYPE, META_BSON_TYPES, META_ROLE, ROLE_DOCUMENT,
 };
-use oxbase_driver::from_arrow;
+use oxbase_driver::{Notice, ResultItem, from_arrow};
 use oxbase_types::Result;
 
 const META_NATIVE_TYPE: &str = "oxbase.native_type";
@@ -100,19 +103,68 @@ fn json_field(name: &str, bson_type: &str) -> Field {
     ]))
 }
 
-/// One result set of `docs` (see the module docs).
-pub(super) fn documents(docs: &[Document]) -> Result<(SchemaRef, RecordBatch)> {
+/// Documents sampled for the columns (the contract's default `sample_size`).
+pub(super) const SAMPLE: usize = 1000;
+/// Columns at most (besides `$document`); further fields stay in the document column only.
+pub(super) const MAX_COLUMNS: usize = 1000;
+/// Rows per Arrow batch (one page of the result store).
+pub(super) const BATCH_ROWS: usize = 1000;
+
+/// A document result set: its schema, its batches, and what did not get a column.
+pub(super) struct DocumentSet {
+    pub(super) schema: SchemaRef,
+    pub(super) batches: Vec<RecordBatch>,
+    /// Values that did not fit their column (NULL there; the document column keeps them).
+    pub(super) misfits: u64,
+    /// The sample had more than [`MAX_COLUMNS`] fields.
+    pub(super) capped: bool,
+}
+
+impl DocumentSet {
+    /// The result items: schema, batches, then a warning per kind of loss.
+    pub(super) fn into_items(self) -> Vec<Result<ResultItem>> {
+        let mut items = Vec::with_capacity(self.batches.len() + 3);
+        items.push(Ok(ResultItem::Schema(self.schema)));
+        items.extend(self.batches.into_iter().map(|b| Ok(ResultItem::Batch(b))));
+        if self.capped {
+            items.push(Ok(ResultItem::Notice(Notice::warning(format!(
+                "the documents have more than {MAX_COLUMNS} fields: only the first \
+                 {MAX_COLUMNS} have columns, the {DOCUMENT_COLUMN} column holds the rest"
+            )))));
+        }
+        if self.misfits > 0 {
+            items.push(Ok(ResultItem::Notice(Notice::warning(format!(
+                "{} value(s) did not fit their column's type and are NULL there; the \
+                 {DOCUMENT_COLUMN} column holds them",
+                self.misfits
+            )))));
+        }
+        items
+    }
+}
+
+/// One result set of `docs` (see the module docs): columns from the first [`SAMPLE`]
+/// documents, at most [`MAX_COLUMNS`] of them, in batches of [`BATCH_ROWS`] rows.
+pub(super) fn documents(docs: &[Document]) -> Result<DocumentSet> {
     let mut order: Vec<String> = Vec::new();
     let mut seen: HashMap<String, Seen> = HashMap::new();
-    for doc in docs {
+    let mut capped = false;
+    for doc in docs.iter().take(SAMPLE) {
         for (key, value) in doc {
             if key == DOCUMENT_COLUMN {
                 continue;
             }
-            let entry = seen.entry(key.clone()).or_insert_with(|| {
+            if !seen.contains_key(key.as_str()) {
+                if order.len() >= MAX_COLUMNS && key != "_id" {
+                    capped = true;
+                    continue;
+                }
                 order.push(key.clone());
-                Seen::default()
-            });
+                seen.insert(key.clone(), Seen::default());
+            }
+            let Some(entry) = seen.get_mut(key.as_str()) else {
+                continue;
+            };
             match value {
                 Bson::Null | Bson::Undefined => entry.nulls = true,
                 other => {
@@ -135,18 +187,12 @@ pub(super) fn documents(docs: &[Document]) -> Result<(SchemaRef, RecordBatch)> {
         order.insert(0, id);
     }
     let mut fields = Vec::with_capacity(order.len() + 1);
-    let mut arrays: Vec<ArrayRef> = Vec::with_capacity(order.len() + 1);
+    let mut kinds = Vec::with_capacity(order.len());
     for name in &order {
         let (kind, field) = column(name, &seen[name]);
-        let values: Vec<Option<&Bson>> = docs.iter().map(|d| d.get(name)).collect();
-        arrays.push(build(kind, &values));
+        kinds.push(kind);
         fields.push(field);
     }
-    let mut column = StringBuilder::with_capacity(docs.len(), docs.len() * 64);
-    for doc in docs {
-        column.append_value(canonical_text(doc));
-    }
-    arrays.push(Arc::new(column.finish()));
     fields.push(
         Field::new(DOCUMENT_COLUMN, DataType::Utf8, true).with_metadata(HashMap::from([
             (META_ROLE.to_owned(), ROLE_DOCUMENT.to_owned()),
@@ -156,8 +202,59 @@ pub(super) fn documents(docs: &[Document]) -> Result<(SchemaRef, RecordBatch)> {
         ])),
     );
     let schema = Arc::new(Schema::new(fields));
-    let batch = RecordBatch::try_new(Arc::clone(&schema), arrays).map_err(from_arrow)?;
-    Ok((schema, batch))
+    let mut misfits = 0u64;
+    let mut batches = Vec::with_capacity(docs.len().div_ceil(BATCH_ROWS).max(1));
+    let mut chunks: Vec<&[Document]> = docs.chunks(BATCH_ROWS).collect();
+    if chunks.is_empty() {
+        chunks.push(&[]);
+    }
+    for chunk in chunks {
+        let mut arrays: Vec<ArrayRef> = Vec::with_capacity(order.len() + 1);
+        for (name, kind) in order.iter().zip(kinds.iter().copied()) {
+            let values: Vec<Option<&Bson>> = chunk
+                .iter()
+                .map(|d| match d.get(name) {
+                    None => None,
+                    Some(v @ (Bson::Null | Bson::Undefined)) => (kind == Kind::Json).then_some(v),
+                    Some(v) if fits(kind, v) => Some(v),
+                    Some(_) => {
+                        misfits += 1;
+                        None
+                    }
+                })
+                .collect();
+            arrays.push(build(kind, &values));
+        }
+        let mut column = StringBuilder::with_capacity(chunk.len(), chunk.len() * 64);
+        for doc in chunk {
+            column.append_value(canonical_text(doc));
+        }
+        arrays.push(Arc::new(column.finish()));
+        batches.push(RecordBatch::try_new(Arc::clone(&schema), arrays).map_err(from_arrow)?);
+    }
+    Ok(DocumentSet {
+        schema,
+        batches,
+        misfits,
+        capped,
+    })
+}
+
+/// Whether a non-null `value` belongs in a column of `kind`.
+fn fits(kind: Kind, value: &Bson) -> bool {
+    matches!(
+        (kind, value),
+        (Kind::Json, _)
+            | (Kind::ObjectId, Bson::ObjectId(_))
+            | (Kind::Str, Bson::String(_))
+            | (Kind::Int32, Bson::Int32(_))
+            | (Kind::Int64, Bson::Int32(_) | Bson::Int64(_))
+            | (Kind::Double, Bson::Double(_))
+            | (Kind::Decimal, Bson::Decimal128(_))
+            | (Kind::Bool, Bson::Boolean(_))
+            | (Kind::Date, Bson::DateTime(_))
+            | (Kind::Binary, Bson::Binary(_))
+    )
 }
 
 /// One row, column [`VALUE_COLUMN`]: `value` as relaxed Extended JSON text.
@@ -378,7 +475,9 @@ mod tests {
             doc! {"name": "a", "_id": oid, "n": 1_i32, "mixed": 1_i32, "nested": {"x": 1_i32}, "nulls": null},
             doc! {"_id": oid, "n": 5_i64, "mixed": "two", "late": true, "nulls": null},
         ];
-        let (schema, batch) = documents(&docs).unwrap();
+        let set = documents(&docs).unwrap();
+        assert_eq!((set.misfits, set.capped, set.batches.len()), (0, false, 1));
+        let (schema, batch) = (set.schema, &set.batches[0]);
         let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
         assert_eq!(
             names,
@@ -418,6 +517,65 @@ mod tests {
             document.contains(r#""n":{"$numberLong":"5"}"#),
             "{document}"
         );
+    }
+
+    #[test]
+    fn columns_are_capped_and_sampled() {
+        // One document with more fields than columns allowed: the rest stay in `$document`.
+        let mut wide = Document::new();
+        for i in 0..MAX_COLUMNS + 5 {
+            wide.insert(format!("f{i}"), 1_i32);
+        }
+        wide.insert("_id", 7_i32);
+        let set = documents(std::slice::from_ref(&wide)).unwrap();
+        assert!(set.capped);
+        assert_eq!(
+            set.schema.fields().len(),
+            MAX_COLUMNS + 2,
+            "_id and $document too"
+        );
+        assert_eq!(set.schema.field(0).name(), "_id");
+        let items = set.into_items();
+        assert!(
+            items.iter().any(|i| matches!(i, Ok(ResultItem::Notice(n))
+                if n.message.contains("more than"))),
+            "a warning names the cap"
+        );
+
+        // Columns come from the sample; a later value of another type is NULL plus a count, a
+        // field first seen after the sample has no column.
+        let mut docs: Vec<Document> = (0..SAMPLE)
+            .map(|i| doc! {"n": i32::try_from(i).unwrap()})
+            .collect();
+        docs.push(doc! {"n": "text", "late": 1_i32});
+        docs.push(doc! {"n": null});
+        let set = documents(&docs).unwrap();
+        assert_eq!(set.misfits, 1);
+        assert!(!set.capped);
+        let names: Vec<&str> = set
+            .schema
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        assert_eq!(names, ["n", DOCUMENT_COLUMN]);
+        assert_eq!(set.batches.len(), 2);
+        assert_eq!(set.batches[0].num_rows(), BATCH_ROWS);
+        let last = &set.batches[1];
+        assert_eq!(last.num_rows(), 2);
+        assert!(last.column(0).is_null(0) && last.column(0).is_null(1));
+        assert!(last.column(1).as_string::<i32>().value(0).contains("text"));
+        let items = set.into_items();
+        assert!(items.iter().any(|i| matches!(i, Ok(ResultItem::Notice(n))
+            if n.message.starts_with("1 value(s)"))));
+    }
+
+    #[test]
+    fn no_documents_is_one_empty_batch() {
+        let set = documents(&[]).unwrap();
+        assert_eq!(set.schema.fields().len(), 1);
+        assert_eq!(set.batches.len(), 1);
+        assert_eq!(set.batches[0].num_rows(), 0);
     }
 
     #[test]

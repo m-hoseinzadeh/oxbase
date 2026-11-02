@@ -85,7 +85,7 @@ async fn show(
         }
         "users" => {
             let reply = command(connection, &database, doc! {"usersInfo": 1_i32}, cancel).await?;
-            rows::documents(&documents(&reply, "users"))?
+            return Ok(rows::documents(&documents(&reply, "users"))?.into_items());
         }
         "roles" => {
             let reply = command(
@@ -95,7 +95,7 @@ async fn show(
                 cancel,
             )
             .await?;
-            rows::documents(&documents(&reply, "roles"))?
+            return Ok(rows::documents(&documents(&reply, "roles"))?.into_items());
         }
         other => {
             return Err(Error::invalid_input(format!(

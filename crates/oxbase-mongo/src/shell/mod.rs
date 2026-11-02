@@ -28,6 +28,19 @@
 //! wrapper (`{$oid: ...}`, `{$date: ...}`, `{$numberDecimal: ...}`) are **not** converted:
 //! in the shell the helpers are the way to write typed values (as in mongosh).
 //!
+//! A whole-number double read from the server is a plain JavaScript number, so writing it
+//! back stores an int32 when it fits (as mongosh does): re-saving a read document can change
+//! such a field's type from `double` to `int`. Dates outside JavaScript's range (beyond
+//! ±8.64e15 ms), `undefined` and symbols stay opaque values that keep their Extended JSON, so
+//! they survive a read and a write unchanged.
+//!
+//! Writes check their arguments before any server call, like mongosh: `updateOne` /
+//! `updateMany` / `replaceOne` / `deleteOne` / `deleteMany` need a filter (`undefined` or
+//! `null` is a `TypeError`; `{}` means every document and the guard asks for it), and
+//! `updateOne` / `updateMany` need update operators (every key starting with `$`) or a
+//! non-empty pipeline. `skip`, `batchSize` and `maxTimeMS` take whole numbers of 0 or more.
+//! An `insertMany` that fails part-way says in its error how many documents went in.
+//!
 //! # Results
 //!
 //! The value of the last expression of a statement is its result:
@@ -38,7 +51,9 @@
 //!   (the statement's run then cancels, pages and limits it like any request). A cursor the
 //!   script already read from, or one a request cannot express (`db.aggregate(...)`, an
 //!   aggregate `hint`), is read to its end into a document result;
-//! - a document or an array of documents: the same shape, from the values;
+//! - a document or an array of documents: the same shape, from the values (columns from the
+//!   first 1000 documents, at most 1000 of them, batches of 1000 rows; a warning says when a
+//!   field got no column or a value did not fit its column, the `$document` column has all);
 //! - write results (`insertOne`, `updateMany`, ...): `RowsAffected` (inserted / modified /
 //!   deleted count) plus a one-row result with the acknowledged fields (`insertedId`,
 //!   `matchedCount`, `modifiedCount`, `upsertedId`, `deletedCount`);
@@ -84,9 +99,10 @@
 //! end with an operator, `.`, `,` or `=>`, and the next non-blank line does not start with
 //! `.`, `)`, `]`, `}`, `?`, `:`, a binary operator, `else`, `catch` or `finally`), and the
 //! statement is not a control head waiting for its body (`if (...)`, `for (...)`, a function
-//! head, `else`). `use x`, `show x` and `it` lines are statements of their own. Text whose first non-blank character is `{` is one request
-//! statement (the whole text; see the driver docs). Comments (`//`, `/* */`) before a
-//! statement are not part of it.
+//! head, `else`); a top-level `;` followed by `else` (or by the `while` of a `do` loop) does
+//! not end it either. `use x`, `show x` and `it` lines are statements of their own. Text whose
+//! first character after blanks and comments is `{` is one request statement (the rest of the
+//! text; see the driver docs). Comments (`//`, `/* */`) before a statement are not part of it.
 //!
 //! # Redaction and guards
 //!
@@ -323,11 +339,15 @@ async fn stream(
                 }
             };
         }
-        Output::Documents(docs) => Some(rows::documents(&docs)?),
+        Output::Documents(docs) => {
+            items.extend(rows::documents(&docs)?.into_items());
+            None
+        }
         Output::Value(value) => Some(rows::value(&value)?),
         Output::Write { affected, row } => {
             items.push(Ok(ResultItem::RowsAffected(affected)));
-            Some(rows::documents(std::slice::from_ref(&row))?)
+            items.extend(rows::documents(std::slice::from_ref(&row))?.into_items());
+            None
         }
     };
     if let Some((schema, batch)) = set {

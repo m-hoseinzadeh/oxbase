@@ -381,7 +381,9 @@
           if (typeof x === 'string') ms = Date.parse(x);
           else if (typeof x === 'number') ms = x;
           else if (x && x.$numberLong !== undefined) ms = Number(x.$numberLong);
-          return new Date(ms);
+          const d = new Date(ms);
+          // Dates JavaScript cannot hold (beyond +-8.64e15 ms) keep their Extended JSON.
+          return Number.isNaN(d.getTime()) ? new Raw(v) : d;
         }
         case '$binary':
           if (x && typeof x === 'object') return new Binary(x.base64, x.subType);
@@ -397,8 +399,8 @@
         }
         case '$minKey': return new MinKey();
         case '$maxKey': return new MaxKey();
-        case '$symbol': return x;
-        case '$undefined': return undefined;
+        case '$symbol':
+        case '$undefined':
         case '$code':
         case '$dbPointer': return new Raw(v);
         default: break;
@@ -472,15 +474,63 @@
     return filter;
   }
 
-  function writeResult(reply) {
+  // Writes need their filter: a missing one (undefined or null, e.g. a property that is not
+  // set) would otherwise reach every document. `{}` says "all documents" explicitly.
+  function requiredFilter(filter, what) {
+    if (filter === undefined || filter === null) {
+      fail(what + ' needs a filter document (use {} for every document)');
+    }
+    return checkFilter(filter, what);
+  }
+
+  // A count that must be a whole number >= 0 (skip, batchSize, maxTimeMS).
+  function checkNonNegative(n, what) {
+    const v = checkCount(n, what);
+    if (!Number.isInteger(v) || v < 0) fail(what + ' takes a whole number of 0 or more');
+    return v;
+  }
+
+  // An update for updateOne / updateMany: a non-empty document whose keys are all update
+  // operators, or a non-empty aggregation pipeline (as mongosh and the drivers require).
+  function checkUpdate(update, what) {
+    if (Array.isArray(update)) {
+      if (update.length === 0) fail(what + ' takes a non-empty update pipeline');
+      return;
+    }
+    if (!isDocument(update)) fail(what + ' takes an update document or pipeline');
+    const keys = Object.keys(update);
+    if (keys.length === 0 || keys.some((k) => k[0] !== '$')) {
+      fail(what + ' takes update operators ($set, ...); use replaceOne() to replace a document');
+    }
+  }
+
+  function writeResult(reply, done) {
     const errors = reply.writeErrors;
     if (Array.isArray(errors) && errors.length > 0) {
       const w = errors[0];
-      throw new MongoServerError(w.errmsg, w.codeName || String(w.code), w.code);
+      let message = w.errmsg;
+      if (done) message += ' (' + done(Number(reply.n || 0), errors.length) + ')';
+      const err = new MongoServerError(message, w.codeName || String(w.code), w.code);
+      if (done) {
+        err.nInserted = Number(reply.n || 0);
+        err.writeErrorCount = errors.length;
+      }
+      throw err;
     }
     const wc = reply.writeConcernError;
     if (wc) throw new MongoServerError(wc.errmsg, wc.codeName || String(wc.code), wc.code);
     return reply;
+  }
+
+  // The document to insert: a missing `_id` (absent or explicitly undefined) gets a new
+  // ObjectId, first, so insertedId reports what the server stored.
+  function withId(doc) {
+    if (doc._id !== undefined) return doc;
+    const out = { _id: new ObjectId() };
+    for (const key of Object.keys(doc)) {
+      if (key !== '_id') out[key] = doc[key];
+    }
+    return out;
   }
 
   function WriteResult(fields, affected) {
@@ -508,12 +558,12 @@
     }
     sort(spec) { if (!isDocument(spec)) fail('sort() takes a document'); return this._option('sort', spec, ['find']); }
     limit(n) { return this._option('limit', Math.abs(checkCount(n, 'limit()')), ['find']); }
-    skip(n) { return this._option('skip', checkCount(n, 'skip()'), ['find']); }
+    skip(n) { return this._option('skip', checkNonNegative(n, 'skip()'), ['find']); }
     project(spec) { if (!isDocument(spec)) fail('project() takes a document'); return this._option('projection', spec, ['find']); }
     projection(spec) { return this.project(spec); }
     hint(h) { return this._option('hint', h, ['find', 'aggregate']); }
-    batchSize(n) { return this._option('batchSize', checkCount(n, 'batchSize()'), ['find', 'aggregate']); }
-    maxTimeMS(n) { return this._option('maxTimeMS', checkCount(n, 'maxTimeMS()'), ['find', 'aggregate']); }
+    batchSize(n) { return this._option('batchSize', checkNonNegative(n, 'batchSize()'), ['find', 'aggregate']); }
+    maxTimeMS(n) { return this._option('maxTimeMS', checkNonNegative(n, 'maxTimeMS()'), ['find', 'aggregate']); }
     collation(c) { if (!isDocument(c)) fail('collation() takes a document'); return this._option('collation', c, ['find', 'aggregate']); }
     allowDiskUse(b) { return this._option('allowDiskUse', b !== false, ['aggregate']); }
     comment() { return this; }
@@ -642,22 +692,25 @@
     }
     insertOne(doc) {
       if (!isDocument(doc)) fail('insertOne() takes a document');
-      const stored = doc._id === undefined ? Object.assign({ _id: new ObjectId() }, doc) : doc;
+      const stored = withId(doc);
       writeResult(this._command({ insert: this._name, documents: [stored], ordered: true }));
       return new WriteResult({ acknowledged: true, insertedId: stored._id }, 1);
     }
     insertMany(docs, options) {
       if (!Array.isArray(docs) || !docs.every(isDocument)) fail('insertMany() takes an array of documents');
-      const stored = docs.map((d) => (d._id === undefined ? Object.assign({ _id: new ObjectId() }, d) : d));
+      const stored = docs.map(withId);
       const ordered = !(options && options.ordered === false);
-      const reply = writeResult(this._command({ insert: this._name, documents: stored, ordered }));
+      const reply = writeResult(
+        this._command({ insert: this._name, documents: stored, ordered }),
+        (n, failed) => 'insertMany() inserted ' + n + ' of ' + stored.length + ' documents; ' + failed + ' failed',
+      );
       const insertedIds = {};
       stored.forEach((d, i) => { insertedIds[i] = d._id; });
       return new WriteResult({ acknowledged: true, insertedCount: Number(reply.n), insertedIds }, Number(reply.n));
     }
     _update(filter, update, options, multi, what) {
       if (!isDocument(update) && !Array.isArray(update)) fail(what + ' takes an update document or pipeline');
-      const statement = { q: checkFilter(filter, what), u: update, multi, upsert: !!(options && options.upsert) };
+      const statement = { q: requiredFilter(filter, what), u: update, multi, upsert: !!(options && options.upsert) };
       if (options) {
         for (const key of ['arrayFilters', 'collation', 'hint']) {
           if (options[key] !== undefined) statement[key] = options[key];
@@ -676,15 +729,13 @@
       }, modified + upserted.length);
     }
     updateOne(filter, update, options) {
-      if (isDocument(update) && Object.keys(update).some((k) => k[0] !== '$')) {
-        fail('updateOne() takes update operators ($set, ...); use replaceOne() to replace a document');
-      }
+      requiredFilter(filter, 'updateOne()');
+      checkUpdate(update, 'updateOne()');
       return this._update(filter, update, options, false, 'updateOne()');
     }
     updateMany(filter, update, options) {
-      if (isDocument(update) && Object.keys(update).some((k) => k[0] !== '$')) {
-        fail('updateMany() takes update operators ($set, ...)');
-      }
+      requiredFilter(filter, 'updateMany()');
+      checkUpdate(update, 'updateMany()');
       return this._update(filter, update, options, true, 'updateMany()');
     }
     replaceOne(filter, replacement, options) {
@@ -694,7 +745,7 @@
       return this._update(filter, replacement, options, false, 'replaceOne()');
     }
     _delete(filter, options, limit, what) {
-      const statement = { q: checkFilter(filter, what), limit };
+      const statement = { q: requiredFilter(filter, what), limit };
       if (options && options.collation) statement.collation = options.collation;
       if (options && options.hint) statement.hint = options.hint;
       const reply = writeResult(this._command({ delete: this._name, deletes: [statement], ordered: true }));

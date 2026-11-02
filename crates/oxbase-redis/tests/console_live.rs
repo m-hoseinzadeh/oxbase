@@ -7,7 +7,8 @@
 //! `tests/fixtures.toml` (`$OXBASE_FIXTURES`). The tests write only keys of their own
 //! (`oxbase:console:t<token>:*`) and delete them at the end. The checks on the M7 seed keys
 //! (`m7:hash`, `m7:zset`, `m7:binary`) run when the seed is loaded and print "pending"
-//! otherwise, unless `OXBASE_SHELL_REQUIRE_M7_SEED=1`.
+//! otherwise, unless `OXBASE_SHELL_REQUIRE_M7_SEED=1`, `OXBASE_SERVICES_REQUIRE_M7=1` or
+//! `OXBASE_CONFORMANCE_REQUIRE_M7=1` (set at integration).
 
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -240,6 +241,18 @@ async fn destructive_lines_are_guarded_and_blocked_lines_refused() {
     c.close().await.unwrap();
 }
 
+/// Whether a missing M7 seed fails the test: `OXBASE_SHELL_REQUIRE_M7_SEED=1`, or the
+/// integration switches `OXBASE_SERVICES_REQUIRE_M7=1` / `OXBASE_CONFORMANCE_REQUIRE_M7=1`.
+fn require_seed() -> bool {
+    [
+        "OXBASE_SHELL_REQUIRE_M7_SEED",
+        "OXBASE_SERVICES_REQUIRE_M7",
+        "OXBASE_CONFORMANCE_REQUIRE_M7",
+    ]
+    .iter()
+    .any(|name| std::env::var(name).as_deref() == Ok("1"))
+}
+
 #[tokio::test]
 #[ignore = "needs the redis fixture"]
 async fn seeded_keys_answer_the_exit_check() {
@@ -251,10 +264,7 @@ async fn seeded_keys_answer_the_exit_check() {
         "value",
     );
     if exists != [Some("3".to_owned())] {
-        assert!(
-            std::env::var("OXBASE_SHELL_REQUIRE_M7_SEED").as_deref() != Ok("1"),
-            "the M7 redis seed is not loaded"
-        );
+        assert!(!require_seed(), "the M7 redis seed is not loaded");
         eprintln!("pending: the M7 redis seed is not loaded");
         c.close().await.unwrap();
         return;

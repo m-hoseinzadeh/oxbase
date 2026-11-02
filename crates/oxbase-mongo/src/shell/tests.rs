@@ -546,6 +546,93 @@ async fn cursors_become_requests_and_db_assignment_switches() {
     assert_eq!(e.sql_code(), Some("TypeError"), "{e}");
 }
 
+/// Writes that would reach every document by mistake, and bad cursor counts, are refused in
+/// JavaScript before any server call (a call would fail with a connection error here).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unsafe_writes_and_bad_counts_are_refused_before_the_server() {
+    let js = Js::new(limits());
+    let cases: &[(&str, &str)] = &[
+        ("db.c.updateOne({}, {})", "update operators"),
+        ("db.c.updateOne({a: 1}, {})", "update operators"),
+        ("db.c.updateMany({a: 1}, {})", "update operators"),
+        ("db.c.updateOne({a: 1}, [])", "non-empty update pipeline"),
+        ("db.c.updateMany({a: 1}, [])", "non-empty update pipeline"),
+        (
+            "db.c.updateOne({a: 1}, {$set: {b: 1}, c: 2})",
+            "update operators",
+        ),
+        ("db.c.updateOne({a: 1}, {c: 2})", "replaceOne()"),
+        ("db.c.updateOne({a: 1}, 5)", "update document or pipeline"),
+        ("db.c.deleteMany()", "needs a filter"),
+        ("db.c.deleteMany(undefined)", "needs a filter"),
+        ("db.c.deleteMany(null)", "needs a filter"),
+        (
+            "var opts = {}; db.c.deleteMany(opts.filter)",
+            "needs a filter",
+        ),
+        ("db.c.deleteOne(null)", "needs a filter"),
+        ("db.c.updateMany(null, {$set: {a: 1}})", "needs a filter"),
+        (
+            "db.c.updateOne(undefined, {$set: {a: 1}})",
+            "needs a filter",
+        ),
+        ("db.c.replaceOne(undefined, {a: 1})", "needs a filter"),
+        ("db.c.find().skip(-1)", "0 or more"),
+        ("db.c.find().skip(1.5)", "0 or more"),
+        ("db.c.find().batchSize(-2)", "0 or more"),
+        ("db.c.find().maxTimeMS(-5)", "0 or more"),
+    ];
+    for (source, message) in cases {
+        let e = js.error(source).await;
+        assert_eq!(e.sql_code(), Some("TypeError"), "{source}: {e}");
+        assert!(e.to_string().contains(message), "{source}: {e}");
+        assert!(e.to_string().contains("(line 1)"), "{source}: {e}");
+    }
+    // An explicit `{}` filter still means every document (the guard asks for it); a negative
+    // limit is a single batch of |n| as in mongosh.
+    let v = js.value("db.c.find().skip(0).limit(-3)").await;
+    assert_eq!(v["request"]["limit"], json!(3), "{v}");
+    assert!(v["request"].get("skip").is_some(), "{v}");
+}
+
+/// BSON values JavaScript cannot hold keep their Extended JSON through a read and write.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn values_javascript_cannot_hold_are_kept_raw() {
+    let js = Js::new(limits());
+    let v = js
+        .value(
+            "var e = EJSON.parse('{\"far\": {\"$date\": {\"$numberLong\": \"9000000000000000\"}}, \
+             \"u\": {\"$undefined\": true}, \"s\": {\"$symbol\": \"sym\"}, \
+             \"near\": {\"$date\": {\"$numberLong\": \"0\"}}}'); \
+             [e.near instanceof Date, e.far instanceof Date, typeof e.u, typeof e.s]",
+        )
+        .await;
+    assert_eq!(v["value"], json!([true, false, "object", "object"]), "{v}");
+    let v = js.value("e").await;
+    assert_eq!(
+        v["docs"][0],
+        json!({
+            "far": {"$date": {"$numberLong": "9000000000000000"}},
+            "u": {"$undefined": true},
+            "s": {"$symbol": "sym"},
+            "near": {"$date": {"$numberLong": "0"}}
+        })
+    );
+    let doc = to_document(&v["docs"][0], "doc").unwrap();
+    assert_eq!(
+        doc.get_datetime("far").unwrap().timestamp_millis(),
+        9_000_000_000_000_000
+    );
+    assert_eq!(doc.get("u"), Some(&bson::Bson::Undefined));
+    assert!(matches!(doc.get("s"), Some(bson::Bson::Symbol(s)) if s == "sym"));
+    // Printing it works too.
+    let outcome = js.run("printjson(e.far)").await;
+    assert_eq!(
+        outcome.notices[0].message,
+        "{\n  \"$date\": {\n    \"$numberLong\": \"9000000000000000\"\n  }\n}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn server_errors_keep_their_category() {
     // Nothing listens: the server call fails with a connection error the script may catch.

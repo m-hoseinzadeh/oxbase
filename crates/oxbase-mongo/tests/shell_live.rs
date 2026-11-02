@@ -7,7 +7,8 @@
 //! `tests/fixtures.toml` (`$OXBASE_FIXTURES`). The tests write only collections of their own
 //! (`m7sh_t<epoch>_<pid>_<what>` in `oxbase_test`), drop them at the end and drop leftovers
 //! older than an hour. The exit-check queries on the M7 seed (`m7_docs`, `m7_big`) run when
-//! the seed is loaded and print "pending" otherwise, unless `OXBASE_SHELL_REQUIRE_M7_SEED=1`.
+//! the seed is loaded and print "pending" otherwise, unless `OXBASE_SHELL_REQUIRE_M7_SEED=1`,
+//! `OXBASE_SERVICES_REQUIRE_M7=1` or `OXBASE_CONFORMANCE_REQUIRE_M7=1` (set at integration).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -215,8 +216,16 @@ async fn fill(c: &MongoConnection, name: &str, count: u32) {
     assert_eq!(out.rows_affected, [u64::from(count)]);
 }
 
+/// Whether a missing M7 seed fails the test: `OXBASE_SHELL_REQUIRE_M7_SEED=1`, or the
+/// integration switches `OXBASE_SERVICES_REQUIRE_M7=1` / `OXBASE_CONFORMANCE_REQUIRE_M7=1`.
 fn require_seed() -> bool {
-    std::env::var("OXBASE_SHELL_REQUIRE_M7_SEED").as_deref() == Ok("1")
+    [
+        "OXBASE_SHELL_REQUIRE_M7_SEED",
+        "OXBASE_SERVICES_REQUIRE_M7",
+        "OXBASE_CONFORMANCE_REQUIRE_M7",
+    ]
+    .iter()
+    .any(|name| std::env::var(name).as_deref() == Ok("1"))
 }
 
 // ---- tests ----------------------------------------------------------------------------------
@@ -343,6 +352,56 @@ async fn shell_statements_read_write_and_stream() {
         "{err}"
     );
     assert!(err.to_string().contains("(line 2)"), "{err}");
+    // An unordered insertMany reports how many documents went in before its error.
+    let err = try_run(
+        &c,
+        &format!(
+            "db.{name}.insertMany([{{_id: 1}}, {{_id: 5001}}, {{_id: 5002}}], {{ordered: false}})"
+        ),
+    )
+    .await
+    .expect_err("one duplicate key");
+    assert!(
+        err.to_string()
+            .contains("insertMany() inserted 2 of 3 documents; 1 failed"),
+        "{err}"
+    );
+    assert_eq!(
+        value_text(
+            &run(
+                &c,
+                &format!("db.{name}.countDocuments({{_id: {{$gt: 5000}}}})")
+            )
+            .await
+        ),
+        "2"
+    );
+    // An explicit `_id: undefined` gets a new ObjectId, which insertedId reports.
+    let out = run(
+        &c,
+        &format!("db.{name}.insertOne({{_id: undefined, s: 'u'}})"),
+    )
+    .await;
+    let id = texts(&one_batch(&out), "insertedId")[0].clone().unwrap();
+    assert_eq!(id.len(), 24, "an ObjectId: {id}");
+    assert_eq!(
+        value_text(
+            &run(
+                &c,
+                &format!("db.{name}.findOne({{s: 'u'}})._id.toHexString() === '{id}'")
+            )
+            .await
+        ),
+        "true"
+    );
+    // updateOne with an empty update is refused before it reaches the server.
+    let err = try_run(&c, &format!("db.{name}.updateOne({{_id: 107}}, {{}})"))
+        .await
+        .expect_err("empty update");
+    assert_eq!(err.sql_code(), Some("TypeError"), "{err}");
+    let b = one_batch(&run(&c, &format!("db.{name}.findOne({{_id: 107}})")).await);
+    assert_eq!(texts(&b, "s"), [Some("row-107".to_owned())]);
+
     let err = try_run(&c, "it").await.expect_err("it");
     assert!(matches!(err, Error::Unsupported { .. }), "{err}");
 

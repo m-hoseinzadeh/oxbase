@@ -415,22 +415,24 @@ fn text_arg<'a>(args: &'a Json, key: &str) -> Result<&'a str> {
         .ok_or_else(|| Error::invalid_input(format!("missing {key}")))
 }
 
+/// A count argument (`skip`, `limit`, `batchSize`, `maxTimeMS`): a finite number of 0 or more
+/// (the prelude passes `limit` as its absolute value, like the shell does).
 fn number(args: &Json, key: &str) -> Result<Option<u64>> {
     match args.get(key) {
         None | Some(Json::Null) => Ok(None),
         Some(v) => v
             .as_f64()
-            .filter(|n| n.is_finite())
+            .filter(|n| n.is_finite() && *n >= 0.0)
             .map(|n| {
                 #[allow(
                     clippy::cast_possible_truncation,
                     clippy::cast_sign_loss,
-                    reason = "a JavaScript count: whole, made non-negative and saturated"
+                    reason = "a JavaScript count: checked non-negative, whole and saturated"
                 )]
-                let n = n.abs().trunc().min(9.0e15) as u64;
+                let n = n.trunc().min(9.0e15) as u64;
                 Some(n)
             })
-            .ok_or_else(|| Error::invalid_input(format!("{key} must be a number"))),
+            .ok_or_else(|| Error::invalid_input(format!("{key} must be a number of 0 or more"))),
     }
 }
 
