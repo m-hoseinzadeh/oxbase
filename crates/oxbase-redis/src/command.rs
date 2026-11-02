@@ -140,7 +140,7 @@ mod tests {
             args("  SET  key\tvalue \r\n"),
             text(&["SET", "key", "value"])
         );
-        assert!(args("   ").is_empty());
+        assert_eq!(args("   "), Vec::<Vec<u8>>::new());
         assert_eq!(args("GET ü"), text(&["GET", "ü"]));
     }
 
