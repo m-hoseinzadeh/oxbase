@@ -54,6 +54,7 @@ import { cancelRequest, newRequestId, toCommandError } from "../../connections/a
 import { languageFor } from "../editor/language";
 import { SqlEditor, type SqlEditorHandle } from "../editor/SqlEditor";
 import { openTableData, sameObject } from "../layout";
+import { qualifiedName } from "../names";
 import {
   ChecksEditor,
   ColumnsEditor,
@@ -352,7 +353,7 @@ export function TableDesignerPanel({
   const nonTransactional = (shown?.script.steps ?? []).filter((s) => !s.transactional);
   const title = creating
     ? `New table${design?.table.name ? ` ${design.table.name}` : ""}`
-    : (design?.table.name ?? table.name);
+    : qualifiedName(design?.table ?? table);
 
   return (
     <section className="designer" aria-label={`Design ${title}`}>
@@ -672,7 +673,7 @@ export function TableDesignerPanel({
         >
           <p>
             {plural(steps.length, "statement", "statements")} will run on{" "}
-            <strong>{design?.table.name}</strong>
+            <strong>{design ? qualifiedName(design.table) : qualifiedName(table)}</strong>
             {current.atomic ? " in one transaction." : "."}
           </p>
           {!current.atomic ? (

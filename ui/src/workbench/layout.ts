@@ -4,6 +4,7 @@
  */
 import type { DockviewApi } from "dockview-react";
 import type { ObjectRef } from "../api";
+import { qualifiedName } from "./names";
 
 /** What a new query editor starts with (`params` of its dockview panel). */
 export interface QueryEditorParams {
@@ -128,7 +129,7 @@ export function openTableData(init: { sessionId: string; table: ObjectRef }): st
   api.addPanel({
     id: `data-${editorId}`,
     component: "tableData",
-    title: init.table.name,
+    title: qualifiedName(init.table),
     params,
     ...(neighbour ? { position: { referencePanel: neighbour, direction: "within" } } : {}),
   });
@@ -137,7 +138,7 @@ export function openTableData(init: { sessionId: string; table: ObjectRef }): st
 
 /** The title of a table designer tab. */
 export function designerTitle(params: DesignerPanelParams): string {
-  return params.isNew ? "New table" : `Design ${params.table.name}`;
+  return params.isNew ? "New table" : `Design ${qualifiedName(params.table)}`;
 }
 
 /** Opens the table designer for a table, or for a new table when `isNew`. */

@@ -309,7 +309,7 @@ describe("TableDesignerPanel", () => {
     // Applying a non-destructive script still asks first.
     fireEvent.click(screen.getByRole("button", { name: "Apply" }));
     const dialog = screen.getByRole("dialog", { name: "Apply the changes?" });
-    expect(dialog).toHaveTextContent("1 statement will run on items in one transaction.");
+    expect(dialog).toHaveTextContent("1 statement will run on public.items in one transaction.");
     fireEvent.click(within(dialog).getByRole("button", { name: "Apply" }));
     await screen.findByText("Applied 1 statement.");
     expect(calls("designer_apply")).toEqual([

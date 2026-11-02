@@ -66,6 +66,7 @@ import { Modal } from "../../components/Modal";
 import { toCommandError } from "../../connections/api";
 import { useConnections } from "../../connections/store";
 import { openTableDesigner } from "../layout";
+import { qualifiedName as qualified } from "../names";
 import { ResultPager } from "../results/pager";
 import { timedQueryPage } from "../results/perf";
 import { type CellOverride, type GridEditing, ResultGrid } from "../results/ResultGrid";
@@ -129,10 +130,6 @@ export const MAX_JSON_ROWS = 100;
 interface AppliedQuery {
   filter?: Filter;
   sort: SortKey[];
-}
-
-function qualified(table: ObjectRef): string {
-  return [table.schema ?? table.catalog, table.name].filter(Boolean).join(".");
 }
 
 function inputOfText(text: string | null | undefined): CellInput {
