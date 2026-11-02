@@ -626,6 +626,6 @@ mod tests {
         assert!(state.notices.last().unwrap().message.contains("dropped"));
         let left = state.end();
         assert_eq!(left.notices.len(), MAX_NOTICES + 1);
-        assert!(state.notices.is_empty());
+        assert_eq!(state.notices.len(), 0);
     }
 }

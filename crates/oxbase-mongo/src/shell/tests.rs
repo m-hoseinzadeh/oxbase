@@ -156,7 +156,7 @@ fn fuzzed_scripts_never_panic_and_keep_the_range_rules() {
             assert!(s.range.start >= last, "{script:?}");
             assert!(s.range.end <= s.segment_end && s.segment_end <= script.len());
             assert_eq!(&script[s.range.clone()], s.text, "{script:?}");
-            assert!(!s.text.trim().is_empty(), "{script:?}");
+            assert_ne!(s.text.trim(), "", "{script:?}");
             last = s.segment_end;
             let _ = MongoShell.guard(s);
         }

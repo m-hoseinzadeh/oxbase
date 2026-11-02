@@ -664,7 +664,7 @@ mod tests {
         ];
         for line in confirm {
             match guard(line) {
-                StatementGuard::Confirm(why) => assert!(!why.is_empty(), "{line}"),
+                StatementGuard::Confirm(why) => assert_ne!(why.as_str(), "", "{line}"),
                 other => panic!("{line}: {other:?}"),
             }
         }
@@ -857,7 +857,7 @@ mod tests {
                 assert!(s.range.start >= last, "{script:?}");
                 assert_eq!(&script[s.range.clone()], s.text, "{script:?}");
                 assert!(s.segment_end >= s.range.end && s.segment_end <= script.len());
-                assert!(!s.text.is_empty());
+                assert_ne!(s.text, "");
                 last = s.segment_end;
                 let _ = RedisConsole.guard(s);
             }

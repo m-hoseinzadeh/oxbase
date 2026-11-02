@@ -267,7 +267,8 @@ async fn seeded_keys_answer_the_exit_check() {
     assert_eq!(hash.schema().field(0).name(), "field");
     let zset = batch(&run(&c, &statements[1].text).await);
     let scores = floats(&zset, "score");
-    assert!(!scores.is_empty() && scores.windows(2).all(|w| w[0] <= w[1]));
+    assert_ne!(scores.len(), 0);
+    assert!(scores.windows(2).all(|w| w[0] <= w[1]));
     let binary = batch(&run(&c, &statements[2].text).await);
     assert_eq!(binaries(&binary, "raw"), [vec![0x00, 0xff, 0xfe, 0x0a]]);
     c.close().await.unwrap();

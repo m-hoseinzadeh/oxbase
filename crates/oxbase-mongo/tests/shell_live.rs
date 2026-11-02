@@ -294,7 +294,7 @@ async fn shell_statements_read_write_and_stream() {
     .await;
     let printed: Vec<&str> = out.notices.iter().map(|n| n.message.as_str()).collect();
     assert_eq!(printed, ["row-1", "row-2", "row-3"]);
-    assert!(out.result_sets.is_empty());
+    assert_eq!(out.result_sets.len(), 0);
     assert_eq!(
         value_text(&run(&c, &format!("db.{name}.distinct('g', {{_id: {{$lt: 3}}}})")).await),
         "[1,2]"
