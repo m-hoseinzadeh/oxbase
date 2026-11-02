@@ -16,13 +16,22 @@ export default function MonacoSqlEditor({
   value,
   testId,
   insight,
+  onChange,
+  compact,
 }: SqlEditorProps) {
   const host = useRef<HTMLDivElement>(null);
   const editor = useRef<monaco.editor.IStandaloneCodeEditor | null>(null);
   // Commands read the latest callback without re-creating the editor.
   const command = useRef(onCommand);
   command.current = onCommand;
-  const initial = useRef({ value: value ?? initialValue, language, readOnly: readOnly ?? false });
+  const change = useRef(onChange);
+  change.current = onChange;
+  const initial = useRef({
+    value: value ?? initialValue,
+    language,
+    readOnly: readOnly ?? false,
+    compact: compact ?? false,
+  });
   // Insight reads the latest target (engine, connection, database) on every request.
   const insightProps = useRef(insight);
   insightProps.current = insight;
@@ -51,6 +60,19 @@ export default function MonacoSqlEditor({
       ariaLabel: ariaLabel ?? "SQL editor",
       readOnly: initial.current.readOnly,
       domReadOnly: initial.current.readOnly,
+      ...(initial.current.compact
+        ? {
+            lineNumbers: "off" as const,
+            glyphMargin: false,
+            folding: false,
+            lineDecorationsNumber: 0,
+            lineDecorationsWidth: 6,
+            padding: { top: 4, bottom: 4 },
+            renderLineHighlight: "none" as const,
+            overviewRulerLanes: 0,
+            scrollbar: { verticalScrollbarSize: 8, horizontalScrollbarSize: 8 },
+          }
+        : {}),
       // With insight the core offers the names; plain words of the text would only add noise.
       ...(insightEditorId
         ? {
@@ -65,6 +87,7 @@ export default function MonacoSqlEditor({
         : {}),
     });
     editor.current = instance;
+    const changes = instance.onDidChangeModelContent(() => change.current?.(instance.getValue()));
     if (insightEditorId !== null) {
       attachment.current = attachInsight(instance, {
         editorId: insightEditorId,
@@ -140,6 +163,7 @@ export default function MonacoSqlEditor({
     const unsubscribe = subscribeTheme(() => applyMonacoTheme(monaco));
     return () => {
       unsubscribe();
+      changes.dispose();
       attachment.current?.dispose();
       attachment.current = null;
       editorRef.current = null;
@@ -172,5 +196,11 @@ export default function MonacoSqlEditor({
     if (instance.getValue() !== value) instance.setValue(value);
   }, [value]);
 
-  return <div ref={host} className="sql-editor" data-testid={testId ?? "sql-editor"} />;
+  return (
+    <div
+      ref={host}
+      className={`sql-editor${compact ? " sql-editor--compact" : ""}`}
+      data-testid={testId ?? "sql-editor"}
+    />
+  );
 }

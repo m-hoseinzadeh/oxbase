@@ -43,7 +43,12 @@ import {
   formFromProfile,
   type HostKeyPolicy,
   isNetworked,
+  MONGO_AUTH_MECHANISMS,
+  MONGO_READ_PREFERENCES,
+  type MongoAuthMechanism,
+  type MongoReadPreference,
   profileFromForm,
+  type RedisMode,
   type SshAuthMethod,
   STRICT_TLS_MODES,
   secretsFromForm,
@@ -292,7 +297,13 @@ export function ConnectionDialog({ profile, onClose, onSaved }: ConnectionDialog
   }
 
   function check(
-    key: "savePassword" | "sshEnabled" | "saveSshSecret" | "strictEncryption" | "readOnlyIntent",
+    key:
+      | "savePassword"
+      | "sshEnabled"
+      | "saveSshSecret"
+      | "strictEncryption"
+      | "readOnlyIntent"
+      | "srv",
   ) {
     return (event: ChangeEvent<HTMLInputElement>) => set(key, event.target.checked);
   }
@@ -516,12 +527,25 @@ export function ConnectionDialog({ profile, onClose, onSaved }: ConnectionDialog
                       inputMode="numeric"
                       className="input--port"
                       placeholder={String(ENGINE_INFO[form.engine].port ?? "")}
-                      value={form.port}
+                      disabled={traits.options === "mongodb" && form.srv}
+                      value={traits.options === "mongodb" && form.srv ? "" : form.port}
                       onChange={text("port")}
                     />
                   )}
                 </Field>
               </div>
+              {traits.options === "mongodb" ? (
+                <MongoServerFields
+                  form={form}
+                  errors={errors}
+                  set={set}
+                  text={text}
+                  check={check}
+                />
+              ) : null}
+              {traits.options === "redis" ? (
+                <RedisServerFields form={form} errors={errors} set={set} text={text} />
+              ) : null}
               {traits.instance ? (
                 <Field
                   field="instance"
@@ -543,7 +567,7 @@ export function ConnectionDialog({ profile, onClose, onSaved }: ConnectionDialog
               ) : null}
               <Field
                 field="database"
-                label="Database (optional)"
+                label={traits.databaseLabel ?? "Database (optional)"}
                 errors={errors}
                 hint={traits.databaseHint}
               >
@@ -558,7 +582,7 @@ export function ConnectionDialog({ profile, onClose, onSaved }: ConnectionDialog
                 )}
               </Field>
               <h3 className="form-section__title form-section__title--spaced">Credentials</h3>
-              <Field field="user" label="User name" errors={errors}>
+              <Field field="user" label="User name" errors={errors} hint={traits.userHint}>
                 {(p) => (
                   <input
                     {...p}
@@ -600,6 +624,9 @@ export function ConnectionDialog({ profile, onClose, onSaved }: ConnectionDialog
                 />
                 Save password
               </label>
+              {traits.options === "mongodb" ? (
+                <MongoAuthFields form={form} errors={errors} set={set} text={text} />
+              ) : null}
               {traits.readOnlyIntent ? (
                 <label className="checkbox">
                   <input
@@ -951,6 +978,271 @@ export function ConnectionDialog({ profile, onClose, onSaved }: ConnectionDialog
         </div>
       ) : null}
     </Modal>
+  );
+}
+
+type SetField = <K extends keyof ConnectionForm>(key: K, value: ConnectionForm[K]) => void;
+type TextHandler = (key: FormField) => (event: ChangeEvent<HTMLInputElement>) => void;
+
+interface EngineFieldsProps {
+  form: ConnectionForm;
+  errors: FormErrors;
+  set: SetField;
+  text: TextHandler;
+}
+
+const READ_PREFERENCE_LABEL: Record<MongoReadPreference, string> = {
+  primary: "Primary",
+  primaryPreferred: "Primary preferred",
+  secondary: "Secondary",
+  secondaryPreferred: "Secondary preferred",
+  nearest: "Nearest",
+};
+
+/** MongoDB: seed hosts, SRV, replica set and read preference (`oxbase_mongo::options`). */
+function MongoServerFields({
+  form,
+  errors,
+  set,
+  text,
+  check,
+}: EngineFieldsProps & { check: (key: "srv") => (e: ChangeEvent<HTMLInputElement>) => void }) {
+  return (
+    <>
+      <div className={`field ${errors.srv ? "field--invalid" : ""}`}>
+        <label className="checkbox">
+          <input
+            id={fieldId("srv")}
+            type="checkbox"
+            checked={form.srv}
+            aria-invalid={Boolean(errors.srv)}
+            aria-describedby={errors.srv ? `${fieldId("srv")}-error` : `${fieldId("srv")}-hint`}
+            onChange={check("srv")}
+          />
+          The host is an SRV name (mongodb+srv)
+        </label>
+        <p id={`${fieldId("srv")}-hint`} className="field__hint">
+          DNS lists the servers and their ports; not available through an SSH tunnel.
+        </p>
+        {errors.srv ? (
+          <p id={`${fieldId("srv")}-error`} className="field__error">
+            {errors.srv}
+          </p>
+        ) : null}
+      </div>
+      {form.srv ? null : (
+        <Field
+          field="hosts"
+          label="More hosts (optional)"
+          errors={errors}
+          hint="Other members of a replica set or sharded cluster, as host:port separated by commas."
+        >
+          {(p) => (
+            <input
+              {...p}
+              type="text"
+              autoComplete="off"
+              spellCheck={false}
+              placeholder="db2.example.com:27017, db3.example.com:27017"
+              value={form.hosts}
+              onChange={text("hosts")}
+            />
+          )}
+        </Field>
+      )}
+      <div className="field-row">
+        <Field field="replicaSet" label="Replica set (optional)" errors={errors}>
+          {(p) => (
+            <input
+              {...p}
+              type="text"
+              autoComplete="off"
+              spellCheck={false}
+              value={form.replicaSet}
+              onChange={text("replicaSet")}
+            />
+          )}
+        </Field>
+        <Field field="readPreference" label="Read preference" errors={errors}>
+          {(p) => (
+            <select
+              {...p}
+              value={form.readPreference}
+              onChange={(e) => set("readPreference", e.target.value as MongoReadPreference)}
+            >
+              {MONGO_READ_PREFERENCES.map((r) => (
+                <option key={r} value={r}>
+                  {READ_PREFERENCE_LABEL[r]}
+                </option>
+              ))}
+            </select>
+          )}
+        </Field>
+      </div>
+    </>
+  );
+}
+
+/** MongoDB: authentication database and mechanism. */
+function MongoAuthFields({ form, errors, set, text }: EngineFieldsProps) {
+  const external = form.authMechanism === "MONGODB-X509" || form.authMechanism === "PLAIN";
+  return (
+    <div className="field-row">
+      <Field
+        field="authSource"
+        label="Authentication database"
+        errors={errors}
+        hint={external ? "Blank: $external." : "Blank: admin."}
+      >
+        {(p) => (
+          <input
+            {...p}
+            type="text"
+            autoComplete="off"
+            spellCheck={false}
+            placeholder={external ? "$external" : "admin"}
+            value={form.authSource}
+            onChange={text("authSource")}
+          />
+        )}
+      </Field>
+      <Field field="authMechanism" label="Authentication mechanism" errors={errors}>
+        {(p) => (
+          <select
+            {...p}
+            value={form.authMechanism}
+            onChange={(e) => set("authMechanism", e.target.value as MongoAuthMechanism | "")}
+          >
+            <option value="">Negotiated (SCRAM)</option>
+            {MONGO_AUTH_MECHANISMS.map((m) => (
+              <option key={m} value={m}>
+                {m === "MONGODB-X509" ? "X.509 client certificate" : m}
+              </option>
+            ))}
+          </select>
+        )}
+      </Field>
+    </div>
+  );
+}
+
+const REDIS_MODE_LABEL: Record<RedisMode, string> = {
+  standalone: "Standalone server",
+  cluster: "Cluster",
+  sentinel: "Sentinel",
+};
+
+/** Redis: mode, seeds, sentinel master, protocol and namespace separator. */
+function RedisServerFields({ form, errors, set, text }: EngineFieldsProps) {
+  return (
+    <>
+      <Field
+        field="redisMode"
+        label="Mode"
+        errors={errors}
+        hint={
+          form.redisMode === "cluster"
+            ? "The host above and the nodes below are seeds; the client discovers the slots."
+            : form.redisMode === "sentinel"
+              ? "The host above and the nodes below are sentinels; they name the master to connect to."
+              : undefined
+        }
+      >
+        {(p) => (
+          <select
+            {...p}
+            value={form.redisMode}
+            onChange={(e) => set("redisMode", e.target.value as RedisMode)}
+          >
+            {(Object.keys(REDIS_MODE_LABEL) as RedisMode[]).map((m) => (
+              <option key={m} value={m}>
+                {REDIS_MODE_LABEL[m]}
+              </option>
+            ))}
+          </select>
+        )}
+      </Field>
+      {form.redisMode === "standalone" ? null : (
+        <Field
+          field="nodes"
+          label={form.redisMode === "cluster" ? "More cluster nodes" : "More sentinels"}
+          errors={errors}
+          hint="host:port separated by commas (optional)."
+        >
+          {(p) => (
+            <input
+              {...p}
+              type="text"
+              autoComplete="off"
+              spellCheck={false}
+              value={form.nodes}
+              onChange={text("nodes")}
+            />
+          )}
+        </Field>
+      )}
+      {form.redisMode === "sentinel" ? (
+        <div className="field-row">
+          <Field field="masterName" label="Master name" errors={errors}>
+            {(p) => (
+              <input
+                {...p}
+                type="text"
+                autoComplete="off"
+                spellCheck={false}
+                value={form.masterName}
+                onChange={text("masterName")}
+              />
+            )}
+          </Field>
+          <Field field="sentinelAuth" label="Sentinel login" errors={errors}>
+            {(p) => (
+              <select
+                {...p}
+                value={form.sentinelAuth}
+                onChange={(e) => set("sentinelAuth", e.target.value as "none" | "same")}
+              >
+                <option value="none">None</option>
+                <option value="same">Same user and password</option>
+              </select>
+            )}
+          </Field>
+        </div>
+      ) : null}
+      <div className="field-row">
+        <Field field="protocol" label="Protocol" errors={errors}>
+          {(p) => (
+            <select
+              {...p}
+              value={form.protocol}
+              onChange={(e) => set("protocol", e.target.value as "auto" | "resp2" | "resp3")}
+            >
+              <option value="auto">Automatic (RESP3 when available)</option>
+              <option value="resp2">RESP2</option>
+              <option value="resp3">RESP3</option>
+            </select>
+          )}
+        </Field>
+        <Field
+          field="namespaceSeparator"
+          label="Namespace separator"
+          errors={errors}
+          hint="Splits key names into tree folders; blank shows every key flat."
+        >
+          {(p) => (
+            <input
+              {...p}
+              type="text"
+              autoComplete="off"
+              spellCheck={false}
+              className="input--port"
+              value={form.namespaceSeparator}
+              onChange={text("namespaceSeparator")}
+            />
+          )}
+        </Field>
+      </div>
+    </>
   );
 }
 

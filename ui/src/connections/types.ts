@@ -6,8 +6,16 @@
 
 export type Engine = "postgres" | "mysql" | "mariadb" | "sqlite" | "mssql" | "mongodb" | "redis";
 
-/** Engines the connection dialog offers (SQL Server since M4). */
-export const DIALOG_ENGINES = ["postgres", "mysql", "mariadb", "sqlite", "mssql"] as const;
+/** Engines the connection dialog offers (SQL Server since M4, MongoDB and Redis since M7). */
+export const DIALOG_ENGINES = [
+  "postgres",
+  "mysql",
+  "mariadb",
+  "sqlite",
+  "mssql",
+  "mongodb",
+  "redis",
+] as const;
 export type DialogEngine = (typeof DIALOG_ENGINES)[number];
 
 export type TlsMode = "disable" | "prefer" | "require" | "verify_ca" | "verify_full";
