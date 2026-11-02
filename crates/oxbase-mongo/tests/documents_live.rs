@@ -20,7 +20,7 @@ use bson::{Bson, Document, doc};
 use futures::StreamExt;
 use oxbase_dialect::document::{DOCUMENT_COLUMN, META_BSON_TYPE, META_BSON_TYPES, META_ROLE};
 use oxbase_dialect::{BulkLoader, DocumentStore, LoadColumn, LoadSession, LoadTarget};
-use oxbase_driver::{CancellationToken, ResultItem, ResultSource, collect};
+use oxbase_driver::{CancellationToken, ResultItem, collect};
 use oxbase_mongo::MongoConnection;
 use oxbase_mongo::dialect::{MongoBulkLoader, MongoDocumentStore};
 use oxbase_mongo::ejson::parse_document;

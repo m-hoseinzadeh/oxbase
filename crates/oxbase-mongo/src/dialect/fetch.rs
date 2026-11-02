@@ -713,32 +713,29 @@ pub(crate) fn infer_columns(sample: &[Document]) -> Vec<ColumnDef> {
             field.name().clone(),
             column_type(bson_type, subtype, field.data_type()),
         );
-        column.native_type = bson_type.to_owned();
+        bson_type.clone_into(&mut column.native_type);
         column.nullable = present.get(field.name().as_str()).copied().unwrap_or(0) < sample.len();
         column
             .extras
             .insert(props::NATIVE_TYPE, bson_type.to_owned());
         columns.push(column);
     }
-    match columns.iter_mut().find(|c| c.name == "_id") {
-        Some(id) => {
-            id.nullable = false;
-            // The client gives a document without `_id` a new ObjectId.
-            id.default = Some("ObjectId()".to_owned());
-        }
-        None => {
-            let mut id = ColumnDef::new(
-                "_id",
-                DataType::Other {
-                    name: "objectId".to_owned(),
-                },
-            );
-            id.native_type = "objectId".to_owned();
-            id.nullable = false;
-            id.default = Some("ObjectId()".to_owned());
-            id.extras.insert(props::NATIVE_TYPE, "objectId");
-            columns.insert(0, id);
-        }
+    if let Some(id) = columns.iter_mut().find(|c| c.name == "_id") {
+        id.nullable = false;
+        // The client gives a document without `_id` a new ObjectId.
+        id.default = Some("ObjectId()".to_owned());
+    } else {
+        let mut id = ColumnDef::new(
+            "_id",
+            DataType::Other {
+                name: "objectId".to_owned(),
+            },
+        );
+        "objectId".clone_into(&mut id.native_type);
+        id.nullable = false;
+        id.default = Some("ObjectId()".to_owned());
+        id.extras.insert(props::NATIVE_TYPE, "objectId");
+        columns.insert(0, id);
     }
     columns
 }

@@ -406,7 +406,7 @@ async fn the_tree_shows_collections_views_users_roles_and_indexes() {
     let ObjectDef::Table(def) = def else {
         panic!("a table def");
     };
-    assert_eq!(def.primary_key.unwrap().columns, ["_id"]);
+    assert_eq!(def.primary_key.as_ref().unwrap().columns, ["_id"]);
     assert_eq!(def.column("n").unwrap().native_type, "long");
 }
 

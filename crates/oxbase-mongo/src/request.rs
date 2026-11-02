@@ -25,6 +25,8 @@
 //! cap). A builder request, a request typed in the editor and the history entry pasted back
 //! therefore behave the same.
 
+use std::fmt::Write as _;
+
 use async_trait::async_trait;
 use bson::{Bson, Document};
 use oxbase_driver::{CancellationToken, Connection, ResultSource, ResultStream};
@@ -100,34 +102,37 @@ fn find_text(out: &mut String, f: &FindRequest) {
         .map_or_else(|| "{}".to_owned(), |v| json_arg(v, "filter"));
     match &f.projection {
         Some(projection) => {
-            out.push_str(&format!(
-                ".find({filter}, {})",
-                json_arg(projection, "projection")
-            ));
+            push(
+                out,
+                format_args!(".find({filter}, {})", json_arg(projection, "projection")),
+            );
         }
-        None => out.push_str(&format!(".find({filter})")),
+        None => push(out, format_args!(".find({filter})")),
     }
     if let Some(sort) = &f.sort {
-        out.push_str(&format!(".sort({})", json_arg(sort, "sort")));
+        push(out, format_args!(".sort({})", json_arg(sort, "sort")));
     }
     if let Some(hint) = &f.hint {
         let hint = match hint {
             Json::String(name) => js_string(name),
             keys => json_arg(keys, "hint"),
         };
-        out.push_str(&format!(".hint({hint})"));
+        push(out, format_args!(".hint({hint})"));
     }
     if let Some(collation) = &f.collation {
-        out.push_str(&format!(".collation({})", json_arg(collation, "collation")));
+        push(
+            out,
+            format_args!(".collation({})", json_arg(collation, "collation")),
+        );
     }
     if let Some(skip) = f.skip {
-        out.push_str(&format!(".skip({skip})"));
+        push(out, format_args!(".skip({skip})"));
     }
     if let Some(limit) = f.limit {
-        out.push_str(&format!(".limit({limit})"));
+        push(out, format_args!(".limit({limit})"));
     }
     if let Some(ms) = f.max_time_ms {
-        out.push_str(&format!(".maxTimeMS({ms})"));
+        push(out, format_args!(".maxTimeMS({ms})"));
     }
 }
 
@@ -156,13 +161,18 @@ fn aggregate_text(out: &mut String, a: &AggregateRequest) {
     if let Some(ms) = a.max_time_ms {
         options.insert("maxTimeMS", i64::try_from(ms).unwrap_or(i64::MAX));
     }
-    out.push_str(&format!(".aggregate([{}]", stages.join(", ")));
+    push(out, format_args!(".aggregate([{}]", stages.join(", ")));
     if !options.is_empty() {
         // Plain JSON options (no type wrappers): every value is a bool, a number or a document.
         out.push_str(", ");
         out.push_str(&Bson::Document(options).into_relaxed_extjson().to_string());
     }
     out.push(')');
+}
+
+/// Appends formatted text to `out`.
+fn push(out: &mut String, args: std::fmt::Arguments<'_>) {
+    let _ = out.write_fmt(args);
 }
 
 /// A JSON part as canonical Extended JSON text (its JSON text when it does not convert, which
