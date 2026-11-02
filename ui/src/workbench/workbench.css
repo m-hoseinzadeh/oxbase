@@ -428,11 +428,10 @@ input[type="search"] {
 }
 
 .tree__toolbar {
-  flex-wrap: nowrap;
+  flex-wrap: wrap;
   gap: 2px;
   padding-bottom: var(--space-1);
   border-bottom: 1px solid var(--color-border);
-  overflow-x: auto;
 }
 
 .tree__system {
@@ -1280,10 +1279,9 @@ input[type="search"] {
 }
 
 .history__toolbar {
-  flex-wrap: nowrap;
+  flex-wrap: wrap;
   align-items: center;
   gap: 2px;
-  overflow-x: auto;
   flex-shrink: 0;
 }
 

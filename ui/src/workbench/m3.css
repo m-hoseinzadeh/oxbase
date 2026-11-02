@@ -208,14 +208,13 @@
 }
 
 .table-data__toolbar {
-  flex-wrap: nowrap;
+  flex-wrap: wrap;
   flex-shrink: 0;
   gap: 2px;
   min-height: 36px;
   padding: var(--space-1) var(--space-2);
   border-bottom: 1px solid var(--color-border);
   background: var(--color-bg-subtle);
-  overflow-x: auto;
 }
 
 .table-data__toolbar .button {
@@ -1029,14 +1028,13 @@ fieldset.sort {
 }
 
 .designer__toolbar {
-  flex-wrap: nowrap;
+  flex-wrap: wrap;
   flex-shrink: 0;
   gap: 2px;
   min-height: 36px;
   padding: var(--space-1) var(--space-2);
   border-bottom: 1px solid var(--color-border);
   background: var(--color-bg-subtle);
-  overflow-x: auto;
 }
 
 .designer__toolbar .button {
