@@ -35,7 +35,7 @@ import {
   useState,
 } from "react";
 import type { ColumnInfo } from "../../api";
-import { subscribeTheme } from "../theme-bridge";
+import { normalizeColor, subscribeTheme } from "../theme-bridge";
 import { type CopyNotify, cellsForSelection, NULL_COPY_TEXT } from "./copy";
 import { cellDisplayText, columnTypeLabel, formatCell, initialColumnWidth } from "./format";
 import { dataCellOf } from "./gridCoords";
@@ -64,8 +64,10 @@ function columnIcon(column: ColumnInfo): GridColumnIcon {
 }
 
 /** `#rrggbb` with an alpha, for the selection tint (Glide parses colours itself). */
-function withAlpha(hex: string, alpha: number): string {
-  const m = /^#([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i.exec(hex);
+function withAlpha(colour: string, alpha: number): string {
+  // Built CSS is minified (`#fff`), so normalise before reading the channels.
+  const hex = normalizeColor(colour) ?? "";
+  const m = /^#([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})/i.exec(hex);
   if (!m) return `rgba(37, 99, 235, ${alpha})`;
   const [r, g, b] = [m[1], m[2], m[3]].map((h) => Number.parseInt(h ?? "0", 16));
   return `rgba(${r}, ${g}, ${b}, ${alpha})`;

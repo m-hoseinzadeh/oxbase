@@ -30,7 +30,14 @@ function systemPrefersLight(): boolean {
 }
 
 function notify() {
-  for (const listener of listeners) listener();
+  // One failing surface (e.g. Monaco rejecting a colour) must not stop the others re-theming.
+  for (const listener of listeners) {
+    try {
+      listener();
+    } catch (error) {
+      console.error("theme listener failed", error);
+    }
+  }
 }
 
 function apply() {
@@ -121,15 +128,38 @@ const SYNTAX: Record<ResolvedTheme, Record<string, string>> = {
   },
 };
 
-function hex(value: string): string {
-  // Monaco wants #rrggbb or #rrggbbaa; tokens are hex in theme.css except rgb() selections.
-  const m = value.match(/^rgb\((\d+)\s+(\d+)\s+(\d+)\s*\/\s*([\d.]+)%\)$/);
-  if (m) {
-    const [r, g, b, a] = [Number(m[1]), Number(m[2]), Number(m[3]), Number(m[4]) / 100];
-    const part = (n: number) => n.toString(16).padStart(2, "0");
-    return `#${part(r)}${part(g)}${part(b)}${part(Math.round(a * 255))}`;
+/**
+ * A colour as `#rrggbb` or `#rrggbbaa`. Built CSS is minified, so tokens can come back as
+ * `#fff`, `#0284c733` or `rgb(2 132 199 / 20%)`; Monaco accepts only the long hex forms.
+ * Returns `null` for anything else (named colours, `var()`), so callers can fall back.
+ */
+export function normalizeColor(value: string): string | null {
+  const v = value.trim().toLowerCase();
+  const short = /^#([0-9a-f])([0-9a-f])([0-9a-f])([0-9a-f])?$/.exec(v);
+  if (short) {
+    const [r, g, b, a] = [short[1], short[2], short[3], short[4]];
+    return `#${r}${r}${g}${g}${b}${b}${a ? `${a}${a}` : ""}`;
   }
-  return value;
+  if (/^#[0-9a-f]{6}([0-9a-f]{2})?$/.test(v)) return v;
+  const fn =
+    /^rgba?\(\s*([\d.]+%?)[\s,]+([\d.]+%?)[\s,]+([\d.]+%?)(?:\s*[,/]\s*([\d.]+%?))?\s*\)$/.exec(v);
+  if (!fn) return null;
+  const channel = (c: string | undefined) =>
+    c?.endsWith("%") ? Math.round((Number.parseFloat(c) / 100) * 255) : Number.parseFloat(c ?? "0");
+  const alpha = (c: string | undefined) =>
+    c === undefined
+      ? 255
+      : Math.round((c.endsWith("%") ? Number.parseFloat(c) / 100 : Number.parseFloat(c)) * 255);
+  const part = (n: number) =>
+    Math.max(0, Math.min(255, Math.round(n)))
+      .toString(16)
+      .padStart(2, "0");
+  const a = alpha(fn[4]);
+  return `#${part(channel(fn[1]))}${part(channel(fn[2]))}${part(channel(fn[3]))}${a === 255 ? "" : part(a)}`;
+}
+
+function hex(value: string, fallback: string): string {
+  return normalizeColor(value) ?? fallback;
 }
 
 export function monacoThemeName(theme: ResolvedTheme = resolvedTheme()): string {
@@ -159,28 +189,35 @@ export function applyMonacoTheme(monaco: MonacoThemeApi): void {
       rule("delimiter", s.operator),
     ],
     colors: {
-      "editor.background": hex(cssToken("--color-bg", "#0f172a")),
-      "editor.foreground": hex(cssToken("--color-fg", "#e2e8f0")),
-      "editorLineNumber.foreground": hex(cssToken("--color-fg-faint", "#8a99ae")),
-      "editorLineNumber.activeForeground": hex(cssToken("--color-fg", "#e2e8f0")),
-      "editor.lineHighlightBackground": hex(cssToken("--color-bg-subtle", "#131c2f")),
+      "editor.background": hex(cssToken("--color-bg", "#0f172a"), "#0f172a"),
+      "editor.foreground": hex(cssToken("--color-fg", "#e2e8f0"), "#e2e8f0"),
+      "editorLineNumber.foreground": hex(cssToken("--color-fg-faint", "#8a99ae"), "#8a99ae"),
+      "editorLineNumber.activeForeground": hex(cssToken("--color-fg", "#e2e8f0"), "#e2e8f0"),
+      "editor.lineHighlightBackground": hex(cssToken("--color-bg-subtle", "#131c2f"), "#131c2f"),
       "editor.lineHighlightBorder": "#00000000",
-      "editor.selectionBackground": hex(cssToken("--color-selection-strong", "#38bdf847")),
-      "editor.inactiveSelectionBackground": hex(cssToken("--color-selection", "#38bdf82e")),
-      "editorCursor.foreground": hex(cssToken("--color-focus", "#38bdf8")),
-      "editorIndentGuide.background1": hex(cssToken("--color-border", "#243045")),
-      "editorWidget.background": hex(cssToken("--color-bg-elevated", "#172036")),
-      "editorWidget.border": hex(cssToken("--color-border-strong", "#334155")),
-      "editorSuggestWidget.background": hex(cssToken("--color-bg-elevated", "#172036")),
-      "editorSuggestWidget.border": hex(cssToken("--color-border-strong", "#334155")),
+      "editor.selectionBackground": hex(
+        cssToken("--color-selection-strong", "#38bdf847"),
+        "#38bdf847",
+      ),
+      "editor.inactiveSelectionBackground": hex(
+        cssToken("--color-selection", "#38bdf82e"),
+        "#38bdf82e",
+      ),
+      "editorCursor.foreground": hex(cssToken("--color-focus", "#38bdf8"), "#38bdf8"),
+      "editorIndentGuide.background1": hex(cssToken("--color-border", "#243045"), "#243045"),
+      "editorWidget.background": hex(cssToken("--color-bg-elevated", "#172036"), "#172036"),
+      "editorWidget.border": hex(cssToken("--color-border-strong", "#334155"), "#334155"),
+      "editorSuggestWidget.background": hex(cssToken("--color-bg-elevated", "#172036"), "#172036"),
+      "editorSuggestWidget.border": hex(cssToken("--color-border-strong", "#334155"), "#334155"),
       "editorSuggestWidget.selectedBackground": hex(
         cssToken("--color-selection-strong", "#38bdf847"),
+        "#38bdf847",
       ),
-      "editorHoverWidget.background": hex(cssToken("--color-bg-elevated", "#172036")),
-      "editorHoverWidget.border": hex(cssToken("--color-border-strong", "#334155")),
-      "editorError.foreground": hex(cssToken("--color-danger", "#f87171")),
-      "editorWarning.foreground": hex(cssToken("--color-warning", "#fbbf24")),
-      focusBorder: hex(cssToken("--color-focus", "#38bdf8")),
+      "editorHoverWidget.background": hex(cssToken("--color-bg-elevated", "#172036"), "#172036"),
+      "editorHoverWidget.border": hex(cssToken("--color-border-strong", "#334155"), "#334155"),
+      "editorError.foreground": hex(cssToken("--color-danger", "#f87171"), "#f87171"),
+      "editorWarning.foreground": hex(cssToken("--color-warning", "#fbbf24"), "#fbbf24"),
+      focusBorder: hex(cssToken("--color-focus", "#38bdf8"), "#38bdf8"),
     },
   });
   monaco.editor.setTheme(monacoThemeName(theme));
