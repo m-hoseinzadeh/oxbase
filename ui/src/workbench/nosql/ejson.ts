@@ -325,3 +325,119 @@ export function viewOf(node: JsonNode): ValueView {
       return { type: "null", text: "null" };
   }
 }
+
+// --- ordered text → IPC values ---------------------------------------------------------------
+
+/** A value the IPC can carry (`oxbase_types` `Json`). */
+type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
+
+/** A value whose text cannot travel as a JS value without changing (see {@link toJsonValue}). */
+export class JsonValueError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "JsonValueError";
+  }
+}
+
+export interface ToJsonOptions {
+  /**
+   * `mongo`: a number written with a fraction or exponent whose value is whole (`1.0`) is sent
+   * as `{"$numberDouble": "1.0"}`, so it stays a double; too-large integers suggest
+   * `$numberLong`. `plain`: such a number is refused, it would be stored as an integer.
+   */
+  flavor: "mongo" | "plain";
+  /** Whether the top level's key order may change (a filter's top level, say). */
+  topOrderFree?: boolean;
+}
+
+function childPath(path: string, key: string): string {
+  return /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(key)
+    ? `${path}.${key}`
+    : `${path}[${JSON.stringify(key)}]`;
+}
+
+/** Whether a JS object keeps `keys` in this order (integer-like keys move first). */
+export function jsKeepsKeyOrder(keys: readonly string[]): boolean {
+  const probe: Record<string, number> = {};
+  for (const key of keys) {
+    Object.defineProperty(probe, key, {
+      value: 0,
+      enumerable: true,
+      writable: true,
+      configurable: true,
+    });
+  }
+  const kept = Object.keys(probe);
+  return kept.length === keys.length && kept.every((k, i) => k === keys[i]);
+}
+
+function numberValue(raw: string, path: string, options: ToJsonOptions): JsonValue {
+  const n = Number(raw);
+  if (!Number.isFinite(n)) {
+    throw new JsonValueError(`The number ${raw} at ${path} is out of range.`);
+  }
+  const integerText = !/[.eE]/.test(raw);
+  if (integerText) {
+    if (Number.isSafeInteger(n)) return n;
+    throw new JsonValueError(
+      options.flavor === "mongo"
+        ? `The number ${raw} at ${path} is too large to send exactly; write it as {"$numberLong": "${raw}"}.`
+        : `The number ${raw} at ${path} is too large to be saved exactly from here.`,
+    );
+  }
+  // A JS number with a whole value travels as an integer (`1.0` → `1`).
+  if (!/[.eE]/.test(JSON.stringify(n))) {
+    if (options.flavor === "mongo") return { $numberDouble: raw };
+    throw new JsonValueError(
+      `The number ${raw} at ${path} would be saved as the integer ${JSON.stringify(n)}.`,
+    );
+  }
+  return n;
+}
+
+/**
+ * The value of `node` for the IPC, refusing what would arrive changed: integers beyond 2^53,
+ * numbers out of range, duplicate keys and key orders a JS object cannot keep (integer-like
+ * keys such as `"2024"` move first). Throws {@link JsonValueError} naming the place.
+ */
+export function toJsonValue(node: JsonNode, options: ToJsonOptions, path = "$"): JsonValue {
+  switch (node.kind) {
+    case "object": {
+      const keys = node.entries.map((e) => e.key);
+      const seen = new Set<string>();
+      for (const key of keys) {
+        if (seen.has(key)) {
+          throw new JsonValueError(`The field "${key}" appears twice at ${path}.`);
+        }
+        seen.add(key);
+      }
+      const free = path === "$" && options.topOrderFree === true;
+      if (!free && !jsKeepsKeyOrder(keys)) {
+        const moved = keys.find((k) => /^(0|[1-9]\d*)$/.test(k)) ?? keys[0];
+        throw new JsonValueError(
+          `The field names at ${path} include a whole number ("${moved}"), which would move before the others; the order cannot be kept.`,
+        );
+      }
+      const out: { [key: string]: JsonValue } = {};
+      for (const entry of node.entries) {
+        Object.defineProperty(out, entry.key, {
+          value: toJsonValue(entry.value, options, childPath(path, entry.key)),
+          enumerable: true,
+          writable: true,
+          configurable: true,
+        });
+      }
+      return out;
+    }
+    case "array":
+      return node.items.map((item, i) => toJsonValue(item, options, `${path}[${i}]`));
+    case "string":
+      return node.value;
+    case "number":
+      return numberValue(node.raw, path, options);
+    case "bool":
+      return node.value;
+    case "null":
+      return null;
+  }
+}

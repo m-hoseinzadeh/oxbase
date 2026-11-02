@@ -4,7 +4,7 @@
  * per field that is not valid Extended JSON.
  */
 import type { AggregateRequest, FindRequest, Json, ObjectRef } from "../../api";
-import { JsonSyntaxError } from "./ejson";
+import { JsonSyntaxError, parseOrdered, toJsonValue } from "./ejson";
 
 export interface FindDraft {
   filter: string;
@@ -85,13 +85,20 @@ export interface BuilderProblem {
   message: string;
 }
 
-function jsonValue(text: string): Json {
+/**
+ * `text` as a request value. Parsed in order (not `JSON.parse`), so a sort keeps its key order,
+ * `1.0` stays a double (`$numberDouble`) and an integer beyond 2^53 is refused, not rounded.
+ * `topOrderFree`: the top level's key order does not matter (a filter, a projection).
+ */
+function jsonValue(text: string, topOrderFree: boolean): Json {
+  let node: ReturnType<typeof parseOrdered>;
   try {
-    return JSON.parse(text) as Json;
+    node = parseOrdered(text);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     throw new JsonSyntaxError(`Not valid Extended JSON: ${message}`, 0);
   }
+  return toJsonValue(node, { flavor: "mongo", topOrderFree }) as Json;
 }
 
 function objectField(
@@ -102,7 +109,7 @@ function objectField(
   const text = draft[field].trim();
   if (text === "") return undefined;
   try {
-    const value = jsonValue(text);
+    const value = jsonValue(text, field !== "sort");
     if (value === null || typeof value !== "object" || Array.isArray(value)) {
       problems.push({ field, message: 'Enter an object, like {"name": 1}.' });
       return undefined;
@@ -167,7 +174,9 @@ export function aggregateRequest(
       continue;
     }
     try {
-      pipeline.push({ [operator]: jsonValue(stage.body.trim() || "{}") });
+      // Only a `$match`'s top-level order is free; `$sort`, `$project`, `$group`, ... keep it.
+      const body = jsonValue(stage.body.trim() || "{}", operator === "$match");
+      pipeline.push({ [operator]: body });
     } catch (error) {
       problems.push({ field: `stage:${stage.id}`, message: (error as Error).message });
     }

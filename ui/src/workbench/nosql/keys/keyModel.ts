@@ -8,11 +8,13 @@ import {
   type BinaryText,
   binaryText,
   displayBinary,
+  type Json,
   type KeyEdit,
   type KeyInfo,
   type KeyType,
   utf8,
 } from "../../../api";
+import { JsonSyntaxError, JsonValueError, parseOrdered, printNode, toJsonValue } from "../ejson";
 
 /** Types a key can be created with (and filtered by). */
 export const KEY_TYPES: readonly Exclude<KeyType, "other">[] = [
@@ -175,9 +177,58 @@ export function elementDraft(row: ElementRow): ElementDraft {
   };
 }
 
-/** The typed text as bytes: the original value when the text was not changed. */
+/**
+ * The bytes of text in {@link displayBinary}'s escaped form (`\xHH`, `\\`, `\"`, `\n`,
+ * `\r`, `\t`; any other character as UTF-8). Throws on a broken escape.
+ */
+export function unescapeBinary(text: string): Uint8Array {
+  const out: number[] = [];
+  const encoder = new TextEncoder();
+  const simple: Record<string, number> = { "\\": 0x5c, '"': 0x22, n: 0x0a, r: 0x0d, t: 0x09 };
+  for (let i = 0; i < text.length; ) {
+    const c = text[i] as string;
+    if (c !== "\\") {
+      const code = text.codePointAt(i) ?? 0;
+      const ch = String.fromCodePoint(code);
+      out.push(...encoder.encode(ch));
+      i += ch.length;
+      continue;
+    }
+    const e = text[i + 1];
+    if (e !== undefined && e in simple) {
+      out.push(simple[e] as number);
+      i += 2;
+    } else if (e === "x" && /^[0-9a-fA-F]{2}$/.test(text.slice(i + 2, i + 4))) {
+      out.push(Number.parseInt(text.slice(i + 2, i + 4), 16));
+      i += 4;
+    } else {
+      throw new Error(
+        'A binary value uses escapes: \\xHH for a byte, \\\\ for a backslash (also \\n, \\r, \\t, \\").',
+      );
+    }
+  }
+  return Uint8Array.from(out);
+}
+
+function hexOf(bytes: Uint8Array): BinaryText {
+  return {
+    encoding: "hex",
+    hex: Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join(""),
+  };
+}
+
+/** Whether a value read from the server is binary (shown escaped in the form). */
+export function isBinary(value: BinaryText | undefined): boolean {
+  return value?.encoding === "hex";
+}
+
+/**
+ * The typed text as bytes: the original value when the text was not changed; for a binary
+ * original, the escapes read back into bytes (never the escape characters themselves).
+ */
 function bytesOf(text: string, original: BinaryText | undefined): BinaryText {
   if (original && binaryLabel(original) === text) return original;
+  if (isBinary(original)) return hexOf(unescapeBinary(text));
   return utf8(text);
 }
 
@@ -187,34 +238,59 @@ function sameBytes(a: BinaryText, b: BinaryText | undefined): boolean {
     a.encoding === b.encoding &&
     (a.encoding === "utf8"
       ? a.text === (b as { text: string }).text
-      : a.hex === (b as { hex: string }).hex)
+      : a.hex.toLowerCase() === (b as { hex: string }).hex.toLowerCase())
   );
 }
 
 function score(text: string): number {
   const t = text.trim();
-  const n =
-    t === "+inf" ? Number.POSITIVE_INFINITY : t === "-inf" ? Number.NEGATIVE_INFINITY : Number(t);
+  const n = Number(t);
   if (t === "" || Number.isNaN(n)) throw new Error("The score must be a number.");
+  if (!Number.isFinite(n)) {
+    throw new Error("The score must be a finite number (+inf and -inf cannot be written here).");
+  }
   return n;
 }
 
+const STREAM_FIELDS_HINT = 'Enter the entry\'s fields as a JSON object: {"field": "value"}.';
+
+/** The entry's fields in the order typed (integer-like names do not move first). */
 function streamFields(text: string): { field: BinaryText; value: BinaryText }[] {
-  let parsed: unknown;
+  let parsed: ReturnType<typeof parseOrdered>;
   try {
-    parsed = JSON.parse(text);
+    parsed = parseOrdered(text);
   } catch {
-    throw new Error('Enter the entry\'s fields as a JSON object: {"field": "value"}.');
+    throw new Error(STREAM_FIELDS_HINT);
   }
-  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
-    throw new Error('Enter the entry\'s fields as a JSON object: {"field": "value"}.');
-  }
-  const entries = Object.entries(parsed as Record<string, unknown>);
-  if (entries.length === 0) throw new Error("A stream entry needs at least one field.");
-  return entries.map(([field, value]) => ({
-    field: utf8(field),
-    value: utf8(typeof value === "string" ? value : JSON.stringify(value)),
+  if (parsed.kind !== "object") throw new Error(STREAM_FIELDS_HINT);
+  if (parsed.entries.length === 0) throw new Error("A stream entry needs at least one field.");
+  return parsed.entries.map(({ key, value }) => ({
+    field: utf8(key),
+    value: utf8(value.kind === "string" ? value.value : printNode(value, 0)),
   }));
+}
+
+/**
+ * JSON text as a `jsonSet` value. Refused (with the reason) when it cannot arrive unchanged:
+ * integers beyond 2^53, `1.0`-style doubles that would become integers, integer-like keys whose
+ * place would move, duplicate keys.
+ */
+export function jsonSetValue(text: string): Json {
+  let node: ReturnType<typeof parseOrdered>;
+  try {
+    node = parseOrdered(text);
+  } catch (error) {
+    const where = error instanceof JsonSyntaxError ? `: ${error.message}` : "";
+    throw new Error(`The value is not valid JSON${where}.`);
+  }
+  try {
+    return toJsonValue(node, { flavor: "plain" }) as Json;
+  } catch (error) {
+    if (error instanceof JsonValueError) {
+      throw new Error(`Nothing was written: ${error.message}`);
+    }
+    throw error;
+  }
 }
 
 /**
@@ -263,6 +339,9 @@ export function elementEdits(
     case "zset": {
       if (draft.member === "") throw new Error("Enter the member.");
       const member = bytesOf(draft.member, row?.member);
+      if (row?.member && sameBytes(member, row.member) && draft.score === elementDraft(row).score) {
+        return [];
+      }
       const edits: KeyEdit[] = [{ type: "zsetAdd", member, score: score(draft.score) }];
       if (row?.member && !sameBytes(member, row.member)) {
         edits.push({ type: "zsetRemove", members: [row.member] });
@@ -275,13 +354,50 @@ export function elementEdits(
   }
 }
 
-/** The edit that removes `row`. */
+/**
+ * The edits that remove `row`. A list item goes by its index, not its value (`LREM` would take
+ * the first equal item): `LSET` it to a unique marker (checked against the value read), then
+ * `LREM 1` the marker, in the same `WATCH` / `MULTI`.
+ */
+export function removeEdits(type: ElementType, row: ElementRow, marker?: string): KeyEdit[] {
+  if (type === "list") {
+    if (row.index === undefined || !row.value) return [];
+    const tombstone = utf8(marker ?? `oxbase:removed:${crypto.randomUUID()}`);
+    return [
+      { type: "listSet", index: row.index, value: tombstone, expected: row.value },
+      { type: "listRemove", value: tombstone, count: 1 },
+    ];
+  }
+  const edit = removeEdit(type, row);
+  return edit ? [edit] : [];
+}
+
+/**
+ * The warning before saving an edit that renames a hash field or a sorted-set member: an
+ * existing field or member of the new name is overwritten. `null` when nothing is renamed.
+ */
+export function renameWarning(
+  type: ElementType,
+  row: ElementRow | null,
+  draft: ElementDraft,
+): string | null {
+  if (!row) return null;
+  if (type === "hash" && row.field && draft.field !== binaryLabel(row.field)) {
+    return `If the field ${draft.field} already exists, its value is replaced by this one.`;
+  }
+  if (type === "zset" && row.member && draft.member !== binaryLabel(row.member)) {
+    return `If the member ${draft.member} already exists, its score is replaced by this one.`;
+  }
+  return null;
+}
+
+/** The edit that removes `row` (`null` for a list item: see {@link removeEdits}). */
 export function removeEdit(type: ElementType, row: ElementRow): KeyEdit | null {
   switch (type) {
     case "hash":
       return row.field ? { type: "hashDelete", fields: [row.field] } : null;
     case "list":
-      return row.value ? { type: "listRemove", value: row.value, count: 1 } : null;
+      return null;
     case "set":
       return row.member ? { type: "setRemove", members: [row.member] } : null;
     case "zset":
@@ -297,11 +413,7 @@ export function createEdit(type: Exclude<KeyType, "other">, draft: ElementDraft)
     case "string":
       return { type: "setString", value: utf8(draft.value) };
     case "json": {
-      try {
-        return { type: "jsonSet", path: "$", value: JSON.parse(draft.value || "{}") };
-      } catch {
-        throw new Error("The value is not valid JSON.");
-      }
+      return { type: "jsonSet", path: "$", value: jsonSetValue(draft.value || "{}") };
     }
     default: {
       const [edit] = elementEdits(type, null, draft);

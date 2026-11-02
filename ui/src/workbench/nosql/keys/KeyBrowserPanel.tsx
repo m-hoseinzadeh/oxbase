@@ -37,6 +37,7 @@ import { ResultPager } from "../../results/pager";
 import { timedQueryPage } from "../../results/perf";
 import { IDLE_RUN, isActive, runReducer } from "../../results/runState";
 import { closeEditorLater, editorReady } from "../editorClose";
+import { EditorRunSlot } from "../runSlot";
 import { KeyList, type KeyRow } from "./KeyList";
 import { KeyValueEditor } from "./KeyValueEditor";
 import { KEY_TYPE_LABEL, KEY_TYPES, prefixPattern } from "./keyModel";
@@ -74,6 +75,8 @@ export function KeyBrowserPanel({
   const sizesInFlight = useRef(new Set<string>());
   const sizesQueue = useRef<KeyRow[]>([]);
   const sizesGen = useRef(0);
+  /** The scan editor runs one scan at a time: a new scan stops the one still streaming. */
+  const slot = useRef(new EditorRunSlot());
 
   // The databases of the connection (database rows of the tree).
   useEffect(() => {
@@ -109,16 +112,23 @@ export function KeyBrowserPanel({
       if (match.trim() !== "") req.pattern = match.trim();
       if (keyType !== "") req.keyType = keyType as Exclude<KeyType, "other">;
       dispatch({ type: "start", script: `SCAN 0 MATCH ${req.pattern ?? "*"}` });
+      const ticket = await slot.current.take();
       await editorReady(editorId);
-      if (mine !== seq.current) return;
+      if (mine !== seq.current) {
+        ticket.release();
+        return;
+      }
       try {
         const id = await keyScanOpen(sessionId, editorId, req, (event) => {
+          ticket.event(event);
           if (mine === seq.current) dispatch({ type: "event", event });
         });
+        ticket.started(id);
         if (mine !== seq.current) return;
         runIdRef.current = id;
         dispatch({ type: "runId", runId: id });
       } catch (error) {
+        ticket.release();
         if (mine === seq.current) dispatch({ type: "startFailed", error: toCommandError(error) });
       }
     },
@@ -132,9 +142,15 @@ export function KeyBrowserPanel({
     if (requestRef.current === request && requestRef.current !== undefined) return;
     requestRef.current = request;
     const match = initialPattern ?? "";
+    // The tab may show another database (its picker): the request names the one to use.
+    const db = initialDatabase ?? session?.database ?? "0";
+    if (db !== database) {
+      setDatabase(db);
+      setSelected(null);
+    }
     setPattern(match);
-    void scan(database, match, type);
-    if (initialKey) setSelected({ row: null, address: { database, key: initialKey } });
+    void scan(db, match, type);
+    if (initialKey) setSelected({ row: null, address: { database: db, key: initialKey } });
     return () => {
       // A remount (StrictMode, dockview moving the tab) scans again.
       requestRef.current = undefined;

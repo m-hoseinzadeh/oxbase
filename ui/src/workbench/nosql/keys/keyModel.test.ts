@@ -5,8 +5,11 @@ import {
   EMPTY_ELEMENT,
   elementDraft,
   elementEdits,
+  jsonSetValue,
   prefixPattern,
   removeEdit,
+  removeEdits,
+  renameWarning,
   sizeText,
   ttlInput,
   ttlText,
@@ -63,7 +66,16 @@ describe("key model", () => {
     expect(elementEdits("list", null, { ...EMPTY_ELEMENT, value: "x", end: "head" })).toEqual([
       { type: "listPush", end: "head", values: [utf8("x")] },
     ]);
-    expect(removeEdit("list", row)).toEqual({ type: "listRemove", value: utf8("old"), count: 1 });
+    // A list item is removed by its index: LSET a marker (checked), then LREM 1 the marker.
+    expect(removeEdit("list", row)).toBeNull();
+    expect(removeEdits("list", row, "marker")).toEqual([
+      { type: "listSet", index: 2, value: utf8("marker"), expected: utf8("old") },
+      { type: "listRemove", value: utf8("marker"), count: 1 },
+    ]);
+    const [set] = removeEdits("list", row);
+    expect(set?.type === "listSet" && set.value.encoding === "utf8" && set.value.text).toMatch(
+      /^oxbase:removed:/,
+    );
   });
 
   it("builds set, zset and stream edits", () => {
@@ -106,5 +118,68 @@ describe("key model", () => {
     expect(ttlInput("")).toBeUndefined();
     expect(ttlInput("60")).toBe(60_000);
     expect(() => ttlInput("0")).toThrow(/seconds/);
+  });
+
+  it("writes edited binary values back as bytes, not as their escapes", () => {
+    const row = { field: utf8("f"), value: { encoding: "hex", hex: "00ff" } as const };
+    const draft = elementDraft(row);
+    expect(draft.value).toBe("\\x00\\xff");
+    expect(elementEdits("hash", row, { ...draft, value: `${draft.value}a\\\\é` })).toEqual([
+      { type: "hashSet", field: utf8("f"), value: { encoding: "hex", hex: "00ff615cc3a9" } },
+    ]);
+    expect(() => elementEdits("hash", row, { ...draft, value: "\\q" })).toThrow(/\\xHH/);
+    // A binary set member keeps its bytes when renamed.
+    const member = { member: BIN };
+    expect(elementEdits("set", member, { ...elementDraft(member), member: "\\x01" })).toEqual([
+      { type: "setAdd", members: [{ encoding: "hex", hex: "01" }] },
+      { type: "setRemove", members: [BIN] },
+    ]);
+  });
+
+  it("warns before a rename that may overwrite, and refuses infinite scores", () => {
+    const field = { field: utf8("f1"), value: utf8("v") };
+    expect(renameWarning("hash", field, { ...elementDraft(field), value: "w" })).toBeNull();
+    expect(renameWarning("hash", field, { ...elementDraft(field), field: "f2" })).toMatch(
+      /field f2 already exists/,
+    );
+    const member = { member: utf8("a"), score: 1 };
+    expect(renameWarning("zset", member, { ...elementDraft(member), member: "b" })).toMatch(
+      /member b/,
+    );
+    expect(renameWarning("zset", null, EMPTY_ELEMENT)).toBeNull();
+    expect(() =>
+      elementEdits("zset", null, { ...EMPTY_ELEMENT, member: "m", score: "+inf" }),
+    ).toThrow(/number/);
+    expect(() =>
+      elementEdits("zset", null, { ...EMPTY_ELEMENT, member: "m", score: "Infinity" }),
+    ).toThrow(/finite/);
+    // An unchanged member with an infinite score sends nothing.
+    const inf = { member: utf8("top"), score: Number.POSITIVE_INFINITY };
+    expect(elementEdits("zset", inf, elementDraft(inf))).toEqual([]);
+  });
+
+  it("keeps stream field order and refuses JSON that would not arrive unchanged", () => {
+    expect(
+      elementEdits("stream", null, { ...EMPTY_ELEMENT, fields: '{"z": "1", "10": {"a": 1}}' }),
+    ).toEqual([
+      {
+        type: "streamAdd",
+        fields: [
+          { field: utf8("z"), value: utf8("1") },
+          { field: utf8("10"), value: utf8('{"a":1}') },
+        ],
+      },
+    ]);
+    expect(jsonSetValue('{"id": 9007199254740991, "x": 1.5}')).toEqual({
+      id: 9_007_199_254_740_991,
+      x: 1.5,
+    });
+    expect(() => jsonSetValue('{"id": 1234567890123456789, "name": "a"}')).toThrow(
+      /1234567890123456789 at \$\.id is too large/,
+    );
+    expect(() => jsonSetValue('{"a": 1.0}')).toThrow(/integer 1/);
+    expect(() => jsonSetValue('{"b": 1, "2024": 2}')).toThrow(/whole number \("2024"\)/);
+    expect(() => jsonSetValue('{"a": 1, "a": 2}')).toThrow(/twice/);
+    expect(() => jsonSetValue("{")).toThrow(/not valid JSON/);
   });
 });

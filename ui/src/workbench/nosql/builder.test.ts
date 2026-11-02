@@ -50,6 +50,36 @@ describe("find builder", () => {
   });
 });
 
+describe("builder values", () => {
+  it("keeps doubles, refuses rounded integers and sort keys that would move", () => {
+    const ok = findRequest(DOCS, {
+      ...EMPTY_FIND,
+      filter: '{"2024": 1, "price": 1.0, "n": {"$numberLong": "1234567890123456789"}}',
+    });
+    expect(ok.problems).toEqual([]);
+    expect(ok.request?.filter).toEqual({
+      2024: 1,
+      price: { $numberDouble: "1.0" },
+      n: { $numberLong: "1234567890123456789" },
+    });
+
+    const big = findRequest(DOCS, { ...EMPTY_FIND, filter: '{"id": 1234567890123456789}' });
+    expect(big.request).toBeNull();
+    expect(big.problems[0]?.message).toMatch(/\$numberLong/);
+
+    const sort = findRequest(DOCS, { ...EMPTY_FIND, sort: '{"z": 1, "2024": -1}' });
+    expect(sort.request).toBeNull();
+    expect(sort.problems[0]).toMatchObject({ field: "sort" });
+    expect(sort.problems[0]?.message).toMatch(/"2024"/);
+
+    const stages = aggregateRequest(DOCS, [
+      stage(1, "$match", '{"10": 1, "a": 2}'),
+      stage(2, "$sort", '{"a": 1, "10": 1}'),
+    ]);
+    expect(stages.problems.map((p) => p.field)).toEqual(["stage:2"]);
+  });
+});
+
 describe("aggregate builder", () => {
   it("writes the enabled stages in order", () => {
     const { request, problems } = aggregateRequest(DOCS, [

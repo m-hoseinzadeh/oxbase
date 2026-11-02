@@ -106,6 +106,21 @@ function stringPage(): Table {
 }
 
 const listeners = new Map<string, (event: RunEvent) => void>();
+/** Editor id → its running run (the core refuses a second run on a busy editor). */
+const busy = new Map<string, string>();
+
+function endRun(runId: string) {
+  for (const [editor, id] of busy) if (id === runId) busy.delete(editor);
+}
+
+function refuseBusy(editorId: string) {
+  if (busy.has(editorId)) {
+    throw {
+      category: "invalid_input",
+      message: "this editor is already running a query; cancel it or wait for it to end",
+    };
+  }
+}
 let applyReport: KeyApplyReport = { committed: true, conflict: false };
 
 function info(key: string, keyType: KeyInfo["keyType"], length: number): KeyInfo {
@@ -120,6 +135,7 @@ function stream(runId: string, columns: ColumnInfo[], rows: number) {
     send({ type: "resultSet", resultIndex: 0, statementIndex: 0, statementRange: SPAN, columns });
     send({ type: "resultDone", resultIndex: 0, totalRows: rows, truncated: false });
     send({ type: "statementDone", statementIndex: 0, elapsedMs: 1 });
+    endRun(runId);
     send({ type: "finished", elapsedMs: 1 });
   });
 }
@@ -154,14 +170,18 @@ function mockCore() {
         return node.object?.kind === "database" ? [NAMESPACE] : [];
       }
       case "key_scan_open": {
+        refuseBusy(a.editorId as string);
         scans += 1;
         const id = `scan-${scans}`;
+        busy.set(a.editorId as string, id);
         if (channel) listeners.set(id, channel.onmessage);
         return id;
       }
       case "key_value_open": {
+        refuseBusy(a.editorId as string);
         const key = (a.key as { key: { text: string } }).key.text;
         valueRun = `value-${key}`;
+        busy.set(a.editorId as string, valueRun);
         if (channel) listeners.set(valueRun, channel.onmessage);
         return {
           runId: valueRun,
@@ -184,8 +204,17 @@ function mockCore() {
       }
       case "key_apply":
         return applyReport;
+      case "query_cancel": {
+        // The core frees the editor, then sends the terminal event.
+        const runId = a.runId as string;
+        if ([...busy.values()].includes(runId)) {
+          endRun(runId);
+          listeners.get(runId)?.({ type: "cancelled", elapsedMs: 1 });
+        }
+        return true;
+      }
       case "query_close_editor":
-      case "query_cancel":
+        busy.delete(a.editorId as string);
         return null;
       default:
         throw new Error(`unexpected command ${cmd}`);
@@ -220,6 +249,7 @@ describe("KeyBrowserPanel", () => {
     tauriCore.invoke.mockReset();
     tauriCore.isTauri.mockReturnValue(true);
     listeners.clear();
+    busy.clear();
     scans = 0;
     valueRun = "";
     applyReport = { committed: true, conflict: false };
@@ -386,5 +416,137 @@ describe("KeyBrowserPanel", () => {
         edits: [{ type: "setAdd", members: [{ encoding: "utf8", text: "a" }] }],
       },
     });
+  });
+
+  it("stops a scan still streaming before it starts the next one", async () => {
+    render(<KeyBrowserPanel editorId="kb" sessionId="s-1" database="0" />);
+    await waitFor(() => expect(calls("key_scan_open")).toHaveLength(1));
+    // scan-1 never ends on its own; the namespace and the type filter start new scans.
+    fireEvent.click(await screen.findByRole("button", { name: "m7:" }));
+    await waitFor(() => expect(calls("key_scan_open")).toHaveLength(2));
+    expect(calls("query_cancel")[0]).toEqual({ runId: "scan-1" });
+    fireEvent.change(screen.getByLabelText("Key type"), { target: { value: "set" } });
+    await waitFor(() => expect(calls("key_scan_open")).toHaveLength(3));
+    expect(calls("query_cancel")[1]).toEqual({ runId: "scan-2" });
+    expect(calls("key_scan_open")[2]?.request).toEqual({
+      database: "0",
+      pattern: "m7:*",
+      keyType: "set",
+    });
+    stream("scan-3", SCAN_COLUMNS, 3);
+    expect(await screen.findByRole("listbox", { name: "Keys" })).toBeInTheDocument();
+    expect(screen.queryByText("Could not scan the keys")).toBeNull();
+  });
+
+  it("stops a value read still streaming before an edit reads it again", async () => {
+    const list = await renderBrowser();
+    fireEvent.click(await within(list).findByRole("option", { name: /m7:hash/ }));
+    await waitFor(() => expect(calls("key_value_open")).toHaveLength(1));
+    // The value is still streaming; a TTL change re-reads it.
+    const ttl = await screen.findByRole("button", { name: "TTL…" });
+    await waitFor(() => expect(ttl).toBeEnabled());
+    fireEvent.click(ttl);
+    const dialog = await screen.findByRole("dialog", { name: "Time to live" });
+    fireEvent.change(within(dialog).getByLabelText("Expire after (seconds)"), {
+      target: { value: "60" },
+    });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(calls("key_value_open")).toHaveLength(2));
+    expect(calls("query_cancel")).toContainEqual({ runId: "value-m7:hash" });
+    stream("value-m7:hash", HASH_COLUMNS, 2);
+    expect(await screen.findByTestId("value-grid")).toBeInTheDocument();
+    expect(screen.queryByText("Could not open the key")).toBeNull();
+  });
+
+  it("opens a tree request in the database it names, not the one the picker shows", async () => {
+    const view = render(<KeyBrowserPanel editorId="kb" sessionId="s-1" database="0" request={1} />);
+    await waitFor(() => expect(calls("key_scan_open")).toHaveLength(1));
+    stream("scan-1", SCAN_COLUMNS, 3);
+    const picker = await screen.findByLabelText("Database");
+    await waitFor(() => expect(within(picker).getAllByRole("option")).toHaveLength(2));
+    fireEvent.change(picker, { target: { value: "1" } });
+    await waitFor(() => expect(calls("key_scan_open")).toHaveLength(2));
+    expect(calls("key_scan_open")[1]?.request).toEqual({ database: "1" });
+    stream("scan-2", SCAN_COLUMNS, 3);
+
+    view.rerender(
+      <KeyBrowserPanel
+        editorId="kb"
+        sessionId="s-1"
+        database="0"
+        openKey={{ encoding: "utf8", text: "m7:hash" }}
+        request={2}
+      />,
+    );
+    await waitFor(() => expect(calls("key_scan_open")).toHaveLength(3));
+    expect(calls("key_scan_open")[2]?.request).toEqual({ database: "0" });
+    await waitFor(() => expect(calls("key_value_open")).toHaveLength(1));
+    expect(calls("key_value_open")[0]).toMatchObject({
+      key: { database: "0", key: { encoding: "utf8", text: "m7:hash" } },
+    });
+    expect(screen.getByLabelText("Database")).toHaveValue("0");
+  });
+
+  it("removes a list item by its index, not the first equal value", async () => {
+    tauriCore.invoke.mockImplementation(async (cmd, args) => {
+      const a = (args ?? {}) as Record<string, unknown>;
+      const channel = a.onEvent as { onmessage: (e: RunEvent) => void } | undefined;
+      if (cmd === "key_value_open") {
+        valueRun = "value-list";
+        if (channel) listeners.set(valueRun, channel.onmessage);
+        return { runId: valueRun, info: info("m7:list", "list", 3) };
+      }
+      if (cmd === "query_page" && a.runId === "value-list") {
+        const table = new Table(
+          new Schema([
+            new Field("index", new Int64(), false),
+            new Field("value", new Binary(), false),
+          ]),
+          {
+            index: vectorFromArray([0n, 1n, 2n], new Int64()),
+            value: vectorFromArray([enc("a"), enc("b"), enc("a")], new Binary()),
+          },
+        );
+        const offset = a.offset as number;
+        return tableToIPC(table.slice(offset, offset + (a.limit as number)), "stream");
+      }
+      if (cmd === "key_apply") return applyReport;
+      if (cmd === "query_close_editor" || cmd === "query_cancel") return null;
+      if (cmd === "tree_children" || cmd === "list_open_connections") return [];
+      if (cmd === "key_scan_open") return "scan-x";
+      throw new Error(`unexpected command ${cmd}`);
+    });
+    render(
+      <KeyBrowserPanel
+        editorId="kb"
+        sessionId="s-1"
+        database="0"
+        openKey={{ encoding: "utf8", text: "m7:list" }}
+      />,
+    );
+    await waitFor(() => expect(calls("key_value_open")).toHaveLength(1));
+    stream(
+      "value-list",
+      [
+        { name: "index", dataType: "Int64", nullable: false },
+        { name: "value", dataType: "Binary", nullable: false, metadata: BIN },
+      ],
+      3,
+    );
+    const editor = await screen.findByTestId("key-editor");
+    fireEvent.click(await within(editor).findByRole("button", { name: "element 2" }));
+    await waitFor(() =>
+      expect(within(editor).getByRole("button", { name: "Remove" })).toBeEnabled(),
+    );
+    fireEvent.click(within(editor).getByRole("button", { name: "Remove" }));
+    await waitFor(() => expect(calls("key_apply")).toHaveLength(1));
+    const request = calls("key_apply")[0]?.request as { edits: Record<string, unknown>[] };
+    const edits = request.edits;
+    expect(edits[0]).toMatchObject({
+      type: "listSet",
+      index: 2,
+      expected: { encoding: "utf8", text: "a" },
+    });
+    expect(edits[1]).toMatchObject({ type: "listRemove", count: 1, value: edits[0]?.value });
   });
 });

@@ -39,6 +39,8 @@ import { ResultGrid } from "../../results/ResultGrid";
 import { type GridRowSelection, NO_ROWS } from "../../results/rowSelection";
 import { IDLE_RUN, isActive, rowCountLabel, runReducer } from "../../results/runState";
 import { closeEditorLater, editorReady } from "../editorClose";
+import { prettyJson } from "../ejson";
+import { EditorRunSlot } from "../runSlot";
 import {
   cellBinary,
   cellValue,
@@ -48,10 +50,13 @@ import {
   EMPTY_ELEMENT,
   elementDraft,
   elementEdits,
+  isBinary,
   isElementType,
+  jsonSetValue,
   KEY_TYPE_BADGE,
   KEY_TYPE_LABEL,
-  removeEdit,
+  removeEdits,
+  renameWarning,
   sizeText,
   ttlInput,
   ttlText,
@@ -124,6 +129,8 @@ export function KeyValueEditor({ sessionId, editorId, address, onChanged }: KeyV
   const [dialog, setDialog] = useState<"ttl" | "rename" | null>(null);
   const [reload, setReload] = useState(0);
   const seq = useRef(0);
+  /** The value editor reads one value at a time: a reload stops the read still streaming. */
+  const slot = useRef(new EditorRunSlot());
   const pagerRef = useRef<{ runId: string; pager: ResultPager } | null>(null);
 
   const keyLabel = displayBinary(address.key);
@@ -139,12 +146,25 @@ export function KeyValueEditor({ sessionId, editorId, address, onChanged }: KeyV
     setElement(null);
     setStringValue(null);
     setOpenError(null);
-    editorReady(editorId)
-      .then(() => {
-        if (mine !== seq.current) throw new Error("superseded");
-        return keyValueOpen(sessionId, editorId, address, (event) => {
-          if (mine === seq.current) dispatch({ type: "event", event });
-        });
+    slot.current
+      .take()
+      .then(async (ticket) => {
+        await editorReady(editorId);
+        if (mine !== seq.current) {
+          ticket.release();
+          throw new Error("superseded");
+        }
+        try {
+          const opened = await keyValueOpen(sessionId, editorId, address, (event) => {
+            ticket.event(event);
+            if (mine === seq.current) dispatch({ type: "event", event });
+          });
+          ticket.started(opened.runId);
+          return opened;
+        } catch (error) {
+          ticket.release();
+          throw error;
+        }
       })
       .then(
         (opened) => {
@@ -317,13 +337,25 @@ export function KeyValueEditor({ sessionId, editorId, address, onChanged }: KeyV
       setNotice("Nothing changed.");
       return;
     }
-    void apply(edits, element.row ? "Saved." : "Added.").then((ok) => ok && setElement(null));
+    const save = () =>
+      void apply(edits, element.row ? "Saved." : "Added.").then((ok) => ok && setElement(null));
+    const warning = renameWarning(keyType, element.row, element.draft);
+    if (!warning) {
+      save();
+      return;
+    }
+    setConfirm({
+      title: keyType === "hash" ? "Rename this field?" : "Rename this member?",
+      text: warning,
+      action: "Rename",
+      run: save,
+    });
   }
 
   function removeSelected(type: ElementType) {
-    const edit = currentRow ? removeEdit(type, currentRow) : null;
-    if (!edit) return;
-    void apply([edit], "Removed.");
+    const edits = currentRow ? removeEdits(type, currentRow) : [];
+    if (edits.length === 0) return;
+    void apply(edits, "Removed.");
   }
 
   function deleteKey() {
@@ -436,14 +468,14 @@ export function KeyValueEditor({ sessionId, editorId, address, onChanged }: KeyV
             disabled={disabled}
             onSave={(text) => {
               if (keyType === "json") {
-                let value: unknown;
+                let value: ReturnType<typeof jsonSetValue>;
                 try {
-                  value = JSON.parse(text);
-                } catch {
-                  setProblem("The value is not valid JSON.");
+                  value = jsonSetValue(text);
+                } catch (error) {
+                  setProblem((error as Error).message);
                   return;
                 }
-                void apply([{ type: "jsonSet", path: "$", value: value as never }], "Saved.");
+                void apply([{ type: "jsonSet", path: "$", value }], "Saved.");
               } else {
                 void apply([{ type: "setString", value: utf8(text), keepTtl: true }], "Saved.");
               }
@@ -498,6 +530,7 @@ export function KeyValueEditor({ sessionId, editorId, address, onChanged }: KeyV
             {element ? (
               <ElementForm
                 type={keyType}
+                row={element.row}
                 isNew={element.row === null}
                 draft={element.draft}
                 disabled={busy}
@@ -608,7 +641,8 @@ function TextValue({
     );
   }
   const readOnly = value.binary || value.tooLarge;
-  const shown = text ?? (type === "json" ? prettyJsonText(value.text) : value.text);
+  // JSON is re-indented only: keys keep their order and numbers their exact text.
+  const shown = text ?? (type === "json" ? prettyJson(value.text) : value.text);
   return (
     <div className="key-editor__text">
       {value.binary ? (
@@ -652,14 +686,6 @@ function TextValue({
   );
 }
 
-function prettyJsonText(text: string): string {
-  try {
-    return JSON.stringify(JSON.parse(text), null, 2);
-  } catch {
-    return text;
-  }
-}
-
 const FORM_FIELDS: Record<ElementType, { name: keyof ElementDraft; label: string }[]> = {
   hash: [
     { name: "field", label: "Field" },
@@ -676,6 +702,7 @@ const FORM_FIELDS: Record<ElementType, { name: keyof ElementDraft; label: string
 
 function ElementForm({
   type,
+  row,
   isNew,
   draft,
   disabled,
@@ -684,6 +711,7 @@ function ElementForm({
   onCancel,
 }: {
   type: ElementType;
+  row: ElementRow | null;
   isNew: boolean;
   draft: ElementDraft;
   disabled: boolean;
@@ -703,6 +731,11 @@ function ElementForm({
     >
       {FORM_FIELDS[type].map((f) => {
         const id = `element-${f.name}`;
+        const original =
+          f.name === "field" || f.name === "value" || f.name === "member"
+            ? row?.[f.name]
+            : undefined;
+        const binary = isBinary(original);
         return (
           <div key={f.name} className="element-form__field">
             <label htmlFor={id}>{f.label}</label>
@@ -724,6 +757,11 @@ function ElementForm({
                 onChange={(e) => onChange({ ...draft, [f.name]: e.target.value })}
               />
             )}
+            {binary ? (
+              <p className="field__hint" data-testid={`${id}-binary`}>
+                Binary: bytes are written \xHH, a backslash \\ (also \n, \r, \t, \").
+              </p>
+            ) : null}
           </div>
         );
       })}
