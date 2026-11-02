@@ -502,7 +502,10 @@ async fn cursors_become_requests_and_db_assignment_switches() {
     let v = js
         .value("db.m7_big.find({g: 7}, {g: 1}).sort({_id: 1}).skip(2).limit(-5).maxTimeMS(900)")
         .await;
-    let Output::Request(DocumentQuery::Find(f)) = parse_output(&v.to_string()).unwrap() else {
+    let Output::Request(query) = parse_output(&v.to_string()).unwrap() else {
+        panic!("a request: {v}");
+    };
+    let DocumentQuery::Find(f) = *query else {
         panic!("a find request: {v}");
     };
     assert_eq!(f.collection.catalog.as_deref(), Some("test"));
@@ -518,7 +521,10 @@ async fn cursors_become_requests_and_db_assignment_switches() {
     let v = js
         .value("db.getSiblingDB('o').c.aggregate([{$match: {a: {$regex: '^x'}}}], {allowDiskUse: true})")
         .await;
-    let Output::Request(DocumentQuery::Aggregate(a)) = parse_output(&v.to_string()).unwrap() else {
+    let Output::Request(query) = parse_output(&v.to_string()).unwrap() else {
+        panic!("a request: {v}");
+    };
+    let DocumentQuery::Aggregate(a) = *query else {
         panic!("an aggregate request: {v}");
     };
     assert_eq!(a.collection.catalog.as_deref(), Some("o"));
