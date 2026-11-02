@@ -1810,23 +1810,33 @@ async function setMonacoText(host, text) {
     { timeoutMs: 60_000 },
   );
   await wd.click(host).catch(() => {});
-  await wd.execute("arguments[0].focus();", area);
-  await wd.chord(Keys.control, "a");
-  await wd.execute(
-    "arguments[0].focus(); document.execCommand('insertText', false, arguments[1]);",
-    area,
-    text,
-  );
-  await sleep(250);
   const flat = (t) => (t ?? "").replace(/\s+/g, "");
-  const shown = await wd.execute(
-    "const v = arguments[0].querySelector('.view-lines');" +
-      "return v ? v.textContent.replace(/\\u00a0/g, ' ') : null;",
-    host,
-  );
-  if (flat(shown) !== flat(text)) {
-    throw new Error(`the editor shows ${JSON.stringify(shown)}, not ${JSON.stringify(text)}`);
+  const shownText = () =>
+    wd.execute(
+      "const v = arguments[0].querySelector('.view-lines');" +
+        "return v ? v.textContent.replace(/\\u00a0/g, ' ') : null;",
+      host,
+    );
+  let shown = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    // Empty the editor first: Monaco works out what an input event inserted by comparing the
+    // text area before and after, and a replacement that shares a suffix with the selected
+    // text (a document edited in place) can keep that suffix. Inserting into an empty editor
+    // has nothing to compare against.
+    await wd.execute("arguments[0].focus();", area);
+    await wd.chord(Keys.control, "a");
+    await wd.sendKeys(area, Keys.backspace);
+    await sleep(100);
+    await wd.execute(
+      "arguments[0].focus(); document.execCommand('insertText', false, arguments[1]);",
+      area,
+      text,
+    );
+    await sleep(250);
+    shown = await shownText();
+    if (flat(shown) === flat(text)) return;
   }
+  throw new Error(`the editor shows ${JSON.stringify(shown)}, not ${JSON.stringify(text)}`);
 }
 
 /** Replaces the value of a React-controlled input or textarea by typing. */
@@ -1998,8 +2008,29 @@ async function m7Tolerant(fn) {
   try {
     return await fn();
   } catch (error) {
+    // Close a dialog the failed step left open, so the next step's clicks reach the page.
+    await closeOpenDialogs().catch(() => {});
     if (config.requireM7 || error instanceof SkipStep) throw error;
     throw new SkipStep(`not working in this build yet: ${error.message}`);
+  }
+}
+
+/** Presses Escape until no `[role=dialog]` is open (at most three times). */
+async function closeOpenDialogs() {
+  for (let i = 0; i < 3; i++) {
+    if (!(await wd.execute("return !!document.querySelector('[role=dialog]');"))) return;
+    await wd.performActions([
+      {
+        type: "key",
+        id: "keyboard",
+        actions: [
+          { type: "keyDown", value: Keys.escape },
+          { type: "keyUp", value: Keys.escape },
+        ],
+      },
+    ]);
+    await wd.releaseActions();
+    await sleep(200);
   }
 }
 
