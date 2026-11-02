@@ -41,7 +41,7 @@ interface Action {
 const ACTIONS: Action[] = [
   {
     title: "New connection",
-    hint: "PostgreSQL, MySQL, MariaDB, SQLite or SQL Server",
+    hint: "PostgreSQL, MySQL, MariaDB, SQLite, SQL Server, MongoDB or Redis",
     Icon: Plug,
     run: () => requestNewConnection(),
     primary: true,
