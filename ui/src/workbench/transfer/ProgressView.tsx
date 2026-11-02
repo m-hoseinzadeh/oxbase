@@ -2,6 +2,8 @@
  * The progress of an import or export: a bar (when the total is known), counters, the rate and
  * the time left.
  */
+import { LoaderCircle } from "lucide-react";
+import { ICON } from "../../components/icons";
 import { formatMs } from "../format";
 import type { Rates } from "./model";
 import { formatBytes, formatCount } from "./model";
@@ -43,9 +45,20 @@ export function ProgressView({
     rate.push(`${formatBytes(Math.round(rates.bytesPerSecond))}/s ${unit}`);
   return (
     <div className="transfer-progress" data-testid="transfer-progress">
-      <p className="transfer-progress__label">{label}</p>
+      <div className="transfer-progress__head">
+        <LoaderCircle {...ICON} className="spin transfer-progress__spinner" />
+        <p className="transfer-progress__label">{label}</p>
+        {percent !== null ? (
+          <span className="transfer-progress__percent" aria-hidden="true">
+            {percent}%
+          </span>
+        ) : null}
+      </div>
       {percent === null ? (
-        <progress className="transfer-progress__bar" aria-label="Progress" />
+        <progress
+          className="transfer-progress__bar transfer-progress__bar--indeterminate"
+          aria-label="Progress"
+        />
       ) : (
         <progress
           className="transfer-progress__bar"

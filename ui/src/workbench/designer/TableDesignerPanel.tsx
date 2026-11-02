@@ -12,6 +12,27 @@
  *   replaces the edited one.
  * - What the engine cannot do (`capabilities_get`) is disabled with the reason.
  */
+import {
+  Check,
+  CircleAlert,
+  CircleCheck,
+  Code,
+  Columns3,
+  Info,
+  Link2,
+  ListChecks,
+  ListTree,
+  LoaderCircle,
+  Lock,
+  type LucideIcon,
+  RefreshCw,
+  Settings2,
+  ShieldCheck,
+  Table2,
+  TableProperties,
+  TriangleAlert,
+  X,
+} from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   capabilitiesGet,
@@ -27,6 +48,7 @@ import {
   type TableDesign,
   type Value,
 } from "../../api";
+import { ICON, ICON_SM } from "../../components/icons";
 import { Modal } from "../../components/Modal";
 import { cancelRequest, newRequestId, toCommandError } from "../../connections/api";
 import { languageFor } from "../editor/language";
@@ -57,12 +79,12 @@ export interface TableDesignerProps {
 }
 
 type Tab = "columns" | "indexes" | "foreignKeys" | "checks" | "options";
-const TABS: { id: Tab; label: string }[] = [
-  { id: "columns", label: "Columns" },
-  { id: "indexes", label: "Indexes" },
-  { id: "foreignKeys", label: "Foreign keys" },
-  { id: "checks", label: "Checks" },
-  { id: "options", label: "Options" },
+const TABS: { id: Tab; label: string; icon: LucideIcon }[] = [
+  { id: "columns", label: "Columns", icon: Columns3 },
+  { id: "indexes", label: "Indexes", icon: ListTree },
+  { id: "foreignKeys", label: "Foreign keys", icon: Link2 },
+  { id: "checks", label: "Checks", icon: ShieldCheck },
+  { id: "options", label: "Options", icon: Settings2 },
 ];
 
 type PreviewState =
@@ -105,6 +127,12 @@ const STEP_STATUS: Record<string, string> = {
   skipped: "skipped",
   rolledBack: "rolled back",
   notRun: "not run",
+};
+
+const STEP_BADGE: Record<string, string> = {
+  done: "badge--success",
+  failed: "badge--danger",
+  rolledBack: "badge--warning",
 };
 
 export function TableDesignerPanel({
@@ -329,8 +357,11 @@ export function TableDesignerPanel({
   return (
     <section className="designer" aria-label={`Design ${title}`}>
       <div className="toolbar designer__toolbar" role="toolbar" aria-label="Designer actions">
-        <strong className="designer__title">{title}</strong>
-        <span className="toolbar__divider" aria-hidden="true" />
+        <span className="designer__title">
+          <TableProperties {...ICON} className="designer__title-icon" />
+          <strong>{title}</strong>
+        </span>
+        <span className="toolbar__separator" aria-hidden="true" />
         <button
           type="button"
           className="button button--primary"
@@ -340,27 +371,49 @@ export function TableDesignerPanel({
             setConfirming(true);
           }}
           data-testid="designer-apply"
+          title={creating ? "Review and create the table" : "Review and apply the changes"}
         >
+          {applying ? <LoaderCircle {...ICON} className="spin" /> : <Check {...ICON} />}
           {applying ? "Applying…" : creating ? "Create table" : "Apply"}
         </button>
-        <button type="button" className="button" disabled={!dirty || applying} onClick={discard}>
+        <button
+          type="button"
+          className="button button--ghost"
+          disabled={!dirty || applying}
+          onClick={discard}
+          title="Drop the unsaved changes"
+        >
+          <X {...ICON} />
           Discard
         </button>
         {!creating ? (
           <>
-            <button type="button" className="button" disabled={applying} onClick={reload}>
+            <button
+              type="button"
+              className="button button--ghost"
+              disabled={applying}
+              onClick={reload}
+              title="Load the table again from the database"
+            >
+              <RefreshCw {...ICON} />
               Reload
             </button>
             <button
               type="button"
-              className="button"
+              className="button button--ghost"
               onClick={() => design && openTableData({ sessionId, table: design.table })}
+              title="Open the table's rows"
             >
+              <Table2 {...ICON} />
               Open data
             </button>
           </>
         ) : null}
-        <span className="query-editor__status" role="status" aria-live="polite">
+        <span
+          className={`query-editor__status designer__status${dirty ? " designer__status--dirty" : ""}`}
+          role="status"
+          aria-live="polite"
+        >
           {!caps && !capsError
             ? "Loading…"
             : dirty
@@ -373,67 +426,88 @@ export function TableDesignerPanel({
 
       {capsError ? (
         <div className="banner banner--error" role="alert">
-          Could not read what this database supports: {capsError}
+          <CircleAlert {...ICON_SM} className="banner__icon" />
+          <p>Could not read what this database supports: {capsError}</p>
         </div>
       ) : null}
       {readOnly ? (
         <div className="banner banner--info" role="status" data-testid="designer-read-only">
-          {tableLock ?? "The designer cannot create tables on this database."}
+          <Lock {...ICON_SM} className="banner__icon" />
+          <p>{tableLock ?? "The designer cannot create tables on this database."}</p>
         </div>
       ) : null}
       {loadError ? (
         <div className="banner banner--error" role="alert">
-          Could not load the table: {loadError}
+          <CircleAlert {...ICON_SM} className="banner__icon" />
+          <p>Could not load the table: {loadError}</p>
         </div>
       ) : null}
       {notice ? (
         <div className="banner banner--ok" role="status">
-          {notice}
+          <CircleCheck {...ICON_SM} className="banner__icon" />
+          <p>{notice}</p>
         </div>
       ) : null}
       {applyError ? (
         <div className="banner banner--error" role="alert" data-testid="designer-apply-error">
-          <p className="banner__title">{applyError}</p>
-          {report ? (
-            <ol className="banner__list">
-              {report.outcome.steps.map((s) => {
-                const step = shown?.script.steps[s.index];
-                return (
-                  <li key={s.index}>
-                    <strong>{STEP_STATUS[s.status] ?? s.status}</strong>
-                    {step?.description ? ` · ${step.description}` : ""}
-                    {s.error ? ` · ${s.error.message}` : ""}
-                  </li>
-                );
-              })}
-            </ol>
-          ) : null}
-          {/changed since it was loaded/i.test(applyError) ? (
-            <button type="button" className="button button--small" onClick={reload}>
-              Reload the table
-            </button>
-          ) : null}
+          <CircleAlert {...ICON_SM} className="banner__icon" />
+          <div className="banner__content">
+            <p className="banner__title">{applyError}</p>
+            {report ? (
+              <ol className="banner__list designer__steps">
+                {report.outcome.steps.map((s) => {
+                  const step = shown?.script.steps[s.index];
+                  return (
+                    <li key={s.index} className={`designer__step designer__step--${s.status}`}>
+                      <span className={`badge ${STEP_BADGE[s.status] ?? ""}`}>
+                        {STEP_STATUS[s.status] ?? s.status}
+                      </span>
+                      <span>
+                        {step?.description || s.error ? (
+                          <span className="visually-hidden">{" · "}</span>
+                        ) : null}
+                        {step?.description ?? ""}
+                        {s.error ? `${step?.description ? " · " : ""}${s.error.message}` : ""}
+                      </span>
+                    </li>
+                  );
+                })}
+              </ol>
+            ) : null}
+            {/changed since it was loaded/i.test(applyError) ? (
+              <button type="button" className="button button--small" onClick={reload}>
+                <RefreshCw {...ICON_SM} />
+                Reload the table
+              </button>
+            ) : null}
+          </div>
         </div>
       ) : null}
 
       {!design || !editorProps ? (
-        <p className="results__empty">{loadError ? "" : "Loading the table…"}</p>
+        loadError ? null : (
+          <div className="designer__loading" role="status">
+            <LoaderCircle {...ICON} className="spin" />
+            Loading the table…
+          </div>
+        )
       ) : (
         <div className="designer__body">
           <div className="designer__editor">
-            <div className="results__tabs" role="tablist" aria-label="Designer sections">
+            <div className="tabs designer__tabs" role="tablist" aria-label="Designer sections">
               {TABS.map((t) => (
                 <button
                   key={t.id}
                   type="button"
                   role="tab"
                   aria-selected={tab === t.id}
-                  className="results__tab"
+                  className="tabs__tab designer__tab"
                   onClick={() => setTab(t.id)}
                 >
+                  <t.icon {...ICON_SM} />
                   {t.label}
                   {counts[t.id] !== null ? (
-                    <span className="results__tab-count">{counts[t.id]}</span>
+                    <span className="count-badge">{counts[t.id]}</span>
                   ) : null}
                 </button>
               ))}
@@ -452,41 +526,47 @@ export function TableDesignerPanel({
             aria-label="DDL preview"
             data-testid="designer-preview"
           >
-            <div className="results__tabs" role="tablist" aria-label="Preview">
+            <div className="tabs designer__tabs" role="tablist" aria-label="Preview">
               <button
                 type="button"
                 role="tab"
                 aria-selected={previewTab === "sql"}
-                className="results__tab"
+                className="tabs__tab designer__tab"
                 onClick={() => setPreviewTab("sql")}
               >
+                <Code {...ICON_SM} />
                 SQL
-                {shown ? (
-                  <span className="results__tab-count">{shown.script.steps.length}</span>
-                ) : null}
+                {shown ? <span className="count-badge">{shown.script.steps.length}</span> : null}
               </button>
               <button
                 type="button"
                 role="tab"
                 aria-selected={previewTab === "changes"}
-                className="results__tab"
+                className="tabs__tab designer__tab"
                 onClick={() => setPreviewTab("changes")}
               >
+                <ListChecks {...ICON_SM} />
                 Changes
-                {shown ? <span className="results__tab-count">{shown.diffs.length}</span> : null}
+                {shown ? <span className="count-badge">{shown.diffs.length}</span> : null}
               </button>
               <span className="designer__preview-state">
-                {preview.status === "loading"
-                  ? "Updating…"
-                  : preview.status === "idle"
-                    ? "No changes"
-                    : ""}
+                {preview.status === "loading" ? (
+                  <>
+                    <LoaderCircle {...ICON_SM} className="spin" />
+                    Updating…
+                  </>
+                ) : preview.status === "idle" ? (
+                  "No changes"
+                ) : (
+                  ""
+                )}
               </span>
             </div>
             {preview.status === "error" ? (
-              <p className="banner banner--error" role="alert">
-                Preview failed: {preview.message}
-              </p>
+              <div className="banner banner--error" role="alert">
+                <CircleAlert {...ICON_SM} className="banner__icon" />
+                <p>Preview failed: {preview.message}</p>
+              </div>
             ) : null}
             {shownIssues.length > 0 ? (
               <ul className="designer__issues" aria-label="Issues">
@@ -495,31 +575,47 @@ export function TableDesignerPanel({
                     key={`${i.path}:${i.message}`}
                     className={`designer__issue designer__issue--${i.severity}`}
                   >
-                    <strong>{i.severity === "error" ? "Error" : "Warning"}</strong>
-                    {i.path ? <code>{i.path}</code> : null} {i.message}
+                    {i.severity === "error" ? (
+                      <CircleAlert {...ICON_SM} className="designer__issue-icon" />
+                    ) : (
+                      <TriangleAlert {...ICON_SM} className="designer__issue-icon" />
+                    )}
+                    <span>
+                      <strong>{i.severity === "error" ? "Error" : "Warning"}</strong>{" "}
+                      {i.path ? <code>{i.path}</code> : null} {i.message}
+                    </span>
                   </li>
                 ))}
               </ul>
             ) : null}
             {shown?.destructive ? (
               <div className="banner banner--warning" role="note" data-testid="destructive-warning">
-                <strong>Destructive:</strong> {plural(destructiveSteps.length, "step", "steps")} can
-                drop or rewrite data:{" "}
-                {destructiveSteps.map((s) => s.description ?? s.sql.split("\n")[0]).join("; ")}
+                <TriangleAlert {...ICON_SM} className="banner__icon" />
+                <p>
+                  <strong>Destructive:</strong> {plural(destructiveSteps.length, "step", "steps")}{" "}
+                  can drop or rewrite data:{" "}
+                  {destructiveSteps.map((s) => s.description ?? s.sql.split("\n")[0]).join("; ")}
+                </p>
               </div>
             ) : null}
             {shown && shown.script.steps.length > 0 && !shown.atomic ? (
               <div className="banner banner--warning" role="note" data-testid="non-atomic-warning">
-                <strong>Not transactional:</strong>{" "}
-                {nonTransactional.length > 0
-                  ? `${plural(nonTransactional.length, "statement commits", "statements commit")} on its own. `
-                  : ""}
-                {shown.notes.length > 0
-                  ? shown.notes.join(" ")
-                  : "If a statement fails, the statements before it stay applied."}
+                <TriangleAlert {...ICON_SM} className="banner__icon" />
+                <p>
+                  <strong>Not transactional:</strong>{" "}
+                  {nonTransactional.length > 0
+                    ? `${plural(nonTransactional.length, "statement commits", "statements commit")} on its own. `
+                    : ""}
+                  {shown.notes.length > 0
+                    ? shown.notes.join(" ")
+                    : "If a statement fails, the statements before it stay applied."}
+                </p>
               </div>
             ) : shown?.notes.length ? (
-              <p className="field__hint">{shown.notes.join(" ")}</p>
+              <div className="banner banner--info" role="note">
+                <Info {...ICON_SM} className="banner__icon" />
+                <p>{shown.notes.join(" ")}</p>
+              </div>
             ) : null}
             {previewTab === "sql" ? (
               <div className="designer__sql">
@@ -555,7 +651,7 @@ export function TableDesignerPanel({
         <Modal
           title={creating ? "Create the table?" : "Apply the changes?"}
           onClose={() => setConfirming(false)}
-          className="modal--wide"
+          className="modal--wide designer__confirm"
           footer={
             <>
               <button type="button" className="button" onClick={() => setConfirming(false)}>
@@ -568,6 +664,7 @@ export function TableDesignerPanel({
                 onClick={() => void apply()}
                 data-testid="designer-confirm"
               >
+                {current.destructive ? <TriangleAlert {...ICON} /> : <Check {...ICON} />}
                 {current.destructive ? "Apply destructive changes" : "Apply"}
               </button>
             </>
@@ -579,21 +676,25 @@ export function TableDesignerPanel({
             {current.atomic ? " in one transaction." : "."}
           </p>
           {!current.atomic ? (
-            <p className="banner banner--warning">
-              Not transactional: if a statement fails, the statements before it stay applied.
-            </p>
+            <div className="banner banner--warning" role="note">
+              <TriangleAlert {...ICON_SM} className="banner__icon" />
+              <p>Not transactional: if a statement fails, the statements before it stay applied.</p>
+            </div>
           ) : null}
           {current.destructive ? (
             <>
-              <p className="banner banner--error">
-                These steps can drop or rewrite data:
-                <br />
-                {steps
-                  .filter((s) => s.destructive)
-                  .map((s) => s.description ?? s.sql)
-                  .join("; ")}
-              </p>
-              <label className="checkbox">
+              <div className="banner banner--error" role="note">
+                <TriangleAlert {...ICON_SM} className="banner__icon" />
+                <p>
+                  These steps can drop or rewrite data:
+                  <br />
+                  {steps
+                    .filter((s) => s.destructive)
+                    .map((s) => s.description ?? s.sql)
+                    .join("; ")}
+                </p>
+              </div>
+              <label className="checkbox designer__ack">
                 <input
                   type="checkbox"
                   checked={acknowledged}

@@ -4,6 +4,15 @@
  * the report. Sources: a result of a run (every row), a table (with an optional filter and
  * sort) or a query.
  */
+import {
+  CircleAlert,
+  CircleCheck,
+  CircleX,
+  Database,
+  Download,
+  LoaderCircle,
+  TriangleAlert,
+} from "lucide-react";
 import { type ReactNode, useEffect, useId, useReducer, useRef, useState } from "react";
 import {
   type ErrorInfo,
@@ -20,6 +29,7 @@ import {
   isTerminalTransferEvent,
   type WriteOptions,
 } from "../../api";
+import { ICON, ICON_SM } from "../../components/icons";
 import { Modal } from "../../components/Modal";
 import { toCommandError } from "../../connections/api";
 import { formatMs } from "../format";
@@ -248,17 +258,26 @@ export function ExportDialog({ init, onClose }: { init: ExportInit; onClose: () 
     body = (
       <div className="transfer-step" data-testid="export-report">
         <div
-          className={`banner ${run.status === "finished" ? "banner--ok" : run.status === "failed" ? "banner--error" : "banner--warning"}`}
+          className={`banner transfer-result ${run.status === "finished" ? "banner--ok" : run.status === "failed" ? "banner--error" : "banner--warning"}`}
           role={run.status === "failed" ? "alert" : "status"}
         >
-          <p className="banner__title">
-            {run.status === "finished"
-              ? "Export finished"
-              : run.status === "cancelled"
-                ? "Export cancelled: no file was written."
-                : "Export failed: no file was written."}
-          </p>
-          {run.error ? <p>{run.error.message}</p> : null}
+          {run.status === "finished" ? (
+            <CircleCheck {...ICON} className="banner__icon" />
+          ) : run.status === "failed" ? (
+            <CircleX {...ICON} className="banner__icon" />
+          ) : (
+            <TriangleAlert {...ICON} className="banner__icon" />
+          )}
+          <div className="banner__content">
+            <p className="banner__title">
+              {run.status === "finished"
+                ? "Export finished"
+                : run.status === "cancelled"
+                  ? "Export cancelled: no file was written."
+                  : "Export failed: no file was written."}
+            </p>
+            {run.error ? <p>{run.error.message}</p> : null}
+          </div>
         </div>
         {report ? (
           <>
@@ -269,7 +288,9 @@ export function ExportDialog({ init, onClose }: { init: ExportInit; onClose: () 
               </div>
               <div>
                 <dt>Rows</dt>
-                <dd data-testid="report-rows">{formatCount(report.rows)}</dd>
+                <dd className="transfer-summary__num" data-testid="report-rows">
+                  {formatCount(report.rows)}
+                </dd>
               </div>
               <div>
                 <dt>Size</dt>
@@ -288,16 +309,22 @@ export function ExportDialog({ init, onClose }: { init: ExportInit; onClose: () 
             </dl>
             {report.sourceTruncated ? (
               <div className="banner banner--warning" role="status">
-                The result was cut at the row limit of its run: only the rows it kept were exported.
-                Export the query to get every row.
+                <TriangleAlert {...ICON_SM} className="banner__icon" />
+                <p>
+                  The result was cut at the row limit of its run: only the rows it kept were
+                  exported. Export the query to get every row.
+                </p>
               </div>
             ) : null}
             {(report.warnings ?? []).length > 0 ? (
-              <ul className="banner banner--warning banner__list">
-                {(report.warnings ?? []).map((w) => (
-                  <li key={w}>{w}</li>
-                ))}
-              </ul>
+              <div className="banner banner--warning" role="status">
+                <TriangleAlert {...ICON_SM} className="banner__icon" />
+                <ul className="banner__list">
+                  {(report.warnings ?? []).map((w) => (
+                    <li key={w}>{w}</li>
+                  ))}
+                </ul>
+              </div>
             ) : null}
           </>
         ) : null}
@@ -306,36 +333,46 @@ export function ExportDialog({ init, onClose }: { init: ExportInit; onClose: () 
   } else {
     body = (
       <div className="transfer-step">
-        <p className="transfer-source" data-testid="export-source">
-          {init.label}
-          {init.totalRows !== undefined ? ` · ${formatCount(init.totalRows)} rows` : ""}
-        </p>
-        <div className="field">
-          <label htmlFor={`${id}-format`}>Format</label>
-          <select
-            id={`${id}-format`}
-            value={format}
-            disabled={running}
-            onChange={(e) => {
-              setFormat(e.target.value as FileFormat);
-              setShowProblems(false);
-            }}
-          >
-            {EXPORT_FORMATS.map((f) => (
-              <option key={f} value={f}>
-                {FORMAT_LABEL[f]}
-              </option>
-            ))}
-          </select>
+        <div className="transfer-source-card">
+          <span className="transfer-file__icon">
+            <Database {...ICON} />
+          </span>
+          <p className="transfer-source" data-testid="export-source">
+            {init.label}
+            {init.totalRows !== undefined ? (
+              <span className="transfer-source__rows">{` · ${formatCount(init.totalRows)} rows`}</span>
+            ) : null}
+          </p>
         </div>
-        <WriteOptionsForm
-          options={options}
-          onChange={setOptions}
-          disabled={running}
-          defaultTable={sourceTable}
-        />
+        <fieldset className="fieldset transfer-group">
+          <legend>File</legend>
+          <div className="field">
+            <label htmlFor={`${id}-format`}>Format</label>
+            <select
+              id={`${id}-format`}
+              value={format}
+              disabled={running}
+              onChange={(e) => {
+                setFormat(e.target.value as FileFormat);
+                setShowProblems(false);
+              }}
+            >
+              {EXPORT_FORMATS.map((f) => (
+                <option key={f} value={f}>
+                  {FORMAT_LABEL[f]}
+                </option>
+              ))}
+            </select>
+          </div>
+          <WriteOptionsForm
+            options={options}
+            onChange={setOptions}
+            disabled={running}
+            defaultTable={sourceTable}
+          />
+        </fieldset>
         {init.offerFilter && init.source.type === "table" ? (
-          <fieldset className="fieldset">
+          <fieldset className="fieldset transfer-group">
             <legend>Rows</legend>
             <div className="field">
               <label htmlFor={`${id}-filter`}>Filter (SQL condition)</label>
@@ -374,6 +411,7 @@ export function ExportDialog({ init, onClose }: { init: ExportInit; onClose: () 
         ) : null}
         {showProblems && problems.length > 0 ? (
           <div className="banner banner--error" role="alert" data-testid="export-problems">
+            <CircleAlert {...ICON_SM} className="banner__icon" />
             <ul className="banner__list">
               {problems.map((p) => (
                 <li key={p}>{p}</li>
@@ -394,6 +432,7 @@ export function ExportDialog({ init, onClose }: { init: ExportInit; onClose: () 
         disabled={run.cancelling}
         onClick={cancel}
       >
+        {run.cancelling ? <LoaderCircle {...ICON} className="spin" /> : <CircleX {...ICON} />}
         {run.cancelling ? "Cancelling…" : "Cancel export"}
       </button>
     ) : done ? (
@@ -412,6 +451,11 @@ export function ExportDialog({ init, onClose }: { init: ExportInit; onClose: () 
           disabled={running}
           onClick={() => void start()}
         >
+          {run.status === "picking" ? (
+            <LoaderCircle {...ICON} className="spin" />
+          ) : (
+            <Download {...ICON} />
+          )}
           {run.status === "picking" ? "Choosing the file…" : "Export…"}
         </button>
       </>

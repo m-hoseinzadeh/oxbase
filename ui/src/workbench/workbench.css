@@ -625,7 +625,8 @@ input[type="search"] {
 
 .context-menu {
   position: fixed;
-  z-index: var(--z-popover);
+  /* Above dockview's floating groups, which sit just under the modal layer. */
+  z-index: calc(var(--z-modal) + 10);
   display: flex;
   flex-direction: column;
   min-width: 200px;
@@ -729,14 +730,14 @@ input[type="search"] {
 }
 
 .query-editor__toolbar {
-  flex-wrap: nowrap;
+  /* Wraps rather than scrolls, so no control is ever clipped or hidden off-screen. */
+  flex-wrap: wrap;
   align-items: center;
   gap: 2px;
   min-height: 40px;
   padding: var(--space-1) var(--space-2);
   border-bottom: 1px solid var(--color-border);
   background: var(--color-bg-subtle);
-  overflow-x: auto;
   flex-shrink: 0;
 }
 
