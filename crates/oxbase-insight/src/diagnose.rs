@@ -194,7 +194,7 @@ pub fn diagnose(
             lexical::parens(&toks, &mut out);
         }
         lexical::directives(&toks, &feat, dialect, &mut out);
-        if cache.is_some() {
+        if cache.is_some() && may_change_schema(&statement.text) {
             env.apply_changes(&oxbase_sql::schema_changes(dialect.sql, &statement.text));
         }
         for st in analyze::analyze(&dialect.language, &feat, &toks) {
@@ -210,9 +210,36 @@ pub fn diagnose(
     Ok(out)
 }
 
+/// `false` when `text` cannot hold a DDL verb `oxbase_sql::schema_changes` looks for
+/// (`CREATE`, `ALTER`, `DROP`, `RENAME`, `sp_rename`, in any case): such statements skip a
+/// second tokenization (most statements of a large script).
+fn may_change_schema(text: &str) -> bool {
+    const VERBS: [&[u8]; 4] = [b"create", b"alter", b"drop", b"rename"];
+    let bytes = text.as_bytes();
+    bytes.iter().enumerate().any(|(at, b)| {
+        matches!(b.to_ascii_lowercase(), b'c' | b'a' | b'd' | b'r')
+            && VERBS.iter().any(|verb| {
+                bytes
+                    .get(at..at + verb.len())
+                    .is_some_and(|w| w.eq_ignore_ascii_case(verb))
+            })
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_texts_with_a_ddl_verb_are_scanned_for_schema_changes() {
+        assert!(may_change_schema("create table t (a int)"));
+        assert!(may_change_schema("ALTER TABLE t ADD b int"));
+        assert!(may_change_schema("exec Sp_Rename 'a', 'b'"));
+        assert!(may_change_schema("x DROP"));
+        assert!(!may_change_schema("SELECT a FROM t WHERE b = 'cre'"));
+        assert!(!may_change_schema("drp"));
+        assert!(!may_change_schema(""));
+    }
 
     #[test]
     fn severities_are_capped() {
