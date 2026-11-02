@@ -712,6 +712,39 @@ async fn replies_render_per_resp_type_and_command() {
         pipe.cmd("TYPE").arg(&hash).cmd("PTTL").arg(&hash);
         let replies = c.pipeline(&pipe, &CancellationToken::new()).await.unwrap();
         assert_eq!(replies.len(), 2);
+        // An atomic pipeline returns the EXEC replies; when a WATCHed key changed elsewhere,
+        // EXEC returns nil and the call fails with EXECABORT (never an empty reply list).
+        let watched = key(&t, "watched");
+        let mut atomic = redis::pipe();
+        atomic
+            .atomic()
+            .cmd("SET")
+            .arg(&watched)
+            .arg("1")
+            .cmd("GET")
+            .arg(&watched);
+        let replies = c
+            .pipeline(&atomic, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(replies.len(), 2, "{replies:?}");
+        let mut watch = redis::cmd("WATCH");
+        watch.arg(&watched);
+        c.command(&watch, &CancellationToken::new()).await.unwrap();
+        let other = connect(&params()).await;
+        run(&other, &format!("SET {watched} 2")).await;
+        other.close().await.unwrap();
+        let mut write = redis::pipe();
+        write.atomic().cmd("SET").arg(&watched).arg("3");
+        let err = c
+            .pipeline(&write, &CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert_eq!(err.sql_code(), Some("EXECABORT"), "{err}");
+        assert_eq!(
+            scalar(&c, &format!("GET {watched}")).await.as_deref(),
+            Some("2")
+        );
         assert_eq!(c.masters(&CancellationToken::new()).await.unwrap().len(), 1);
 
         cleanup(&c, &t).await;
@@ -770,11 +803,13 @@ async fn blocking_commands_cancel_within_2s_and_the_session_stays() {
 #[tokio::test]
 #[ignore = "needs the redis fixture"]
 async fn a_cancelled_run_reports_the_reconnect() {
-    // A run whose stream is dropped before the reply leaves the connection to be replaced; the
-    // next command reconnects and says so.
+    // A run whose stream is dropped before the reply closes its connection at once (the BLPOP
+    // must not stay blocked on the server and pop an element nobody reads); the next command
+    // reconnects and says so.
     let t = token();
     let c = connect(&params()).await;
-    let line = format!("BLPOP {} 0", key(&t, "dropped"));
+    let queue = key(&t, "dropped");
+    let line = format!("BLPOP {queue} 0");
     let stream = c
         .execute(&line, &[], CancellationToken::new())
         .await
@@ -786,6 +821,17 @@ async fn a_cancelled_run_reports_the_reconnect() {
             .is_err()
     );
     drop(stream);
+    // Give the server a moment to see the closed socket, then push from another session: the
+    // element stays in the list.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let other = connect(&params()).await;
+    run(&other, &format!("LPUSH {queue} x")).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        scalar(&other, &format!("LLEN {queue}")).await.as_deref(),
+        Some("1"),
+        "the dropped BLPOP consumed the element"
+    );
     let out = run(&c, "PING").await;
     assert!(
         out.notices
@@ -1074,7 +1120,40 @@ async fn cluster_connects_and_routes_by_slot() {
         run(&conn, &format!("DEL oxbase:driver:t{tok}:{index}")).await;
     }
     assert!(try_run(&conn, "SELECT 1", &[]).await.is_err());
+    // Console transactions are refused on a cluster (they would not be atomic).
+    for line in ["MULTI", "EXEC", "DISCARD", "WATCH k"] {
+        let err = try_run(&conn, line, &[]).await.unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "{line}: {err}");
+    }
     conn.close().await.unwrap();
+
+    // A cancelled BLPOP ends on the server too: an element pushed afterwards stays in the list.
+    let conn = Arc::new(connect(&profile).await);
+    let queue = format!("oxbase:driver:t{tok}:queue");
+    cancel_once(&conn, &format!("BLPOP {queue} 0"), CancelBy::Token).await;
+    cancel_once(&conn, &format!("BLPOP {queue} 0"), CancelBy::CancelRunning).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let other = connect(&profile).await;
+    run(&other, &format!("LPUSH {queue} x")).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        scalar(&other, &format!("LLEN {queue}")).await.as_deref(),
+        Some("1"),
+        "a cancelled BLPOP consumed the element"
+    );
+    run(&other, &format!("DEL {queue}")).await;
+    other.close().await.unwrap();
+    conn.close().await.unwrap();
+
+    // read_from_replicas is accepted and reads still answer.
+    let replicas = connect(&with_option(
+        profile.clone(),
+        options::READ_FROM_REPLICAS,
+        "true",
+    ))
+    .await;
+    ping(&replicas).await;
+    replicas.close().await.unwrap();
 }
 
 #[tokio::test]

@@ -70,7 +70,9 @@ pub(crate) enum Link {
 }
 
 impl Link {
-    /// Ends the link's socket(s) now, even while clones are still alive.
+    /// Ends the link's socket now, even while clones are still alive (one server). A cluster
+    /// connection closes its node sockets only when its last clone is dropped
+    /// ([`Session::discard`] takes the session's own clone out for that).
     fn abort(&self) {
         if let Self::Single { task, .. } = self {
             task.abort();
@@ -141,6 +143,18 @@ struct State {
     generation: u64,
 }
 
+impl State {
+    /// Takes the link of `generation` out of the session and ends it (a later command
+    /// reconnects); a newer link is left alone.
+    fn drop_link(&mut self, generation: u64) {
+        if self.generation == generation
+            && let Some(old) = self.link.take()
+        {
+            old.abort();
+        }
+    }
+}
+
 /// One session (see the driver module docs).
 pub(crate) struct Session {
     pub params: ConnectParams,
@@ -156,8 +170,9 @@ pub(crate) struct Session {
     state: tokio::sync::Mutex<State>,
     stale: AtomicU64,
     closed: AtomicBool,
-    /// The token of the command running now, for `cancel_running`.
-    running: Mutex<Option<(u64, CancellationToken)>>,
+    /// The tokens of the commands running now (one per run, from before its reconnect to its
+    /// reply), for `cancel_running`.
+    running: Mutex<Vec<(u64, CancellationToken)>>,
     next_run: AtomicU64,
 }
 
@@ -201,7 +216,7 @@ impl Session {
             }),
             stale: AtomicU64::new(0),
             closed: AtomicBool::new(false),
-            running: Mutex::new(None),
+            running: Mutex::new(Vec::new()),
             next_run: AtomicU64::new(1),
         })
     }
@@ -274,6 +289,39 @@ impl Session {
         self.stale.fetch_max(generation, Ordering::SeqCst);
     }
 
+    /// Ends the link of `generation` now, so a command abandoned on it (a cancelled or dropped
+    /// `BLPOP`) cannot go on running on the server: marks it stale, aborts its socket (one
+    /// server) and takes it out of the session, so the last clone of a cluster connection goes
+    /// with the caller's and the crate closes the node sockets. The next command reconnects.
+    fn discard(self: &Arc<Self>, generation: u64, link: &Link) {
+        self.mark_stale(generation);
+        link.abort();
+        if let Ok(mut state) = self.state.try_lock() {
+            state.drop_link(generation);
+        } else if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            // Another call holds the state (a reconnect replaces the stale link anyway, or a
+            // command takes a clone for a moment): take it out as soon as the lock is free.
+            let session = Arc::clone(self);
+            runtime.spawn(async move {
+                session.state.lock().await.drop_link(generation);
+            });
+        }
+    }
+
+    /// The live link, raced against `token` (a reconnect can take the whole connect timeout;
+    /// cancel must not wait for it).
+    async fn link_or_cancel(
+        &self,
+        notices: &mut Vec<Notice>,
+        token: &CancellationToken,
+    ) -> Result<(Link, u64)> {
+        tokio::select! {
+            biased;
+            () = token.cancelled() => Err(Error::Cancelled),
+            link = self.link(notices) => link,
+        }
+    }
+
     /// Runs `cmd` (on `node` of a cluster when given) and returns its reply. An error reply is
     /// [`Error::Sql`]; cancel follows the driver module docs. Notices (a reconnect, a replaced
     /// connection) are returned next to the outcome.
@@ -288,14 +336,15 @@ impl Session {
         if cancel.is_cancelled() {
             return (Err(Error::Cancelled), notices);
         }
-        let (link, generation) = match self.link(&mut notices).await {
+        let token = cancel.child_token();
+        let _running = Running::start(self, token.clone());
+        let (link, generation) = match self.link_or_cancel(&mut notices, &token).await {
             Ok(l) => l,
             Err(e) => return (Err(e), notices),
         };
-        let token = cancel.child_token();
-        let _running = Running::start(self, token.clone());
         let mut in_flight = InFlight {
             session: self,
+            link: link.clone(),
             generation,
             armed: true,
         };
@@ -339,8 +388,9 @@ impl Session {
             in_flight.armed = false;
             return (Err(Error::Cancelled), notices);
         }
-        self.mark_stale(generation);
-        link.abort();
+        // Ends the connection now (a cluster: once `send` and `link` go, right below), so the
+        // command cannot complete later and consume data nobody receives.
+        drop(in_flight);
         notices.push(Notice::warning(
             "the cancelled command could not be interrupted on the server: its reply is \
              dropped and the session reconnects before the next command",
@@ -361,7 +411,9 @@ impl Session {
         }
     }
 
-    /// Runs `pipe` on the session's link (cancel replaces the connection).
+    /// Runs `pipe` on the session's link (cancel ends the connection; the next command
+    /// reconnects). An atomic pipeline whose `EXEC` returns nil (a `WATCH`ed key changed) is
+    /// `Error::Sql { code: "EXECABORT" }`.
     pub(crate) async fn pipeline(
         self: &Arc<Self>,
         pipe: &redis::Pipeline,
@@ -371,27 +423,29 @@ impl Session {
         if cancel.is_cancelled() {
             return Err(Error::Cancelled);
         }
-        let (link, generation) = self.link(&mut notices).await?;
         let token = cancel.child_token();
         let _running = Running::start(self, token.clone());
+        let (link, generation) = self.link_or_cancel(&mut notices, &token).await?;
         let mut in_flight = InFlight {
             session: self,
+            link: link.clone(),
             generation,
             armed: true,
         };
-        let mut conn = link.clone();
+        let mut conn = link;
         let reply = tokio::select! {
             biased;
-            reply = pipe.query_async::<Vec<Value>>(&mut conn) => reply,
-            () = token.cancelled() => {
-                self.mark_stale(generation);
-                link.abort();
-                return Err(Error::Cancelled);
-            }
+            reply = pipe.query_async::<Value>(&mut conn) => reply,
+            // `in_flight` (armed) ends the connection on the way out.
+            () = token.cancelled() => return Err(Error::Cancelled),
         };
         in_flight.armed = false;
         match reply {
-            Ok(values) => Ok(values),
+            Ok(Value::Nil) if pipe.is_transaction() => Err(exec_aborted()),
+            Ok(Value::Array(values)) => Ok(values),
+            Ok(other) => Err(Error::internal(format!(
+                "a pipeline returned {other:?} instead of one reply per command"
+            ))),
             Err(e) => {
                 if is_link_broken(&e) {
                     self.mark_stale(generation);
@@ -401,12 +455,12 @@ impl Session {
         }
     }
 
-    /// Cancels the command running now, if any.
+    /// Cancels every command running on the session now, if any.
     pub(crate) fn cancel_running(&self) {
-        if let Ok(running) = self.running.lock()
-            && let Some((_, token)) = running.as_ref()
-        {
-            token.cancel();
+        if let Ok(running) = self.running.lock() {
+            for (_, token) in running.iter() {
+                token.cancel();
+            }
         }
     }
 
@@ -529,7 +583,15 @@ pub(crate) fn closed() -> Error {
     Error::connection("the Redis connection is closed")
 }
 
-/// Keeps the token of the running command for `cancel_running`.
+/// The error of an atomic pipeline whose `EXEC` returned nil.
+pub(crate) fn exec_aborted() -> Error {
+    Error::sql(
+        Some("EXECABORT"),
+        "the transaction was aborted: a watched key changed, nothing was written",
+    )
+}
+
+/// Keeps the token of a running command for `cancel_running` while it runs.
 struct Running<'a> {
     session: &'a Session,
     id: u64,
@@ -539,7 +601,7 @@ impl<'a> Running<'a> {
     fn start(session: &'a Session, token: CancellationToken) -> Self {
         let id = session.next_run.fetch_add(1, Ordering::SeqCst);
         if let Ok(mut running) = session.running.lock() {
-            *running = Some((id, token));
+            running.push((id, token));
         }
         Self { session, id }
     }
@@ -547,18 +609,18 @@ impl<'a> Running<'a> {
 
 impl Drop for Running<'_> {
     fn drop(&mut self) {
-        if let Ok(mut running) = self.session.running.lock()
-            && running.as_ref().is_some_and(|(id, _)| *id == self.id)
-        {
-            *running = None;
+        if let Ok(mut running) = self.session.running.lock() {
+            running.retain(|(id, _)| *id != self.id);
         }
     }
 }
 
-/// While armed, dropping it (the caller dropped the run before the reply) marks the link stale:
-/// the abandoned command may still hold the connection (a blocking command).
+/// While armed, dropping it (a cancel the server did not end, or the caller dropped the run
+/// before the reply) ends the link at once ([`Session::discard`]): the abandoned command may
+/// still run on the server (a `BLPOP` would pop an element whose reply nobody reads).
 struct InFlight<'a> {
-    session: &'a Session,
+    session: &'a Arc<Session>,
+    link: Link,
     generation: u64,
     armed: bool,
 }
@@ -566,7 +628,7 @@ struct InFlight<'a> {
 impl Drop for InFlight<'_> {
     fn drop(&mut self) {
         if self.armed {
-            self.session.mark_stale(self.generation);
+            self.session.discard(self.generation, &self.link);
         }
     }
 }
@@ -891,6 +953,10 @@ impl ClusterSetup<'_> {
             .connection_timeout(self.timeout)
             .response_timeout(CLUSTER_RESPONSE_TIMEOUT)
             .use_protocol(protocol);
+        if self.options.read_from_replicas {
+            // Read-only commands go to a random replica of their slot's shard.
+            builder = builder.read_from_replicas();
+        }
         if let Some(user) = self
             .params
             .user

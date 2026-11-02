@@ -72,6 +72,9 @@ pub(crate) struct CommandInfo {
     pub cancel: CancelKind,
 }
 
+/// Transaction commands a cluster session refuses ([`CommandInfo::check_cluster`]).
+const CLUSTER_REFUSED: [&str; 5] = ["MULTI", "EXEC", "DISCARD", "WATCH", "UNWATCH"];
+
 /// Commands that switch the connection into a mode the multiplexed session cannot serve, or
 /// end it. The console guard blocks them too; the driver refuses them for every caller.
 const REFUSED: [(&str, &str); 11] = [
@@ -189,6 +192,22 @@ impl CommandInfo {
         Ok(())
     }
 
+    /// Refuses the transaction commands on a cluster session: the cluster routes `MULTI` /
+    /// `EXEC` to any node and each queued command to the node of its key, so a transaction
+    /// typed line by line would not be one (writes would apply at once, `DISCARD` would not
+    /// undo them).
+    pub(crate) fn check_cluster(&self) -> Result<()> {
+        if CLUSTER_REFUSED.contains(&self.name.as_str()) {
+            return Err(Error::invalid_input(format!(
+                "{} is not offered on a cluster session: the cluster sends each command of a \
+                 transaction to the node of its key, so it would not be atomic. Open a \
+                 standalone profile on the node that holds the keys instead",
+                self.name
+            )));
+        }
+        Ok(())
+    }
+
     /// `true` when an integer reply counts changed items ([`WRITES`]).
     pub(crate) fn counts_changes(&self) -> bool {
         WRITES.contains(&self.name.as_str())
@@ -294,6 +313,22 @@ mod tests {
         for line in ["HELLO", "CLIENT ID", "PUBLISH c m", "GET k"] {
             let args = command_args(line, &[]).unwrap();
             CommandInfo::of(&args).check_allowed(&args).unwrap();
+        }
+    }
+
+    #[test]
+    fn cluster_sessions_refuse_console_transactions() {
+        for line in ["MULTI", "exec", "DISCARD", "WATCH k", "unwatch"] {
+            let args = command_args(line, &[]).unwrap();
+            let info = CommandInfo::of(&args);
+            info.check_allowed(&args).unwrap();
+            let err = info.check_cluster().unwrap_err();
+            assert!(matches!(err, Error::InvalidInput { .. }), "{line}: {err}");
+            assert!(err.to_string().contains("cluster"), "{err}");
+        }
+        for line in ["GET k", "SET k v", "SCAN 0", "CLUSTER INFO"] {
+            let args = command_args(line, &[]).unwrap();
+            CommandInfo::of(&args).check_cluster().unwrap();
         }
     }
 }

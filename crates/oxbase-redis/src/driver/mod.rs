@@ -38,7 +38,8 @@
 //!   ([`RedisConnection::current_database`] reports it); a console `SELECT` changes it and the
 //!   connection tracks the new index (a reconnect selects it again).
 //! - **Modes.** Standalone: one multiplexed connection. Cluster: `ClusterClient` (cluster-async)
-//!   over the seeds; keys are routed by slot, and [`RedisConnection::masters`] /
+//!   over the seeds; keys are routed by slot (read-only commands to a random replica of the
+//!   slot when `read_from_replicas = true`), and [`RedisConnection::masters`] /
 //!   [`RedisConnection::command_on`] let the dialect cells run `SCAN`-like commands per
 //!   master. Sentinel: the sentinels are asked in order (`SENTINEL GET-MASTER-ADDR-BY-NAME`,
 //!   with the profile's credentials only for `sentinel_auth = same`), then the master is
@@ -63,7 +64,10 @@
 //!   `SUBSCRIBE` and the other pub/sub mode commands (use the pub/sub panel), `MONITOR`,
 //!   `SYNC`, `PSYNC`, `QUIT`, `RESET`, `HELLO` with arguments, `CLIENT REPLY`.
 //! - `MULTI` ... `EXEC` typed line by line work on the editor's own session (`EXEC` returns
-//!   the replies as an array). `begin()` is `Unsupported`: grid-style transactions are not
+//!   the replies as an array) for standalone and sentinel profiles. A cluster session refuses
+//!   `MULTI`, `EXEC`, `DISCARD`, `WATCH` and `UNWATCH` with `InvalidInput`: the cluster routes
+//!   each command to the node of its key, so the transaction would not be atomic (use a
+//!   standalone profile on the node that holds the keys). `begin()` is `Unsupported`: grid-style transactions are not
 //!   offered; key edits use `WATCH` / `MULTI` / `EXEC` inside the key-value cell (on a
 //!   [`RedisConnection::dedicated`] connection when the session is shared).
 //!
@@ -98,11 +102,15 @@
 //! `CLIENT UNBLOCK <id> ERROR`; a busy script gets `SCRIPT KILL` (`EVAL*`) or `FUNCTION KILL`
 //! (`FCALL*`), which only end read-only scripts. When the server ends the command within 1.5 s
 //! the session keeps its connection. Otherwise (any other command, an ACL user without
-//! `CLIENT UNBLOCK`, a cluster) the reply is dropped and the connection replaced (reconnected
-//! and re-`SELECT`ed) before the next command, with a warning notice that `MULTI` state and
-//! connection settings are gone. The stream ends with `Error::Cancelled` within 2 s in every
-//! case. `CLIENT KILL` is never used (it ends the session for everyone on it). A run dropped
-//! before its reply also marks the connection for replacement (the command may still hold it).
+//! `CLIENT UNBLOCK`, a cluster) the connection is closed at once (a cluster: every node socket
+//! of the session), so the server ends the command and it cannot pop or move data whose reply
+//! nobody reads; the next command reconnects (and re-`SELECT`s), with a warning notice that
+//! `MULTI` state and connection settings are gone. Commands running concurrently on the same
+//! session fail with `Error::Connection`. The stream ends with `Error::Cancelled` within 2 s
+//! in every case, also while the session is reconnecting (the reconnect is abandoned).
+//! `CLIENT KILL` is never used (it ends the session for everyone on it). A run dropped before
+//! its reply closes the connection the same way. `cancel_running` cancels every command
+//! running on the session.
 //! A broken connection (server restart, idle timeout) fails its command with
 //! `Error::Connection` and is replaced before the next one.
 //!
@@ -319,7 +327,10 @@ impl RedisHandle {
 
     /// Runs `pipe` (atomic or not) on the session's connection: one reply per command (for an
     /// atomic pipeline: the `EXEC` replies). Without `ignore_errors` the first error reply
-    /// fails the call. Cancel replaces the connection.
+    /// fails the call. An atomic pipeline whose `EXEC` returns nil (a key `WATCH`ed on this
+    /// connection changed, nothing was written) fails with
+    /// `Error::Sql { code: Some("EXECABORT") }`, never with an empty reply list. Cancel closes
+    /// the connection (the next command reconnects).
     pub async fn pipeline(
         &self,
         pipe: &redis::Pipeline,
@@ -443,6 +454,9 @@ impl Connection for RedisConnection {
         let args = command_args(sql, params)?;
         let info = CommandInfo::of(&args);
         info.check_allowed(&args)?;
+        if self.session.is_cluster() {
+            info.check_cluster()?;
+        }
         let session = self.session.clone();
         let run = async move {
             let mut cmd = redis::Cmd::new();
