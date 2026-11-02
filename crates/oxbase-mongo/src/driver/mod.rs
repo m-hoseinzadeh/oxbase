@@ -101,11 +101,11 @@
 //! stream, which stops the statement at once (also while it waits for a slow batch): its
 //! operation is killed by comment and the cursor dropped (→ `killCursors`).
 
-mod convert;
+pub(crate) mod convert;
 mod dialer;
-mod error;
+pub(crate) mod error;
 mod run;
-mod statement;
+pub(crate) mod statement;
 
 use std::collections::HashMap;
 use std::fmt;

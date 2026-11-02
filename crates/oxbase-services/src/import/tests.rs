@@ -292,16 +292,36 @@ impl Capabilities for ToyCaps {
 }
 
 /// Keeps the loaded batches; fails a call that holds the text `boom`; sleeps `delay` per call.
+/// With `transactional` off it is an M7 loader without transactions that creates its target
+/// itself (`CREATE TARGET` in the log), like MongoDB's.
 struct RecordingLoader {
     loaded: Arc<Mutex<Vec<RecordBatch>>>,
     log: Log,
     delay: Duration,
+    transactional: bool,
 }
 
 #[async_trait]
 impl BulkLoader for RecordingLoader {
     fn method(&self, _version: &ServerVersion) -> BulkMethod {
         BulkMethod::CopyText
+    }
+
+    fn transactional(&self) -> bool {
+        self.transactional
+    }
+
+    async fn create_target(
+        &self,
+        _session: LoadSession<'_>,
+        target: &LoadTarget<'_>,
+        _cancel: CancellationToken,
+    ) -> Option<Result<()>> {
+        if self.transactional {
+            return None;
+        }
+        lock(&self.log).push(format!("CREATE TARGET {}", target.table.name));
+        Some(Ok(()))
     }
 
     fn limits(&self, _version: &ServerVersion) -> BulkLimits {
@@ -352,6 +372,8 @@ struct Setup {
     /// Register the recording loader (else the fallback `InsertLoader` runs).
     recording: bool,
     delay: Duration,
+    /// M7: the recording loader works without transactions.
+    no_transaction: bool,
 }
 
 impl Default for Setup {
@@ -360,6 +382,7 @@ impl Default for Setup {
             transactional_ddl: true,
             recording: true,
             delay: Duration::ZERO,
+            no_transaction: false,
         }
     }
 }
@@ -412,6 +435,7 @@ async fn harness(setup: Setup) -> Harness {
                 loaded: Arc::clone(&loaded),
                 log: Arc::clone(&log),
                 delay: setup.delay,
+                transactional: !setup.no_transaction,
             }),
         );
     }
@@ -1028,6 +1052,103 @@ async fn batches_commit_and_failures_keep_committed_rows() {
         .collect();
     assert_eq!(committed, [2, 4]);
     assert_eq!(h.log().iter().filter(|l| *l == "COMMIT").count(), 2);
+}
+
+fn no_transaction() -> Setup {
+    Setup {
+        no_transaction: true,
+        ..Setup::default()
+    }
+}
+
+#[tokio::test]
+async fn a_loader_without_transactions_cannot_empty_or_replace() {
+    let h = harness(no_transaction()).await;
+    let specs = text_specs(&["id", "code"]);
+    for mode in [
+        TargetMode::Truncate,
+        TargetMode::DeleteAll,
+        TargetMode::Replace,
+    ] {
+        let request = h.request(specs.clone(), vec![map(0, "id"), map(1, "code")], "t", mode);
+        let e = h.plan_err(&request).await;
+        assert_eq!(e.category(), ErrorCategory::Unsupported, "{mode:?}: {e}");
+    }
+    let request = h.request(
+        specs,
+        vec![map(0, "id"), map(1, "code")],
+        "fresh",
+        TargetMode::Create,
+    );
+    let plan = h
+        .import
+        .plan(&h.source(), &request, CancellationToken::new())
+        .await
+        .unwrap();
+    assert!(plan.creates_table);
+    assert!(plan.ddl.is_empty(), "{:?}", plan.ddl);
+    assert!(!plan.destructive);
+    assert!(
+        plan.warnings
+            .iter()
+            .any(|w| w.contains("without a transaction")),
+        "{:?}",
+        plan.warnings
+    );
+}
+
+#[tokio::test]
+async fn a_loader_without_transactions_creates_its_target_and_keeps_written_rows() {
+    let h = harness(no_transaction()).await;
+    let specs = text_specs(&["id", "code"]);
+    let request = h.request(
+        specs.clone(),
+        vec![map(0, "id"), map(1, "code")],
+        "fresh",
+        TargetMode::Create,
+    );
+    let ids = vec![Some("1"), Some("2"), Some("3"), Some("4"), Some("5")];
+    let codes = vec![Some("a"), Some("b"), Some("c"), Some("d"), Some("e")];
+    let events = h
+        .run(request, vec![(text_rows(&[ids, codes]), Vec::new())])
+        .await;
+    assert!(
+        matches!(events.last(), Some(ImportEvent::Finished { .. })),
+        "{events:?}"
+    );
+    let report = report_of(&events);
+    assert_eq!(report.rows_committed, 5);
+    assert!(report.table_created);
+    let log = h.log();
+    assert_eq!(log[0], "CREATE TARGET fresh", "{log:?}");
+    assert!(
+        !log.iter()
+            .any(|l| l == "BEGIN" || l == "COMMIT" || l.starts_with("tx:")),
+        "no transaction: {log:?}"
+    );
+
+    // A failure keeps the calls written before it, and says so.
+    let request = h.request(
+        specs,
+        vec![map(0, "id"), map(1, "code")],
+        "t",
+        TargetMode::Append,
+    );
+    let ids = vec![Some("1"), Some("2"), Some("3"), Some("4"), Some("5")];
+    let codes = vec![Some("a"), Some("b"), Some("c"), Some("d"), Some("boom")];
+    let events = h
+        .run(request, vec![(text_rows(&[ids, codes]), Vec::new())])
+        .await;
+    let error = failure(&events);
+    assert!(error.message.contains("row 5"), "{error:?}");
+    let report = report_of(&events);
+    assert_eq!(report.rows_committed, 4);
+    assert!(
+        report.left_behind.contains("keeps the 4 rows"),
+        "{}",
+        report.left_behind
+    );
+    assert!(!h.log().iter().any(|l| l == "ROLLBACK"), "{:?}", h.log());
 }
 
 #[tokio::test]
