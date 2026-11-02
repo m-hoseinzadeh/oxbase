@@ -106,8 +106,8 @@ import / export step (step 9) once the integrator turns it on.
       saves a profile through IPC (`save_profile`, password _prompt_, TLS off: "E2E MongoDB"
       with `auth_source`, "E2E Redis"), reloads the window (the Connections panel lists profiles
       when it mounts; the core keeps its sessions) and connects through the Connections panel
-      and its password prompt. Neither fixture reachable is a skip: `scripts/e2e-fixtures.sh`
-      starts PostgreSQL only until the M7 integration adds `mongodb` and `redis`.
+      and its password prompt. `scripts/e2e-fixtures.sh` starts both (with PostgreSQL); an
+      unreachable fixture is a skip unless `OXBASE_E2E_REQUIRE_M7=1`.
     - **MongoDB.** The tree path `oxbase_test` → `Collections` → `m7_docs` opens the collection
       tab (`data-testid=collection-tab`, labelled "Collection oxbase_test.m7_docs"), whose status
       (`collection-status`) must reach 12 documents and whose grid must not show `$document`.
@@ -127,9 +127,9 @@ import / export step (step 9) once the integrator turns it on.
       to `after`, checks it with `GET` through IPC and deletes the key. The connection's
       **Console** runs `HGETALL m7:hash` (`console-input`); the reply (`resp-table` or
       `resp-lines`) must show without `(error)`.
-    - Until the integration, a missing fixture or any failure of these steps is a skip with a
-      warning. With `OXBASE_E2E_REQUIRE_M7=1` (set in the webview job at integration) a skip or
-      a failure fails the run.
+    - Without `OXBASE_E2E_REQUIRE_M7=1`, a missing fixture or any failure of these steps is a
+      skip with a warning. The webview job sets it (M7 integration), so there a skip or a
+      failure fails the run.
 
 ### The M5 file hook (app stream)
 

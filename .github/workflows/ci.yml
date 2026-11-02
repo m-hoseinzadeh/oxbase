@@ -228,16 +228,17 @@ jobs:
       # M1-M3 cell (connection checks, fetch_list, roundtrip, capabilities), nothing pending or
       # skipped; the live test mssql_seed_scripts_created_every_named_object checks the 03-06
       # init scripts through the catalog.
-      # M7: MongoDB and Redis run every connection check (plain, TLS, SSH, TLS over SSH, cancel,
-      # 200k rows) through their drivers, which must pass; their fetch_list cells list the [m7]
-      # seed once their dialect cells are registered (pending until then). The integrator adds
-      # OXBASE_CONFORMANCE_REQUIRE_M7=1 below (the 7-engine guard: every applicable cell of all
-      # seven engines passes) once those cells are merged.
+      # M7 exit check (docs/m7-contracts.md §11): MongoDB and Redis run every connection check
+      # (plain, TLS, SSH, TLS over SSH, cancel, 200k rows) through their drivers, and their
+      # fetch_list cells list the [m7] seed through the registered dialect cells.
+      # OXBASE_CONFORMANCE_REQUIRE_M7=1 is the 7-engine guard: every applicable cell of all
+      # seven engines must pass, nothing pending or skipped.
       - name: Run conformance harness
         env:
           OXBASE_CONFORMANCE_REQUIRE_M2_FETCH: "1"
           OXBASE_CONFORMANCE_REQUIRE_M3_ROUNDTRIP: "1"
           OXBASE_CONFORMANCE_REQUIRE_M4: "1"
+          OXBASE_CONFORMANCE_REQUIRE_M7: "1"
         run: cargo test -p oxbase-conformance --locked -- --include-ignored --nocapture --test-threads 1
 
       # Driver, tunnel and connection-manager live tests (SSH bastion, TLS-only users, cancel),
@@ -252,10 +253,16 @@ jobs:
       # (OXBASE_SERVICES_REQUIRE_M5_IO=1: a missing reader or writer fails instead of being
       # pending), and oxbase-io's SQL dump live test (each engine's dump run on its fixture).
       # The import_perf test is a skip here (no OXBASE_PERF_DIR); it runs in import-perf.
+      # M7: the MongoDB / Redis driver, fetch, document, key, pub/sub, cluster, sentinel, shell
+      # and console live tests and the services' m7_*_live tests (browse, edit and query on both
+      # engines). The REQUIRE switches turn a missing M7 fixture, seed or cell into a failure.
       - name: Run M1-M5 live tests
         env:
           OXBASE_SERVICES_REQUIRE_M3_CELLS: "1"
           OXBASE_SERVICES_REQUIRE_M5_IO: "1"
+          OXBASE_SERVICES_REQUIRE_M7: "1"
+          OXBASE_REDIS_REQUIRE_M7: "1"
+          OXBASE_SHELL_REQUIRE_M7_SEED: "1"
         run: cargo test -p oxbase-net -p oxbase-pg -p oxbase-mysql -p oxbase-sqlite -p oxbase-mssql -p oxbase-mongo -p oxbase-redis -p oxbase-services -p oxbase-io --locked -- --include-ignored --test-threads 1 --nocapture
 
       - name: Dump fixture logs
@@ -387,7 +394,7 @@ jobs:
       - name: Generate fixture TLS PKI and SSH keys
         run: bash scripts/fixtures-certs.sh
 
-      - name: Start the PostgreSQL fixture
+      - name: Start the PostgreSQL, MongoDB and Redis fixtures
         run: bash scripts/ci-fixtures.sh up postgres
 
       - name: Completion latency on a live 5k-table PostgreSQL schema
@@ -468,18 +475,20 @@ jobs:
       - name: Build the debug app
         run: cargo build -p app-tauri --locked --features tauri/custom-protocol
 
-      - name: Start the PostgreSQL fixture
+      - name: Start the PostgreSQL, MongoDB and Redis fixtures
         run: bash scripts/e2e-fixtures.sh up
 
       # M3: the table-data edit step is mandatory (a skip fails the job). M5: so is the
       # import / export step (the debug app's --e2e-file-dir hook, ui/e2e/README.md). M6: so is
-      # the code-insight step (completion, diagnostics, format, IPC latency).
+      # the code-insight step (completion, diagnostics, format, IPC latency). M7: so is the
+      # MongoDB / Redis step (collection, shell, key browser, console; screenshots).
       - name: Webview smoke test
         env:
           OXBASE_E2E_OUT: ${{ runner.temp }}/e2e
           OXBASE_E2E_REQUIRE_EDIT: "1"
           OXBASE_E2E_REQUIRE_M5: "1"
           OXBASE_E2E_REQUIRE_M6: "1"
+          OXBASE_E2E_REQUIRE_M7: "1"
         run: bash scripts/e2e-smoke.sh
 
       - name: Upload e2e results

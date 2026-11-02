@@ -9,8 +9,8 @@ use oxbase_types::{Engine, ObjectKind};
 /// `DialectRegistry`'s *Registration* docs). Until an engine registers anything, its
 /// not-applicable cells come from [`provisional_applicable`], the M0 table the conformance
 /// harness used, so the object-kind matrix does not change shape. SQL Server registers its cells
-/// since M4; MongoDB and Redis stay provisional until their M7 cells are integrated (the two
-/// commented lines below; `docs/m7-contracts.md` §1).
+/// since M4, MongoDB and Redis since M7 (`docs/m7-contracts.md` §1), so every shipped engine
+/// registers its own cells now.
 pub fn default_dialects() -> DialectRegistry {
     let mut reg = DialectRegistry::new();
 
@@ -25,13 +25,11 @@ pub fn default_dialects() -> DialectRegistry {
 
     oxbase_mssql::dialect::register(&mut reg);
 
-    // M7 integration: uncomment once the mongo, mongo-driver and shell streams are merged
-    // (fetchers, DocumentStore, BulkLoader, ScriptLanguage all registered at once).
-    // oxbase_mongo::dialect::register(&mut reg);
+    // M7: fetchers, DocumentStore, BulkLoader and ScriptLanguage (the mongo shell).
+    oxbase_mongo::dialect::register(&mut reg);
 
-    // M7 integration: uncomment once the redis, redis-driver and shell streams are merged
-    // (fetchers, KeyValueStore, PubSub, ScriptLanguage all registered at once).
-    // oxbase_redis::dialect::register(&mut reg);
+    // M7: fetchers, KeyValueStore, PubSub and ScriptLanguage (the console).
+    oxbase_redis::dialect::register(&mut reg);
 
     mark_provisional(&mut reg);
     reg
@@ -159,8 +157,39 @@ mod tests {
         ] {
             assert!(reg.has_bulk_loader(engine), "{engine}");
         }
-        assert!(!reg.has_bulk_loader(Engine::MongoDb));
+        // M7: MongoDB imports through `insertMany`; Redis has no bulk loader.
+        assert!(reg.has_bulk_loader(Engine::MongoDb));
         assert!(!reg.has_bulk_loader(Engine::Redis));
+    }
+
+    #[test]
+    fn every_engine_registers_its_own_cells() {
+        // M7 integration (docs/m7-contracts.md §1): no engine is provisional any more.
+        let reg = default_dialects();
+        for engine in Engine::ALL {
+            assert!(reg.tree_layout(engine).is_ok(), "{engine}");
+        }
+    }
+
+    #[test]
+    fn document_and_key_value_engines_have_their_m7_roles() {
+        // M7 integration (docs/m7-contracts.md §1): the tree, fetchers, script language and the
+        // document / key-value / pub-sub roles of both engines.
+        let reg = default_dialects();
+        for engine in Engine::ALL {
+            assert_eq!(
+                reg.missing_m7_roles(engine),
+                Vec::<String>::new(),
+                "{engine}"
+            );
+        }
+        for engine in [Engine::MongoDb, Engine::Redis] {
+            assert_eq!(
+                reg.missing_layout_fetchers(engine),
+                Vec::<ObjectKind>::new(),
+                "{engine}"
+            );
+        }
     }
 
     #[test]
