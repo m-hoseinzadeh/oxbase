@@ -343,9 +343,8 @@ async fn handshake(
     redactor: &Redactor,
 ) -> Result<ServerVersion> {
     let direct = options.direct_connection && !options.srv;
-    let build_info = client
-        .database("admin")
-        .run_command(doc! {"buildInfo": 1_i32});
+    let admin = client.database("admin");
+    let build_info = admin.run_command(doc! {"buildInfo": 1_i32});
     let reply = tokio::select! {
         reply = build_info => reply.map_err(|e| map_error(&e, redactor))?,
         _ = failures.changed(), if direct => {

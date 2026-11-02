@@ -32,7 +32,6 @@ use std::time::Duration;
 
 use oxbase_driver::ConnectParams;
 use oxbase_net::tls::rustls::ClientConfig;
-use oxbase_net::tls::rustls::pki_types::ServerName;
 use oxbase_types::{Endpoint, Error, Result, TlsMode, TlsOptions};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
@@ -284,9 +283,12 @@ impl Shared {
     }
 }
 
+fn bare_host(h: &str) -> &str {
+    h.trim().trim_start_matches('[').trim_end_matches(']')
+}
+
 fn same_host(a: &str, b: &str) -> bool {
-    let trim = |h: &str| h.trim().trim_start_matches('[').trim_end_matches(']');
-    let (a, b) = (trim(a), trim(b));
+    let (a, b) = (bare_host(a), bare_host(b));
     match (a.parse::<IpAddr>(), b.parse::<IpAddr>()) {
         (Ok(x), Ok(y)) => x == y,
         _ => a.eq_ignore_ascii_case(b),

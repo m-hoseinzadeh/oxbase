@@ -45,7 +45,7 @@ impl Redactor {
 pub(crate) fn map_error(e: &MongoError, redactor: &Redactor) -> Error {
     let text = |m: &str| redactor.apply(m);
     match e.kind.as_ref() {
-        ErrorKind::Authentication { message } => Error::auth(text(message)),
+        ErrorKind::Authentication { message, .. } => Error::auth(text(message)),
         ErrorKind::Command(c) => server_error(c.code, &c.code_name, &text(&c.message)),
         ErrorKind::Write(WriteFailure::WriteError(w)) => server_error(
             w.code,
@@ -55,23 +55,22 @@ pub(crate) fn map_error(e: &MongoError, redactor: &Redactor) -> Error {
         ErrorKind::Write(WriteFailure::WriteConcernError(w)) => {
             server_error(w.code, &w.code_name, &text(&w.message))
         }
-        ErrorKind::ServerSelection { message }
-        | ErrorKind::ProxyConnect { message }
-        | ErrorKind::DnsResolve { message }
-        | ErrorKind::ConnectionPoolCleared { message } => Error::connection(text(message)),
+        ErrorKind::ServerSelection { message, .. }
+        | ErrorKind::ProxyConnect { message, .. }
+        | ErrorKind::DnsResolve { message, .. }
+        | ErrorKind::ConnectionPoolCleared { message, .. } => Error::connection(text(message)),
         ErrorKind::Io(io) => Error::connection(text(&io.to_string())),
         ErrorKind::Shutdown => Error::connection("the MongoDB connection is closed"),
-        ErrorKind::InvalidArgument { message } | ErrorKind::InvalidTlsConfig { message } => {
-            Error::invalid_input(text(message))
-        }
+        ErrorKind::InvalidArgument { message, .. }
+        | ErrorKind::InvalidTlsConfig { message, .. } => Error::invalid_input(text(message)),
         ErrorKind::BsonDeserialization(err) => Error::invalid_input(text(&err.to_string())),
         ErrorKind::BsonSerialization(err) => Error::invalid_input(text(&err.to_string())),
         ErrorKind::Bson(err) => Error::invalid_input(text(&err.to_string())),
-        ErrorKind::IncompatibleServer { message } => Error::unsupported(text(message)),
+        ErrorKind::IncompatibleServer { message, .. } => Error::unsupported(text(message)),
         ErrorKind::SessionsNotSupported => {
             Error::unsupported("this MongoDB deployment does not support sessions")
         }
-        ErrorKind::InvalidResponse { message } | ErrorKind::Internal { message } => {
+        ErrorKind::InvalidResponse { message, .. } | ErrorKind::Internal { message, .. } => {
             Error::internal(text(message))
         }
         _ => Error::sql(None::<String>, text(&e.to_string())),
