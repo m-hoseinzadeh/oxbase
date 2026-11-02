@@ -5,7 +5,9 @@
 //!
 //! 1. If [`HistorySettings::enabled`] is off, nothing is written (`Ok(None)`).
 //! 2. The SQL text and the error message are passed through `oxbase_sql::redact_secrets` for the
-//!    statement's dialect (password literals become `'***'`), then cut to
+//!    statement's dialect (password literals become `'***'`), or (M7) through the engine's
+//!    `ScriptLanguage::redact_secrets` for MongoDB and Redis (`AUTH`, `ACL SETUSER`,
+//!    `createUser` passwords become `***`), see [`StatementSource`], then cut to
 //!    [`MAX_SQL_BYTES`] / [`MAX_ERROR_BYTES`] at a character boundary (with a trailing `…`).
 //! 3. The entry gets a UUID v7 id and is appended; every [`PRUNE_EVERY`] appends the repository
 //!    is pruned to [`HistorySettings::max_entries`].
@@ -20,7 +22,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
-use oxbase_sql::{SqlDialect, redact_secrets};
+use crate::script::StatementSource;
 use oxbase_store::{HistoryEntry, HistoryQuery, HistoryRepository, HistorySettings, HistoryStatus};
 use oxbase_types::Result;
 
@@ -38,8 +40,9 @@ const ELLIPSIS: &str = "…";
 pub struct HistoryRecord {
     pub profile_id: Uuid,
     pub database: Option<String>,
-    /// Dialect used to find the literals to redact.
-    pub dialect: SqlDialect,
+    /// M7: the editor's statement source, used to find the secrets to redact (was the SQL
+    /// dialect).
+    pub source: StatementSource,
     /// The statement text as it ran (not yet redacted).
     pub sql: String,
     pub started_at: DateTime<Utc>,
@@ -75,11 +78,11 @@ impl HistoryService {
         if !settings.enabled {
             return Ok(None);
         }
-        let sql = truncate(&redact(record.dialect, &record.sql), MAX_SQL_BYTES);
+        let sql = truncate(&record.source.redact_secrets(&record.sql), MAX_SQL_BYTES);
         let error = record
             .error
             .as_deref()
-            .map(|e| truncate(&redact(record.dialect, e), MAX_ERROR_BYTES));
+            .map(|e| truncate(&record.source.redact_secrets(e), MAX_ERROR_BYTES));
         let entry = HistoryEntry {
             id: Uuid::now_v7(),
             profile_id: record.profile_id,
@@ -127,11 +130,6 @@ impl HistoryService {
     }
 }
 
-/// `oxbase_sql::redact_secrets`, owned.
-fn redact(dialect: SqlDialect, text: &str) -> String {
-    redact_secrets(dialect, text).into_owned()
-}
-
 /// `text` cut to at most `max` bytes at a character boundary, with `…` appended when cut.
 pub fn truncate(text: &str, max: usize) -> String {
     if text.len() <= max {
@@ -176,7 +174,7 @@ mod tests {
             .record(HistoryRecord {
                 profile_id: Uuid::nil(),
                 database: None,
-                dialect: SqlDialect::Postgres,
+                source: StatementSource::Sql(oxbase_sql::SqlDialect::Postgres),
                 sql: "ALTER USER x PASSWORD 'marker-secret'".into(),
                 started_at: Utc::now(),
                 duration: Duration::from_millis(1),

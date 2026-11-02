@@ -9,7 +9,8 @@ use oxbase_types::{Engine, ObjectKind};
 /// `DialectRegistry`'s *Registration* docs). Until an engine registers anything, its
 /// not-applicable cells come from [`provisional_applicable`], the M0 table the conformance
 /// harness used, so the object-kind matrix does not change shape. SQL Server registers its cells
-/// since M4; MongoDB and Redis stay provisional until M7.
+/// since M4; MongoDB and Redis stay provisional until their M7 cells are integrated (the two
+/// commented lines below; `docs/m7-contracts.md` §1).
 pub fn default_dialects() -> DialectRegistry {
     let mut reg = DialectRegistry::new();
 
@@ -23,6 +24,14 @@ pub fn default_dialects() -> DialectRegistry {
     oxbase_sqlite::dialect::register(&mut reg);
 
     oxbase_mssql::dialect::register(&mut reg);
+
+    // M7 integration: uncomment once the mongo, mongo-driver and shell streams are merged
+    // (fetchers, DocumentStore, BulkLoader, ScriptLanguage all registered at once).
+    // oxbase_mongo::dialect::register(&mut reg);
+
+    // M7 integration: uncomment once the redis, redis-driver and shell streams are merged
+    // (fetchers, KeyValueStore, PubSub, ScriptLanguage all registered at once).
+    // oxbase_redis::dialect::register(&mut reg);
 
     mark_provisional(&mut reg);
     reg

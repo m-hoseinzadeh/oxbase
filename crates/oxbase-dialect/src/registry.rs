@@ -8,7 +8,11 @@ use oxbase_types::{Engine, Error, ObjectKind, Result, ServerVersion};
 
 use crate::bulk::{BulkLimits, BulkLoader, InsertLoader};
 use crate::catalog::CatalogReader;
+use crate::document::DocumentStore;
+use crate::keyvalue::KeyValueStore;
 use crate::language::SqlLanguage;
+use crate::pubsub::PubSub;
+use crate::script::ScriptLanguage;
 use crate::{Capabilities, Comparator, DdlGenerator, DmlWriter, Fetcher, Quoting, TreeLayout};
 
 /// The kinds the M3 table designer and the round-trip conformance cells need a
@@ -230,6 +234,14 @@ struct EngineEntry {
     catalog: Option<Arc<dyn CatalogReader>>,
     /// M6: keywords, functions, types and identifier rules for code insight. Data, not a role.
     language: Option<Arc<SqlLanguage>>,
+    /// M7: the editor language of an engine without SQL (mongo shell, Redis console).
+    script: Option<Arc<dyn ScriptLanguage>>,
+    /// M7: document reads and writes (MongoDB).
+    documents: Option<Arc<dyn DocumentStore>>,
+    /// M7: key browsing and typed values (Redis).
+    key_values: Option<Arc<dyn KeyValueStore>>,
+    /// M7: publish / subscribe (Redis).
+    pubsub: Option<Arc<dyn PubSub>>,
 }
 
 /// Holds every dialect implementation, keyed by (engine, object kind) for per-kind roles and by
@@ -289,6 +301,22 @@ struct EngineEntry {
 ///
 /// [`DialectRegistry::missing_insight_roles`] must be empty for PostgreSQL, MySQL, MariaDB,
 /// SQLite and SQL Server at the end of M6.
+///
+/// # Registration (M7)
+///
+/// `oxbase_mongo::dialect::register` and `oxbase_redis::dialect::register` register, besides
+/// fetchers, the tree layout, capabilities and not-applicable marks (`docs/m7-contracts.md`
+/// §3, §4):
+///
+/// - both: a [`ScriptLanguage`] ([`DialectRegistry::register_script_language`]), the editor
+///   language the query service splits and redacts with (mongo shell, Redis console);
+/// - MongoDB: a [`DocumentStore`] ([`DialectRegistry::register_document_store`]) and a
+///   [`BulkLoader`] for collections;
+/// - Redis: a [`KeyValueStore`] ([`DialectRegistry::register_key_value_store`]) and a
+///   [`PubSub`] ([`DialectRegistry::register_pubsub`]).
+///
+/// Neither registers `Quoting`, `DmlWriter`, DDL generators or comparators: they have no SQL.
+/// [`DialectRegistry::missing_m7_roles`] must be empty for both at the end of M7.
 #[derive(Default, Clone)]
 pub struct DialectRegistry {
     cells: HashMap<(Engine, ObjectKind), Cell>,
@@ -383,6 +411,42 @@ impl DialectRegistry {
     /// Registers the SQL language data of `engine` (M6), replacing earlier data.
     pub fn register_language(&mut self, engine: Engine, language: SqlLanguage) -> &mut Self {
         self.engine_mut(engine).language = Some(Arc::new(language));
+        self
+    }
+
+    /// Registers the editor language of `engine` (M7), replacing an earlier one.
+    pub fn register_script_language(
+        &mut self,
+        engine: Engine,
+        language: Arc<dyn ScriptLanguage>,
+    ) -> &mut Self {
+        self.engine_mut(engine).script = Some(language);
+        self
+    }
+
+    /// Registers the document store of `engine` (M7), replacing an earlier one.
+    pub fn register_document_store(
+        &mut self,
+        engine: Engine,
+        store: Arc<dyn DocumentStore>,
+    ) -> &mut Self {
+        self.engine_mut(engine).documents = Some(store);
+        self
+    }
+
+    /// Registers the key-value store of `engine` (M7), replacing an earlier one.
+    pub fn register_key_value_store(
+        &mut self,
+        engine: Engine,
+        store: Arc<dyn KeyValueStore>,
+    ) -> &mut Self {
+        self.engine_mut(engine).key_values = Some(store);
+        self
+    }
+
+    /// Registers the publish / subscribe role of `engine` (M7), replacing an earlier one.
+    pub fn register_pubsub(&mut self, engine: Engine, pubsub: Arc<dyn PubSub>) -> &mut Self {
+        self.engine_mut(engine).pubsub = Some(pubsub);
         self
     }
 
@@ -546,6 +610,89 @@ impl DialectRegistry {
             );
         } else {
             out.push(format!("{engine}: no SqlLanguage"));
+        }
+        out
+    }
+
+    /// The editor language of `engine` (M7); `Error::Unsupported` when none is registered (the
+    /// SQL engines use `oxbase_sql` instead).
+    pub fn script_language(&self, engine: Engine) -> Result<Arc<dyn ScriptLanguage>> {
+        self.engines
+            .get(&engine)
+            .and_then(|e| e.script.clone())
+            .ok_or_else(|| {
+                Error::unsupported(format!("{} has no query editor", engine.display_name()))
+            })
+    }
+
+    /// The document store of `engine` (M7); `Error::Unsupported` when none is registered.
+    pub fn document_store(&self, engine: Engine) -> Result<Arc<dyn DocumentStore>> {
+        self.engines
+            .get(&engine)
+            .and_then(|e| e.documents.clone())
+            .ok_or_else(|| {
+                Error::unsupported(format!("{} has no documents", engine.display_name()))
+            })
+    }
+
+    /// The key-value store of `engine` (M7); `Error::Unsupported` when none is registered.
+    pub fn key_value_store(&self, engine: Engine) -> Result<Arc<dyn KeyValueStore>> {
+        self.engines
+            .get(&engine)
+            .and_then(|e| e.key_values.clone())
+            .ok_or_else(|| Error::unsupported(format!("{} has no keys", engine.display_name())))
+    }
+
+    /// The publish / subscribe role of `engine` (M7); `Error::Unsupported` when none is
+    /// registered.
+    pub fn pubsub(&self, engine: Engine) -> Result<Arc<dyn PubSub>> {
+        self.engines
+            .get(&engine)
+            .and_then(|e| e.pubsub.clone())
+            .ok_or_else(|| {
+                Error::unsupported(format!(
+                    "{} has no publish / subscribe",
+                    engine.display_name()
+                ))
+            })
+    }
+
+    /// What `engine` still lacks for M7 (`docs/m7-contracts.md` §1): MongoDB needs a tree
+    /// layout, a fetcher per layout kind, a [`ScriptLanguage`], a [`DocumentStore`] and a
+    /// [`BulkLoader`]; Redis a tree layout, its fetchers, a [`ScriptLanguage`], a
+    /// [`KeyValueStore`] and a [`PubSub`]. Empty for every other engine. Engine streams assert
+    /// this is empty.
+    pub fn missing_m7_roles(&self, engine: Engine) -> Vec<String> {
+        let mut out = Vec::new();
+        if !matches!(engine, Engine::MongoDb | Engine::Redis) {
+            return out;
+        }
+        let entry = self.engines.get(&engine);
+        if self.tree_layout(engine).is_err() {
+            out.push(format!("{engine}: no TreeLayout"));
+        }
+        out.extend(
+            self.missing_layout_fetchers(engine)
+                .into_iter()
+                .map(|k| format!("{engine}/{k}: no Fetcher")),
+        );
+        if entry.is_none_or(|e| e.script.is_none()) {
+            out.push(format!("{engine}: no ScriptLanguage"));
+        }
+        if engine == Engine::MongoDb {
+            if entry.is_none_or(|e| e.documents.is_none()) {
+                out.push(format!("{engine}: no DocumentStore"));
+            }
+            if entry.is_none_or(|e| e.bulk.is_none()) {
+                out.push(format!("{engine}: no BulkLoader"));
+            }
+        } else {
+            if entry.is_none_or(|e| e.key_values.is_none()) {
+                out.push(format!("{engine}: no KeyValueStore"));
+            }
+            if entry.is_none_or(|e| e.pubsub.is_none()) {
+                out.push(format!("{engine}: no PubSub"));
+            }
         }
         out
     }

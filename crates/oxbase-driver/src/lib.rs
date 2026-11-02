@@ -44,6 +44,19 @@
 //! [`cell_value`] reads one Arrow cell as a [`Value`] (the inverse of what drivers produce), for
 //! bulk loaders and the SQL dump writer.
 //!
+//! # Result sources (M7)
+//!
+//! A [`ResultSource`] produces a [`ResultStream`] from engine code rather than from statement
+//! text (a MongoDB find request, a Redis `SCAN` over every key). Services run it like a
+//! statement (`QueryService::run_source`), so it gets the same events, paging and cancel.
+//!
+//! # Statement text of non-SQL engines (M7)
+//!
+//! [`Connection::execute`] takes the statement in the engine's own language: SQL for the SQL
+//! engines, one mongo-shell statement (or a JSON request) for MongoDB, one console command line
+//! for Redis (`docs/m7-contracts.md` §4). `params` are bound values for SQL; for Redis they are
+//! extra arguments after the command words; MongoDB takes none.
+//!
 //! # Feature `mock`
 //!
 //! Enables `mock::MockDriver`, an in-memory driver that streams fixed Arrow batches and honours
@@ -54,6 +67,7 @@ mod params;
 mod progress;
 mod registry;
 mod result;
+mod source;
 
 #[cfg(feature = "mock")]
 pub mod mock;
@@ -73,6 +87,7 @@ pub use registry::DriverRegistry;
 pub use result::{
     Collected, Notice, NoticeSeverity, ResultItem, ResultSet, ResultStream, collect, from_arrow,
 };
+pub use source::ResultSource;
 pub use tokio_util::sync::CancellationToken;
 
 /// Re-exports of the Arrow types that appear in this crate's API.

@@ -15,6 +15,10 @@ pub fn default_drivers() -> DriverRegistry {
     drivers.register_as(Engine::MariaDb, mysql);
     drivers.register(Arc::new(oxbase_sqlite::SqliteDriver));
     oxbase_mssql::register(&mut drivers);
+    // M7: the mongo-driver and redis-driver streams each uncomment their own line (and extend
+    // the test below) when their driver connects (docs/m7-contracts.md §1).
+    // oxbase_mongo::register(&mut drivers);
+    // oxbase_redis::register(&mut drivers);
     drivers
 }
 

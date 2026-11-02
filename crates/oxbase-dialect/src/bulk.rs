@@ -90,6 +90,9 @@ pub enum BulkMethod {
     PreparedInsert,
     /// SQL Server TDS bulk load (`INSERT BULK`).
     TdsBulkLoad,
+    /// M7: MongoDB `insertMany` batches of documents built from the rows (unordered within a
+    /// batch is not used: `ordered: true`, so a failure names its row).
+    DocumentInsert,
 }
 
 /// Batch-size rules of one engine. See the module docs, *Limits*.
@@ -367,6 +370,29 @@ pub trait BulkLoader: Send + Sync {
     ) -> Result<()> {
         let _ = (session, target, cancel);
         Ok(())
+    }
+
+    /// M7: `true` (default) when loads run inside a transaction the import service opens.
+    /// `false` (MongoDB collections): the service calls `load` without a transaction
+    /// (`LoadSession::tx` is `None`), every call that returned is kept, and the import plan and
+    /// report say a failure or cancel leaves the batches loaded so far (like the M3
+    /// non-transactional tables). `docs/m7-contracts.md` §5.3.
+    fn transactional(&self) -> bool {
+        true
+    }
+
+    /// M7: creates `target.table` with `target.columns` for the import mode *create* on an
+    /// engine without a `DdlGenerator` (MongoDB: `create` the collection; the columns become
+    /// document fields, nothing to declare). `None` (default): the service uses the engine's
+    /// `DdlGenerator`, as for every SQL engine.
+    async fn create_target(
+        &self,
+        session: LoadSession<'_>,
+        target: &LoadTarget<'_>,
+        cancel: CancellationToken,
+    ) -> Option<Result<()>> {
+        let _ = (session, target, cancel);
+        None
     }
 
     /// Inserts every row of `batch` (in the load schema of `target`) into `target.table` on

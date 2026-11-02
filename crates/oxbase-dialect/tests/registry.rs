@@ -636,3 +636,108 @@ async fn a_registered_catalog_reader_reads_through_the_connection() {
     assert_eq!(snap.engine, Engine::MySql);
     assert_eq!(snap.relation_count(), 0);
 }
+
+/// M7: a toy editor language (one statement per non-empty line).
+struct ToyLines;
+
+impl oxbase_dialect::ScriptLanguage for ToyLines {
+    fn name(&self) -> &'static str {
+        "toy-lines"
+    }
+
+    fn editor_language(&self) -> &'static str {
+        "plaintext"
+    }
+
+    fn split(&self, text: &str) -> Vec<oxbase_sql::Statement> {
+        let mut out = Vec::new();
+        let mut offset = 0;
+        for line in text.split_inclusive('\n') {
+            let range = offset..offset + line.len();
+            offset = range.end;
+            if let Some(trimmed) = oxbase_dialect::script::trim_range(text, range.clone()) {
+                out.push(oxbase_dialect::script::statement(
+                    text,
+                    trimmed,
+                    range.end,
+                    oxbase_sql::StatementKind::Other,
+                ));
+            }
+        }
+        out
+    }
+
+    fn redact_secrets<'a>(&self, text: &'a str) -> std::borrow::Cow<'a, str> {
+        std::borrow::Cow::Borrowed(text)
+    }
+}
+
+#[test]
+fn missing_m7_roles_lists_what_mongodb_and_redis_need() {
+    let mut reg = DialectRegistry::new();
+    assert_eq!(reg.missing_m7_roles(Engine::Postgres), Vec::<String>::new());
+    assert_eq!(
+        reg.missing_m7_roles(Engine::MongoDb),
+        [
+            "mongodb: no TreeLayout",
+            "mongodb: no ScriptLanguage",
+            "mongodb: no DocumentStore",
+            "mongodb: no BulkLoader",
+        ]
+    );
+    assert_eq!(
+        reg.missing_m7_roles(Engine::Redis),
+        [
+            "redis: no TreeLayout",
+            "redis: no ScriptLanguage",
+            "redis: no KeyValueStore",
+            "redis: no PubSub",
+        ]
+    );
+    assert_eq!(
+        reg.script_language(Engine::Redis)
+            .err()
+            .as_ref()
+            .map(Error::category),
+        Some(ErrorCategory::Unsupported)
+    );
+    assert!(reg.document_store(Engine::MongoDb).is_err());
+    assert!(reg.key_value_store(Engine::Redis).is_err());
+    assert!(reg.pubsub(Engine::Redis).is_err());
+
+    reg.register_tree_layout(
+        Engine::Redis,
+        TreeLayout::new(DatabaseScope::Session)
+            .with_root(&[ChildGroup::direct(ObjectKind::Database)])
+            .with_children(
+                ObjectKind::Database,
+                &[
+                    ChildGroup::direct(ObjectKind::Schema),
+                    ChildGroup::direct(ObjectKind::Key),
+                ],
+            )
+            .with_label(ObjectKind::Schema, "Namespace", "Namespaces"),
+    );
+    reg.register_script_language(Engine::Redis, Arc::new(ToyLines));
+    assert_eq!(
+        reg.missing_m7_roles(Engine::Redis),
+        [
+            "redis/database: no Fetcher",
+            "redis/schema: no Fetcher",
+            "redis/key: no Fetcher",
+            "redis: no KeyValueStore",
+            "redis: no PubSub",
+        ]
+    );
+    let language = reg.script_language(Engine::Redis).unwrap();
+    assert_eq!(language.name(), "toy-lines");
+    let statements = language.split("PING\n\nGET a\n");
+    assert_eq!(statements.len(), 2);
+    assert_eq!(statements[1].text, "GET a");
+    assert_eq!(
+        reg.tree_layout(Engine::Redis)
+            .unwrap()
+            .folder_label(ObjectKind::Schema),
+        "Namespaces"
+    );
+}

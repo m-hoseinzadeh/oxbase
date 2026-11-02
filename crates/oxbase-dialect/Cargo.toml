@@ -24,6 +24,10 @@ arrow-schema.workspace = true
 futures.workspace = true
 # M5 integration: SQL dump date-time literals (`dump`).
 chrono.workspace = true
+# M7: editor languages of non-SQL engines return `oxbase_sql::Statement`s (`script`).
+oxbase-sql.workspace = true
+# M7: the pub/sub role's bounded event sink (`pubsub`).
+tokio.workspace = true
 
 [dev-dependencies]
 oxbase-driver = { workspace = true, features = ["mock"] }

@@ -1,6 +1,6 @@
 [package]
 name = "oxbase-redis"
-description = "oxbase: Redis driver"
+description = "oxbase: Redis driver, dialect cells and console"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,6 +11,32 @@ authors.workspace = true
 [lints]
 workspace = true
 
+# M7 (Design step). Every dependency the redis-driver, redis and shell streams need is listed
+# here so no stream touches Cargo.lock. A stream that needs another crate adds it with an explicit
+# version and reports it for hoisting (docs/m7-contracts.md §1).
 [dependencies]
+oxbase-types.workspace = true
+oxbase-driver.workspace = true
+oxbase-dialect.workspace = true
+# The statement type the console's ScriptLanguage returns (oxbase_sql::Statement, positions).
+oxbase-sql.workspace = true
+# `install_default_crypto_provider` (redis builds its rustls config with the process default)
+# and the PEM loaders for CA / client certificates.
+oxbase-net.workspace = true
+redis.workspace = true
+rustls.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+futures.workspace = true
+async-trait.workspace = true
+arrow-array.workspace = true
+arrow-schema.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
+pretty_assertions.workspace = true
+tokio.workspace = true
+# Live tests read tests/fixtures.toml.
+toml.workspace = true

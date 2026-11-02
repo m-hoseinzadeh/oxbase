@@ -141,7 +141,11 @@ anyhow = "1.0.104"
 
 # --- serialization / data ---
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.154"
+# M7: `preserve_order` keeps JSON object keys in insertion order (IndexMap, already in the
+# graph). MongoDB documents, sort specifications and projections are ordered: a sort of
+# {"b": 1, "a": 1} differs from {"a": 1, "b": 1}, and optimistic document checks compare whole
+# documents field by field in order (docs/m7-contracts.md §3.1).
+serde_json = { version = "1.0.154", features = ["preserve_order"] }
 toml = "1.1.8"
 bytes = { version = "1.12.1", features = ["serde"] }
 uuid = { version = "1.29.0", features = ["v4", "v7", "serde"] }
@@ -194,6 +198,31 @@ rusqlite = { version = "0.41.1", features = ["bundled"] }
 # datetimeoffset types; `chrono` = conversions. Never enable `rustls`, `native-tls`,
 # `vendored-openssl`, `winauth`, `integrated-auth-gssapi` or the default features.
 tiberius = { version = "0.13.0", default-features = false, features = ["tds73", "chrono"] }
+# M7: MongoDB (docs/m7-contracts.md §2.1), Apache-2.0. `rustls-tls` is rustls + *ring*
+# (`rustls/ring`, `tokio-rustls/ring`; never `rustls-tls-aws-lc` or `openssl-tls`). The driver's
+# own TLS is never switched on, though: it cannot verify a server name other than the address it
+# dials, has no chain-only mode and reads roots only from webpki-roots or a CA file, so
+# oxbase-mongo hands it an in-process SOCKS5 dialer (`socks5-proxy`) that dials the tunnel and
+# runs the TLS handshake with `oxbase_net::tls` (§2.1). `rustls-tls` is still enabled because
+# the crate refuses to build without a TLS backend. `bson-3` + `compat-3-3-0` is the current
+# BSON line; `dns-resolver` (hickory, MIT OR Apache-2.0) resolves `mongodb+srv://` seed lists.
+mongodb = { version = "3.9.1", default-features = false, features = ["compat-3-3-0", "bson-3", "rustls-tls", "dns-resolver", "socks5-proxy"] }
+# BSON values and Extended JSON v2 (relaxed / canonical) for the Arrow mapping, the document
+# model and the shell helpers. MIT. Same version as mongodb's `bson-3` dependency.
+bson = { version = "3.1.0", features = ["serde", "serde_json-1", "chrono-0_4", "uuid-1"] }
+# M7: Redis (docs/m7-contracts.md §2.2), BSD-3-Clause. Async (tokio) multiplexed connections,
+# RESP3, cluster and sentinel. TLS through `tokio-rustls-comp` (rustls with no provider feature:
+# it uses the process default, which `oxbase_net::tls::install_default_crypto_provider` sets to
+# ring; never `tls-native-tls`). `tls-rustls-insecure` is needed for TlsMode::Require / Prefer
+# (no verification) and VerifyCa (`danger_accept_invalid_hostnames`). Sockets are mapped onto
+# the SSH tunnel with the crate's `AsyncDNSResolver` hook, so TLS still verifies the server
+# name. No default features (num-bigint, geospatial, script, bloom are not needed).
+redis = { version = "1.8.1", default-features = false, features = ["aio", "tokio-comp", "tokio-rustls-comp", "tls-rustls-insecure", "cluster-async", "sentinel", "acl", "streams"] }
+# M7: the mongo shell subset (docs/m7-contracts.md §4.2). QuickJS-ng bundled and built with `cc`
+# (pre-generated bindings for x86_64/aarch64 Linux, both macOS targets and Windows MSVC; no
+# bindgen, no clang needed). MIT (rquickjs and QuickJS). Only the default `std` feature: no
+# module loader, no `futures`, no libc std/os modules, so scripts have no fs, net or process.
+rquickjs = "0.14.0"
 
 # --- network: TLS (rustls + ring) and SSH (russh + ring) ---
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12", "logging"] }

@@ -51,6 +51,9 @@ allow = [
     "Zlib",
     "MPL-2.0",
     "CC0-1.0",
+    # M7: xxhash-rust (via redis, client-side caching hashes). Boost Software License 1.0:
+    # OSI-approved, permissive, no copyleft; compatible with Apache-2.0.
+    "BSL-1.0",
 ]
 exceptions = [
     # Mozilla's root store as data. mysql_async's rustls feature always links it; Oxbase turns

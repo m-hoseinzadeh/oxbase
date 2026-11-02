@@ -25,16 +25,22 @@
 //! - [`catalog`] (M6): [`CatalogSnapshot`], every schema-level name of one database for code
 //!   insight, and the identifier case rules [`IdentCase`] / [`CaseRules`].
 //! - [`snippet`] (M6): editor [`Snippet`]s and their body syntax.
+//! - [`document`] (M7): find / aggregate requests ([`DocumentQuery`]) and optimistic document
+//!   edits ([`DocumentEdit`]) for document databases (MongoDB), in Extended JSON.
+//! - [`keyvalue`] (M7): key types, binary-safe [`BinaryText`], key-browser scans and typed,
+//!   atomic key edits ([`KeyApplyRequest`]) for key-value stores (Redis).
 
 pub mod catalog;
 pub mod data_type;
 pub mod def;
 pub mod diff;
+pub mod document;
 pub mod edit;
 pub mod engine;
 pub mod error;
 pub mod filter;
 mod int_text;
+pub mod keyvalue;
 pub mod net;
 pub mod object;
 pub mod progress;
@@ -57,10 +63,18 @@ pub use def::{
     ViewDef,
 };
 pub use diff::{DiffKind, PropertyDiff, Rename};
+pub use document::{
+    AggregateRequest, DocumentApplyReport, DocumentEdit, DocumentEditOutcome, DocumentEditStatus,
+    DocumentQuery, FieldChange, FieldValue, FindRequest,
+};
 pub use edit::{ColumnValue, KeyKind, RowEdit, RowKey};
 pub use engine::Engine;
 pub use error::{Error, ErrorCategory, Result};
 pub use filter::{Filter, FilterOp, NullsOrder, SortKey, TableDataQuery};
+pub use keyvalue::{
+    BinaryText, KeyAddress, KeyApplyReport, KeyApplyRequest, KeyEdit, KeyInfo, KeyScanRequest,
+    KeyType, ListEnd, StreamField,
+};
 pub use net::{
     Endpoint, KeySource, KnownHostsPolicy, PemSource, SshAuth, SshOptions, TlsMode, TlsOptions,
 };

@@ -56,6 +56,18 @@
     "allow-snippet-list",
     "allow-snippet-save",
     "allow-snippet-delete",
+    "allow-document-find",
+    "allow-document-aggregate",
+    "allow-document-at",
+    "allow-document-get",
+    "allow-document-apply",
+    "allow-key-scan-open",
+    "allow-key-info",
+    "allow-key-value-open",
+    "allow-key-apply",
+    "allow-pubsub-subscribe",
+    "allow-pubsub-unsubscribe",
+    "allow-pubsub-publish",
     "dialog:allow-open"
   ]
 }

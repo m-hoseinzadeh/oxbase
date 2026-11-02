@@ -10,12 +10,12 @@
 
 use std::sync::Arc;
 
-use oxbase_services::SessionId;
 use oxbase_services::history::HistoryService;
 use oxbase_services::query::{
     EditorId, QueryService, RunEvent, RunId, RunOptions, RunTarget, StatementSpan,
 };
 use oxbase_services::tree::{TreeNode, TreeNodeRef, TreeOptions, TreeService};
+use oxbase_services::{DialectRegistry, SessionId};
 use oxbase_store::{HistoryEntry, HistoryQuery, HistorySettings};
 use oxbase_types::{Engine, ObjectDef, ObjectRef};
 use tauri::State;
@@ -178,14 +178,26 @@ pub async fn query_close_editor(
 }
 
 /// The statement under the cursor; `offset` is in UTF-16 code units (Monaco `getOffsetAt`).
+/// M7: every engine with an editor (SQL, and the mongo shell / Redis console languages).
 #[tauri::command]
 #[allow(clippy::needless_pass_by_value)] // Tauri deserializes owned arguments.
 pub fn statement_at(
+    workbench: State<'_, WorkbenchState>,
     engine: Engine,
     text: String,
     offset: usize,
 ) -> CommandResult<Option<StatementSpan>> {
-    QueryService::statement_at(engine, &text, offset).map_err(CommandError::from)
+    span_at(workbench.query.dialects(), engine, &text, offset)
+}
+
+/// [`statement_at`] against `dialects`.
+fn span_at(
+    dialects: &DialectRegistry,
+    engine: Engine,
+    text: &str,
+    offset: usize,
+) -> CommandResult<Option<StatementSpan>> {
+    QueryService::statement_at_with(dialects, engine, text, offset).map_err(CommandError::from)
 }
 
 /// History entries, newest first.
@@ -365,7 +377,12 @@ mod tests {
 
     #[test]
     fn statement_at_maps_errors() {
-        let err = statement_at(Engine::MongoDb, "db.x.find()".into(), 0).unwrap_err();
+        let dialects = DialectRegistry::new();
+        let err = span_at(&dialects, Engine::MongoDb, "db.x.find()", 0).unwrap_err();
         assert_eq!(err.category, oxbase_types::ErrorCategory::Unsupported);
+        let span = span_at(&dialects, Engine::Postgres, "SELECT 1;\nSELECT 2", 12)
+            .unwrap()
+            .unwrap();
+        assert_eq!(span.index, 1);
     }
 }

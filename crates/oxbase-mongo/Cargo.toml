@@ -1,6 +1,6 @@
 [package]
 name = "oxbase-mongo"
-description = "oxbase: MongoDB driver"
+description = "oxbase: MongoDB driver, dialect cells and mongo-shell subset"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,6 +11,38 @@ authors.workspace = true
 [lints]
 workspace = true
 
+# M7 (Design step). Every dependency the mongo-driver, mongo and shell streams need is listed here
+# so no stream touches Cargo.lock. A stream that needs another crate adds it with an explicit
+# version and reports it for hoisting (docs/m7-contracts.md §1).
 [dependencies]
+oxbase-types.workspace = true
+oxbase-driver.workspace = true
+oxbase-dialect.workspace = true
+# The statement type the shell's ScriptLanguage returns (oxbase_sql::Statement, positions).
+oxbase-sql.workspace = true
+# rustls client configuration (ring) shared by every driver; the SOCKS5 dialer runs the TLS
+# handshake with it (docs/m7-contracts.md §2.1).
+oxbase-net.workspace = true
+mongodb.workspace = true
+bson.workspace = true
+# The mongo shell subset (sandboxed QuickJS).
+rquickjs.workspace = true
+rustls.workspace = true
+tokio-rustls.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+futures.workspace = true
+async-trait.workspace = true
+arrow-array.workspace = true
+arrow-schema.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
+pretty_assertions.workspace = true
+tokio.workspace = true
+# Live tests read tests/fixtures.toml.
+toml.workspace = true
