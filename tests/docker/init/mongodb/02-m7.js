@@ -4,7 +4,8 @@
 // waits for it, so a data volume from before M7 (or from schema_version 1, without `score` and
 // `big_long`) reports unhealthy (run scripts/fixtures-down.sh to rebuild it).
 //
-// mongosh numbers are doubles: every int32 / int64 value is written with NumberInt / NumberLong.
+// mongosh stores an integral JS number as int32 and any other as double, so the seed spells out
+// each numeric type: NumberInt / NumberLong / Double.
 
 const t = db.getSiblingDB("oxbase_test");
 
@@ -33,8 +34,8 @@ for (let i = 1; i <= 12; i++) {
     meta: { city: cities[i - 1], zip: "Z" + nn, geo: { lat: 10 + i / 4, lon: 20 - i / 8 } },
     flag: i % 2 === 1,
     // A double in every document (one Float64 column; 1.5, 3, 4.5, ...: the even ones are
-    // integral doubles).
-    score: 1.5 * i,
+    // integral doubles, which only Double() keeps as doubles).
+    score: Double(1.5 * i),
     // An int64 above 2^53 (2^53 + NN): exact only as a 64-bit integer, not as a JS number or a
     // relaxed-JSON double.
     big_long: NumberLong(String(9007199254740992n + BigInt(i))),
