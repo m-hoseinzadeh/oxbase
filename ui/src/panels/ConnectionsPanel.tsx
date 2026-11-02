@@ -1,4 +1,17 @@
+import {
+  CircleAlert,
+  Database,
+  Info,
+  Loader2,
+  LockKeyhole,
+  Pencil,
+  Plug,
+  Plus,
+  Trash2,
+  Unplug,
+} from "lucide-react";
 import { type FormEvent, type KeyboardEvent, useEffect, useId, useRef, useState } from "react";
+import { ICON, ICON_LG, ICON_SM } from "../components/icons";
 import { Modal } from "../components/Modal";
 import {
   cancelRequest,
@@ -76,8 +89,13 @@ function PromptSecretsDialog({
         </>
       }
     >
-      <form id={formId} onSubmit={submit} data-testid="password-prompt">
-        <p className="field__hint">These are not saved. They are used for this connection only.</p>
+      <form id={formId} className="form-stack" onSubmit={submit} data-testid="password-prompt">
+        <p className="callout callout--muted">
+          <LockKeyhole {...ICON_SM} className="callout__icon" />
+          <span className="callout__text">
+            These are not saved. They are used for this connection only.
+          </span>
+        </p>
         {fields.map((field, index) => (
           <div className="field" key={field}>
             <label htmlFor={`prompt-${field}`}>{SECRET_LABELS[field]}</label>
@@ -224,77 +242,108 @@ export function ConnectionsPanel() {
 
   return (
     <section className="panel panel--connections" aria-label="Connections">
-      <div className="toolbar" role="toolbar" aria-label="Connection actions">
-        <button type="button" className="button" onClick={() => setDialog({ kind: "edit" })}>
-          New
-        </button>
-        <button
-          type="button"
-          className="button"
-          disabled={!selected}
-          onClick={() => selected && setDialog({ kind: "edit", profile: selected })}
-        >
-          Edit
-        </button>
-        <button
-          type="button"
-          className="button"
-          disabled={!selected}
-          onClick={() => selected && setDialog({ kind: "delete", profile: selected })}
-        >
-          Delete
-        </button>
-        <button
-          type="button"
-          className="button button--primary"
-          data-testid="connect-button"
-          disabled={!selected || busyId !== null}
-          onClick={() => {
-            if (!selected) return;
-            if (selectedOpen) void disconnect(selected);
-            else startConnect(selected);
-          }}
-        >
-          {selectedOpen ? "Disconnect" : busyId ? "Connecting…" : "Connect"}
-        </button>
-        {pendingOpen ? (
-          <button type="button" className="button" onClick={cancelConnect}>
-            Cancel connecting
-          </button>
+      <header className="panel__header connections__header">
+        <span>Saved connections</span>
+        {profiles.length > 0 ? (
+          <span className="connections__count" aria-hidden="true">
+            {profiles.length}
+          </span>
         ) : null}
-      </div>
+        <div className="panel__header-actions">
+          <button
+            type="button"
+            className="icon-button"
+            aria-label="New"
+            title="New connection"
+            onClick={() => setDialog({ kind: "edit" })}
+          >
+            <Plus {...ICON} />
+          </button>
+          <button
+            type="button"
+            className="icon-button"
+            aria-label="Edit"
+            title="Edit connection"
+            disabled={!selected}
+            onClick={() => selected && setDialog({ kind: "edit", profile: selected })}
+          >
+            <Pencil {...ICON} />
+          </button>
+          <button
+            type="button"
+            className="icon-button icon-button--danger"
+            aria-label="Delete"
+            title="Delete connection (Delete)"
+            disabled={!selected}
+            onClick={() => selected && setDialog({ kind: "delete", profile: selected })}
+          >
+            <Trash2 {...ICON} />
+          </button>
+        </div>
+      </header>
 
       {notice ? (
-        <p className="test-result" role="status">
-          {notice}
-        </p>
+        <div className="callout" role="status">
+          <Info {...ICON_SM} className="callout__icon" />
+          <p className="callout__text">{notice}</p>
+        </div>
       ) : null}
 
       {actionError ? (
-        <div className="test-result test-result--error" role="alert">
-          <p className="test-result__title">{CATEGORY_LABEL[actionError.category]}</p>
-          <p className="test-result__message">{actionError.message}</p>
+        <div className="callout callout--danger" role="alert">
+          <CircleAlert {...ICON_SM} className="callout__icon" />
+          <div className="callout__text">
+            <p className="callout__title">{CATEGORY_LABEL[actionError.category]}</p>
+            <p className="callout__message">{actionError.message}</p>
+          </div>
         </div>
       ) : null}
 
       {profilesStatus === "error" && !noCore ? (
-        <div className="test-result test-result--error" role="alert">
-          <p className="test-result__title">Could not load connections</p>
-          <p className="test-result__message">{profilesError?.message}</p>
+        <div className="callout callout--danger" role="alert">
+          <CircleAlert {...ICON_SM} className="callout__icon" />
+          <div className="callout__text">
+            <p className="callout__title">Could not load connections</p>
+            <p className="callout__message">{profilesError?.message}</p>
+          </div>
         </div>
       ) : null}
 
       {profiles.length === 0 ? (
         profilesStatus === "loading" ? (
-          <p className="empty-state__hint">Loading connections…</p>
+          <div className="connection-list connection-list--loading" aria-busy="true">
+            <span className="visually-hidden">Loading connections…</span>
+            {[0, 1, 2].map((i) => (
+              <div key={i} className="connection-list__skeleton" aria-hidden="true">
+                <span className="skeleton connection-list__skeleton-tile" />
+                <span className="connection-list__skeleton-text">
+                  <span className="skeleton connection-list__skeleton-line" />
+                  <span className="skeleton connection-list__skeleton-line connection-list__skeleton-line--short" />
+                </span>
+              </div>
+            ))}
+          </div>
         ) : (
           <div className="empty-state">
+            <span className="empty-state__icon" aria-hidden="true">
+              <Database {...ICON_LG} />
+            </span>
             <p className="empty-state__title">No connections yet</p>
             <p className="empty-state__hint">
               {noCore
                 ? "Saved connections are available in the desktop app."
-                : "Choose New to add a database connection."}
+                : "Add a PostgreSQL, MySQL, MariaDB, SQLite or SQL Server connection."}
             </p>
+            {noCore ? null : (
+              <button
+                type="button"
+                className="button button--primary"
+                onClick={() => setDialog({ kind: "edit" })}
+              >
+                <Plus {...ICON} />
+                New connection
+              </button>
+            )}
           </div>
         )
       ) : (
@@ -317,8 +366,9 @@ export function ConnectionsPanel() {
                 tabIndex={-1}
                 id={`conn-item-${profile.id}`}
                 role="option"
+                data-testid="connection-item"
                 aria-selected={profile.id === selectedId}
-                className="connection-list__item"
+                className={`connection-list__item${open ? " connection-list__item--open" : ""}`}
                 onClick={() => setSelectedId(profile.id)}
                 onDoubleClick={() => (open ? undefined : startConnect(profile))}
               >
@@ -336,13 +386,51 @@ export function ConnectionsPanel() {
                     Connected
                   </span>
                 ) : busyId === profile.id ? (
-                  <span className="connection-list__status">Connecting…</span>
+                  <span className="connection-list__status connection-list__status--busy">
+                    <Loader2 {...ICON_SM} className="spin" />
+                    Connecting…
+                  </span>
                 ) : null}
               </div>
             );
           })}
         </div>
       )}
+
+      {profiles.length > 0 || pendingOpen ? (
+        <div
+          className="toolbar connections__actions"
+          role="toolbar"
+          aria-label="Connection actions"
+        >
+          <button
+            type="button"
+            className="button button--primary connections__connect"
+            data-testid="connect-button"
+            disabled={!selected || busyId !== null}
+            title={selected ? undefined : "Select a connection first"}
+            onClick={() => {
+              if (!selected) return;
+              if (selectedOpen) void disconnect(selected);
+              else startConnect(selected);
+            }}
+          >
+            {selectedOpen ? (
+              <Unplug {...ICON} />
+            ) : busyId ? (
+              <Loader2 {...ICON} className="spin" />
+            ) : (
+              <Plug {...ICON} />
+            )}
+            {selectedOpen ? "Disconnect" : busyId ? "Connecting…" : "Connect"}
+          </button>
+          {pendingOpen ? (
+            <button type="button" className="button" onClick={cancelConnect}>
+              Cancel connecting
+            </button>
+          ) : null}
+        </div>
+      ) : null}
 
       {dialog.kind === "edit" ? (
         <ConnectionDialog
@@ -375,6 +463,7 @@ export function ConnectionsPanel() {
                 className="button button--danger"
                 onClick={() => void confirmDelete(dialog.profile)}
               >
+                <Trash2 {...ICON} />
                 Delete
               </button>
             </>

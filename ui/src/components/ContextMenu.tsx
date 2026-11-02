@@ -1,10 +1,20 @@
-import { type KeyboardEvent, useEffect, useRef } from "react";
+import type { LucideIcon } from "lucide-react";
+import { Fragment, type KeyboardEvent, useEffect, useRef } from "react";
 import { createPortal } from "react-dom";
+import { ICON_SM } from "./icons";
 
 export interface MenuItem {
   label: string;
   onSelect: () => void;
   disabled?: boolean;
+  /** A Lucide icon shown before the label. */
+  icon?: LucideIcon;
+  /** A keyboard shortcut shown after the label (e.g. "F5"); also exposed as aria-keyshortcuts. */
+  shortcut?: string;
+  /** A destructive action, shown in the danger colour. */
+  danger?: boolean;
+  /** Draw a separator line above this item. */
+  separatorBefore?: boolean;
 }
 
 export interface ContextMenuProps {
@@ -15,6 +25,10 @@ export interface ContextMenuProps {
   items: MenuItem[];
   onClose: () => void;
 }
+
+const ITEM_HEIGHT = 28;
+const SEPARATOR_HEIGHT = 9;
+const MENU_WIDTH = 240;
 
 /**
  * A context menu: `role="menu"` at a viewport position, focus on the first item, arrows /
@@ -76,8 +90,10 @@ export function ContextMenu({ x, y, label, items, onClose }: ContextMenuProps) {
   }
 
   // Kept inside the viewport.
-  const left = Math.max(0, Math.min(x, window.innerWidth - 220));
-  const top = Math.max(0, Math.min(y, window.innerHeight - (items.length * 28 + 12)));
+  const separators = items.filter((item, index) => index > 0 && item.separatorBefore).length;
+  const height = items.length * ITEM_HEIGHT + separators * SEPARATOR_HEIGHT + 10;
+  const left = Math.max(0, Math.min(x, window.innerWidth - MENU_WIDTH));
+  const top = Math.max(0, Math.min(y, window.innerHeight - height));
 
   return createPortal(
     <div
@@ -88,23 +104,37 @@ export function ContextMenu({ x, y, label, items, onClose }: ContextMenuProps) {
       style={{ left, top }}
       onKeyDown={onKeyDown}
     >
-      {items.map((item) => (
-        <button
-          key={item.label}
-          type="button"
-          role="menuitem"
-          tabIndex={-1}
-          className="context-menu__item"
-          aria-disabled={item.disabled ? true : undefined}
-          onClick={() => {
-            if (item.disabled) return;
-            onClose();
-            item.onSelect();
-          }}
-        >
-          {item.label}
-        </button>
-      ))}
+      {items.map((item, index) => {
+        const Icon = item.icon;
+        return (
+          <Fragment key={item.label}>
+            {item.separatorBefore && index > 0 ? <hr className="context-menu__separator" /> : null}
+            <button
+              type="button"
+              role="menuitem"
+              tabIndex={-1}
+              className={`context-menu__item${item.danger ? " context-menu__item--danger" : ""}`}
+              aria-disabled={item.disabled ? true : undefined}
+              aria-keyshortcuts={item.shortcut}
+              onClick={() => {
+                if (item.disabled) return;
+                onClose();
+                item.onSelect();
+              }}
+            >
+              <span className="context-menu__icon" aria-hidden="true">
+                {Icon ? <Icon {...ICON_SM} /> : null}
+              </span>
+              <span className="context-menu__label">{item.label}</span>
+              {item.shortcut ? (
+                <span className="kbd context-menu__shortcut" aria-hidden="true">
+                  {item.shortcut}
+                </span>
+              ) : null}
+            </button>
+          </Fragment>
+        );
+      })}
     </div>,
     document.body,
   );

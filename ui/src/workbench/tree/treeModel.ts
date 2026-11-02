@@ -3,7 +3,7 @@
  * with `tree_children`), and the flat list of rows the panel renders and navigates.
  */
 import type { ObjectRef, TreeNode, TreeNodeRef, Value } from "../../api";
-import type { SessionSummary } from "../../connections/types";
+import type { Engine, SessionSummary } from "../../connections/types";
 
 /** A node's id in the panel: its session plus the core's node key. */
 export function nodeId(sessionId: string, key: string): string {
@@ -31,8 +31,10 @@ export type Row =
       expandable: boolean;
       expanded: boolean;
       ref: TreeNodeRef;
-      /** CSS icon name. */
+      /** Icon name: `connection`, `folder` or the object kind with dashes (`mat-view`). */
       icon: string;
+      /** The engine of a connection row (drawn as the engine tile). */
+      engine?: Engine;
       system: boolean;
       comment?: string;
       parentId: string | null;
@@ -163,7 +165,8 @@ export function flattenTree(sessions: SessionSummary[], state: TreeState): Row[]
       expandable: true,
       expanded,
       ref: { type: "connection" },
-      icon: `connection tree-icon--${session.engine}`,
+      icon: "connection",
+      engine: session.engine,
       system: false,
       parentId: null,
       posInSet: index + 1,

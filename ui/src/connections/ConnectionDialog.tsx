@@ -1,4 +1,16 @@
 import {
+  CircleAlert,
+  CircleCheck,
+  FolderOpen,
+  KeyRound,
+  Loader2,
+  type LucideIcon,
+  PlugZap,
+  Server,
+  ShieldCheck,
+  Square,
+} from "lucide-react";
+import {
   type ChangeEvent,
   type KeyboardEvent,
   type ReactNode,
@@ -7,6 +19,7 @@ import {
   useRef,
   useState,
 } from "react";
+import { ICON, ICON_SM } from "../components/icons";
 import { Modal } from "../components/Modal";
 import {
   cancelRequest,
@@ -17,6 +30,7 @@ import {
   testConnection,
   toCommandError,
 } from "./api";
+import { EngineBadge } from "./EngineBadge";
 import {
   type ConnectionForm,
   emptyForm,
@@ -42,7 +56,6 @@ import {
   type ConnectionInfo,
   type ConnectionProfile,
   DIALOG_ENGINES,
-  type DialogEngine,
   ENGINE_INFO,
   type ErrorCategory,
   type TlsMode,
@@ -116,10 +129,10 @@ const SQLITE_FILTERS: FileFilter[] = [
   { name: "All files", extensions: ["*"] },
 ];
 
-const TABS: Array<{ id: FormTab; label: string }> = [
-  { id: "general", label: "General" },
-  { id: "tls", label: "SSL/TLS" },
-  { id: "ssh", label: "SSH" },
+const TABS: Array<{ id: FormTab; label: string; Icon: LucideIcon }> = [
+  { id: "general", label: "General", Icon: Server },
+  { id: "tls", label: "SSL/TLS", Icon: ShieldCheck },
+  { id: "ssh", label: "SSH", Icon: KeyRound },
 ];
 
 type TestState =
@@ -184,33 +197,46 @@ export function TestResult({ state }: { state: TestState }) {
     case "idle":
       return null;
     case "running":
-      return <p className="test-result">Testing connection…</p>;
+      return (
+        <div className="test-result test-result--running">
+          <Loader2 {...ICON} className="test-result__icon spin" />
+          <div className="test-result__body">
+            <p className="test-result__title">Testing connection…</p>
+          </div>
+        </div>
+      );
     case "ok": {
       const { info } = state;
       return (
         <div className="test-result test-result--ok">
-          <p className="test-result__title">Connection succeeded</p>
-          <dl className="test-result__details">
-            <dt>Server version</dt>
-            <dd>{info.server_version.raw}</dd>
-            <dt>Encryption (TLS)</dt>
-            <dd>{info.tls_in_use ? "In use" : "Not in use"}</dd>
-            <dt>SSH tunnel</dt>
-            <dd>{info.via_ssh ? "Yes" : "No"}</dd>
-            <dt>Connect time</dt>
-            <dd>{info.latency_ms} ms</dd>
-          </dl>
+          <CircleCheck {...ICON} className="test-result__icon" />
+          <div className="test-result__body">
+            <p className="test-result__title">Connection succeeded</p>
+            <dl className="test-result__details">
+              <dt>Server version</dt>
+              <dd>{info.server_version.raw}</dd>
+              <dt>Encryption (TLS)</dt>
+              <dd>{info.tls_in_use ? "In use" : "Not in use"}</dd>
+              <dt>SSH tunnel</dt>
+              <dd>{info.via_ssh ? "Yes" : "No"}</dd>
+              <dt>Connect time</dt>
+              <dd>{info.latency_ms} ms</dd>
+            </dl>
+          </div>
         </div>
       );
     }
     case "error":
       return (
         <div className="test-result test-result--error">
-          <p className="test-result__title">
-            Connection failed:{" "}
-            <span data-testid="error-category">{CATEGORY_LABEL[state.error.category]}</span>
-          </p>
-          <p className="test-result__message">{state.error.message}</p>
+          <CircleAlert {...ICON} className="test-result__icon" />
+          <div className="test-result__body">
+            <p className="test-result__title">
+              Connection failed:{" "}
+              <span data-testid="error-category">{CATEGORY_LABEL[state.error.category]}</span>
+            </p>
+            <p className="test-result__message">{state.error.message}</p>
+          </div>
         </div>
       );
   }
@@ -231,6 +257,7 @@ export function ConnectionDialog({ profile, onClose, onSaved }: ConnectionDialog
   const runningRequest = useRef<string | null>(null);
   const tlsHelpId = useId();
   const hostKeyHelpId = useId();
+  const sshHintId = useId();
 
   const networked = isNetworked(form.engine);
   const traits = engineTraits(form.engine);
@@ -352,10 +379,12 @@ export function ConnectionDialog({ profile, onClose, onSaved }: ConnectionDialog
       <div className="modal__footer-start">
         {testing ? (
           <button type="button" className="button" onClick={stopTest}>
+            <Square {...ICON_SM} />
             Stop test
           </button>
         ) : (
           <button type="button" className="button" onClick={() => void runTest()}>
+            <PlugZap {...ICON} />
             Test connection
           </button>
         )}
@@ -383,12 +412,51 @@ export function ConnectionDialog({ profile, onClose, onSaved }: ConnectionDialog
     >
       <form
         id="connection-form"
+        className="connection-form"
         noValidate
         onSubmit={(event) => {
           event.preventDefault();
           void save();
         }}
       >
+        <fieldset className="engine-picker">
+          <legend className="form-section__title">Database type</legend>
+          <div className="engine-picker__grid">
+            {DIALOG_ENGINES.map((engine) => (
+              <label key={engine} className="engine-tile">
+                <input
+                  type="radio"
+                  name="conn-engine"
+                  className="engine-tile__input"
+                  value={engine}
+                  checked={form.engine === engine}
+                  {...(form.engine === engine ? { id: fieldId("engine") } : {})}
+                  onChange={() => {
+                    setForm((f) => withEngine(f, engine));
+                    setErrors({});
+                    if (engine === "sqlite") setTab("general");
+                  }}
+                />
+                <EngineBadge engine={engine} />
+                <span className="engine-tile__label">{ENGINE_INFO[engine].label}</span>
+              </label>
+            ))}
+          </div>
+        </fieldset>
+
+        <Field field="name" label="Connection name" errors={errors}>
+          {(p) => (
+            <input
+              {...p}
+              data-autofocus
+              type="text"
+              placeholder="e.g. Production"
+              value={form.name}
+              onChange={text("name")}
+            />
+          )}
+        </Field>
+
         <div className="tabs" role="tablist" aria-label="Connection settings">
           {TABS.map((t) => {
             const disabled = t.id !== "general" && !networked;
@@ -410,6 +478,7 @@ export function ConnectionDialog({ profile, onClose, onSaved }: ConnectionDialog
                 onClick={() => setTab(t.id)}
                 onKeyDown={onTabKeyDown}
               >
+                <t.Icon {...ICON_SM} />
                 {t.label}
               </button>
             );
@@ -423,33 +492,9 @@ export function ConnectionDialog({ profile, onClose, onSaved }: ConnectionDialog
           hidden={tab !== "general"}
           className="tabs__panel"
         >
-          <Field field="name" label="Connection name" errors={errors}>
-            {(p) => (
-              <input {...p} data-autofocus type="text" value={form.name} onChange={text("name")} />
-            )}
-          </Field>
-          <Field field="engine" label="Database type" errors={errors}>
-            {(p) => (
-              <select
-                {...p}
-                value={form.engine}
-                onChange={(e) => {
-                  setForm((f) => withEngine(f, e.target.value as DialogEngine));
-                  setErrors({});
-                  if (e.target.value === "sqlite") setTab("general");
-                }}
-              >
-                {DIALOG_ENGINES.map((engine) => (
-                  <option key={engine} value={engine}>
-                    {ENGINE_INFO[engine].label}
-                  </option>
-                ))}
-              </select>
-            )}
-          </Field>
-
           {networked ? (
             <>
+              <h3 className="form-section__title">Server</h3>
               <div className="field-row">
                 <Field field="host" label="Host" errors={errors}>
                   {(p) => (
@@ -512,6 +557,7 @@ export function ConnectionDialog({ profile, onClose, onSaved }: ConnectionDialog
                   />
                 )}
               </Field>
+              <h3 className="form-section__title form-section__title--spaced">Credentials</h3>
               <Field field="user" label="User name" errors={errors}>
                 {(p) => (
                   <input
@@ -583,6 +629,7 @@ export function ConnectionDialog({ profile, onClose, onSaved }: ConnectionDialog
                       void browse("filePath", "Choose a SQLite database", SQLITE_FILTERS)
                     }
                   >
+                    <FolderOpen {...ICON_SM} />
                     Browse…
                   </button>
                 </div>
@@ -710,10 +757,20 @@ export function ConnectionDialog({ profile, onClose, onSaved }: ConnectionDialog
           hidden={tab !== "ssh"}
           className="tabs__panel"
         >
-          <label className="checkbox">
-            <input type="checkbox" checked={form.sshEnabled} onChange={check("sshEnabled")} />
-            Connect through an SSH tunnel
-          </label>
+          <div className="option-card">
+            <label className="checkbox">
+              <input
+                type="checkbox"
+                checked={form.sshEnabled}
+                aria-describedby={sshHintId}
+                onChange={check("sshEnabled")}
+              />
+              Connect through an SSH tunnel
+            </label>
+            <p id={sshHintId} className="field__hint">
+              Reach a database that only accepts connections from a bastion or jump host.
+            </p>
+          </div>
           <fieldset className="fieldset" disabled={!form.sshEnabled}>
             <legend className="visually-hidden">SSH tunnel settings</legend>
             <div className="field-row">
@@ -884,8 +941,13 @@ export function ConnectionDialog({ profile, onClose, onSaved }: ConnectionDialog
       </div>
       {saveError ? (
         <div className="test-result test-result--error" role="alert">
-          <p className="test-result__title">Could not save: {CATEGORY_LABEL[saveError.category]}</p>
-          <p className="test-result__message">{saveError.message}</p>
+          <CircleAlert {...ICON} className="test-result__icon" />
+          <div className="test-result__body">
+            <p className="test-result__title">
+              Could not save: {CATEGORY_LABEL[saveError.category]}
+            </p>
+            <p className="test-result__message">{saveError.message}</p>
+          </div>
         </div>
       ) : null}
     </Modal>
@@ -919,6 +981,7 @@ function FileField({
         <div className="file-input">
           <input {...p} type="text" spellCheck={false} value={value} onChange={onChange} />
           <button type="button" className="button" aria-label={browseLabel} onClick={onBrowse}>
+            <FolderOpen {...ICON_SM} />
             Browse…
           </button>
         </div>

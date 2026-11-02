@@ -4,13 +4,29 @@
  * expanded; a collapsed node's pending request is cancelled. Keyboard: arrows move and
  * expand/collapse, Home/End jump, Enter toggles (or retries a failed load), F5 refreshes.
  */
+import {
+  ChevronRight,
+  CircleAlert,
+  FileInput,
+  FileOutput,
+  Loader2,
+  PencilRuler,
+  RefreshCw,
+  RotateCw,
+  SquarePen,
+  Table2,
+  TableProperties,
+  Unplug,
+} from "lucide-react";
 import { type KeyboardEvent, useCallback, useEffect, useId, useRef, useState } from "react";
 import { type ObjectRef, type TreeNodeRef, treeChildren } from "../../api";
 import { ContextMenu, type MenuItem } from "../../components/ContextMenu";
+import { ICON, ICON_LG, ICON_SM } from "../../components/icons";
 import { cancelRequest, newRequestId, toCommandError } from "../../connections/api";
 import { useConnections } from "../../connections/store";
 import { openQueryEditor, openTableData, openTableDesigner } from "../layout";
 import { openExport, openImport } from "../transfer/store";
+import { TreeIcon } from "./TreeIcon";
 import {
   type ChildrenState,
   cachedDescendants,
@@ -261,10 +277,11 @@ export function ObjectTreePanel() {
     const items: MenuItem[] = [];
     const object = dataObject(row);
     if (object) {
-      items.push({ label: "Open", onSelect: () => openData(row) });
+      items.push({ label: "Open", icon: Table2, onSelect: () => openData(row) });
       if (object.kind === "table") {
         items.push({
           label: "Design",
+          icon: PencilRuler,
           onSelect: () => openTableDesigner({ sessionId: row.sessionId, table: object }),
         });
       }
@@ -273,12 +290,16 @@ export function ObjectTreePanel() {
     if (tableTarget) {
       items.push({
         label: "New table",
+        icon: TableProperties,
+        separatorBefore: true,
         onSelect: () =>
           openTableDesigner({ sessionId: row.sessionId, table: tableTarget, isNew: true }),
       });
     }
     items.push({
       label: "New query",
+      icon: SquarePen,
+      separatorBefore: !tableTarget,
       onSelect: () => {
         const database = databaseOf(row.ref);
         openQueryEditor({ sessionId: row.sessionId, ...(database ? { database } : {}) });
@@ -287,11 +308,26 @@ export function ObjectTreePanel() {
     if (importTarget(row) !== undefined) {
       items.push({
         label: object ? "Import into this table…" : "Import data…",
+        icon: FileInput,
+        separatorBefore: true,
         onSelect: () => importInto(row),
       });
     }
-    if (object) items.push({ label: "Export…", onSelect: () => exportRows(row) });
-    items.push({ label: "Refresh", onSelect: refresh });
+    if (object) {
+      items.push({
+        label: "Export…",
+        icon: FileOutput,
+        separatorBefore: importTarget(row) === undefined,
+        onSelect: () => exportRows(row),
+      });
+    }
+    items.push({
+      label: "Refresh",
+      icon: RefreshCw,
+      shortcut: "F5",
+      separatorBefore: true,
+      onSelect: refresh,
+    });
     return items;
   }
 
@@ -364,65 +400,78 @@ export function ObjectTreePanel() {
 
   return (
     <section className="panel panel--tree" aria-label="Objects">
-      <div className="toolbar" role="toolbar" aria-label="Object tree actions">
+      <div className="toolbar tree__toolbar" role="toolbar" aria-label="Object tree actions">
         <button
           type="button"
-          className="button"
+          className="icon-button"
           onClick={refresh}
           disabled={sessions.length === 0}
+          aria-label="Refresh"
           title="Refresh (F5)"
         >
-          Refresh
+          <RefreshCw {...ICON} />
         </button>
         <button
           type="button"
-          className="button"
+          className="icon-button"
           onClick={newQuery}
           disabled={sessions.length === 0}
+          aria-label="New query"
+          title="New query in the selected database"
         >
-          New query
+          <SquarePen {...ICON} />
         </button>
+        <span className="toolbar__separator" aria-hidden="true" />
         <button
           type="button"
-          className="button"
+          className="icon-button"
           onClick={() => openData()}
           disabled={!dataObject(selectedRow)}
-          title="Open the rows (double-click or Enter)"
+          aria-label="Open"
+          title="Open the rows (Enter or double-click)"
         >
-          Open
+          <Table2 {...ICON} />
         </button>
         <button
           type="button"
-          className="button"
+          className="icon-button"
           onClick={design}
           disabled={dataObject(selectedRow)?.kind !== "table"}
+          aria-label="Design"
+          title="Design the selected table"
         >
-          Design
+          <PencilRuler {...ICON} />
         </button>
         <button
           type="button"
-          className="button"
+          className="icon-button"
           onClick={newTable}
           disabled={newTableTarget(selectedRow) === null}
+          aria-label="New table"
+          title="New table in the selected database or schema"
         >
-          New table
+          <TableProperties {...ICON} />
         </button>
         <button
           type="button"
-          className="button"
+          className="icon-button"
           onClick={() => importInto()}
           disabled={importTarget(selectedRow) === undefined}
+          aria-label="Import"
           title="Import a file into the selected database, schema or table"
         >
-          Import
+          <FileInput {...ICON} />
         </button>
-        <label className="checkbox tree__system">
+        <label className="checkbox tree__system" title="Show system databases, schemas and objects">
           <input type="checkbox" checked={showSystem} onChange={toggleSystem} />
           System objects
         </label>
       </div>
       {sessions.length === 0 ? (
         <div className="empty-state">
+          <span className="empty-state__icon" aria-hidden="true">
+            <Unplug {...ICON_LG} />
+          </span>
           <p className="empty-state__title">No open connections</p>
           <p className="empty-state__hint">Connect to a database to browse its objects.</p>
         </div>
@@ -437,7 +486,7 @@ export function ObjectTreePanel() {
           onKeyDown={onKeyDown}
         >
           {rows.map((row) => {
-            const indent = { paddingLeft: `${(row.level - 1) * 14 + 4}px` };
+            const indent = { paddingLeft: `${(row.level - 1) * 16 + 4}px` };
             if (row.type !== "node") {
               const text =
                 row.type === "loading"
@@ -458,15 +507,25 @@ export function ObjectTreePanel() {
                   style={indent}
                   onClick={() => row.type === "error" && setSelected(row.id)}
                 >
-                  <span className={`tree-icon tree-icon--${row.type}`} aria-hidden="true" />
-                  <span className="tree__label">{text}</span>
+                  <span className="tree__twisty tree__twisty--leaf" aria-hidden="true" />
+                  <span className={`tree-icon tree-icon--${row.type}`} aria-hidden="true">
+                    {row.type === "loading" ? (
+                      <Loader2 {...ICON_SM} className="spin" />
+                    ) : row.type === "error" ? (
+                      <CircleAlert {...ICON_SM} />
+                    ) : null}
+                  </span>
+                  <span className="tree__label" title={row.type === "error" ? text : undefined}>
+                    {text}
+                  </span>
                   {row.type === "error" ? (
                     <button
                       type="button"
-                      className="button button--small"
+                      className="button button--small button--ghost tree__retry"
                       tabIndex={-1}
                       onClick={() => dropChildren([row.parentId])}
                     >
+                      <RotateCw {...ICON_SM} />
                       Retry
                     </button>
                   ) : null}
@@ -510,8 +569,10 @@ export function ObjectTreePanel() {
                     setSelected(row.id);
                     setOpen(row, !row.expanded);
                   }}
-                />
-                <span className={`tree-icon tree-icon--${row.icon}`} aria-hidden="true" />
+                >
+                  {row.expandable ? <ChevronRight {...ICON_SM} /> : null}
+                </span>
+                <TreeIcon row={row} />
                 <span className="tree__label">{row.label}</span>
                 {row.detail ? <span className="tree__detail">{row.detail}</span> : null}
               </div>
