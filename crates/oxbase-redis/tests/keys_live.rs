@@ -456,6 +456,25 @@ async fn every_key_edit_applies_atomically() {
     )
     .await;
     conflict(&r);
+    // An expiry of 0 ms deletes the key: it needs confirmation like a delete.
+    let mut expire_now = request(&k("s"), None, vec![KeyEdit::Expire { ttl_ms: Some(0) }]);
+    let err = RedisKeyValueStore
+        .apply(&c, &expire_now, CancellationToken::new())
+        .await
+        .unwrap_err();
+    assert_eq!(err.category(), ErrorCategory::InvalidInput);
+    assert_eq!(
+        raw(&c, &[b"EXISTS", k("s").as_bytes()]).await,
+        redis::Value::Int(1)
+    );
+    expire_now.confirm_destructive = true;
+    let r = apply(&c, &expire_now).await;
+    committed(&r);
+    assert!(r.info.is_none(), "{r:?}");
+    assert_eq!(
+        raw(&c, &[b"EXISTS", k("s").as_bytes()]).await,
+        redis::Value::Int(0)
+    );
 
     // Hashes.
     let r = apply(
@@ -556,7 +575,8 @@ async fn every_key_edit_applies_atomically() {
     )
     .await;
     committed(&r);
-    let stale = request(
+    // A set by index after a push of the same apply is refused before anything is written.
+    let pushed = request(
         &k("l"),
         Some(KeyType::List),
         vec![
@@ -567,9 +587,24 @@ async fn every_key_edit_applies_atomically() {
             KeyEdit::ListSet {
                 index: 1,
                 value: t("X"),
-                expected: Some(t("b")),
+                expected: Some(t("B")),
             },
         ],
+    );
+    let err = RedisKeyValueStore
+        .apply(&c, &pushed, CancellationToken::new())
+        .await
+        .unwrap_err();
+    assert_eq!(err.category(), ErrorCategory::InvalidInput);
+    // A stale expected value is a conflict.
+    let stale = request(
+        &k("l"),
+        Some(KeyType::List),
+        vec![KeyEdit::ListSet {
+            index: 1,
+            value: t("X"),
+            expected: Some(t("b")),
+        }],
     );
     conflict(&apply(&c, &stale).await);
     let r = apply(
@@ -722,6 +757,70 @@ async fn every_key_edit_applies_atomically() {
     .await;
     committed(&r);
     assert_eq!(r.info.unwrap().length, Some(1));
+    // Deleting the top entry does not lower the last generated id: an id at or below it is
+    // refused before anything is written (the TTL of the same apply is not set either).
+    let add = |id: &str| KeyEdit::StreamAdd {
+        id: Some(id.to_owned()),
+        fields: vec![field("a", "1")],
+    };
+    committed(&apply(&c, &create(&k("x2"), vec![add("7-1"), add("7-2")])).await);
+    let r = apply(
+        &c,
+        &request(
+            &k("x2"),
+            Some(KeyType::Stream),
+            vec![KeyEdit::StreamDelete {
+                ids: vec!["7-2".into()],
+            }],
+        ),
+    )
+    .await;
+    committed(&r);
+    let r = apply(
+        &c,
+        &request(
+            &k("x2"),
+            Some(KeyType::Stream),
+            vec![
+                KeyEdit::Expire {
+                    ttl_ms: Some(600_000),
+                },
+                add("7-2"),
+            ],
+        ),
+    )
+    .await;
+    assert!(!r.committed && !r.conflict && r.error.is_some(), "{r:?}");
+    assert_eq!(
+        raw(&c, &[b"PTTL", k("x2").as_bytes()]).await,
+        redis::Value::Int(-1)
+    );
+    let r = apply(
+        &c,
+        &request(&k("x2"), Some(KeyType::Stream), vec![add("7-*")]),
+    )
+    .await;
+    committed(&r);
+    assert_eq!(r.info.unwrap().length, Some(2));
+    let top = raw(
+        &c,
+        &[b"XREVRANGE", k("x2").as_bytes(), b"+", b"-", b"COUNT", b"1"],
+    )
+    .await;
+    let top_id = match top {
+        redis::Value::Array(entries) => match entries.into_iter().next() {
+            Some(redis::Value::Array(entry)) => entry.into_iter().next(),
+            other => panic!("XREVRANGE entry {other:?}"),
+        },
+        other => panic!("XREVRANGE {other:?}"),
+    };
+    assert_eq!(top_id, Some(redis::Value::BulkString(b"7-3".to_vec())));
+    let r = apply(
+        &c,
+        &request(&k("x2"), Some(KeyType::Stream), vec![add("6-*")]),
+    )
+    .await;
+    assert!(!r.committed && r.error.is_some(), "{r:?}");
 
     // Rename: RENAMENX refuses an existing target; the new key is reported.
     let r = apply(
@@ -817,6 +916,7 @@ async fn every_key_edit_applies_atomically() {
         Ok(r) => {
             committed(&r);
             assert_eq!(r.info.unwrap().key_type, KeyType::Json);
+            json_paths_and_numbers(&c, &k("j"), &k("big")).await;
         }
         Err(e) => {
             assert_eq!(e.category(), ErrorCategory::Unsupported, "{e}");
@@ -831,5 +931,86 @@ async fn every_key_edit_applies_atomically() {
     let seed = raw(&c, &[b"HGET", b"m7:edit:seed", b"v"]).await;
     assert_eq!(seed, redis::Value::BulkString(b"1".to_vec()));
     cleanup(&c, &format!("m7:edit:t{tok}:*")).await;
+    c.close().await.unwrap();
+}
+
+/// RedisJSON loaded: a new member of an existing object is set; a path whose parent is missing
+/// is refused before anything is written; numbers beyond 64 bits are shown as the server
+/// stores them (cut out of the reply, not parsed and printed again).
+async fn json_paths_and_numbers(c: &oxbase_redis::RedisConnection, j: &str, big: &str) {
+    let member = request(
+        j,
+        Some(KeyType::Json),
+        vec![KeyEdit::JsonSet {
+            path: "$.m".into(),
+            value: serde_json::json!([1]),
+        }],
+    );
+    committed(&apply(c, &member).await);
+    let deep = request(
+        j,
+        Some(KeyType::Json),
+        vec![
+            KeyEdit::Expire {
+                ttl_ms: Some(600_000),
+            },
+            KeyEdit::JsonSet {
+                path: "$.a.b".into(),
+                value: serde_json::json!(2),
+            },
+        ],
+    );
+    let r = apply(c, &deep).await;
+    assert!(!r.committed && !r.conflict && r.error.is_some(), "{r:?}");
+    assert_eq!(
+        raw(c, &[b"PTTL", j.as_bytes()]).await,
+        redis::Value::Int(-1)
+    );
+    let doc = r#"{"id":123456789012345678901234567890,"n":18446744073709551615,"d":0.1}"#;
+    raw(c, &[b"JSON.SET", big.as_bytes(), b"$", doc.as_bytes()]).await;
+    let stored = match raw(c, &[b"JSON.GET", big.as_bytes(), b"$"]).await {
+        redis::Value::BulkString(b) => String::from_utf8(b).unwrap(),
+        other => panic!("JSON.GET {other:?}"),
+    };
+    let expected = stored
+        .trim()
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .unwrap()
+        .trim()
+        .to_owned();
+    let out = value(c, big, KeyType::Json).await;
+    assert_eq!(texts(&out, "value"), [Some(expected)]);
+}
+
+#[tokio::test]
+#[ignore = "needs the redis fixture"]
+async fn a_large_string_is_read_in_pieces() {
+    let c = connect(&params()).await;
+    if !seeded(&c).await {
+        return;
+    }
+    let key = format!("m7:edit:t{}:large", token());
+    let big: Vec<u8> = (0..3 * 1024 * 1024 + 17)
+        .map(|i| u8::try_from(i % 251).unwrap())
+        .collect();
+    raw(&c, &[b"SET", key.as_bytes(), big.as_slice()]).await;
+    let out = value(&c, &key, KeyType::String).await;
+    assert_eq!(bytes(&out, "value"), [big]);
+    // Nothing stays watched: an apply afterwards commits.
+    let r = apply(
+        &c,
+        &request(
+            &key,
+            Some(KeyType::String),
+            vec![KeyEdit::SetString {
+                value: t("small"),
+                keep_ttl: false,
+            }],
+        ),
+    )
+    .await;
+    committed(&r);
+    raw(&c, &[b"DEL", key.as_bytes()]).await;
     c.close().await.unwrap();
 }

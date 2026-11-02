@@ -17,17 +17,26 @@
 //!   one pipeline (a cluster: single commands side by side, since a pipeline cannot span
 //!   slots). Servers before 6.0 get no `TYPE` argument and are filtered here. The stream is
 //!   lazy: dropping it stops the scan.
-//! - **Values** (`ValueSource`): strings `STRLEN` then `GET`, or `GETRANGE` in 1 MiB pieces
-//!   above [`VALUE_CHUNK`](oxbase_dialect::keyvalue::VALUE_CHUNK) bytes, at most 64 MiB (a
-//!   warning notice says when cut); lists `LRANGE` windows; hashes / sets `HSCAN` / `SSCAN`
-//!   cursors (repeats dropped); sorted sets `ZRANGE start stop WITHSCORES` windows by index, so
-//!   the rows come in score order; streams `XRANGE` from the id after the last one read; JSON
-//!   `JSON.GET key $`, shown as the document itself (the one element of the `$` result).
+//! - **Values** (`ValueSource`): strings `STRLEN` then `GET` up to 1 MiB; a larger string is
+//!   read with `GETRANGE` in 1 MiB pieces, at most 64 MiB (a warning notice says when cut),
+//!   between a `WATCH` and a `MULTI` / `EXISTS` / `EXEC` that fails when the value changed
+//!   meanwhile (it is then read again, up to three times), so a value written during the read
+//!   is never shown torn. Lists `LRANGE` windows; hashes / sets `HSCAN` / `SSCAN` cursors
+//!   (repeats dropped); sorted sets `ZRANGE start stop WITHSCORES` windows by index, so the rows
+//!   come in score order; streams `XRANGE` from the id after the last one read, `fields` a JSON
+//!   object `{name: value}`, or, when a name repeats in the entry or is not UTF-8, an array of
+//!   `[name, value]` pairs in entry order (names and values are text, or `{"hex"}` for bytes
+//!   that are not UTF-8); JSON `JSON.GET key $`, shown as the document itself (the one element
+//!   of the `$` result, cut out of the reply text so numbers keep every digit).
 //! - **Edits**: see the private `edit` module. Standalone and sentinel sessions run them on a
 //!   [`RedisConnection::dedicated`](crate::RedisConnection::dedicated) connection (so nothing
-//!   else on the session can slip into the `MULTI`); a cluster on the session (the key's node).
-//!   After the `EXEC` the key is read back with [`KeyValueStore::info`] (after a rename: the
-//!   new key; nothing after a delete or when the key expired at once).
+//!   else on the session can slip into the `MULTI`); a cluster on the session (the key's node),
+//!   one apply of the session at a time. After the `EXEC` the key is read back with
+//!   [`KeyValueStore::info`] (after a rename: the new key; nothing after a delete or when the
+//!   key expired at once). When some edits failed inside `EXEC` while others applied, the
+//!   report is not committed but still carries the key as it is now.
+//!   A `SET` over a string larger than the 64 MiB the editor reads needs
+//!   `confirm_destructive`, like an expiry of 0 ms (which deletes the key).
 
 pub(super) mod common;
 mod edit;
@@ -110,8 +119,8 @@ impl KeyValueStore for RedisKeyValueStore {
         check(&cancel)?;
         request.validate()?;
         let redis = native(c)?;
-        let mut report = edit::apply(redis, request, &cancel).await?;
-        if !report.committed {
+        let (mut report, wrote) = edit::apply(redis, request, &cancel).await?;
+        if !wrote {
             return Ok(report);
         }
         // The key afterwards: the rename's new name, nothing after a delete.
@@ -127,6 +136,12 @@ impl KeyValueStore for RedisKeyValueStore {
             let address = KeyAddress::new(request.address.database.clone(), target);
             let bytes = address.key.to_bytes()?;
             report.info = read_info(redis, &address, &bytes, &cancel).await?;
+        }
+        if !report.committed && report.info.is_none() {
+            // Some edits failed inside `EXEC` (a failed rename leaves the old name): the key as
+            // it is now, so the UI refreshes instead of applying the others twice.
+            let bytes = request.address.key.to_bytes()?;
+            report.info = read_info(redis, &request.address, &bytes, &cancel).await?;
         }
         Ok(report)
     }

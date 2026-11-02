@@ -23,13 +23,15 @@ use super::common::{
     Nodes, binary_field, check, console_arg, float_of, int_of, into_bytes, items, json_bytes,
     json_field, key_name, native, pairs, scan_done, scan_reply, text_of,
 };
+use super::edit::{Link, LinkTarget};
 use crate::driver::RedisHandle;
 
-/// Strings longer than this many bytes are read with `GETRANGE` in pieces of
-/// [`STRING_PIECE`] bytes.
+/// Strings longer than this many bytes are read with `GETRANGE` in pieces of this size.
 const STRING_PIECE: usize = 1024 * 1024;
 /// At most this many bytes of a string value are read (a warning notice says when cut).
 pub(crate) const STRING_READ_LIMIT: usize = 64 * 1024 * 1024;
+/// How often a string read in pieces starts again when the value changed during the read.
+const STRING_READ_ATTEMPTS: usize = 3;
 
 fn chunk_i64() -> i64 {
     i64::try_from(VALUE_CHUNK).unwrap_or(1000)
@@ -312,6 +314,8 @@ enum Position {
 
 struct ValueState {
     handle: RedisHandle,
+    /// Strings: where a read in pieces watches the key.
+    link: Option<LinkTarget>,
     key: Vec<u8>,
     key_type: KeyType,
     position: Position,
@@ -366,20 +370,57 @@ impl ValueState {
     async fn string(&mut self, cancel: &CancellationToken) -> Result<Step> {
         let length = int_of(&self.run(&self.command("STRLEN"), cancel).await?).unwrap_or(0);
         let length = usize::try_from(length).unwrap_or(0);
-        let mut notices = Vec::new();
-        let value = if length <= VALUE_CHUNK {
+        let mut out = Vec::new();
+        let value = if length <= STRING_PIECE {
             match self.run(&self.command("GET"), cancel).await? {
                 // Gone since the type was read.
                 Value::Nil => return Ok((Vec::new(), false)),
                 other => into_bytes(other).unwrap_or_default(),
             }
         } else {
-            let wanted = length.min(STRING_READ_LIMIT);
-            if wanted < length {
-                notices.push(Ok(ResultItem::Notice(Notice::warning(format!(
-                    "the value has {length} bytes; only the first {STRING_READ_LIMIT} are shown"
+            let Some((value, length)) = self.pieces(cancel).await? else {
+                return Ok((Vec::new(), false));
+            };
+            if value.len() < length {
+                out.push(Ok(ResultItem::Notice(Notice::warning(format!(
+                    "the value has {length} bytes; only the first {} are shown",
+                    value.len()
                 )))));
             }
+            value
+        };
+        out.push(batch(
+            &self.schema,
+            vec![Arc::new(BinaryArray::from_iter_values([value.as_slice()]))],
+        ));
+        Ok((out, false))
+    }
+
+    /// A string above one piece, read between `WATCH` and a `MULTI` / `EXISTS` / `EXEC` that
+    /// fails when the value changed meanwhile (then it is read again): the value (at most
+    /// [`STRING_READ_LIMIT`] bytes) and its whole length, `None` when the key is gone.
+    async fn pieces(&self, cancel: &CancellationToken) -> Result<Option<(Vec<u8>, usize)>> {
+        let Some(target) = &self.link else {
+            return Err(Error::internal("a string value read without its link"));
+        };
+        let link = target.open(&self.key, cancel).await?;
+        let outcome = self.watched_pieces(&link, cancel).await;
+        if outcome.is_err() {
+            link.unwatch().await;
+        }
+        outcome
+    }
+
+    async fn watched_pieces(
+        &self,
+        link: &Link,
+        cancel: &CancellationToken,
+    ) -> Result<Option<(Vec<u8>, usize)>> {
+        for _ in 0..STRING_READ_ATTEMPTS {
+            link.watch(&[self.key.as_slice()], cancel).await?;
+            let length = int_of(&self.run(&self.command("STRLEN"), cancel).await?).unwrap_or(0);
+            let length = usize::try_from(length).unwrap_or(0);
+            let wanted = length.min(STRING_READ_LIMIT);
             let mut value = Vec::with_capacity(wanted);
             while value.len() < wanted {
                 check(cancel)?;
@@ -393,14 +434,16 @@ impl ValueState {
                 }
                 value.extend_from_slice(&piece);
             }
-            value
-        };
-        let item = batch(
-            &self.schema,
-            vec![Arc::new(BinaryArray::from_iter_values([value.as_slice()]))],
-        );
-        notices.push(item);
-        Ok((notices, false))
+            let mut unchanged = redis::pipe();
+            unchanged.atomic().cmd("EXISTS").arg(self.key.as_slice());
+            if link.exec(&unchanged, cancel).await?.is_some() {
+                return Ok((length > 0).then_some((value, length)));
+            }
+        }
+        Err(Error::sql(
+            None::<&str>,
+            format!("the value changed {STRING_READ_ATTEMPTS} times while it was read; try again"),
+        ))
     }
 
     async fn list(&mut self, cancel: &CancellationToken) -> Result<Step> {
@@ -527,15 +570,12 @@ impl ValueState {
             else {
                 continue;
             };
-            let mut object = serde_json::Map::new();
-            for (f, v) in pairs(body) {
-                let (Some(f), Some(v)) = (into_bytes(f), into_bytes(v)) else {
-                    continue;
-                };
-                object.insert(String::from_utf8_lossy(&f).into_owned(), json_bytes(&v));
-            }
+            let entry: Vec<(Vec<u8>, Vec<u8>)> = pairs(body)
+                .into_iter()
+                .filter_map(|(f, v)| Some((into_bytes(f)?, into_bytes(v)?)))
+                .collect();
             ids.push(id);
-            fields.push(serde_json::Value::Object(object).to_string());
+            fields.push(stream_fields(&entry).to_string());
         }
         let Some(last) = ids.last() else {
             return Ok((Vec::new(), false));
@@ -559,13 +599,48 @@ impl ValueState {
         let Some(text) = text_of(&reply) else {
             return Ok((Vec::new(), false));
         };
-        // `JSON.GET key $` answers `[document]`: the document itself is shown.
-        let value = match serde_json::from_str::<serde_json::Value>(&text) {
-            Ok(serde_json::Value::Array(mut all)) if all.len() == 1 => all.remove(0).to_string(),
-            _ => text,
-        };
-        let columns: Vec<ArrayRef> = vec![Arc::new(StringArray::from(vec![value]))];
+        let columns: Vec<ArrayRef> = vec![Arc::new(StringArray::from(vec![json_root(&text)]))];
         Ok((vec![batch(&self.schema, columns)], false))
+    }
+}
+
+/// The `fields` JSON of a stream entry: an object `{name: value}` when every name is UTF-8
+/// and appears once, else an array of `[name, value]` pairs in entry order (`XADD` allows a
+/// name twice). Names and values are text, or `{"hex"}` when not UTF-8.
+pub(crate) fn stream_fields(entry: &[(Vec<u8>, Vec<u8>)]) -> serde_json::Value {
+    let mut names = HashSet::new();
+    let plain = entry
+        .iter()
+        .all(|(f, _)| std::str::from_utf8(f).is_ok() && names.insert(f.as_slice()));
+    if plain {
+        let object: serde_json::Map<String, serde_json::Value> = entry
+            .iter()
+            .map(|(f, v)| (String::from_utf8_lossy(f).into_owned(), json_bytes(v)))
+            .collect();
+        return serde_json::Value::Object(object);
+    }
+    serde_json::Value::Array(
+        entry
+            .iter()
+            .map(|(f, v)| serde_json::Value::Array(vec![json_bytes(f), json_bytes(v)]))
+            .collect(),
+    )
+}
+
+/// The document of a `JSON.GET key $` reply (`[document]`), cut out of the reply text so
+/// nothing is parsed into numbers (an integer beyond 64 bits or a long decimal keeps every
+/// digit); any other reply as it is.
+pub(crate) fn json_root(text: &str) -> String {
+    let one =
+        serde_json::from_str::<Vec<serde::de::IgnoredAny>>(text).is_ok_and(|all| all.len() == 1);
+    let inner = text
+        .trim()
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .map(str::trim);
+    match inner {
+        Some(inner) if one => inner.to_owned(),
+        _ => text.to_owned(),
     }
 }
 
@@ -596,6 +671,7 @@ impl ResultSource for ValueSource {
         let redis = native(c)?;
         let state = ValueState {
             handle: redis.handle(),
+            link: (self.key_type == KeyType::String).then(|| LinkTarget::of(redis)),
             key: self.key.clone(),
             key_type: self.key_type,
             position: Position::Start,
@@ -659,6 +735,44 @@ mod tests {
         let scan = scan_schema();
         assert_eq!(scan.field(0).data_type(), &DataType::Binary);
         assert!(scan.field(3).is_nullable());
+    }
+
+    #[test]
+    fn json_documents_keep_every_digit() {
+        let big = r#"[{"id":123456789012345678901234567890,"d":1.000000000000000000001}]"#;
+        assert_eq!(
+            json_root(big),
+            r#"{"id":123456789012345678901234567890,"d":1.000000000000000000001}"#
+        );
+        assert_eq!(
+            json_root(" [ 18446744073709551616 ] "),
+            "18446744073709551616"
+        );
+        assert_eq!(json_root("[[1,2]]"), "[1,2]");
+        assert_eq!(json_root(r#"["a]"]"#), r#""a]""#);
+        // Not one element: the reply as it is.
+        assert_eq!(json_root("[1,2]"), "[1,2]");
+        assert_eq!(json_root("[]"), "[]");
+        assert_eq!(json_root("{\"a\":1}"), "{\"a\":1}");
+        assert_eq!(json_root("not json"), "not json");
+    }
+
+    #[test]
+    fn stream_fields_keep_repeated_and_binary_names() {
+        let e = |f: &[u8], v: &[u8]| (f.to_vec(), v.to_vec());
+        assert_eq!(
+            stream_fields(&[e(b"k", b"v1"), e(b"n", &[0xff])]),
+            serde_json::json!({"k": "v1", "n": {"hex": "ff"}})
+        );
+        assert_eq!(
+            stream_fields(&[e(b"k", b"1"), e(b"k", b"2")]),
+            serde_json::json!([["k", "1"], ["k", "2"]])
+        );
+        assert_eq!(
+            stream_fields(&[e(&[0xfe], b"x")]),
+            serde_json::json!([[{"hex": "fe"}, "x"]])
+        );
+        assert_eq!(stream_fields(&[]), serde_json::json!({}));
     }
 
     #[tokio::test]
