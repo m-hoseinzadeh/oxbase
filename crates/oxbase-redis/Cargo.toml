@@ -25,6 +25,10 @@ oxbase-sql.workspace = true
 oxbase-net.workspace = true
 redis.workspace = true
 rustls.workspace = true
+# redis-driver stream: the session's own TLS handshake (rustls + ring through oxbase_net's
+# client config) on the socket it hands to `MultiplexedConnection::new_with_config`. Already a
+# workspace dependency (oxbase-pg, oxbase-mssql), so Cargo.lock gains no crate.
+tokio-rustls.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 futures.workspace = true

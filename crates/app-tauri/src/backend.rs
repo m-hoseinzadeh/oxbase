@@ -290,7 +290,8 @@ mod tests {
                 Engine::MariaDb,
                 Engine::Sqlite,
                 Engine::MsSql,
-                Engine::MongoDb
+                Engine::MongoDb,
+                Engine::Redis
             ]
         );
     }
