@@ -228,7 +228,10 @@ async fn binary_names_flat_listings_and_truncation() {
     let parent = ObjectRef::schema(Some("0"), prefix.clone());
     let keys = list(&c, ObjectKind::Key, &parent).await;
     assert_eq!(keys.len(), 14);
-    assert!(list(&c, ObjectKind::Schema, &parent).await.is_empty());
+    assert_eq!(
+        list(&c, ObjectKind::Schema, &parent).await,
+        Vec::<ObjectSummary>::new()
+    );
     let bin = keys
         .iter()
         .find(|r| r.extras.contains(&props::KEY_HEX))
@@ -258,10 +261,9 @@ async fn binary_names_flat_listings_and_truncation() {
     );
     // No separator: every key directly under its parent.
     let flat = connect(&with_option(params(), options::NAMESPACE_SEPARATOR, "")).await;
-    assert!(
-        list(&flat, ObjectKind::Schema, &ObjectRef::database("0"))
-            .await
-            .is_empty()
+    assert_eq!(
+        list(&flat, ObjectKind::Schema, &ObjectRef::database("0")).await,
+        Vec::<ObjectSummary>::new()
     );
     let flat_keys = by_name(list(&flat, ObjectKind::Key, &parent).await);
     assert_eq!(flat_keys.len(), 14);

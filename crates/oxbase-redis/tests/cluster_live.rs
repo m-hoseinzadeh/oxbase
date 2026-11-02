@@ -163,7 +163,7 @@ async fn cluster_values_and_edits_are_routed_by_slot() {
     for i in 0..12 {
         let key = format!("m7:edit:t{tok}:{i}");
         let create = KeyApplyRequest {
-            address: KeyAddress::new("0", BinaryText::text(&key)),
+            address: KeyAddress::new("0", BinaryText::text(key.as_str())),
             key_type: None,
             create: true,
             edits: vec![
@@ -188,7 +188,10 @@ async fn cluster_values_and_edits_are_routed_by_slot() {
         assert_eq!(info.length, Some(1));
         let out = read(
             store
-                .read_value(&KeyAddress::new("0", BinaryText::text(&key)), KeyType::Hash)
+                .read_value(
+                    &KeyAddress::new("0", BinaryText::text(key.as_str())),
+                    KeyType::Hash,
+                )
                 .unwrap()
                 .as_ref(),
             &c,
@@ -225,7 +228,7 @@ async fn cluster_values_and_edits_are_routed_by_slot() {
         .subscribe(
             &c,
             &SubscribeRequest {
-                channels: vec![BinaryText::text(&channel)],
+                channels: vec![BinaryText::text(channel.as_str())],
                 patterns: Vec::new(),
             },
             sink,
@@ -241,7 +244,7 @@ async fn cluster_values_and_edits_are_routed_by_slot() {
     RedisPubSub
         .publish(
             &c,
-            &BinaryText::text(&channel),
+            &BinaryText::text(channel.as_str()),
             &BinaryText::text("hello"),
             CancellationToken::new(),
         )
@@ -293,7 +296,7 @@ async fn the_sentinel_master_is_browsed_and_read() {
         return;
     }
     let store = RedisKeyValueStore;
-    let address = KeyAddress::new("0", BinaryText::text(&seed));
+    let address = KeyAddress::new("0", BinaryText::text(seed.as_str()));
     let info = store
         .info(&c, &address, CancellationToken::new())
         .await
@@ -324,7 +327,7 @@ async fn the_sentinel_master_is_browsed_and_read() {
         .apply(
             &c,
             &KeyApplyRequest {
-                address: KeyAddress::new("0", BinaryText::text(&key)),
+                address: KeyAddress::new("0", BinaryText::text(key.as_str())),
                 key_type: None,
                 create: true,
                 edits: vec![KeyEdit::SetString {

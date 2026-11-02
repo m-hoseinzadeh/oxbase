@@ -494,7 +494,7 @@ mod tests {
         assert_eq!(counts.get(&0), Some(&12));
         assert_eq!(counts.get(&1), Some(&1));
         assert_eq!(counts.get(&2), None);
-        assert!(parse_keyspace("").is_empty());
+        assert_eq!(parse_keyspace(""), BTreeMap::new());
     }
 
     #[test]

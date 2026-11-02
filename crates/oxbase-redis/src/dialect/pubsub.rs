@@ -73,10 +73,10 @@ impl PubSub for RedisPubSub {
             let conn = dedicated.connection_mut();
             let subscribed = async {
                 if !channels.is_empty() {
-                    conn.subscribe(&channels).await?;
+                    conn.subscribe(channels.as_slice()).await?;
                 }
                 if !patterns.is_empty() {
-                    conn.psubscribe(&patterns).await?;
+                    conn.psubscribe(patterns.as_slice()).await?;
                 }
                 Ok::<_, redis::RedisError>(())
             };
@@ -86,10 +86,10 @@ impl PubSub for RedisPubSub {
             let mut pubsub = redis.pubsub(&cancel).await?;
             let subscribed = async {
                 if !channels.is_empty() {
-                    pubsub.subscribe(&channels).await?;
+                    pubsub.subscribe(channels.as_slice()).await?;
                 }
                 if !patterns.is_empty() {
-                    pubsub.psubscribe(&patterns).await?;
+                    pubsub.psubscribe(patterns.as_slice()).await?;
                 }
                 Ok::<_, redis::RedisError>(())
             };

@@ -46,8 +46,8 @@ async fn channel_and_pattern_subscriptions_receive_publishes_on_both_protocols()
         let c = connect(&with_option(params(), options::PROTOCOL, protocol)).await;
         let (sink, mut events) = mpsc::channel(64);
         let request = SubscribeRequest {
-            channels: vec![BinaryText::text(&channel)],
-            patterns: vec![BinaryText::text(&pattern)],
+            channels: vec![BinaryText::text(channel.as_str())],
+            patterns: vec![BinaryText::text(pattern.as_str())],
         };
         let subscription = RedisPubSub
             .subscribe(&c, &request, sink, CancellationToken::new())
@@ -72,7 +72,7 @@ async fn channel_and_pattern_subscriptions_receive_publishes_on_both_protocols()
                     payload,
                     received_at_ms,
                 } => {
-                    assert_eq!(ch, BinaryText::text(&channel));
+                    assert_eq!(ch, BinaryText::text(channel.as_str()));
                     assert_eq!(payload, BinaryText::from_bytes(&[b'h', b'i', 0xff]));
                     assert!(received_at_ms > 0);
                     seen.push(p);
@@ -81,7 +81,11 @@ async fn channel_and_pattern_subscriptions_receive_publishes_on_both_protocols()
             }
         }
         seen.sort();
-        assert_eq!(seen, [None, Some(BinaryText::text(&pattern))], "{protocol}");
+        assert_eq!(
+            seen,
+            [None, Some(BinaryText::text(pattern.as_str()))],
+            "{protocol}"
+        );
         // Only the pattern matches another m7 channel.
         let other = format!("m7:other:{}", token());
         publish(&c, &other, b"x").await;
@@ -91,8 +95,8 @@ async fn channel_and_pattern_subscriptions_receive_publishes_on_both_protocols()
                 pattern: p,
                 ..
             } => {
-                assert_eq!(ch, BinaryText::text(&other));
-                assert_eq!(p, Some(BinaryText::text(&pattern)));
+                assert_eq!(ch, BinaryText::text(other.as_str()));
+                assert_eq!(p, Some(BinaryText::text(pattern.as_str())));
             }
             other => panic!("{protocol}: {other:?}"),
         }
@@ -121,7 +125,7 @@ async fn a_full_sink_drops_messages_and_counts_them() {
             .subscribe(
                 &c,
                 &SubscribeRequest {
-                    channels: vec![BinaryText::text(&channel)],
+                    channels: vec![BinaryText::text(channel.as_str())],
                     patterns: Vec::new(),
                 },
                 sink,
@@ -171,7 +175,7 @@ async fn cancelling_the_subscribe_token_or_dropping_ends_the_subscription() {
     let c = connect(&params()).await;
     let channel = format!("m7:cancel:{}", token());
     let request = SubscribeRequest {
-        channels: vec![BinaryText::text(&channel)],
+        channels: vec![BinaryText::text(channel.as_str())],
         patterns: Vec::new(),
     };
     let cancel = CancellationToken::new();

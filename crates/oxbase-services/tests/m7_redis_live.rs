@@ -497,7 +497,7 @@ async fn redis_browse_query_edit_and_pubsub_through_the_services() {
     let tok = token();
     let key = format!("m7:edit:t{tok}:svc");
     let create = KeyApplyRequest {
-        address: KeyAddress::new("0", BinaryText::text(&key)),
+        address: KeyAddress::new("0", BinaryText::text(key.as_str())),
         key_type: None,
         create: true,
         edits: vec![
@@ -546,7 +546,7 @@ async fn redis_browse_query_edit_and_pubsub_through_the_services() {
     assert!(report.committed && report.info.is_none(), "{report:?}");
     // The same edits on database 1 go to its own session.
     let on_db1 = KeyApplyRequest {
-        address: KeyAddress::new("1", BinaryText::text(&key)),
+        address: KeyAddress::new("1", BinaryText::text(key.as_str())),
         key_type: None,
         create: true,
         edits: vec![KeyEdit::SetString {
@@ -572,7 +572,7 @@ async fn redis_browse_query_edit_and_pubsub_through_the_services() {
         .keys
         .info(
             live.session,
-            &KeyAddress::new("0", BinaryText::text(&key)),
+            &KeyAddress::new("0", BinaryText::text(key.as_str())),
             CancellationToken::new(),
         )
         .await
@@ -594,8 +594,8 @@ async fn redis_browse_query_edit_and_pubsub_through_the_services() {
         .subscribe(
             live.session,
             &SubscribeRequest {
-                channels: vec![BinaryText::text(&channel)],
-                patterns: vec![BinaryText::text(&pattern)],
+                channels: vec![BinaryText::text(channel.as_str())],
+                patterns: vec![BinaryText::text(pattern.as_str())],
             },
             CancellationToken::new(),
         )
@@ -609,7 +609,7 @@ async fn redis_browse_query_edit_and_pubsub_through_the_services() {
         .pubsub
         .publish(
             live.session,
-            &BinaryText::text(&channel),
+            &BinaryText::text(channel.as_str()),
             &BinaryText::text("hello"),
             CancellationToken::new(),
         )
@@ -635,7 +635,7 @@ async fn redis_browse_query_edit_and_pubsub_through_the_services() {
         .subscribe(
             live.session,
             &SubscribeRequest {
-                channels: vec![BinaryText::text(&channel)],
+                channels: vec![BinaryText::text(channel.as_str())],
                 patterns: Vec::new(),
             },
             CancellationToken::new(),
