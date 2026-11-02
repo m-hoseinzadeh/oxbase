@@ -8,7 +8,8 @@
 //! request's own `comment` is kept after it (`oxbase:<id>:<n> <the user's comment>`), so the
 //! kill filter is the run's comment followed by a space or the end. A command that returns a
 //! cursor (`listCollections`, `find`, ...) shows its first batch; the driver then closes the
-//! server cursor in the command's session and says so in a notice.
+//! server cursor with `killCursors` (sessionless, as the `mongodb` crate closes its own) and
+//! says so in a notice.
 
 use std::pin::pin;
 use std::time::Duration;
@@ -133,32 +134,30 @@ async fn execute(
             // Replaces the user's comment in place (key order kept), keeping its text.
             let comment = command_comment(&ctx.comment, command.get("comment"));
             command.insert("comment", comment);
-            // An explicit session, so a cursor the command opens can be closed in it.
-            let mut session = ctx.client.start_session().await.map_err(map)?;
             let reply = ctx
                 .client
                 .database(&database)
                 .run_command(command)
-                .session(&mut session)
                 .await
                 .map_err(map)?;
-            let closed = close_reply_cursor(ctx, &mut session, &reply).await;
+            let cursor = close_reply_cursor(ctx, &reply).await;
             let layout = Layout::infer(std::slice::from_ref(&reply), None);
             send(tx, ResultItem::Schema(layout.schema())).await?;
             let (batch, _) = layout.batch(&[reply])?;
             send(tx, ResultItem::Batch(batch)).await?;
-            if closed {
-                send(
-                    tx,
-                    ResultItem::Notice(Notice::info(
-                        "the command returned a cursor: only its first batch is shown and the \
-                         server cursor was closed (a find or aggregate request streams every \
-                         document)",
-                    )),
-                )
-                .await?;
-            }
-            Ok(())
+            let notice = match cursor {
+                ReplyCursor::None => return Ok(()),
+                ReplyCursor::Closed => Notice::info(
+                    "the command returned a cursor: only its first batch is shown and the server \
+                     cursor was closed (a find or aggregate request streams every document)",
+                ),
+                ReplyCursor::Open => Notice::warning(
+                    "the command returned a cursor: only its first batch is shown; the server \
+                     cursor could not be closed and stays open until the server times it out \
+                     (a find or aggregate request streams every document)",
+                ),
+            };
+            send(tx, ResultItem::Notice(notice)).await
         }
         Statement::Query(query) => {
             let collection = query.collection();
@@ -207,15 +206,18 @@ fn command_comment(ours: &str, user: Option<&Bson>) -> Bson {
     })
 }
 
-/// When `reply` holds an open cursor (`cursor.id` not 0), closes it with `killCursors` in the
-/// command's session. Returns whether there was one.
-async fn close_reply_cursor(
-    ctx: &RunContext,
-    session: &mut mongodb::ClientSession,
-    reply: &Document,
-) -> bool {
+/// The server cursor a command reply left open.
+enum ReplyCursor {
+    None,
+    Closed,
+    /// `killCursors` failed (or the reply named no namespace).
+    Open,
+}
+
+/// When `reply` holds an open cursor (`cursor.id` not 0), closes it with `killCursors`.
+async fn close_reply_cursor(ctx: &RunContext, reply: &Document) -> ReplyCursor {
     let Ok(cursor) = reply.get_document("cursor") else {
-        return false;
+        return ReplyCursor::None;
     };
     let id = match cursor.get("id") {
         Some(Bson::Int64(id)) => *id,
@@ -223,21 +225,37 @@ async fn close_reply_cursor(
         _ => 0,
     };
     if id == 0 {
-        return false;
+        return ReplyCursor::None;
     }
     let Some((database, collection)) = cursor.get_str("ns").ok().and_then(|ns| ns.split_once('.'))
     else {
-        return true;
+        return ReplyCursor::Open;
     };
+    // `killCursors` takes no session (the `mongodb` crate refuses one); the server lets the
+    // user who opened the cursor close it from any session.
     let kill = doc! {"killCursors": collection, "cursors": [id]};
-    let db = ctx.client.database(database);
-    if let Err(e) = db.run_command(kill).session(session).await {
-        tracing::debug!(
-            error = %map_error(&e, &ctx.redactor),
-            "MongoDB: killCursors after a command failed"
-        );
+    match ctx.client.database(database).run_command(kill).await {
+        Ok(reply) if cursor_killed(&reply, id) => ReplyCursor::Closed,
+        Ok(_) => ReplyCursor::Open,
+        Err(e) => {
+            tracing::debug!(
+                error = %map_error(&e, &ctx.redactor),
+                "MongoDB: killCursors after a command failed"
+            );
+            ReplyCursor::Open
+        }
     }
-    true
+}
+
+/// Whether a `killCursors` reply lists `id` in `cursorsKilled`.
+fn cursor_killed(reply: &Document, id: i64) -> bool {
+    reply.get_array("cursorsKilled").is_ok_and(|killed| {
+        killed.iter().any(|k| match k {
+            Bson::Int64(k) => *k == id,
+            Bson::Int32(k) => i64::from(*k) == id,
+            _ => false,
+        })
+    })
 }
 
 /// Streams documents as one result set: the first `sample_size` infer the layout, then
@@ -440,6 +458,19 @@ mod tests {
             command_comment("oxbase:ab:2", Some(&Bson::Document(doc! {"tag": 1_i32}))),
             Bson::String(r#"oxbase:ab:2 {"tag":1}"#.into())
         );
+    }
+
+    #[test]
+    fn kill_cursors_replies() {
+        assert!(cursor_killed(
+            &doc! {"cursorsKilled": [7_i64], "ok": 1.0},
+            7
+        ));
+        assert!(!cursor_killed(
+            &doc! {"cursorsKilled": [], "cursorsNotFound": [7_i64]},
+            7
+        ));
+        assert!(!cursor_killed(&doc! {"ok": 1.0}, 7));
     }
 
     #[tokio::test]
