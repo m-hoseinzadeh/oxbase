@@ -6,7 +6,8 @@
 # The marker key oxbase_test:fixture:seeded is set here, only after the whole seed ran without errors.
 # M7: then /oxbase-init/seed-m7.redis once (marker oxbase_test:fixture:m7_seeded, so a volume
 # seeded before M7 gets the M7 keys too), m7:json when RedisJSON is loaded, and on every start the
-# ACL user m7_reader (ACL rules live in memory only, not in the AOF).
+# ACL user m7_reader (ACL rules live in memory only, not in the AOF) and m7:ttl (its 24 h TTL is
+# shorter than the life of a local volume).
 set -eu
 
 # M7: the TLS port (--tls-port in compose) reads the test CA / server certificate / key from
@@ -99,6 +100,13 @@ if [ "$(cli -n 0 EXISTS oxbase_test:fixture:m7_seeded)" = "0" ]; then
     echo "oxbase-init: M7 seed complete"
 else
     echo "oxbase-init: M7 seed already present, skipping"
+fi
+
+# M7: m7:ttl again on every start (as the ACL user): the volume outlives its 24 h TTL, and the
+# marker above would otherwise keep a local fixture older than a day without the key.
+if [ "$(cli -n 0 SET m7:ttl expires EX 86400)" != "OK" ]; then
+    echo "oxbase-init: could not write m7:ttl" >&2
+    exit 1
 fi
 
 # `wait` returns early when a trapped signal arrives; keep waiting until the server has exited,

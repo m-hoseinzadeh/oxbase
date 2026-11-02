@@ -369,8 +369,9 @@ services:
         read_only: true
     # The init-phase mongod also listens on 127.0.0.1:27017, so a plain ping would go green too
     # early. Require the final server (--bind_ip_all, reported as
-    # net.bindIp "*") and the completion markers of both seeds (01-seed.js, M7: 02-m7.js). A data
-    # volume from before M7 has no "m7" marker and stays unhealthy: scripts/fixtures-down.sh.
+    # net.bindIp "*") and the completion markers of both seeds (01-seed.js, M7: 02-m7.js with
+    # schema_version 2, the seed with the score / big_long fields). A data volume from before M7,
+    # or from the first M7 seed, stays unhealthy: scripts/fixtures-down.sh.
     healthcheck:
       test:
         - CMD-SHELL
@@ -380,7 +381,7 @@ services:
           'const o = db.adminCommand({getCmdLineOpts: 1}).parsed;
           const ok = db.adminCommand({ping: 1}).ok === 1
           && o.net && (o.net.bindIpAll === true || o.net.bindIp === "*")
-          && db.getSiblingDB("oxbase_test").fixture_meta.countDocuments({_id: {$$in: ["seed", "m7"]}}) === 2;
+          && db.getSiblingDB("oxbase_test").fixture_meta.countDocuments({$$or: [{_id: "seed"}, {_id: "m7", schema_version: {$$gte: 2}}]}) === 2;
           if (!ok) quit(1);'
       interval: 3s
       timeout: 10s
@@ -400,8 +401,8 @@ services:
       OXBASE_REDIS_PASSWORD: Oxbase_Fixture_Pw_2026
     # The image has no init-script hook: the wrapper copies the TLS files (owned by redis),
     # starts redis-server, loads the seed once (when the marker key is absent), the M7 seed once
-    # (its own marker), creates the ACL user m7_reader on every start, and forwards stop signals.
-    # Healthy once both markers and the ACL user exist.
+    # (its own marker), creates the ACL user m7_reader and sets m7:ttl on every start, and
+    # forwards stop signals. Healthy once both markers, m7:ttl and the ACL user exist.
     entrypoint: ["/bin/sh", "/oxbase-init/entrypoint.sh"]
     command:
       - redis-server
@@ -454,7 +455,7 @@ services:
         - CMD-SHELL
         - >-
           redis-cli --no-auth-warning -a Oxbase_Fixture_Pw_2026 ping | grep -q PONG &&
-          [ "$$(redis-cli --no-auth-warning -a Oxbase_Fixture_Pw_2026 EXISTS oxbase_test:fixture:seeded oxbase_test:fixture:m7_seeded)" = "2" ] &&
+          [ "$$(redis-cli --no-auth-warning -a Oxbase_Fixture_Pw_2026 EXISTS oxbase_test:fixture:seeded oxbase_test:fixture:m7_seeded m7:ttl)" = "3" ] &&
           redis-cli --no-auth-warning -a Oxbase_Fixture_Pw_2026 ACL GETUSER m7_reader | grep -q flags
       interval: 3s
       timeout: 5s

@@ -4,6 +4,8 @@
 # deleting every key it creates, so a reseed cannot duplicate list entries or stream IDs.
 # Not here (entrypoint.sh does them): m7:json (JSON.SET, only when RedisJSON is loaded) and the
 # ACL user m7_reader (ACL rules are not persisted in the AOF, so it is set on every start).
+# m7:ttl is set here and again by entrypoint.sh on every start (it expires after 24 h, the
+# marker does not).
 # Arguments use redis-cli quoting: "\x00\xff\xfe\n" is the four bytes 00 ff fe 0a.
 SELECT 0
 DEL m7:string m7:binary m7:hash m7:list m7:set m7:zset m7:stream m7:ttl m7:json m7:big:list m7:big:zset m7:ns:a:1 m7:ns:a:2 m7:ns:b:1 m7:ns:leaf m7:edit:seed

@@ -840,7 +840,11 @@ large_rows = 200000
 #             strings; meta embedded document {city (unique), zip, geo: {lat, lon}}; mixed:
 #             string in doc 1, int32 in doc 2, double in doc 3, null in doc 4, object in doc 5,
 #             array in doc 6, missing in 7-12 (one `mixed` column); flag bool (true in odd
-#             docs); only_late: a field present only in doc 12 (outside a 10-document sample).
+#             docs); only_late: a field present only in doc 12 (outside a 10-document sample);
+#             score double 1.5 * NN in every document (one Float64 column; 3.0, 6.0, ... are
+#             integral doubles); big_long int64 2^53 + NN (9007199254740993 .. 9007199254741004:
+#             exact only as a 64-bit integer, a JS number or relaxed-JSON double rounds it).
+#             fixture_meta {_id: "m7"} has schema_version 2 since score and big_long.
 #   m7_big    200 000 documents {_id: int32 1..200000, g: int32 (_id % 100), s: "row-<_id>"}
 #             inserted in batches; streaming, cancel and paging checks.
 #   m7_edit   3 seed documents {_id: int32 1..3, name: "seed-<n>", v: int32 n}; edit tests
@@ -881,7 +885,8 @@ shell_aggregate = "db.m7_big.aggregate([{$group: {_id: null, total: {$sum: \"$g\
 #   m7:hash          f1=v1 f2=v2 f3="grüße"         m7:list     a b c
 #   m7:set           a b c                         m7:zset     a 1, b 2, c 3
 #   m7:stream        2 entries 1767261600000-0 {k: v1}, 1767261600000-1 {k: v2}
-#   m7:ttl           "expires" with EXPIRE 86400 (set at seed time; the job is shorter)
+#   m7:ttl           "expires" with EXPIRE 86400 (set by the seed and again by the entrypoint on
+#                    every container start, so a volume older than a day still has it)
 #   m7:json          {"a": 1, "b": [true, null]} with JSON.SET, only when the image loads
 #                    RedisJSON (json_optional; the entrypoint logs whether it did)
 #   m7:big:list      200 000 elements "e1" .. "e200000" (RPUSH in batches)
