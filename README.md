@@ -484,11 +484,16 @@ scopes, cancel); an editor `CREATE` / `DROP`, a designer apply and an import cre
 cache in 311 to 444 ms (limit 2 s; the 300 ms refresh coalescing included), and a `CREATE`
 inside a transaction committed by a later run 0 to 338 ms after the `COMMIT`.
 
-Diagnostics: the valid-SQL corpus (`crates/oxbase-insight/tests/corpus/`, 205 PostgreSQL, 197
-MySQL / MariaDB, 169 SQLite and 166 SQL Server statement lines; at least 150 statements per
-dialect) gives zero errors and zero warnings with and without a matching cache. The formatter's
-properties (`check_format` token equivalence and idempotence) hold over the corpus with all 96
-option combinations and over every prefix, every single-token deletion and random insertions.
+Diagnostics: the valid-SQL corpus (`crates/oxbase-insight/tests/corpus/`: 205 PostgreSQL, 191
+MySQL (also run as MariaDB), 169 SQLite and 167 SQL Server statements) gives zero errors and zero
+warnings without a cache and with a matching one (0 to 4 hints per dialect); a 1 MiB script is
+diagnosed in 64 ms (budget 100 ms, perf profile). The formatter's properties (`check_format`
+token equivalence and idempotence) held on 23 232 inputs (the corpus with all 96 option
+combinations) and 31 578 more (every prefix, every single-token deletion and random
+insertions), 0 violations; 100 KiB formats in 4 to 25 ms per engine (budget 200 ms). The
+diagnostics and formatter numbers come from the `insight-perf` job of fast-lane run
+41367296758 at 34de45a, the commit that started printing them.
+
 Tests: 1 205 Rust tests passed on Linux and macOS and 1 203 on Windows (235 live / perf tests
 ignored there and run in the Conformance and perf jobs), 1 021 in the Conformance job, 284 UI
 tests.

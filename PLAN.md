@@ -438,7 +438,10 @@ max 1.97 ms in the perf profile (release: p95 1.51 ms), against 50 ms; on a live
 schema of 5 000 tables x 20 columns read through the real catalog reader (524 ms, 18.2 MiB
 index, reload from the app database 43 ms) the same scenarios through `InsightService::complete`
 took p50 0.23 ms / p95 1.02 ms / max 1.47 ms; through Tauri IPC in the webview smoke test p95
-2 ms. The README (*Code insight (M6)*) has the rest of the numbers. Where the build differs from
+2 ms. Diagnostics: zero errors and warnings on the valid corpus (732 statements in four files
+covering the five dialects) with and without a cache, 1 MiB in 64 ms; the formatter kept token equivalence
+and idempotence on 54 810 generated inputs. The README (*Code insight (M6)*) has the rest of the
+numbers. Where the build differs from
 the text above or from `docs/m6-contracts.md` (its §12 lists the planned deviations):
 
 - No tree-sitter: a tolerant hand-written parser over the `oxbase-sql` lexer (contracts §2.1).
