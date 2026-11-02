@@ -813,10 +813,13 @@ mod tests {
             .map(String::as_str)
     }
 
+    /// A reply, its `type`, its `value` text and its `raw` bytes.
+    type Case<'a> = (Value, &'a str, Option<&'a str>, Option<&'a [u8]>);
+
     #[test]
     fn scalars_render_one_row_per_resp_type() {
         let big = Value::BigNumber(b"3492890328409238509324850943850943825024385".to_vec());
-        let cases: Vec<(Value, &str, Option<&str>, Option<&[u8]>)> = vec![
+        let cases: Vec<Case<'_>> = vec![
             (bulk(b"hello"), "string", Some("hello"), Some(b"hello")),
             (
                 bulk(&[0, 0xff, 0xfe, b'\n']),
