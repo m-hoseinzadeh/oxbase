@@ -314,13 +314,53 @@ services:
       MONGO_INITDB_ROOT_USERNAME: oxbase
       MONGO_INITDB_ROOT_PASSWORD: Oxbase_Fixture_Pw_2026
       MONGO_INITDB_DATABASE: oxbase_test
-    command: ["mongod", "--wiredTigerCacheSizeGB", "0.25"]
+      OXBASE_TLS_OWNER: mongodb:mongodb
+      OXBASE_TLS_COMBINED: server-combined.pem
+    # M7 (docs/m7-contracts.md §9.1, added by the mongo-driver stream): TLS on the same port,
+    # optional for clients (allowTLS), with the [tls] server certificate. mongod reads the
+    # certificate and key from one PEM, which tls/entrypoint.sh writes (OXBASE_TLS_COMBINED)
+    # before handing over to the image entrypoint. Client certificates are accepted, not
+    # required.
+    entrypoint: ["/bin/sh", "/oxbase-tls-init/entrypoint.sh"]
+    command:
+      - mongod
+      - --wiredTigerCacheSizeGB
+      - "0.25"
+      - --tlsMode
+      - allowTLS
+      - --tlsCertificateKeyFile
+      - /etc/oxbase-tls/server-combined.pem
+      - --tlsCAFile
+      - /etc/oxbase-tls/ca.pem
+      - --tlsAllowConnectionsWithoutCertificates
     ports:
       - "127.0.0.1:15417:27017"
     volumes:
       - mongodb-data:/data/db
       - mongodb-config:/data/configdb
       - ./init/mongodb:/docker-entrypoint-initdb.d:ro
+      - type: bind
+        source: ../../target/fixtures/tls/ca.pem
+        target: /oxbase-tls-src/ca.pem
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ../../target/fixtures/tls/server.pem
+        target: /oxbase-tls-src/server.pem
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ../../target/fixtures/tls/server-key.pem
+        target: /oxbase-tls-src/server-key.pem
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./tls
+        target: /oxbase-tls-init
+        read_only: true
     # The init-phase mongod also listens on 127.0.0.1:27017, so a plain ping would go green too
     # early. Require the final server (--bind_ip_all, reported as
     # net.bindIp "*") and the seed's completion marker.
