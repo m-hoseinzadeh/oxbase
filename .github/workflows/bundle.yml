@@ -1,7 +1,8 @@
 name: Bundle
 
 # Dev bundles of the Tauri desktop app for Linux, macOS and Windows, uploaded as
-# workflow artifacts (no GitHub release is created).
+# workflow artifacts. This workflow creates no GitHub release itself: release.yml calls it
+# (workflow_call) for a version tag and publishes the artifacts.
 #
 # Signing secrets (missing ones are skipped by the build itself):
 #   macOS signing      APPLE_CERTIFICATE (base64 .p12), APPLE_CERTIFICATE_PASSWORD,
@@ -37,6 +38,24 @@ on:
         description: Fail unless macOS bundles are Developer ID signed + notarized and Windows bundles are Authenticode signed
         type: boolean
         default: false
+  # Used by release.yml.
+  workflow_call:
+    inputs:
+      ref:
+        description: Git ref to build (a release tag)
+        type: string
+        required: true
+      artifact_prefix:
+        description: Artifact name prefix, e.g. oxbase-0.6.0 (default oxbase-dev)
+        type: string
+        required: true
+      msi_version:
+        description: Numeric Windows MSI version (major.minor.patch[.build]) for pre-release versions
+        type: string
+        default: ""
+      require_signing:
+        type: boolean
+        default: false
 
 # Superseded runs on other refs are cancelled; every main commit gets its own bundle.
 concurrency:
@@ -53,7 +72,8 @@ env:
   RUSTUP_MAX_RETRIES: "10"
   NODE_VERSION: "24"
   PNPM_VERSION: "12.15.0"
-  OXBASE_REQUIRE_SIGNING: ${{ (github.event_name == 'workflow_dispatch' && inputs.require_signing) || (github.event_name != 'workflow_dispatch' && vars.OXBASE_REQUIRE_SIGNING == 'true') }}
+  # A manual run or a release call decides with its input; a push uses the repository variable.
+  OXBASE_REQUIRE_SIGNING: ${{ inputs.require_signing == true || (github.event_name == 'push' && vars.OXBASE_REQUIRE_SIGNING == 'true') }}
 
 jobs:
   bundle:
@@ -88,6 +108,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.ref || '' }}
           persist-credentials: false
 
       # Fails in seconds, not after a 30-minute build, when signing is required but the
@@ -176,6 +197,21 @@ jobs:
           Set-Content -Path $conf -Value $override -Encoding utf8
           "OXBASE_SIGNING_ARGS=--config $conf" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
+      # MSI versions must be numeric, so a pre-release such as 0.7.0-beta.2 needs an explicit
+      # WiX version (0.7.0.2, from scripts/release-check.mjs). Other bundles keep the SemVer.
+      - name: Release - Windows installer version
+        if: runner.os == 'Windows' && inputs.msi_version != ''
+        shell: pwsh
+        env:
+          MSI_VERSION: ${{ inputs.msi_version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $override = @{ bundle = @{ windows = @{ wix = @{ version = $env:MSI_VERSION } } } } | ConvertTo-Json -Depth 6
+          $conf = Join-Path $env:RUNNER_TEMP 'oxbase-release.json'
+          Set-Content -Path $conf -Value $override -Encoding utf8
+          Write-Host "MSI version $env:MSI_VERSION"
+          "OXBASE_RELEASE_ARGS=--config $conf" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
       # ---------------------------------------------------------------- build + upload
 
       - name: Build bundles
@@ -197,9 +233,9 @@ jobs:
         with:
           projectPath: .
           tauriScript: node scripts/ci-tauri.mjs
-          args: ${{ matrix.args }} ${{ env.OXBASE_SIGNING_ARGS }}
+          args: ${{ matrix.args }} ${{ env.OXBASE_SIGNING_ARGS }} ${{ env.OXBASE_RELEASE_ARGS }}
           uploadWorkflowArtifacts: true
-          workflowArtifactNamePattern: oxbase-dev-[platform]-[arch]-[bundle]
+          workflowArtifactNamePattern: ${{ inputs.artifact_prefix || 'oxbase-dev' }}-[platform]-[arch]-[bundle]
           retryAttempts: 1
 
       # A green build does not prove the bundles are signed (see the header). Runs without

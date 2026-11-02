@@ -608,6 +608,23 @@ value after a reload.
   `TAURI_SIGNING_PRIVATE_KEY`, `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`); see the header of the
   workflow file.
 
+### Releases
+
+`.github/workflows/release.yml` publishes a GitHub release when a `v*` tag is pushed:
+
+1. Set the same version in `Cargo.toml` (`[workspace.package] version`) and `ui/package.json`
+   (for example `0.7.0`, or `0.7.0-beta.2` for a pre-release) and merge it to main.
+2. Tag that commit: `git tag v0.7.0 && git push origin v0.7.0`.
+3. The workflow checks the tag against both versions (`scripts/release-check.mjs`), builds the
+   bundles with `bundle.yml`, and creates the release with the Windows (`.msi`, `-setup.exe`),
+   macOS (`.dmg` for Apple Silicon and Intel) and Linux (`.deb`, `.rpm`, `.AppImage`) installers
+   plus `SHA256SUMS.txt`. A tag with a pre-release part becomes a GitHub pre-release.
+
+To test the pipeline without publishing anything, run the Release workflow manually with
+`dry_run` ticked: it builds the current version and creates a draft release named
+`v<version>-dry-run` (drafts are visible only to maintainers; delete it afterwards). Until the
+signing secrets exist, the release notes say the installers are unsigned.
+
 ### Verifying changes in CI
 
 Maintainers build and test in GitHub Actions rather than locally. Work in progress goes to a
