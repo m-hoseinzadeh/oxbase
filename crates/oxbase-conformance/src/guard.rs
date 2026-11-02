@@ -13,6 +13,18 @@
 //!
 //! Without the guard SQL Server cells may pass or stay pending (until the integrator registers
 //! the SQL Server dialect cells), never fail.
+//!
+//! # The 7-engine guard (M7)
+//!
+//! `OXBASE_CONFORMANCE_REQUIRE_M7=1` (`docs/m7-contracts.md` §11; the integrator sets it once
+//! the MongoDB and Redis dialect cells are registered) extends the guard to [`M7_ENGINES`]: it
+//! implies the M4 guard for the SQL engines, and MongoDB and Redis must also have a reachable
+//! fixture, pass every applicable connection check (plain, TLS, SSH, TLS over SSH, cancel, the
+//! 200 000-row stream) and every `fetch_list` cell of their tree layout (the `fetch_list` gate
+//! with `require_m7`), with nothing failed or skipped. Their `roundtrip` / `capabilities` cells
+//! are not applicable once their cells are registered (no DDL designer in M7,
+//! [`crate::matrix`]). Without it their connection checks must still pass (both drivers are
+//! merged) and their `fetch_list` cells may stay pending until the dialect cells land.
 
 use crate::adapter::Engine;
 use crate::fixtures::ResolvedEngine;
@@ -23,6 +35,9 @@ use crate::runner::{RunOptions, is_truthy};
 /// The environment variable that turns the guard on (the integrator sets it in CI).
 pub const REQUIRE_ENV: &str = "OXBASE_CONFORMANCE_REQUIRE_M4";
 
+/// The environment variable that turns the 7-engine guard on (M7; implies [`REQUIRE_ENV`]).
+pub const REQUIRE_M7_ENV: &str = "OXBASE_CONFORMANCE_REQUIRE_M7";
+
 /// The engines the M4 exit check covers.
 pub const M4_ENGINES: [Engine; 5] = [
     Engine::Postgres,
@@ -32,13 +47,30 @@ pub const M4_ENGINES: [Engine; 5] = [
     Engine::MsSql,
 ];
 
+/// The engines the M7 exit check covers: every engine.
+pub const M7_ENGINES: [Engine; 7] = Engine::ALL;
+
 /// Whether [`REQUIRE_ENV`] is set to a true value.
 pub fn require_from_env() -> bool {
     is_truthy(std::env::var(REQUIRE_ENV).ok().as_deref())
 }
 
+/// Whether [`REQUIRE_M7_ENV`] is set to a true value.
+pub fn require_m7_from_env() -> bool {
+    is_truthy(std::env::var(REQUIRE_M7_ENV).ok().as_deref())
+}
+
 /// `Err` when the run options would let the guard pass by not running something.
 pub fn check_run(opts: &RunOptions) -> Result<(), String> {
+    check_run_for(opts, REQUIRE_ENV, "5-engine")
+}
+
+/// [`check_run`] for the 7-engine guard.
+pub fn check_run_m7(opts: &RunOptions) -> Result<(), String> {
+    check_run_for(opts, REQUIRE_M7_ENV, "7-engine")
+}
+
+fn check_run_for(opts: &RunOptions, env: &str, what: &str) -> Result<(), String> {
     let skips = [
         ("OXBASE_CONFORMANCE_ALLOW_MISSING", opts.allow_missing),
         ("OXBASE_CONFORMANCE_SKIP_CONNECT", opts.skip_connect),
@@ -55,7 +87,7 @@ pub fn check_run(opts: &RunOptions) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!(
-            "{REQUIRE_ENV} is set together with {}: the 5-engine guard cannot skip anything",
+            "{env} is set together with {}: the {what} guard cannot skip anything",
             set.join(", ")
         ))
     }
@@ -64,23 +96,37 @@ pub fn check_run(opts: &RunOptions) -> Result<(), String> {
 /// Every problem of `report` under the guard (empty = acceptable). The `fetch_list` and
 /// round-trip specifics are checked by their own gates (see the module docs).
 pub fn gate(report: &Report, engines: &[ResolvedEngine]) -> Vec<String> {
+    gate_for(report, engines, &M4_ENGINES, REQUIRE_ENV)
+}
+
+/// [`gate`] for the 7-engine guard ([`M7_ENGINES`], [`REQUIRE_M7_ENV`]).
+pub fn gate_m7(report: &Report, engines: &[ResolvedEngine]) -> Vec<String> {
+    gate_for(report, engines, &M7_ENGINES, REQUIRE_M7_ENV)
+}
+
+fn gate_for(
+    report: &Report,
+    engines: &[ResolvedEngine],
+    required: &[Engine],
+    env: &str,
+) -> Vec<String> {
     let mut problems = Vec::new();
-    for want in M4_ENGINES {
+    for &want in required {
         if !engines.iter().any(|e| e.engine == want) {
             problems.push(format!(
-                "no {want} fixture in the fixtures file ({REQUIRE_ENV} is set)"
+                "no {want} fixture in the fixtures file ({env} is set)"
             ));
         }
     }
     let guarded = |name: &str| {
         engines
             .iter()
-            .any(|e| e.name == name && M4_ENGINES.contains(&e.engine))
+            .any(|e| e.name == name && required.contains(&e.engine))
     };
     for e in report.engines.iter().filter(|e| guarded(&e.name)) {
         if !e.probe.reachable {
             problems.push(format!(
-                "{}: fixture unreachable at {} ({REQUIRE_ENV} is set)",
+                "{}: fixture unreachable at {} ({env} is set)",
                 e.name, e.target
             ));
         }
@@ -88,7 +134,7 @@ pub fn gate(report: &Report, engines: &[ResolvedEngine]) -> Vec<String> {
     for c in report.connections.iter().filter(|c| guarded(&c.engine)) {
         if !matches!(c.status, CellStatus::Pass | CellStatus::NotApplicable) {
             problems.push(format!(
-                "{} {} connection check: {} ({}; {REQUIRE_ENV} is set: must pass)",
+                "{} {} connection check: {} ({}; {env} is set: must pass)",
                 c.engine,
                 c.check,
                 c.status.label(),
@@ -99,7 +145,7 @@ pub fn gate(report: &Report, engines: &[ResolvedEngine]) -> Vec<String> {
     for c in report.cells.iter().filter(|c| guarded(&c.engine)) {
         if matches!(c.status, CellStatus::Fail | CellStatus::Skipped) {
             problems.push(format!(
-                "{} {} {}: {} ({}; {REQUIRE_ENV} is set)",
+                "{} {} {}: {} ({}; {env} is set)",
                 c.engine,
                 c.object_kind,
                 c.check,
@@ -340,6 +386,92 @@ mod tests {
                 .collect(),
         );
         assert_eq!(gate(&ok, &five), Vec::<String>::new());
+    }
+
+    #[test]
+    fn the_m7_gate_adds_mongodb_and_redis() {
+        let engines = vec![
+            resolved("postgres", Engine::Postgres, 15432),
+            resolved("mongodb", Engine::MongoDb, 15417),
+            resolved("redis", Engine::Redis, 15479),
+        ];
+        let r = report(
+            vec![
+                status("postgres", Engine::Postgres, 15432, true),
+                status("mongodb", Engine::MongoDb, 15417, false),
+                status("redis", Engine::Redis, 15479, true),
+            ],
+            vec![
+                conn("redis", Engine::Redis, ConnCheck::Connect, CellStatus::Fail),
+                conn("redis", Engine::Redis, ConnCheck::Tls, CellStatus::Pending),
+                conn(
+                    "postgres",
+                    Engine::Postgres,
+                    ConnCheck::Connect,
+                    CellStatus::Pass,
+                ),
+            ],
+            vec![
+                cell(
+                    "mongodb",
+                    Engine::MongoDb,
+                    ObjectKind::Table,
+                    Check::FetchList,
+                    CellStatus::Fail,
+                ),
+                cell(
+                    "redis",
+                    Engine::Redis,
+                    ObjectKind::Key,
+                    Check::FetchList,
+                    CellStatus::Pass,
+                ),
+            ],
+        );
+        let problems = gate_m7(&r, &engines);
+        let has = |needle: &str| problems.iter().filter(|p| p.contains(needle)).count();
+        assert_eq!(has("mongodb: fixture unreachable"), 1, "{problems:?}");
+        assert_eq!(
+            has("redis connect connection check: fail"),
+            1,
+            "{problems:?}"
+        );
+        assert_eq!(
+            has("redis tls connection check: pending"),
+            1,
+            "{problems:?}"
+        );
+        assert_eq!(has("mongodb table fetch_list: fail"), 1, "{problems:?}");
+        // mysql, mariadb, sqlite and mssql have no fixture here.
+        assert_eq!(has("fixture in the fixtures file"), 4, "{problems:?}");
+        assert!(
+            problems
+                .iter()
+                .all(|p| p.contains("OXBASE_CONFORMANCE_REQUIRE_M7 is set")),
+            "{problems:?}"
+        );
+        assert_eq!(problems.len(), 8, "{problems:?}");
+        // The M4 gate ignores both.
+        let m4 = gate(&r, &engines);
+        assert!(
+            m4.iter()
+                .all(|p| !p.contains("mongodb") && !p.contains("redis")),
+            "{m4:?}"
+        );
+        assert_eq!(M7_ENGINES.len(), 7);
+        for e in M4_ENGINES {
+            assert!(M7_ENGINES.contains(&e), "{e}");
+        }
+        let mut opts = RunOptions::from_vars(None, None, None);
+        assert_eq!(check_run_m7(&opts), Ok(()));
+        opts.skip_fetch = true;
+        let err = check_run_m7(&opts).unwrap_err();
+        assert!(
+            err.starts_with("OXBASE_CONFORMANCE_REQUIRE_M7 is set together with")
+                && err.contains("OXBASE_CONFORMANCE_SKIP_FETCH")
+                && err.contains("7-engine"),
+            "{err}"
+        );
     }
 
     #[test]

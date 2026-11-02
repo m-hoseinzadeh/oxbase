@@ -208,6 +208,8 @@ jobs:
         run: bash scripts/fixtures-certs.sh
 
       # The kernel version matters for some images (MongoDB 8.x refuses kernel 6.19+).
+      # M7: also the Redis cluster (127.0.0.1:15501-15503) and sentinel (15511, 15512, 15526)
+      # on the host network, the MongoDB / Redis TLS ports and seeds (docs/m7-contracts.md §9).
       - name: Start database fixtures
         run: |
           echo "kernel: $(uname -r)"
@@ -226,6 +228,11 @@ jobs:
       # M1-M3 cell (connection checks, fetch_list, roundtrip, capabilities), nothing pending or
       # skipped; the live test mssql_seed_scripts_created_every_named_object checks the 03-06
       # init scripts through the catalog.
+      # M7: MongoDB and Redis run every connection check (plain, TLS, SSH, TLS over SSH, cancel,
+      # 200k rows) through their drivers, which must pass; their fetch_list cells list the [m7]
+      # seed once their dialect cells are registered (pending until then). The integrator adds
+      # OXBASE_CONFORMANCE_REQUIRE_M7=1 below (the 7-engine guard: every applicable cell of all
+      # seven engines passes) once those cells are merged.
       - name: Run conformance harness
         env:
           OXBASE_CONFORMANCE_REQUIRE_M2_FETCH: "1"

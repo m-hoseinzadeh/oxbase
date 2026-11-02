@@ -1,9 +1,11 @@
 // M7 fixture data (MongoDB, docs/m7-contracts.md §9.2; names in tests/fixtures.toml [m7.mongodb]).
 // Runs once after 01-seed.js via the image's /docker-entrypoint-initdb.d hook, on an empty data
-// volume. fixture_meta {_id: "m7"} is written last; the compose healthcheck waits for it, so a
-// data volume from before M7 reports unhealthy (run scripts/fixtures-down.sh to rebuild it).
+// volume. fixture_meta {_id: "m7", schema_version: 2} is written last; the compose healthcheck
+// waits for it, so a data volume from before M7 (or from schema_version 1, without `score` and
+// `big_long`) reports unhealthy (run scripts/fixtures-down.sh to rebuild it).
 //
-// mongosh numbers are doubles: every int32 / int64 value is written with NumberInt / NumberLong.
+// mongosh stores an integral JS number as int32 and any other as double, so the seed spells out
+// each numeric type: NumberInt / NumberLong / Double.
 
 const t = db.getSiblingDB("oxbase_test");
 
@@ -31,6 +33,12 @@ for (let i = 1; i <= 12; i++) {
     tags: i % 3 === 0 ? ["t" + nn] : ["t" + nn, "common"],
     meta: { city: cities[i - 1], zip: "Z" + nn, geo: { lat: 10 + i / 4, lon: 20 - i / 8 } },
     flag: i % 2 === 1,
+    // A double in every document (one Float64 column; 1.5, 3, 4.5, ...: the even ones are
+    // integral doubles, which only Double() keeps as doubles).
+    score: Double(1.5 * i),
+    // An int64 above 2^53 (2^53 + NN): exact only as a 64-bit integer, not as a JS number or a
+    // relaxed-JSON double.
+    big_long: NumberLong(String(9007199254740992n + BigInt(i))),
   };
   if (i <= 6) {
     d.mixed = mixed[i - 1];
@@ -42,6 +50,13 @@ for (let i = 1; i <= 12; i++) {
   docs.push(d);
 }
 t.m7_docs.insertMany(docs);
+if (t.m7_docs.countDocuments({ score: { $type: "double" } }) !== 12) {
+  throw new Error("m7_docs: score must be a double in every document");
+}
+if (t.m7_docs.countDocuments({ big_long: { $type: "long" } }) !== 12 ||
+    t.m7_docs.countDocuments({ big_long: NumberLong("9007199254740993") }) !== 1) {
+  throw new Error("m7_docs: big_long must be the exact int64 2^53 + NN");
+}
 
 // m7_big: 200 000 documents {_id: int32 n, g: int32 (n % 100), s: "row-<n>"}, in batches.
 const bigCount = 200000;
@@ -87,4 +102,4 @@ db.getSiblingDB("admin").createUser({
   roles: [{ role: "read", db: "oxbase_test" }],
 });
 
-t.fixture_meta.insertOne({ _id: "m7", schema_version: NumberInt(1), seeded_at: new Date() });
+t.fixture_meta.insertOne({ _id: "m7", schema_version: NumberInt(2), seeded_at: new Date() });

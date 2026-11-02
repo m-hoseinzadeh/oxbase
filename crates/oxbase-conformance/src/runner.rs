@@ -18,7 +18,7 @@ use crate::report::{
 use crate::roundtrip;
 
 /// The milestone this harness build implements.
-pub const MILESTONE: &str = "M4";
+pub const MILESTONE: &str = "M7";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RunOptions {
@@ -329,11 +329,12 @@ mod tests {
         assert_eq!(o.probe.timeout, probe::DEFAULT_TIMEOUT);
     }
 
-    /// Object kinds that apply to Redis.
-    fn redis_kinds() -> usize {
-        oxbase_types::ObjectKind::ALL
-            .into_iter()
-            .filter(|&k| adapter::supports_kind(Engine::Redis, k))
+    /// The Redis cells the plan of the real registry starts as pending (all of its applicable
+    /// cells before its dialect is registered; its `fetch_list` cells after).
+    fn redis_pending() -> usize {
+        crate::matrix::plan_engine("redis", Engine::Redis)
+            .iter()
+            .filter(|c| c.status == CellStatus::Pending)
             .count()
     }
 
@@ -354,10 +355,13 @@ mod tests {
         let report = run(Path::new("t"), &fixtures, &engines, &opts);
 
         assert!(!report.engines[0].probe.reachable);
-        // Redis has no driver before M7: its connection checks are pending, never run.
-        assert_eq!(report.connection_summary.pending, ConnCheck::ALL.len());
+        // Every connection check of an unreachable fixture is skipped (Redis has a driver since
+        // M7), and so is every planned cell.
+        assert_eq!(report.connection_summary.skipped, ConnCheck::ALL.len());
+        assert_eq!(report.connection_summary.pending, 0);
         assert_eq!(report.summary.pending, 0);
-        assert_eq!(report.summary.skipped, redis_kinds() * Check::ALL.len());
+        assert_eq!(report.summary.skipped, redis_pending());
+        assert!(report.summary.skipped > 0);
         assert_eq!(report.missing_engines.len(), Engine::ALL.len() - 1);
         // Missing engines fail the gate even with allow_missing.
         assert!(report.gate().is_err());
@@ -377,11 +381,22 @@ mod tests {
             version_prefix: None,
         }];
         let fixtures = Fixtures::parse("schema_version = 1\n", "t").unwrap();
-        let opts = RunOptions::from_vars(None, Some("500"), Some("1"));
+        // The listener never answers a protocol: nothing may try to talk to it.
+        let opts = RunOptions {
+            skip_connect: true,
+            skip_fetch: true,
+            skip_roundtrip: true,
+            ..RunOptions::from_vars(None, Some("500"), Some("1"))
+        };
         let report = run(Path::new("t"), &fixtures, &engines, &opts);
         assert!(report.engines[0].probe.reachable);
-        assert_eq!(report.summary.pending, redis_kinds() * Check::ALL.len());
-        assert_eq!(report.summary.skipped, 0);
+        // Pending, or skipped where a registered cell would have run (once the Redis dialect
+        // cells are registered); never run.
+        assert_eq!(
+            report.summary.pending + report.summary.skipped,
+            redis_pending()
+        );
+        assert_eq!(report.summary.pass + report.summary.fail, 0);
         assert_eq!(report.milestone, MILESTONE);
     }
 

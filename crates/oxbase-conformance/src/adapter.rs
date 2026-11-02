@@ -78,7 +78,11 @@ pub fn supports_kind(engine: Engine, kind: ObjectKind) -> bool {
             kind,
             K::Database | K::Table | K::Index | K::View | K::User | K::Role
         ),
-        // Logical databases, keys and ACL users.
+        // Logical databases, keys and ACL users. Namespaces (`Schema`, docs/m7-contracts.md §3.2
+        // and §11) are left out on purpose: this table mirrors the provisional one of
+        // `oxbase_services::default_dialects` (see
+        // `default_registry_is_provisional_for_unregistered_engines`), and the Redis `Schema`
+        // cell applies once `oxbase_redis::dialect::register` marks it at integration.
         Engine::Redis => matches!(kind, K::Database | K::Key | K::User),
     }
 }

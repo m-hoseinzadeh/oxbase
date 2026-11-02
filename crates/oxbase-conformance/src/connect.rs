@@ -2,17 +2,24 @@
 //!
 //! Every check goes through the real stack the app uses: [`ConnectionManager`] with
 //! [`default_drivers`], a [`MemorySecretStore`] holding the fixture passwords, and the russh
-//! tunnel provider. Engines without a driver yet (mongodb, redis) report every check as pending
-//! with the milestone that brings their driver; SQL Server runs them since M4.
+//! tunnel provider. SQL Server runs them since M4, MongoDB and Redis since M7 (every engine has
+//! a driver now); an unreachable fixture reports its checks as skipped.
 //!
 //! | Check | What passes |
 //! |---|---|
 //! | `connect` | plain connect as the fixture user; the server version equals `version_prefix` |
-//! | `tls` | `VerifyFull` with the fixture CA as the TLS-only user reports `tls_in_use`; the same user in plaintext and a wrong `server_name` are refused |
+//! | `tls` | `VerifyFull` with the fixture CA reports `tls_in_use` and a wrong `server_name` is refused by certificate verification ([`names_tls_failure`]); as the TLS-only user (`tls_user`, whose plaintext login is refused), else as the fixture user on the TLS-only port (`tls_port`, Redis: plaintext to it is refused) or on the shared port (MongoDB `allowTLS`: plaintext stays allowed) |
 //! | `ssh` | through the bastion (password auth, `Strict` known_hosts) to the in-network address |
-//! | `tls_over_ssh` | through the bastion (encrypted-key auth) with `VerifyFull` against the service name while dialling `127.0.0.1`; a wrong `server_name` is refused |
-//! | `cancel` | a 30 s statement ends with `Cancelled`, and the same session answers `SELECT 1`, within 2 s of the request, via the token and via `cancel_running` |
-//! | `stream_200k` | 200 000 generated rows arrive complete in more than one batch |
+//! | `tls_over_ssh` | through the bastion (encrypted-key auth) to the `<name>_tls` target if there is one (Redis), else `<name>`, with `VerifyFull` against the service name while dialling `127.0.0.1`; a wrong `server_name` is refused |
+//! | `cancel` | a long statement ends with `Cancelled`, and the same session answers its ping, within 2 s of the request, via the token and via `cancel_running`; MongoDB also: `currentOp` lists the statement before the cancel and no longer within 2 s after the ping (its client pools connections, so the ping alone does not prove a server-side kill) |
+//! | `stream_200k` | 200 000 rows arrive complete in more than one batch |
+//!
+//! The statements per engine ([`Statements`]): SQL engines ping with `SELECT 1`, sleep 30 s and
+//! generate 200 000 rows. MongoDB runs JSON requests of its driver (`docs/m7-contracts.md`
+//! §4.2): a `ping` command, a `find` on `[m7.mongodb] big_collection` with a `$where` busy loop
+//! (minutes, tagged with a marker field so `currentOp` finds exactly it), and that whole
+//! collection. Redis runs console lines: `PING`, `BLPOP` on a key that
+//! never exists (cancelled by `CLIENT UNBLOCK`), and `LRANGE <[m7.redis] big_list> 0 -1`.
 
 use std::fmt;
 use std::future::Future;
@@ -31,14 +38,15 @@ use oxbase_store::{
     SecretSlot, SecretStore, SshAuthSettings, SshSettings, TlsMode, TlsSettings,
 };
 use oxbase_types::{Engine, ServerVersion};
+use serde_json::json;
 
 use crate::fixtures::{EngineFixture, Fixtures, ResolvedEngine};
-use crate::matrix::{CellStatus, driver_milestone};
+use crate::matrix::CellStatus;
 use crate::probe::Target;
 
 /// Longest a cancelled statement may take to end after the cancel request.
 pub const CANCEL_DEADLINE: Duration = Duration::from_secs(2);
-/// Rows the streaming check generates.
+/// Rows the streaming check reads.
 pub const STREAM_ROWS: usize = 200_000;
 /// Upper bound for one whole check, so a hung server cannot hang the run.
 const CHECK_TIMEOUT: Duration = Duration::from_secs(90);
@@ -85,8 +93,8 @@ impl ConnCheck {
         match self {
             Self::Connect => "plain connect; server version matches the fixture",
             Self::Tls => {
-                "VerifyFull with the fixture CA as the TLS-only user (tls_in_use); plaintext and \
-                 a wrong server name are refused"
+                "VerifyFull with the fixture CA (tls_in_use; the TLS-only user or port where the \
+                 fixture has one, whose plaintext use is refused); a wrong server name is refused"
             }
             Self::Ssh => "connect through the SSH bastion (password auth, Strict known_hosts)",
             Self::TlsOverSsh => {
@@ -97,7 +105,7 @@ impl ConnCheck {
                 "a long statement ends with Cancelled and the session answers again within 2 s \
                  (token and cancel_running)"
             }
-            Self::Stream200k => "200k generated rows stream in more than one batch",
+            Self::Stream200k => "200k rows stream in more than one batch",
         }
     }
 
@@ -152,41 +160,32 @@ impl ConnCell {
         match self.status {
             CellStatus::Pass => "pass".to_owned(),
             CellStatus::Fail => "FAIL".to_owned(),
-            CellStatus::Pending => driver_milestone(self.engine_kind)
-                .map_or_else(|| "pending".to_owned(), |m| format!("pending ({m})")),
+            CellStatus::Pending => "pending".to_owned(),
             CellStatus::Skipped => "skipped".to_owned(),
             CellStatus::NotApplicable => "n/a".to_owned(),
         }
     }
 }
 
-/// The cells of engines that cannot run any check: no M1 driver (pending), or an unreachable
-/// fixture (skipped). `None` when the engine's checks should run.
+/// The cells of an engine that cannot run any check: an unreachable fixture (skipped). `None`
+/// when the engine's checks should run (every engine has a driver since M7).
 pub fn static_cells(e: &ResolvedEngine, reachable: bool) -> Option<Vec<ConnCell>> {
-    let pending = driver_milestone(e.engine);
-    if pending.is_none() && reachable {
+    if reachable {
         return None;
     }
     Some(
         ConnCheck::ALL
             .iter()
             .map(|&check| {
-                if !check.applies(e.engine) {
-                    ConnCell::new(e, check, CellStatus::NotApplicable, None)
-                } else if let Some(m) = pending {
-                    ConnCell::new(
-                        e,
-                        check,
-                        CellStatus::Pending,
-                        Some(format!("no driver until {m}")),
-                    )
-                } else {
+                if check.applies(e.engine) {
                     ConnCell::new(
                         e,
                         check,
                         CellStatus::Skipped,
                         Some("fixture unreachable".to_owned()),
                     )
+                } else {
+                    ConnCell::new(e, check, CellStatus::NotApplicable, None)
                 }
             })
             .collect(),
@@ -374,6 +373,12 @@ impl Ctx {
         };
         p.user = user;
         p.database = database;
+        // MongoDB: the database the fixture user is defined in (profile option, §7.1 of the
+        // M7 contracts).
+        if let Some(source) = fx.extra.get("auth_source").and_then(toml::Value::as_str) {
+            p.options
+                .insert("auth_source".to_owned(), source.to_owned());
+        }
         if let Some(pw) = password {
             let key = p.secret_key(SecretSlot::Password);
             self.secrets
@@ -405,12 +410,22 @@ impl Ctx {
         })
     }
 
-    /// Routes `p` through the bastion to the in-network address of `e`, with password auth
-    /// (`encrypted_key = false`) or the passphrase-protected key.
+    /// The `[ssh.targets]` entry TLS over SSH uses for `e`: `<name>_tls` when the fixture has
+    /// a separate TLS port (Redis), else `<name>`.
+    fn tls_ssh_target(&self, e: &ResolvedEngine) -> String {
+        let tls = format!("{}_tls", e.name);
+        match &self.fixtures.ssh {
+            Some(ssh) if ssh.targets.contains_key(&tls) => tls,
+            _ => e.name.clone(),
+        }
+    }
+
+    /// Routes `p` through the bastion to the in-network address `[ssh.targets] <target>`, with
+    /// password auth (`encrypted_key = false`) or the passphrase-protected key.
     async fn through_ssh(
         &self,
         p: &mut ConnectionProfile,
-        e: &ResolvedEngine,
+        target: &str,
         encrypted_key: bool,
     ) -> Result<(), String> {
         let ssh = self
@@ -420,8 +435,8 @@ impl Ctx {
             .ok_or("no [ssh] in the fixtures file")?;
         let target = ssh
             .targets
-            .get(&e.name)
-            .ok_or_else(|| format!("no [ssh.targets] entry for {}", e.name))?;
+            .get(target)
+            .ok_or_else(|| format!("no [ssh.targets] entry for {target}"))?;
         p.address = ProfileAddress::Network {
             host: target.host.clone(),
             port: Some(target.port),
@@ -469,11 +484,17 @@ impl Ctx {
         Ok(())
     }
 
-    /// Opens a session for `p`, runs `SELECT 1`, closes it. Returns (tls_in_use, via_ssh,
-    /// server version, connect ms).
+    /// The statements the checks run on `e` ([`Statements::for_engine`]).
+    fn statements(&self, e: &ResolvedEngine) -> Result<Statements, String> {
+        Statements::for_engine(&self.fixtures, e.engine)
+    }
+
+    /// Opens a session for `p`, runs the ping statement, closes it. Returns (tls_in_use,
+    /// via_ssh, server version, connect ms).
     async fn open_and_ping(
         &self,
         p: &ConnectionProfile,
+        ping_sql: &str,
     ) -> Result<(bool, bool, ServerVersion, u64), String> {
         let session = self
             .mgr
@@ -481,7 +502,7 @@ impl Ctx {
             .await
             .map_err(|err| format!("open failed: {err}"))?;
         let info = session.info().clone();
-        let ping = ping(session.connection().as_ref()).await;
+        let ping = ping(session.connection().as_ref(), ping_sql).await;
         let close = self.mgr.close(session.id()).await;
         ping?;
         close.map_err(|err| format!("close failed: {err}"))?;
@@ -493,20 +514,33 @@ impl Ctx {
         ))
     }
 
-    async fn expect_refused(&self, p: &ConnectionProfile, what: &str) -> Result<(), String> {
+    /// Requires `p` to be refused; with [`Refusal::TlsName`] the error must also come from
+    /// certificate verification ([`names_tls_failure`]), not from a timeout, the tunnel or the
+    /// login.
+    async fn expect_refused(
+        &self,
+        p: &ConnectionProfile,
+        what: &str,
+        cause: Refusal,
+    ) -> Result<(), String> {
         match self
             .mgr
             .test_connection(p, &ProvidedSecrets::none(), CancellationToken::new())
             .await
         {
             Ok(info) => Err(format!("{what} was accepted ({info:?})")),
+            Err(err) if cause == Refusal::TlsName && !names_tls_failure(&err) => Err(format!(
+                "{what} was refused, but not by certificate verification ({}): {err}",
+                err.category()
+            )),
             Err(_) => Ok(()),
         }
     }
 
     async fn connect(&self, e: &ResolvedEngine) -> CheckResult {
+        let st = self.statements(e)?;
         let p = self.profile(e, false).await?;
-        let (tls, ssh, version, ms) = self.open_and_ping(&p).await?;
+        let (tls, ssh, version, ms) = self.open_and_ping(&p, &st.ping).await?;
         if tls || ssh {
             return Err(format!(
                 "expected plaintext without SSH, got tls={tls} ssh={ssh}"
@@ -523,10 +557,23 @@ impl Ctx {
         Ok(format!("server {} ({ms} ms)", version.raw()))
     }
 
+    /// `VerifyFull` as the TLS-only user when the fixture has one (its plaintext login must be
+    /// refused); else as the fixture user on the TLS-only port when there is one (plaintext to it
+    /// must be refused), else on the shared port, where plaintext stays allowed (MongoDB
+    /// `allowTLS`: the server cannot require TLS per user).
     async fn tls(&self, e: &ResolvedEngine) -> CheckResult {
-        let mut p = self.profile(e, true).await?;
+        let st = self.statements(e)?;
+        let fx = self.fixture(e)?;
+        let tls_user = fx.tls_user.is_some();
+        let tls_port = fx.tls_port.filter(|_| !tls_user);
+        let mut p = self.profile(e, tls_user).await?;
+        if let (Some(port), ProfileAddress::Network { port: p_port, .. }) =
+            (tls_port, &mut p.address)
+        {
+            *p_port = Some(port);
+        }
         p.tls = self.verify_full()?;
-        let (tls, ssh, _, ms) = self.open_and_ping(&p).await?;
+        let (tls, ssh, _, ms) = self.open_and_ping(&p, &st.ping).await?;
         if !tls || ssh {
             return Err(format!(
                 "expected TLS without SSH, got tls_in_use={tls} via_ssh={ssh}"
@@ -534,25 +581,40 @@ impl Ctx {
         }
         let mut wrong = p.clone();
         wrong.tls.server_name = Some(WRONG_SERVER_NAME.to_owned());
-        self.expect_refused(&wrong, "VerifyFull with a wrong server name")
-            .await?;
+        self.expect_refused(
+            &wrong,
+            "VerifyFull with a wrong server name",
+            Refusal::TlsName,
+        )
+        .await?;
         let mut plain = p.clone();
         plain.tls = TlsSettings {
             mode: TlsMode::Disable,
             ..TlsSettings::default()
         };
-        self.expect_refused(&plain, "the TLS-only user in plaintext")
-            .await?;
+        let plaintext = if tls_user {
+            self.expect_refused(&plain, "the TLS-only user in plaintext", Refusal::Any)
+                .await?;
+            "plaintext and wrong name refused"
+        } else if tls_port.is_some() {
+            self.expect_refused(&plain, "plaintext to the TLS-only port", Refusal::Any)
+                .await?;
+            "plaintext to the TLS port and wrong name refused"
+        } else {
+            "wrong name refused; plaintext allowed on the shared port"
+        };
         Ok(format!(
-            "tls_in_use as {} ({ms} ms); plaintext and wrong name refused",
-            p.user.as_deref().unwrap_or("?")
+            "tls_in_use as {} at {} ({ms} ms); {plaintext}",
+            p.user.as_deref().unwrap_or("?"),
+            address(&p)
         ))
     }
 
     async fn ssh(&self, e: &ResolvedEngine) -> CheckResult {
+        let st = self.statements(e)?;
         let mut p = self.profile(e, false).await?;
-        self.through_ssh(&mut p, e, false).await?;
-        let (tls, ssh, _, ms) = self.open_and_ping(&p).await?;
+        self.through_ssh(&mut p, &e.name, false).await?;
+        let (tls, ssh, _, ms) = self.open_and_ping(&p, &st.ping).await?;
         if !ssh || tls {
             return Err(format!(
                 "expected SSH without TLS, got tls_in_use={tls} via_ssh={ssh}"
@@ -565,10 +627,13 @@ impl Ctx {
     }
 
     async fn tls_over_ssh(&self, e: &ResolvedEngine) -> CheckResult {
-        let mut p = self.profile(e, true).await?;
-        self.through_ssh(&mut p, e, true).await?;
+        let st = self.statements(e)?;
+        let tls_user = self.fixture(e)?.tls_user.is_some();
+        let mut p = self.profile(e, tls_user).await?;
+        self.through_ssh(&mut p, &self.tls_ssh_target(e), true)
+            .await?;
         p.tls = self.verify_full()?;
-        let (tls, ssh, _, ms) = self.open_and_ping(&p).await?;
+        let (tls, ssh, _, ms) = self.open_and_ping(&p, &st.ping).await?;
         if !ssh || !tls {
             return Err(format!(
                 "expected TLS over SSH, got tls_in_use={tls} via_ssh={ssh}"
@@ -576,8 +641,12 @@ impl Ctx {
         }
         let mut wrong = p.clone();
         wrong.tls.server_name = Some(WRONG_SERVER_NAME.to_owned());
-        self.expect_refused(&wrong, "VerifyFull through SSH with a wrong server name")
-            .await?;
+        self.expect_refused(
+            &wrong,
+            "VerifyFull through SSH with a wrong server name",
+            Refusal::TlsName,
+        )
+        .await?;
         Ok(format!(
             "VerifyFull as {} via tunnel ({ms} ms); wrong name refused",
             address(&p)
@@ -585,6 +654,7 @@ impl Ctx {
     }
 
     async fn cancel(&self, e: &ResolvedEngine) -> CheckResult {
+        let st = self.statements(e)?;
         let p = self.profile(e, false).await?;
         let session = self
             .mgr
@@ -593,9 +663,8 @@ impl Ctx {
             .map_err(|err| format!("open failed: {err}"))?;
         let conn = session.connection().clone();
         let result = async {
-            let sql = long_statement(e.engine);
-            let token = cancel_once(&conn, sql, CancelBy::Token).await?;
-            let call = cancel_once(&conn, sql, CancelBy::CancelRunning).await?;
+            let token = cancel_once(&conn, &st, CancelBy::Token).await?;
+            let call = cancel_once(&conn, &st, CancelBy::CancelRunning).await?;
             Ok(format!("token {token}; cancel_running {call}"))
         }
         .await;
@@ -604,6 +673,7 @@ impl Ctx {
     }
 
     async fn stream(&self, e: &ResolvedEngine) -> CheckResult {
+        let st = self.statements(e)?;
         let p = self.profile(e, false).await?;
         let session = self
             .mgr
@@ -614,7 +684,7 @@ impl Ctx {
         let result = async {
             let mut stream = session
                 .connection()
-                .execute(rows_statement(e.engine), &[], CancellationToken::new())
+                .execute(&st.rows, &[], CancellationToken::new())
                 .await
                 .map_err(|err| format!("execute failed: {err}"))?;
             let (mut rows, mut batches) = (0usize, 0usize);
@@ -624,8 +694,8 @@ impl Ctx {
                     batches += 1;
                 }
             }
-            if rows != STREAM_ROWS {
-                return Err(format!("got {rows} rows, expected {STREAM_ROWS}"));
+            if rows != st.rows_expected {
+                return Err(format!("got {rows} rows, expected {}", st.rows_expected));
             }
             if batches < 2 {
                 return Err(format!("all {rows} rows came in {batches} batch(es)"));
@@ -641,6 +711,30 @@ impl Ctx {
     }
 }
 
+/// What a refusal in [`Checker::expect_refused`] must be caused by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Refusal {
+    /// Any error (plaintext to a TLS-only user or port: the drivers word these differently).
+    Any,
+    /// Certificate verification of the server name ([`names_tls_failure`]).
+    TlsName,
+}
+
+/// Whether `err` reports a failed certificate check: a connection-level error (not a timeout,
+/// a refused login or a server error) whose text names the certificate or its name. Every
+/// driver passes the rustls reason through (`invalid peer certificate: certificate not valid
+/// for name ...`), wrapped in its own words.
+fn names_tls_failure(err: &oxbase_types::Error) -> bool {
+    use oxbase_types::ErrorCategory as C;
+    if !matches!(err.category(), C::Connection | C::Io) {
+        return false;
+    }
+    let text = err.to_string().to_ascii_lowercase();
+    ["certificate", "notvalidforname", "not valid for name"]
+        .iter()
+        .any(|w| text.contains(w))
+}
+
 fn address(p: &ConnectionProfile) -> String {
     match &p.address {
         ProfileAddress::Network { host, port } => {
@@ -653,18 +747,139 @@ fn address(p: &ConnectionProfile) -> String {
     }
 }
 
-async fn ping(conn: &dyn Connection) -> Result<(), String> {
+/// Runs the engine's ping statement; it must return one result set with one row.
+async fn ping(conn: &dyn Connection, sql: &str) -> Result<(), String> {
+    let what = short(sql);
     let stream = conn
-        .execute("SELECT 1", &[], CancellationToken::new())
+        .execute(sql, &[], CancellationToken::new())
         .await
-        .map_err(|err| format!("SELECT 1 failed: {err}"))?;
+        .map_err(|err| format!("{what} failed: {err}"))?;
     let out = oxbase_driver::collect(stream)
         .await
-        .map_err(|err| format!("SELECT 1 failed: {err}"))?;
+        .map_err(|err| format!("{what} failed: {err}"))?;
     match out.result_sets.as_slice() {
         [rs] if rs.num_rows() == 1 => Ok(()),
-        other => Err(format!("SELECT 1 returned {} result set(s)", other.len())),
+        [rs] => Err(format!("{what} returned {} rows", rs.num_rows())),
+        other => Err(format!("{what} returned {} result set(s)", other.len())),
     }
+}
+
+/// A statement for messages: the whole text up to 40 characters, else its start.
+fn short(sql: &str) -> String {
+    clip(sql, 40)
+}
+
+/// The `$where` function of the MongoDB cancel check: 50 ms of busy loop per document, so a
+/// `find` on the 200 000-document collection runs for hours.
+const MONGO_SLOW_WHERE: &str =
+    "function() { var t = Date.now(); while (Date.now() - t < 50) {} return true; }";
+/// Prefix of the marker field the MongoDB cancel check adds to its `find` filter (with the
+/// process id). The filter asks for it to be `null`, which every document matches (none has
+/// the field), and `currentOp` finds the operation by that field's explicit `null` in the
+/// filter, so other `$where` finds on the collection (other tests, other runs) never count.
+const MONGO_CANCEL_MARK: &str = "oxbase_conformance_cancel_";
+
+/// What the checks run on one engine: the ping (one row), a statement that runs until it is
+/// cancelled, and a statement returning [`Statements::rows_expected`] rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Statements {
+    pub ping: String,
+    pub long: String,
+    pub rows: String,
+    pub rows_expected: usize,
+    /// A request listing the server operations of `long` still running (MongoDB: a `currentOp`
+    /// command; its one row's `inprog` column is `[]` when none is left). `None` where the
+    /// session proves it: a SQL or Redis session runs one statement at a time, so its ping
+    /// answers only after the server stopped `long`.
+    pub leftover: Option<String>,
+}
+
+impl Statements {
+    /// The statements of `engine` (see the module docs). MongoDB and Redis read their names
+    /// from `[m7.mongodb]` / `[m7.redis]`; `Err` says what is missing.
+    pub fn for_engine(fixtures: &Fixtures, engine: Engine) -> Result<Self, String> {
+        let expected = |count: Option<u64>| {
+            count.map_or(Ok(STREAM_ROWS), |n| {
+                usize::try_from(n).map_err(|err| format!("big_count {n}: {err}"))
+            })
+        };
+        match engine {
+            Engine::MongoDb => {
+                let seed = fixtures
+                    .m7_mongo(engine)
+                    .ok_or("no [m7.mongodb] in the fixtures file")?;
+                let db = seed
+                    .database
+                    .as_deref()
+                    .ok_or("[m7.mongodb] has no database")?;
+                let big = seed
+                    .big_collection
+                    .as_deref()
+                    .ok_or("[m7.mongodb] has no big_collection")?;
+                let mark = format!("{MONGO_CANCEL_MARK}{}", std::process::id());
+                let mut long_filter = serde_json::Map::new();
+                long_filter.insert(mark.clone(), serde_json::Value::Null);
+                long_filter.insert("$where".to_owned(), json!(MONGO_SLOW_WHERE));
+                let is_null = json!({"$type": "null"});
+                Ok(Self {
+                    ping: json!({"type": "command", "database": "admin", "command": {"ping": 1}})
+                        .to_string(),
+                    long: mongo_find(db, big, Some(serde_json::Value::Object(long_filter))),
+                    rows: mongo_find(db, big, None),
+                    rows_expected: expected(seed.big_count)?,
+                    // The find itself, or a getMore of its cursor.
+                    leftover: Some(
+                        json!({"type": "command", "database": "admin", "command": {
+                            "currentOp": 1,
+                            "$ownOps": true,
+                            "ns": format!("{db}.{big}"),
+                            "$or": [
+                                {format!("command.filter.{mark}"): is_null},
+                                {format!("cursor.originatingCommand.filter.{mark}"): is_null},
+                            ],
+                        }})
+                        .to_string(),
+                    ),
+                })
+            }
+            Engine::Redis => {
+                let seed = fixtures
+                    .m7_redis(engine)
+                    .ok_or("no [m7.redis] in the fixtures file")?;
+                let list = seed
+                    .big_list
+                    .as_deref()
+                    .ok_or("[m7.redis] has no big_list")?;
+                Ok(Self {
+                    ping: "PING".to_owned(),
+                    // A key nobody writes: BLPOP blocks until the cancel unblocks it.
+                    long: format!("BLPOP oxbase_conformance:never:{} 0", std::process::id()),
+                    rows: format!("LRANGE {list} 0 -1"),
+                    rows_expected: expected(seed.big_count)?,
+                    leftover: None,
+                })
+            }
+            _ => Ok(Self {
+                ping: "SELECT 1".to_owned(),
+                long: long_statement(engine).to_owned(),
+                rows: rows_statement(engine).to_owned(),
+                rows_expected: STREAM_ROWS,
+                leftover: None,
+            }),
+        }
+    }
+}
+
+/// A MongoDB `find` request (the driver's JSON statement form) on `database.collection`.
+fn mongo_find(database: &str, collection: &str, filter: Option<serde_json::Value>) -> String {
+    let mut request = json!({
+        "type": "find",
+        "collection": {"kind": "table", "catalog": database, "name": collection},
+    });
+    if let Some(filter) = filter {
+        request["filter"] = filter;
+    }
+    request.to_string()
 }
 
 #[derive(Clone, Copy)]
@@ -673,21 +888,26 @@ enum CancelBy {
     CancelRunning,
 }
 
-/// Runs `sql`, cancels it after [`CANCEL_AFTER`], and checks that the stream ends with
-/// `Cancelled` and that the same session then answers `SELECT 1`, both within
-/// [`CANCEL_DEADLINE`] of the request. The `SELECT 1` proves the server really stopped the
-/// statement: a session runs one statement at a time. Returns both timings as text.
+/// Runs the long statement, cancels it after [`CANCEL_AFTER`], and checks that the stream ends
+/// with `Cancelled` and that the same session then answers its ping, both within
+/// [`CANCEL_DEADLINE`] of the request. For SQL and Redis the ping proves the server really
+/// stopped the statement: their session runs one statement at a time. A pooled client
+/// (MongoDB) can answer the ping on another connection while the statement still runs, so
+/// there [`Statements::leftover`] must list the operation before the cancel (which also proves
+/// its filter finds it) and no longer within [`CANCEL_DEADLINE`] after the ping. Returns the
+/// timings as text.
 async fn cancel_once(
     conn: &Arc<dyn Connection>,
-    sql: &'static str,
+    st: &Statements,
     by: CancelBy,
 ) -> Result<String, String> {
     let token = CancellationToken::new();
     let run = {
         let conn = conn.clone();
         let token = token.clone();
+        let sql = st.long.clone();
         tokio::spawn(async move {
-            let stream = conn.execute(sql, &[], token).await?;
+            let stream = conn.execute(&sql, &[], token).await?;
             oxbase_driver::collect(stream).await
         })
     };
@@ -697,6 +917,14 @@ async fn cancel_once(
             "the long statement finished before the cancel: {:?}",
             run.await.map(|r| r.map(|_| ()))
         ));
+    }
+    if let Some(list) = &st.leftover
+        && let Err(err) = await_ops(conn.as_ref(), list, true).await
+    {
+        token.cancel();
+        // The statement is stopped by the token; its end does not matter any more.
+        let _ = tokio::time::timeout(CANCEL_DEADLINE * 5, run).await;
+        return Err(err);
     }
     let requested = Instant::now();
     match by {
@@ -730,8 +958,8 @@ async fn cancel_once(
             millis(CANCEL_DEADLINE)
         )),
         Ok(Ok(Err(_))) => {
-            match tokio::time::timeout(CANCEL_DEADLINE * 5, ping(conn.as_ref())).await {
-                Err(_) => return Err(format!("{label}: SELECT 1 hung after the cancel")),
+            match tokio::time::timeout(CANCEL_DEADLINE * 5, ping(conn.as_ref(), &st.ping)).await {
+                Err(_) => return Err(format!("{label}: the ping hung after the cancel")),
                 Ok(r) => r.map_err(|err| format!("{label}: after the cancel: {err}"))?,
             }
             let free = requested.elapsed();
@@ -743,12 +971,83 @@ async fn cancel_once(
                     millis(CANCEL_DEADLINE)
                 ));
             }
+            let server = match &st.leftover {
+                Some(list) => {
+                    await_ops(conn.as_ref(), list, false)
+                        .await
+                        .map_err(|err| format!("{label}: {err}"))?;
+                    format!(
+                        ", server operation gone in {} ms",
+                        millis(requested.elapsed())
+                    )
+                }
+                None => String::new(),
+            };
             Ok(format!(
-                "ended in {} ms, session answered in {} ms",
+                "ended in {} ms, session answered in {} ms{server}",
                 millis(took),
                 millis(free)
             ))
         }
+    }
+}
+
+/// Polls the [`Statements::leftover`] request every 100 ms for at most [`CANCEL_DEADLINE`]
+/// until it lists an operation (`running`) or none.
+async fn await_ops(conn: &dyn Connection, request: &str, running: bool) -> Result<(), String> {
+    let deadline = Instant::now() + CANCEL_DEADLINE;
+    loop {
+        let ops = in_progress(conn, request).await?;
+        if (ops != "[]") == running {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(if running {
+                "currentOp did not list the long statement before the cancel".to_owned()
+            } else {
+                format!(
+                    "the server operation still runs {} ms after the session answered: {}",
+                    millis(CANCEL_DEADLINE),
+                    clip(&ops, 300)
+                )
+            });
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// The `inprog` list (JSON text) a `currentOp` command answers.
+async fn in_progress(conn: &dyn Connection, request: &str) -> Result<String, String> {
+    let stream = conn
+        .execute(request, &[], CancellationToken::new())
+        .await
+        .map_err(|err| format!("currentOp failed: {err}"))?;
+    let out = oxbase_driver::collect(stream)
+        .await
+        .map_err(|err| format!("currentOp failed: {err}"))?;
+    let set = out
+        .result_sets
+        .first()
+        .ok_or("currentOp returned no result set")?;
+    let column = set
+        .schema
+        .index_of("inprog")
+        .map_err(|_| "currentOp returned no inprog column".to_owned())?;
+    let batch = set
+        .batches
+        .iter()
+        .find(|b| b.num_rows() > 0)
+        .ok_or("currentOp returned no row")?;
+    crate::roundtrip::cell_text(batch.column(column).as_ref(), 0)
+        .ok_or_else(|| "currentOp returned a NULL inprog".to_owned())
+}
+
+/// `text` up to `max` characters, else its start and `...`.
+fn clip(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        text.to_owned()
+    } else {
+        format!("{}...", text.chars().take(max).collect::<String>())
     }
 }
 
@@ -831,13 +1130,97 @@ mod tests {
     }
 
     #[test]
-    fn engines_without_a_driver_are_pending_with_their_milestone() {
-        let cells = static_cells(&engine("redis", Engine::Redis), true).unwrap();
-        assert_eq!(cells.len(), ConnCheck::ALL.len());
-        assert!(cells.iter().all(|c| c.status == CellStatus::Pending));
-        assert_eq!(cells[0].label(), "pending (M7)");
-        // SQL Server has its driver since M4: its checks run.
-        assert!(static_cells(&engine("mssql", Engine::MsSql), true).is_none());
+    fn every_engine_runs_its_checks_since_m7() {
+        for e in Engine::ALL {
+            assert!(static_cells(&engine(e.as_str(), e), true).is_none(), "{e}");
+        }
+        let down = static_cells(&engine("redis", Engine::Redis), false).unwrap();
+        assert_eq!(down.len(), ConnCheck::ALL.len());
+        assert!(down.iter().all(|c| c.status == CellStatus::Skipped));
+        assert_eq!(down[0].label(), "skipped");
+    }
+
+    #[test]
+    fn mongodb_and_redis_statements_come_from_the_m7_seed() {
+        let fx =
+            Fixtures::from_path(&crate::fixtures::workspace_root().join("tests/fixtures.toml"))
+                .unwrap();
+        let mongo = Statements::for_engine(&fx, Engine::MongoDb).unwrap();
+        let ping: serde_json::Value = serde_json::from_str(&mongo.ping).unwrap();
+        assert_eq!(ping["type"], "command");
+        assert_eq!(ping["command"]["ping"], 1);
+        let long: serde_json::Value = serde_json::from_str(&mongo.long).unwrap();
+        assert_eq!(long["type"], "find");
+        assert_eq!(long["collection"]["catalog"], "oxbase_test");
+        assert_eq!(long["collection"]["name"], "m7_big");
+        assert!(long["filter"]["$where"].as_str().unwrap().contains("while"));
+        assert!(mongo.long.trim_start().starts_with('{'), "{}", mongo.long);
+        // The `type` tag comes first (serde_json preserve_order).
+        assert!(
+            mongo.rows.starts_with(r#"{"type":"find""#),
+            "{}",
+            mongo.rows
+        );
+        let rows: serde_json::Value = serde_json::from_str(&mongo.rows).unwrap();
+        assert!(rows.get("filter").is_none());
+        assert_eq!(mongo.rows_expected, STREAM_ROWS);
+        // The long find carries the marker field the currentOp request looks for.
+        let mark = format!("{MONGO_CANCEL_MARK}{}", std::process::id());
+        assert_eq!(long["filter"][&mark], serde_json::Value::Null);
+        assert!(long["filter"].as_object().unwrap().contains_key(&mark));
+        let left: serde_json::Value =
+            serde_json::from_str(mongo.leftover.as_deref().unwrap()).unwrap();
+        assert_eq!(left["type"], "command");
+        assert_eq!(left["database"], "admin");
+        let op = &left["command"];
+        assert!(
+            mongo
+                .leftover
+                .as_deref()
+                .unwrap()
+                .contains(r#""command":{"currentOp":1"#),
+            "the command name comes first"
+        );
+        assert_eq!(op["$ownOps"], true);
+        assert_eq!(op["ns"], "oxbase_test.m7_big");
+        assert_eq!(
+            op["$or"][0][format!("command.filter.{mark}")]["$type"],
+            "null"
+        );
+        assert_eq!(
+            op["$or"][1][format!("cursor.originatingCommand.filter.{mark}")]["$type"],
+            "null"
+        );
+
+        let redis = Statements::for_engine(&fx, Engine::Redis).unwrap();
+        assert_eq!(redis.ping, "PING");
+        assert!(
+            redis.long.starts_with("BLPOP oxbase_conformance:never:"),
+            "{}",
+            redis.long
+        );
+        assert!(redis.long.ends_with(" 0"), "{}", redis.long);
+        assert_eq!(redis.rows, "LRANGE m7:big:list 0 -1");
+        assert_eq!(redis.rows_expected, STREAM_ROWS);
+        assert_eq!(redis.leftover, None);
+
+        let pg = Statements::for_engine(&fx, Engine::Postgres).unwrap();
+        assert_eq!(pg.ping, "SELECT 1");
+        assert_eq!(pg.long, "SELECT pg_sleep(30)");
+        assert_eq!(pg.leftover, None);
+
+        // Without [m7] the checks say what is missing.
+        let bare = Fixtures::parse("schema_version = 1\n", "t").unwrap();
+        assert_eq!(
+            Statements::for_engine(&bare, Engine::Redis).unwrap_err(),
+            "no [m7.redis] in the fixtures file"
+        );
+        assert_eq!(
+            Statements::for_engine(&bare, Engine::MongoDb).unwrap_err(),
+            "no [m7.mongodb] in the fixtures file"
+        );
+        assert_eq!(short("PING"), "PING");
+        assert_eq!(short(&"x".repeat(50)), format!("{}...", "x".repeat(40)));
     }
 
     #[test]
@@ -878,6 +1261,35 @@ mod tests {
             .map(|c| c.check)
             .collect();
         assert_eq!(na, [ConnCheck::Tls, ConnCheck::Ssh, ConnCheck::TlsOverSsh]);
+    }
+
+    #[test]
+    fn only_certificate_errors_count_as_a_tls_name_refusal() {
+        use oxbase_types::Error;
+        for yes in [
+            Error::connection(
+                "TLS handshake with mongodb:27017 failed: invalid peer certificate: certificate \
+                 not valid for name \"wrong-name.oxbase.invalid\"",
+            ),
+            Error::connection("Redis connection: invalid peer certificate: NotValidForName"),
+            Error::Io {
+                kind: "InvalidData".to_owned(),
+                message: "invalid peer certificate: UnknownIssuer".to_owned(),
+            },
+        ] {
+            assert!(names_tls_failure(&yes), "{yes}");
+        }
+        for no in [
+            Error::timeout("TLS handshake did not finish: certificate"),
+            Error::auth("bad password"),
+            Error::connection("ssh tunnel: connection refused"),
+            Error::connection("TLS handshake did not finish within 10 s"),
+            Error::sql(Some("X"), "certificate"),
+        ] {
+            assert!(!names_tls_failure(&no), "{no}");
+        }
+        assert_eq!(clip("abc", 5), "abc");
+        assert_eq!(clip("abcdef", 3), "abc...");
     }
 
     #[test]
