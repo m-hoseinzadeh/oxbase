@@ -349,7 +349,16 @@ describe("KeyBrowserPanel", () => {
       },
     });
 
-    fireEvent.click(await screen.findByRole("button", { name: "TTL…" }));
+    // The value is read again after the save.
+    await waitFor(() => expect(calls("key_value_open")).toHaveLength(2));
+    stream(
+      "value-m7:string",
+      [{ name: "value", dataType: "Binary", nullable: false, metadata: BIN }],
+      1,
+    );
+    const ttl = await screen.findByRole("button", { name: "TTL…" });
+    await waitFor(() => expect(ttl).toBeEnabled());
+    fireEvent.click(ttl);
     const dialog = await screen.findByRole("dialog", { name: "Time to live" });
     fireEvent.change(within(dialog).getByLabelText("Expire after (seconds)"), {
       target: { value: "60" },

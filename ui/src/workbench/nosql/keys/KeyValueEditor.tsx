@@ -337,6 +337,8 @@ export function KeyValueEditor({ sessionId, editorId, address, onChanged }: KeyV
 
   const active = isActive(run.status);
   const disabled = busy || active || !info;
+  /** TTL, rename and delete do not need the value: only an edit in flight blocks them. */
+  const keyDisabled = busy || !info;
 
   return (
     <section className="key-editor" aria-label={`Key ${keyLabel}`} data-testid="key-editor">
@@ -373,7 +375,7 @@ export function KeyValueEditor({ sessionId, editorId, address, onChanged }: KeyV
           <button
             type="button"
             className="button button--ghost button--small"
-            disabled={disabled}
+            disabled={keyDisabled}
             onClick={() => setDialog("ttl")}
           >
             <Clock {...ICON_SM} />
@@ -382,7 +384,7 @@ export function KeyValueEditor({ sessionId, editorId, address, onChanged }: KeyV
           <button
             type="button"
             className="button button--ghost button--small"
-            disabled={disabled}
+            disabled={keyDisabled}
             onClick={() => setDialog("rename")}
           >
             <PencilLine {...ICON_SM} />
@@ -392,7 +394,7 @@ export function KeyValueEditor({ sessionId, editorId, address, onChanged }: KeyV
             type="button"
             className="button button--ghost button--small table-data__delete"
             data-testid="key-delete"
-            disabled={disabled}
+            disabled={keyDisabled}
             onClick={deleteKey}
           >
             <Trash2 {...ICON_SM} />
