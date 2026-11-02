@@ -146,11 +146,17 @@ pub(crate) async fn read_info(
         cmd.arg(key);
         cmd
     };
+    let (type_cmd, ttl_cmd, encoding_cmd, memory_cmd) = (
+        one("TYPE"),
+        one("PTTL"),
+        one("OBJECT ENCODING"),
+        one("MEMORY USAGE"),
+    );
     let (key_type, ttl, encoding, memory) = futures::join!(
-        c.command(&one("TYPE"), cancel),
-        c.command(&one("PTTL"), cancel),
-        c.command(&one("OBJECT ENCODING"), cancel),
-        c.command(&one("MEMORY USAGE"), cancel),
+        c.command(&type_cmd, cancel),
+        c.command(&ttl_cmd, cancel),
+        c.command(&encoding_cmd, cancel),
+        c.command(&memory_cmd, cancel),
     );
     let Some(key_type) = key_type_of(&key_type?) else {
         return Ok(None);

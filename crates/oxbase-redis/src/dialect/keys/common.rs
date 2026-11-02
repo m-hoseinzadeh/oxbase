@@ -3,7 +3,6 @@
 //! of commands and Arrow field builders.
 
 use arrow_schema::{DataType, Field};
-use futures::StreamExt;
 use oxbase_dialect::keyvalue::META_ENCODING;
 use oxbase_driver::{CancellationToken, Connection};
 use oxbase_types::keyvalue::{escape_bytes, to_hex};
@@ -349,22 +348,28 @@ impl Nodes {
             return Ok(Vec::new());
         }
         let replies: Vec<(Value, Value)> = if self.cluster {
-            let handle = &self.handle;
-            futures::stream::iter(keys)
-                .map(|key| async move {
+            // Side by side in groups (no closure over references: the futures must be `Send`
+            // for every lifetime).
+            let mut replies = Vec::with_capacity(keys.len());
+            for chunk in keys.chunks(CLUSTER_FAN_OUT) {
+                let mut pending = Vec::with_capacity(chunk.len());
+                for key in chunk {
                     let mut t = redis::cmd("TYPE");
                     t.arg(key.as_slice());
                     let mut p = redis::cmd("PTTL");
                     p.arg(key.as_slice());
-                    let t = handle.command(&t, cancel).await?;
-                    let p = handle.command(&p, cancel).await?;
-                    Ok::<_, Error>((t, p))
-                })
-                .buffered(CLUSTER_FAN_OUT)
-                .collect::<Vec<_>>()
-                .await
-                .into_iter()
-                .collect::<Result<_>>()?
+                    let handle = &self.handle;
+                    pending.push(async move {
+                        let t = handle.command(&t, cancel).await?;
+                        let p = handle.command(&p, cancel).await?;
+                        Ok::<_, Error>((t, p))
+                    });
+                }
+                for reply in futures::future::join_all(pending).await {
+                    replies.push(reply?);
+                }
+            }
+            replies
         } else {
             let mut pipe = redis::pipe();
             for key in keys {

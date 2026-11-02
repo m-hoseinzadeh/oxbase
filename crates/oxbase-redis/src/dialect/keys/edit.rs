@@ -12,7 +12,6 @@
 //!    conflict and nothing was written; an error while queuing (an unknown command) aborts
 //!    everything too.
 
-use futures::StreamExt;
 use oxbase_driver::{CancellationToken, Connection};
 use oxbase_types::{Error, KeyApplyReport, KeyApplyRequest, KeyEdit, KeyType, ListEnd, Result};
 use redis::Value;
@@ -354,15 +353,18 @@ async fn list_checks(
     if sets.is_empty() {
         return Ok(None);
     }
-    let replies: Vec<Result<Value>> = futures::stream::iter(&sets)
-        .map(|(index, _, _)| async move {
+    // Side by side in groups (no closure over references: the futures must be `Send` for
+    // every lifetime).
+    let mut replies = Vec::with_capacity(sets.len());
+    for chunk in sets.chunks(CLUSTER_FAN_OUT) {
+        let mut pending = Vec::with_capacity(chunk.len());
+        for (index, _, _) in chunk {
             let mut c = redis::cmd("LINDEX");
             c.arg(key).arg(*index);
-            link.command(&c, cancel).await
-        })
-        .buffered(CLUSTER_FAN_OUT)
-        .collect()
-        .await;
+            pending.push(async move { link.command(&c, cancel).await });
+        }
+        replies.extend(futures::future::join_all(pending).await);
+    }
     for ((index, expected, pushed), reply) in sets.into_iter().zip(replies) {
         let current = bytes_of(&reply?);
         match (current, expected) {
