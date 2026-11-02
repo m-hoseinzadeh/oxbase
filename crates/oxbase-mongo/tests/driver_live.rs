@@ -426,8 +426,7 @@ async fn tls_modes_verify_against_the_fixture_ca() {
     let wrong =
         MongoConnection::connect(&params().with_tls(verify(TlsMode::VerifyFull, WRONG_NAME)))
             .await
-            .err()
-            .expect("a wrong server name is refused");
+            .expect_err("a wrong server name is refused");
     assert!(matches!(wrong, Error::Connection { .. }), "{wrong}");
     assert!(
         started.elapsed() < Duration::from_secs(10),
@@ -476,8 +475,7 @@ async fn scram_mechanisms_and_a_wrong_password() {
     let p = params().with_password(marker);
     let err = MongoConnection::connect(&p)
         .await
-        .err()
-        .expect("a wrong password is refused");
+        .expect_err("a wrong password is refused");
     assert!(matches!(err, Error::Auth { .. }), "{err}");
     let shown = format!("{err} {err:?}");
     assert!(!shown.contains(marker), "{shown}");
@@ -486,7 +484,7 @@ async fn scram_mechanisms_and_a_wrong_password() {
     let mut p = params();
     p.options
         .insert(options::AUTH_SOURCE.into(), DATABASE.into());
-    let err = MongoConnection::connect(&p).await.err().expect("refused");
+    let err = MongoConnection::connect(&p).await.expect_err("refused");
     assert!(matches!(err, Error::Auth { .. }), "{err}");
 }
 
@@ -698,8 +696,7 @@ async fn ssh_tunnels_with_password_and_key_and_tls_by_service_name() {
     wrong.tls = verify(TlsMode::VerifyFull, WRONG_NAME);
     let err = MongoConnection::connect(&wrong)
         .await
-        .err()
-        .expect("wrong name refused");
+        .expect_err("wrong name refused");
     assert!(matches!(err, Error::Connection { .. }), "{err}");
 
     owned.drop_now(&direct).await;

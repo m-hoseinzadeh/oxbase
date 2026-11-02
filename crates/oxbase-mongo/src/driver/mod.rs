@@ -657,7 +657,7 @@ mod tests {
         let mut p = params();
         p.connect_timeout = Some(Duration::from_secs(5));
         let started = std::time::Instant::now();
-        let err = MongoConnection::connect(&p).await.err().expect("refused");
+        let err = MongoConnection::connect(&p).await.expect_err("refused");
         assert!(matches!(err, Error::Connection { .. }), "{err}");
         assert!(err.to_string().contains("127.0.0.1:1"), "{err}");
         assert!(
@@ -671,7 +671,7 @@ mod tests {
     async fn unknown_options_are_refused_before_connecting() {
         let mut p = params();
         p.options.insert("bogus".into(), "1".into());
-        let err = MongoConnection::connect(&p).await.err().expect("refused");
+        let err = MongoConnection::connect(&p).await.expect_err("refused");
         assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
     }
 }
