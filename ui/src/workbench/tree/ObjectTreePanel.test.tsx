@@ -318,7 +318,7 @@ describe("ObjectTreePanel import and export", () => {
     expect(
       within(menu)
         .getAllByRole("menuitem")
-        .map((m) => m.textContent),
+        .map((m) => m.querySelector(".context-menu__label")?.textContent),
     ).toEqual([
       "Open",
       "Design",
