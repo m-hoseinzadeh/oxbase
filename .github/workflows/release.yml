@@ -1,0 +1,202 @@
+name: Release
+
+# Publishes a GitHub release for a version tag.
+#
+# Cutting a release:
+#   1. Set the same version in Cargo.toml ([workspace.package] version) and ui/package.json,
+#      e.g. 0.7.0 or 0.7.0-beta.2, and land it on main through a pull request.
+#   2. Tag that commit and push the tag:  git tag v0.7.0 && git push origin v0.7.0
+#   3. This workflow checks the tag against both versions (scripts/release-check.mjs), builds the
+#      bundles for Linux, Windows and macOS with bundle.yml, and creates the release with the
+#      installers and SHA256SUMS.txt. A tag with a pre-release part (-beta.2) makes a pre-release.
+#
+# Dry run: run this workflow manually with `dry_run` ticked (the default). It builds the version
+# in Cargo.toml from the selected branch and creates a DRAFT release named v<version>-dry-run.
+# Drafts are visible only to people with write access, and no tag is created. Delete the draft
+# afterwards. A manual run with `dry_run` unticked publishes the release for an existing tag.
+#
+# Signing: bundles are signed only when the signing secrets exist (see bundle.yml). Until then
+# the release notes say the installers are unsigned. Set the repository variable
+# OXBASE_REQUIRE_SIGNING=true (tag pushes) or tick `require_signing` (manual runs) to refuse to
+# publish unsigned bundles.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to publish (ignored for a dry run)
+        type: string
+        default: ""
+      dry_run:
+        description: Build and create a draft release only (no tag, not public)
+        type: boolean
+        default: true
+      require_signing:
+        description: Fail unless the bundles are signed (and notarized on macOS)
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    name: Check version
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      tag: ${{ steps.check.outputs.tag }}
+      version: ${{ steps.check.outputs.version }}
+      prerelease: ${{ steps.check.outputs.prerelease }}
+      msi_version: ${{ steps.check.outputs.msi_version }}
+      artifact_prefix: ${{ steps.check.outputs.artifact_prefix }}
+      ref: ${{ steps.ref.outputs.ref }}
+      sha: ${{ steps.check.outputs.sha }}
+      dry_run: ${{ steps.ref.outputs.dry_run }}
+      require_signing: ${{ steps.ref.outputs.require_signing }}
+    steps:
+      - name: Resolve ref
+        id: ref
+        env:
+          EVENT: ${{ github.event_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_DRY_RUN: ${{ inputs.dry_run }}
+          INPUT_REQUIRE_SIGNING: ${{ inputs.require_signing }}
+          VAR_REQUIRE_SIGNING: ${{ vars.OXBASE_REQUIRE_SIGNING }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = "push" ]; then
+            echo "ref=$GITHUB_REF" >> "$GITHUB_OUTPUT"
+            echo "dry_run=false" >> "$GITHUB_OUTPUT"
+            echo "require_signing=$([ "$VAR_REQUIRE_SIGNING" = "true" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          elif [ "$INPUT_DRY_RUN" = "true" ]; then
+            echo "ref=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+            echo "dry_run=true" >> "$GITHUB_OUTPUT"
+            echo "require_signing=$INPUT_REQUIRE_SIGNING" >> "$GITHUB_OUTPUT"
+          else
+            case "$INPUT_TAG" in v*) ;; *) echo "::error::set the tag input (v<version>) or tick dry_run"; exit 1 ;; esac
+            echo "ref=refs/tags/$INPUT_TAG" >> "$GITHUB_OUTPUT"
+            echo "dry_run=false" >> "$GITHUB_OUTPUT"
+            echo "require_signing=$INPUT_REQUIRE_SIGNING" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ steps.ref.outputs.ref }}
+          persist-credentials: false
+
+      - name: Check tag and versions
+        id: check
+        env:
+          DRY_RUN: ${{ steps.ref.outputs.dry_run }}
+          REF: ${{ steps.ref.outputs.ref }}
+        run: |
+          set -euo pipefail
+          if [ "$DRY_RUN" = "true" ]; then
+            node scripts/release-check.mjs --dry-run
+          else
+            node scripts/release-check.mjs "${REF#refs/tags/}"
+          fi
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  bundle:
+    name: Bundle
+    needs: prepare
+    uses: ./.github/workflows/bundle.yml
+    with:
+      ref: ${{ needs.prepare.outputs.ref }}
+      artifact_prefix: ${{ needs.prepare.outputs.artifact_prefix }}
+      msi_version: ${{ needs.prepare.outputs.msi_version }}
+      require_signing: ${{ needs.prepare.outputs.require_signing == 'true' }}
+    secrets: inherit
+
+  publish:
+    name: Publish release
+    needs: [prepare, bundle]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: ${{ needs.prepare.outputs.artifact_prefix }}-*
+          path: artifacts
+
+      # Installers only: the .app bundles are inside the .dmg files.
+      - name: Collect installers and checksums
+        run: |
+          set -euo pipefail
+          mkdir dist
+          find artifacts -type f \( -name '*.msi' -o -name '*-setup.exe' -o -name '*.dmg' \
+            -o -name '*.deb' -o -name '*.rpm' -o -name '*.AppImage' \) -print0 |
+          while IFS= read -r -d '' f; do
+            name=$(basename "$f")
+            if [ -e "dist/$name" ]; then echo "::error::two bundles are named $name"; exit 1; fi
+            cp "$f" "dist/$name"
+          done
+          ls -l dist
+          # 2 Windows (msi, nsis) + 2 macOS dmg + 3 Linux (deb, rpm, AppImage)
+          count=$(ls dist | wc -l)
+          if [ "$count" -ne 7 ]; then echo "::error::expected 7 installers, found $count"; exit 1; fi
+          (cd dist && sha256sum -- * > SHA256SUMS.txt && cat SHA256SUMS.txt)
+
+      - name: Write release notes
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          SIGNED: ${{ needs.prepare.outputs.require_signing }}
+          SHA: ${{ needs.prepare.outputs.sha }}
+        run: |
+          set -euo pipefail
+          {
+            echo "Oxbase $VERSION, built from commit ${SHA:0:7}."
+            echo
+            if [ "$SIGNED" != "true" ]; then
+              echo "> **Unsigned build.** These installers are not code-signed yet. macOS blocks the app"
+              echo "> until you right-click it and choose **Open** (or run"
+              echo "> \`xattr -dr com.apple.quarantine /Applications/Oxbase.app\`), and Windows SmartScreen"
+              echo "> shows a warning (**More info → Run anyway**)."
+              echo
+            fi
+            echo "| Platform | Download |"
+            echo "|---|---|"
+            echo "| Windows x64 | \`.msi\` or \`-setup.exe\` |"
+            echo "| macOS Apple Silicon | \`_aarch64.dmg\` |"
+            echo "| macOS Intel | \`_x64.dmg\` |"
+            echo "| Linux x64 | \`.deb\`, \`.rpm\` or \`.AppImage\` (needs glibc 2.39+, e.g. Ubuntu 24.04, Debian 13, Fedora 40) |"
+            echo
+            echo "Check a download with \`sha256sum -c SHA256SUMS.txt --ignore-missing\`."
+          } > notes.md
+          cat notes.md
+
+      - name: Create or update the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
+          DRY_RUN: ${{ needs.prepare.outputs.dry_run }}
+          SHA: ${{ needs.prepare.outputs.sha }}
+        run: |
+          set -euo pipefail
+          if [ "$DRY_RUN" = "true" ]; then
+            # A draft under a tag name that is never pushed, so it can't touch a real release.
+            name="$TAG-dry-run"
+            if gh release view "$name" >/dev/null 2>&1; then gh release delete "$name" --yes; fi
+            gh release create "$name" dist/* --draft --target "$SHA" \
+              --title "Oxbase $VERSION (dry run)" --notes-file notes.md
+            echo "Draft release $name created; delete it when done."
+            exit 0
+          fi
+          flags=()
+          if [ "$PRERELEASE" = "true" ]; then flags+=(--prerelease); else flags+=(--latest); fi
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            # Re-run for the same tag: replace the files, keep the existing notes.
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* --verify-tag --title "Oxbase $VERSION" \
+              --notes-file notes.md --generate-notes "${flags[@]}"
+          fi
