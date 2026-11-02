@@ -3,7 +3,24 @@
  * tab (notices, rows affected, timings, errors). Each result tab pages its rows from the core
  * through its own {@link ResultPager}; hidden tabs drop their cached pages.
  */
+import {
+  CircleCheck,
+  CircleCheckBig,
+  CircleSlash,
+  CircleX,
+  Download,
+  Info,
+  LoaderCircle,
+  type LucideIcon,
+  MessageSquareText,
+  Play,
+  Rows3,
+  Table2,
+  Timer,
+  TriangleAlert,
+} from "lucide-react";
 import { type KeyboardEvent, useEffect, useRef, useState } from "react";
+import { ICON_LG, ICON_SM } from "../../components/icons";
 import { formatMs } from "../format";
 import { ResultPager } from "./pager";
 import { timedQueryPage } from "./perf";
@@ -18,12 +35,22 @@ import {
 
 type TabId = "messages" | number;
 
-const MESSAGE_ICON: Record<RunMessage["kind"], string> = {
-  notice: "i",
-  ok: "✓",
-  error: "!",
-  summary: "∑",
-};
+type Tone = "info" | "success" | "warning" | "danger" | "muted";
+
+/** A message's severity icon, its tone and what it says to assistive technology. */
+function messageIcon(m: RunMessage): { Icon: LucideIcon; tone: Tone; label: string } {
+  switch (m.kind) {
+    case "error":
+      return { Icon: CircleX, tone: "danger", label: "Error" };
+    case "ok":
+      return { Icon: CircleCheck, tone: "success", label: "Done" };
+    case "summary":
+      return { Icon: CircleCheckBig, tone: "success", label: "Summary" };
+    case "notice":
+      if (m.level === "warning") return { Icon: TriangleAlert, tone: "warning", label: "Warning" };
+      return { Icon: Info, tone: m.level === "debug" ? "muted" : "info", label: "Notice" };
+  }
+}
 
 function Messages({
   messages,
@@ -39,16 +66,30 @@ function Messages({
   const noteLine =
     note && status !== "idle" ? (
       <p className="messages__note" role="note" data-testid="messages-note">
-        {note}
+        <Info {...ICON_SM} className="messages__note-icon" />
+        <span>{note}</span>
       </p>
     ) : null;
   if (messages.length === 0) {
+    const idle = status === "idle";
     return (
       <>
-        <p className="results__empty">
-          {status === "idle" ? "Run a query to see its results here." : "No messages yet."}
-        </p>
         {noteLine}
+        <div className="empty-state results__empty-state">
+          <span className="empty-state__icon">
+            {idle ? <Play {...ICON_LG} /> : <LoaderCircle {...ICON_LG} className="spin" />}
+          </span>
+          <p className="empty-state__title">
+            {idle ? "Run a query to see its results here." : "No messages yet."}
+          </p>
+          {idle ? (
+            <p className="empty-state__hint">
+              <kbd className="kbd">Ctrl</kbd> <kbd className="kbd">Enter</kbd> runs the statement at
+              the cursor, <kbd className="kbd">Ctrl</kbd> <kbd className="kbd">Shift</kbd>{" "}
+              <kbd className="kbd">Enter</kbd> the whole script.
+            </p>
+          ) : null}
+        </div>
       </>
     );
   }
@@ -57,28 +98,35 @@ function Messages({
       {noteLine}
       {dropped > 0 ? (
         <p className="messages__dropped" data-testid="messages-dropped">
-          {dropped.toLocaleString("en-US")} earlier {dropped === 1 ? "message" : "messages"} not
-          shown
+          <Info {...ICON_SM} className="messages__note-icon" />
+          <span>
+            {dropped.toLocaleString("en-US")} earlier {dropped === 1 ? "message" : "messages"} not
+            shown
+          </span>
         </p>
       ) : null}
       <ol className="messages" aria-label="Messages">
-        {messages.map((m) => (
-          <li
-            key={m.id}
-            className={`messages__item messages__item--${m.kind}${m.level ? ` messages__item--${m.level}` : ""}`}
-          >
-            <span className="messages__icon" aria-hidden="true">
-              {MESSAGE_ICON[m.kind]}
-            </span>
-            <span className="messages__body">
-              {m.statement ? <code className="messages__statement">{m.statement}</code> : null}
-              <span className="messages__text">{m.text}</span>
-            </span>
-            {m.elapsedMs !== undefined ? (
-              <span className="messages__time">{formatMs(m.elapsedMs)}</span>
-            ) : null}
-          </li>
-        ))}
+        {messages.map((m) => {
+          const { Icon, tone, label } = messageIcon(m);
+          return (
+            <li
+              key={m.id}
+              className={`messages__item messages__item--${m.kind}${m.level ? ` messages__item--${m.level}` : ""}`}
+              data-tone={tone}
+            >
+              <span className="messages__icon" role="img" aria-label={label}>
+                <Icon {...ICON_SM} />
+              </span>
+              <span className="messages__body">
+                {m.statement ? <code className="messages__statement">{m.statement}</code> : null}
+                <span className="messages__text">{m.text}</span>
+              </span>
+              {m.elapsedMs !== undefined ? (
+                <span className="messages__time">{formatMs(m.elapsedMs)}</span>
+              ) : null}
+            </li>
+          );
+        })}
       </ol>
     </>
   );
@@ -177,6 +225,15 @@ export function ResultsArea({ run, messagesNote = null, onExport }: ResultsAreaP
   usePagerUpdates(pager);
   const gridKey = activeResult ? `${run.runId}:${activeResult.resultIndex}` : "";
   const shownNotice = notice && notice.key === gridKey ? notice.text : null;
+  // The time the result's statement took, once it has ended.
+  const activeElapsed = activeResult
+    ? run.messages.find(
+        (m) =>
+          m.statementIndex === activeResult.statementIndex &&
+          m.elapsedMs !== undefined &&
+          (m.kind === "ok" || m.kind === "error"),
+      )?.elapsedMs
+    : undefined;
 
   return (
     <section className="results" aria-label="Results">
@@ -197,6 +254,11 @@ export function ResultsArea({ run, messagesNote = null, onExport }: ResultsAreaP
             className="results__tab"
             onClick={() => setActive(r.resultIndex)}
           >
+            {r.done ? (
+              <Table2 {...ICON_SM} className="results__tab-icon" />
+            ) : (
+              <LoaderCircle {...ICON_SM} className="results__tab-icon spin" />
+            )}
             Result {r.resultIndex + 1}
             <span className="results__tab-count">{rowCountLabel(r)}</span>
           </button>
@@ -210,6 +272,7 @@ export function ResultsArea({ run, messagesNote = null, onExport }: ResultsAreaP
           className="results__tab"
           onClick={() => setActive("messages")}
         >
+          <MessageSquareText {...ICON_SM} className="results__tab-icon" />
           Messages
           {errors > 0 ? <span className="results__tab-badge">{errors}</span> : null}
         </button>
@@ -218,14 +281,52 @@ export function ResultsArea({ run, messagesNote = null, onExport }: ResultsAreaP
         {activeResult && pager ? (
           <>
             <div className="results__status" aria-live="polite" data-testid="result-status">
-              <span data-testid="row-counter">{rowCountLabel(activeResult)}</span>
-              {activeResult.columns.length === 0 ? " · no columns" : ""}
-              {pager.error ? ` · page failed: ${pager.error}` : ""}
-              {shownNotice ? ` · ${shownNotice}` : ""}
+              <span className="results__count">
+                {activeResult.done ? (
+                  <Rows3 {...ICON_SM} className="results__status-icon" />
+                ) : (
+                  <LoaderCircle {...ICON_SM} className="results__status-icon spin" />
+                )}
+                <span data-testid="row-counter">{rowCountLabel(activeResult)}</span>
+              </span>
+              {activeElapsed !== undefined ? (
+                <span className="results__meta" title="Time the statement took">
+                  <Timer {...ICON_SM} />
+                  {formatMs(activeElapsed)}
+                </span>
+              ) : null}
+              {activeResult.columns.length === 0 ? (
+                <span className="results__meta">no columns</span>
+              ) : null}
+              {activeResult.done ? null : <span className="badge badge--info">Streaming</span>}
+              {activeResult.truncated && run.status === "cancelled" ? (
+                <span className="badge badge--warning">
+                  <CircleSlash {...ICON_SM} />
+                  Cancelled
+                </span>
+              ) : null}
+              {activeResult.truncated && run.status === "failed" ? (
+                <span className="badge badge--danger">
+                  <CircleX {...ICON_SM} />
+                  Failed
+                </span>
+              ) : null}
+              {pager.error ? (
+                <span className="results__problem">
+                  <TriangleAlert {...ICON_SM} />
+                  page failed: {pager.error}
+                </span>
+              ) : null}
+              {shownNotice ? (
+                <span className="results__notice">
+                  <Info {...ICON_SM} />
+                  {shownNotice}
+                </span>
+              ) : null}
               {onExport ? (
                 <button
                   type="button"
-                  className="button button--small results__export"
+                  className="button button--small button--ghost results__export"
                   disabled={isActive(run.status) || activeResult.columns.length === 0}
                   title={
                     isActive(run.status)
@@ -234,6 +335,7 @@ export function ResultsArea({ run, messagesNote = null, onExport }: ResultsAreaP
                   }
                   onClick={() => onExport(activeResult)}
                 >
+                  <Download {...ICON_SM} />
                   Export…
                 </button>
               ) : null}

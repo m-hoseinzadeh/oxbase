@@ -2,8 +2,10 @@
  * The SQL text editor of a query tab. The Monaco implementation is loaded on demand (it is large
  * and needs a browser), behind a small handle the query panel drives.
  */
+import { LoaderCircle } from "lucide-react";
 import { lazy, type RefObject, Suspense } from "react";
 import type { CacheState, Engine } from "../../api";
+import { ICON_SM } from "../../components/icons";
 import type { FormatOutcome } from "./insight/controller";
 import type { SqlLanguage } from "./language";
 
@@ -67,7 +69,14 @@ const MonacoSqlEditor = lazy(() => import("./MonacoSqlEditor"));
 
 export function SqlEditor(props: SqlEditorProps) {
   return (
-    <Suspense fallback={<div className="sql-editor sql-editor--loading">Loading editor…</div>}>
+    <Suspense
+      fallback={
+        <div className="sql-editor sql-editor--loading">
+          <LoaderCircle {...ICON_SM} className="spin" />
+          Loading editor…
+        </div>
+      }
+    >
       <MonacoSqlEditor {...props} />
     </Suspense>
   );

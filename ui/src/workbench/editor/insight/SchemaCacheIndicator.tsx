@@ -1,5 +1,7 @@
 /** The schema cache's state in the query editor's toolbar, with a refresh button. */
+import { RefreshCw } from "lucide-react";
 import type { CacheStatus } from "../../../api";
+import { ICON_SM } from "../../../components/icons";
 import type { SchemaCacheView } from "./useSchemaCache";
 
 const COUNT = new Intl.NumberFormat("en-US");
@@ -96,14 +98,14 @@ export function SchemaCacheIndicator({
       </span>
       <button
         type="button"
-        className="button button--small schema-cache__refresh"
+        className="icon-button icon-button--small schema-cache__refresh"
         data-testid="schema-cache-refresh"
         aria-label="Refresh schema cache"
-        title="Read the schema again (tables, columns, routines) for completion"
+        title="Refresh schema cache: read the tables, columns and routines again for completion"
         disabled={!connected || view.refreshing}
         onClick={view.refresh}
       >
-        ↻
+        <RefreshCw {...ICON_SM} className={view.refreshing ? "spin" : undefined} />
       </button>
     </span>
   );

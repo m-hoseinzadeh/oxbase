@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { tableFromArrays, tableToIPC } from "apache-arrow";
 import { useEffect } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -84,6 +84,8 @@ describe("ResultsArea", () => {
     rerender(<ResultsArea run={run} />);
     expect(screen.getByTestId("result-status")).toHaveTextContent("1,000,000 rows");
     expect(screen.getByTestId("result-status")).not.toHaveTextContent("…");
+    // The statement's time shows once it has ended.
+    expect(screen.getByTestId("result-status")).toHaveTextContent("1.50 s");
 
     // Only the first screen of the million rows was asked for.
     await waitFor(() => expect(tauriCore.invoke).toHaveBeenCalled());
@@ -135,6 +137,9 @@ describe("ResultsArea", () => {
     expect(messages).toHaveTextContent("row limit reached");
     expect(messages).toHaveTextContent("boom");
     expect(messages).toHaveTextContent("4 ms");
+    // Severity is an icon with a name, not colour alone.
+    expect(within(messages).getByRole("img", { name: "Warning" })).toBeInTheDocument();
+    expect(within(messages).getAllByRole("img", { name: "Error" })).toHaveLength(2);
   });
 
   it("shows the engine's messages note once something ran (SQL Server PRINT)", () => {
