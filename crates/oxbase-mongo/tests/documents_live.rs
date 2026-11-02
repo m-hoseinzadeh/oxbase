@@ -436,6 +436,151 @@ async fn documents_insert_update_replace_and_delete_with_conflicts() {
 
 #[tokio::test]
 #[ignore = "needs the mongodb fixture with the M7 seed"]
+async fn case_only_and_type_only_changes_are_conflicts() {
+    let c = connect(None).await;
+    let db = c.client().database(DATABASE);
+    // A collection whose default collation ignores case (strength 2): `$eq` under it would
+    // call "abc" and "ABC" equal. The `m7load_t` prefix lets the loader test clean leftovers.
+    let name = format!("m7load_t{}_collation", token());
+    db.run_command(doc! {
+        "create": name.as_str(),
+        "collation": {"locale": "en", "strength": 2},
+    })
+    .await
+    .expect("create with a collation");
+    let raw = db.collection::<Document>(&name);
+    raw.insert_many([
+        doc! {"_id": "k1", "name": "abc", "v": 1_i32, "meta": {"x": 1_i32}},
+        doc! {"_id": "k2", "name": "abc", "v": 1_i32, "meta": {"x": 1_i32}},
+    ])
+    .await
+    .unwrap();
+    let target = coll(&name);
+    let store = MongoDocumentStore;
+    let read = |id: &'static str| {
+        let c = &c;
+        let target = target.clone();
+        async move {
+            store
+                .get(c, &target, id, CancellationToken::new())
+                .await
+                .unwrap()
+                .expect("stored")
+        }
+    };
+    let apply = |edits: Vec<DocumentEdit>| {
+        let c = &c;
+        let target = target.clone();
+        async move {
+            store
+                .apply(c, &target, &edits, CancellationToken::new())
+                .await
+                .expect("apply")
+        }
+    };
+    let stale_edits = |id: &str, previous: &str, field: &str, old: &str| {
+        vec![
+            vec![DocumentEdit::Replace {
+                id: id.to_owned(),
+                previous: previous.to_owned(),
+                document: r#"{"name": "lost"}"#.into(),
+            }],
+            vec![DocumentEdit::Update {
+                id: id.to_owned(),
+                changes: vec![FieldChange {
+                    path: field.to_owned(),
+                    previous: present(old),
+                    value: present(r#""lost""#),
+                }],
+            }],
+            vec![DocumentEdit::Delete {
+                id: id.to_owned(),
+                previous: Some(previous.to_owned()),
+            }],
+        ]
+    };
+
+    // Case only: another client changes "abc" to "ABC" after k1 was read.
+    let before = read(r#""k1""#).await;
+    raw.update_one(doc! {"_id": "k1"}, doc! {"$set": {"name": "ABC"}})
+        .await
+        .unwrap();
+    let after = read(r#""k1""#).await;
+    assert!(after.contains(r#""name":"ABC""#), "{after}");
+    for edits in stale_edits(r#""k1""#, &before, "name", r#""abc""#) {
+        let report = apply(edits).await;
+        assert_eq!(
+            report.outcomes[0].status,
+            DocumentEditStatus::Conflict,
+            "{report:?}"
+        );
+    }
+    assert_eq!(read(r#""k1""#).await, after, "the conflicts wrote nothing");
+    // The current text still applies (the exact comparison matches itself).
+    let report = apply(vec![DocumentEdit::Update {
+        id: r#""k1""#.into(),
+        changes: vec![FieldChange {
+            path: "name".into(),
+            previous: present(r#""ABC""#),
+            value: present(r#""abd""#),
+        }],
+    }])
+    .await;
+    assert_eq!(report.applied(), 1, "{report:?}");
+
+    // Type only: v int32 1 becomes int64 1, then meta.x int32 1 becomes double 1.0.
+    let before = read(r#""k2""#).await;
+    raw.update_one(doc! {"_id": "k2"}, doc! {"$set": {"v": 1_i64}})
+        .await
+        .unwrap();
+    for edits in stale_edits(r#""k2""#, &before, "v", "1") {
+        let report = apply(edits).await;
+        assert_eq!(
+            report.outcomes[0].status,
+            DocumentEditStatus::Conflict,
+            "{report:?}"
+        );
+    }
+    let before = read(r#""k2""#).await;
+    raw.update_one(doc! {"_id": "k2"}, doc! {"$set": {"meta.x": 1.0_f64}})
+        .await
+        .unwrap();
+    for edits in stale_edits(r#""k2""#, &before, "meta", r#"{"x": 1}"#) {
+        let report = apply(edits).await;
+        assert_eq!(
+            report.outcomes[0].status,
+            DocumentEditStatus::Conflict,
+            "{report:?}"
+        );
+    }
+    let stored = parse_document(&read(r#""k2""#).await).unwrap();
+    assert_eq!(stored.get_str("name").unwrap(), "abc");
+    assert_eq!(stored.get("v"), Some(&Bson::Int64(1)));
+
+    // An operator-shaped id is refused before anything is sent (it would match another
+    // document as a filter).
+    let err = store
+        .apply(
+            &c,
+            &target,
+            &[DocumentEdit::Delete {
+                id: r#"{"$gt": ""}"#.into(),
+                previous: None,
+            }],
+            CancellationToken::new(),
+        )
+        .await
+        .expect_err("operator id");
+    assert!(
+        matches!(err, oxbase_types::Error::InvalidInput { .. }),
+        "{err}"
+    );
+    assert_eq!(raw.count_documents(doc! {}).await.unwrap(), 2);
+    raw.drop().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "needs the mongodb fixture with the M7 seed"]
 async fn get_reads_one_document_by_id() {
     let c = connect(None).await;
     let docs = coll("m7_docs");

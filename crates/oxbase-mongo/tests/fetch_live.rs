@@ -273,3 +273,59 @@ async fn a_cancelled_listing_returns_cancelled() {
         .expect_err("cancelled");
     assert!(err.is_cancelled(), "{err}");
 }
+
+#[tokio::test]
+#[ignore = "needs the mongodb fixture with the M7 seed"]
+async fn a_user_with_collection_privileges_only_lists_the_collections_it_may_read() {
+    use bson::doc;
+    use oxbase_mongo::{MongoConnection, options};
+
+    let admin = connect(None).await;
+    let token = common::token();
+    let user = format!("m7_t{token}_lister");
+    let password = format!("Pw_{token}_lister");
+    let db = admin.client().database(DATABASE);
+    db.run_command(doc! {
+        "createUser": user.as_str(),
+        "pwd": password.as_str(),
+        "roles": [{"role": "m7_role", "db": DATABASE}],
+    })
+    .await
+    .expect("createUser");
+
+    let mut params = common::params(None)
+        .with_user(user.clone())
+        .with_password(password);
+    params
+        .options
+        .insert(options::AUTH_SOURCE.into(), DATABASE.to_owned());
+    let listed = async {
+        let c = MongoConnection::connect(&params)
+            .await
+            .unwrap_or_else(|e| panic!("connect as {user}: {e}"));
+        let parent = ObjectRef::database(DATABASE);
+        let collections = MongoFetcher::new(ObjectKind::Table)
+            .list(&c, &parent, CancellationToken::new())
+            .await;
+        let views = MongoFetcher::new(ObjectKind::View)
+            .list(&c, &parent, CancellationToken::new())
+            .await;
+        (collections, views)
+    }
+    .await;
+    // Drop the user before asserting, so a failure leaves nothing behind.
+    db.run_command(doc! {"dropUser": user.as_str()})
+        .await
+        .expect("dropUser");
+
+    let collections = listed.0.unwrap_or_else(|e| panic!("list collections: {e}"));
+    let docs = find(&collections, "m7_docs");
+    assert_eq!(docs.row_estimate, Some(12), "the role may count m7_docs");
+    assert!(
+        !names(&collections).contains(&"m7_big"),
+        "only authorized collections: {:?}",
+        names(&collections)
+    );
+    let views = listed.1.unwrap_or_else(|e| panic!("list views: {e}"));
+    assert_eq!(names(&views), Vec::<&str>::new(), "m7_role reads no view");
+}

@@ -12,8 +12,9 @@
 //!   first batch, up to the profile's `sample_size` documents).
 //! - [`request_text`] writes the request the way the shell would:
 //!   `db.getSiblingDB("oxbase_test").getCollection("m7_docs").find({...}, {...}).sort({...}).skip(5).limit(10)`
-//!   with canonical Extended JSON arguments, so the history entry can be pasted into the
-//!   shell editor.
+//!   with arguments in shell syntax ([`crate::ejson::to_shell_text`]: plain numbers for int32,
+//!   `NumberLong("..")`, `ObjectId("..")`, `ISODate("..")`, `/re/flags`, ...), so the history
+//!   entry can be pasted into the shell editor or mongosh and means the same request.
 //!
 //! # How a request runs
 //!
@@ -34,7 +35,7 @@ use oxbase_types::{AggregateRequest, DocumentQuery, Error, FindRequest, Result};
 use serde_json::Value as Json;
 
 use crate::driver::statement::{aggregate_parts, find_parts};
-use crate::ejson::{query_document, to_canonical_text};
+use crate::ejson::{query_document, to_shell_text};
 
 /// A validated request, ready to run on a [`crate::MongoConnection`].
 #[derive(Debug, Clone)]
@@ -159,13 +160,16 @@ fn aggregate_text(out: &mut String, a: &AggregateRequest) {
         }
     }
     if let Some(ms) = a.max_time_ms {
-        options.insert("maxTimeMS", i64::try_from(ms).unwrap_or(i64::MAX));
+        let ms = i32::try_from(ms).map_or_else(
+            |_| Bson::Int64(i64::try_from(ms).unwrap_or(i64::MAX)),
+            Bson::Int32,
+        );
+        options.insert("maxTimeMS", ms);
     }
     push(out, format_args!(".aggregate([{}]", stages.join(", ")));
     if !options.is_empty() {
-        // Plain JSON options (no type wrappers): every value is a bool, a number or a document.
         out.push_str(", ");
-        out.push_str(&Bson::Document(options).into_relaxed_extjson().to_string());
+        out.push_str(&to_shell_text(&Bson::Document(options)));
     }
     out.push(')');
 }
@@ -175,11 +179,11 @@ fn push(out: &mut String, args: std::fmt::Arguments<'_>) {
     let _ = out.write_fmt(args);
 }
 
-/// A JSON part as canonical Extended JSON text (its JSON text when it does not convert, which
-/// a validated request never has).
+/// A JSON part as shell code (its JSON text when it does not convert, which a validated
+/// request never has).
 fn json_arg(value: &Json, what: &str) -> String {
     match query_document(value, what) {
-        Ok(doc) => to_canonical_text(&Bson::Document(doc)),
+        Ok(doc) => to_shell_text(&Bson::Document(doc)),
         Err(_) => value.to_string(),
     }
 }
@@ -219,7 +223,7 @@ mod tests {
     }
 
     #[test]
-    fn find_text_is_shell_code_with_canonical_arguments() {
+    fn find_text_is_shell_code_with_shell_arguments() {
         let mut f = FindRequest::new(docs());
         f.filter = Some(json!({"n": {"$gte": 5}, "name": {"$regex": "^a"}}));
         f.projection = Some(json!({"name": 1, "n": 1}));
@@ -232,10 +236,29 @@ mod tests {
             request_text(&DocumentQuery::Find(f)),
             concat!(
                 r#"db.getSiblingDB("oxbase_test").getCollection("m7_docs")"#,
-                r#".find({"n":{"$gte":{"$numberInt":"5"}},"name":{"$regex":"^a"}}, "#,
-                r#"{"name":{"$numberInt":"1"},"n":{"$numberInt":"1"}})"#,
-                r#".sort({"n":{"$numberInt":"-1"},"name":{"$numberInt":"1"}})"#,
+                r#".find({"n":{"$gte":5},"name":{"$regex":"^a"}}, "#,
+                r#"{"name":1,"n":1})"#,
+                r#".sort({"n":-1,"name":1})"#,
                 r#".hint("m7_docs_name_idx").skip(5).limit(10).maxTimeMS(500)"#
+            )
+        );
+        // Typed values use the shell's helpers, never wrapper objects.
+        let mut f = FindRequest::new(docs());
+        f.filter = Some(json!({
+            "_id": {"$oid": "65a000000000000000000001"},
+            "big": {"$numberLong": "9007199254740993"},
+            "at": {"$gte": {"$date": "2026-01-02T00:00:00Z"}},
+            "price": {"$numberDecimal": "12.50"},
+            "re": {"$regularExpression": {"pattern": "^d", "options": "i"}},
+        }));
+        assert_eq!(
+            request_text(&DocumentQuery::Find(f)),
+            concat!(
+                r#"db.getSiblingDB("oxbase_test").getCollection("m7_docs").find({"#,
+                r#""_id":ObjectId("65a000000000000000000001"),"#,
+                r#""big":NumberLong("9007199254740993"),"#,
+                r#""at":{"$gte":ISODate("2026-01-02T00:00:00Z")},"#,
+                r#""price":NumberDecimal("12.50"),"re":/^d/i})"#
             )
         );
         let plain = FindRequest::new(ObjectRef::table(Some("d\"b"), None, "c"));
@@ -259,7 +282,7 @@ mod tests {
             concat!(
                 r#"db.getSiblingDB("oxbase_test").getCollection("m7_docs").aggregate(["#,
                 r#"{"$match":{"flag":true}}, "#,
-                r#"{"$group":{"_id":null,"n":{"$sum":{"$numberInt":"1"}}}}])"#
+                r#"{"$group":{"_id":null,"n":{"$sum":1}}}])"#
             )
         );
         a.allow_disk_use = true;

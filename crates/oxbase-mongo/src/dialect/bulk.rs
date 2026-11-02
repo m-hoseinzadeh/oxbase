@@ -38,7 +38,9 @@
 //! `mongodb` crate splits a command further at the server's message size). The token is
 //! checked before each command; a cancel while one runs kills it by its comment
 //! (`Cancelled`). With `ordered: true` the documents before a failing one are written: the
-//! error says which document of the call failed.
+//! error names the failing row of the load batch and how many rows of that batch were written
+//! before it (they stay: `load` cannot return a count with its error, so the import report's
+//! committed rows do not include them; a cancel while a command runs cannot know the count).
 
 use arrow_array::RecordBatch;
 use async_trait::async_trait;
@@ -194,9 +196,11 @@ fn insert_error(e: &mongodb::error::Error, first: usize) -> Error {
             .filter(|n| !n.is_empty())
             .unwrap_or_else(|| w.code.to_string());
         let row = first + w.index + 1;
+        // `first` counts the rows of the earlier calls of this load, all written; with
+        // `ordered: true` the server wrote exactly the documents before the failing one.
         let before = if row > 1 {
             format!(
-                "; the {} rows before it in this batch were written",
+                "; the {} rows before it in this batch were written and stay in the collection",
                 row - 1
             )
         } else {

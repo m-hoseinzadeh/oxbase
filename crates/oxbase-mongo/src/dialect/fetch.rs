@@ -276,20 +276,48 @@ async fn list_databases(
     Ok(out)
 }
 
-/// `listCollections` entries of `db` matching `filter`.
+/// `listCollections` entries of `db` matching `filter` (a filter on `name` / `type` only).
+///
+/// A user without the `listCollections` action on `db` (a role with collection-level
+/// privileges only, like the fixture's `m7_role`) gets `Unauthorized` for the full listing;
+/// then the listing is retried as `{nameOnly: true, authorizedCollections: true}`, which the
+/// server allows and which lists the collections and views the user has privileges on (name and
+/// type only: no options, so such entries show no capped flag or view source).
 async fn collection_infos(
     conn: &MongoConnection,
     db: &str,
     filter: Document,
     cancel: &CancellationToken,
 ) -> Result<Vec<Document>> {
-    cursor_command(
+    let full = cursor_command(
         conn,
         db,
-        doc! {"listCollections": 1_i32, "filter": filter, "nameOnly": false},
+        doc! {"listCollections": 1_i32, "filter": filter.clone(), "nameOnly": false},
         cancel,
     )
-    .await
+    .await;
+    match full {
+        Err(e) if is_unauthorized(&e) => {
+            cursor_command(
+                conn,
+                db,
+                doc! {
+                    "listCollections": 1_i32,
+                    "filter": filter,
+                    "nameOnly": true,
+                    "authorizedCollections": true,
+                },
+                cancel,
+            )
+            .await
+        }
+        other => other,
+    }
+}
+
+/// The server refused a command for missing privileges (`Unauthorized`, code 13).
+fn is_unauthorized(e: &Error) -> bool {
+    matches!(e, Error::Sql { code: Some(code), .. } if code == "Unauthorized" || code == "13")
 }
 
 async fn list_collections(
@@ -952,6 +980,21 @@ mod tests {
             ]
         );
         assert_eq!(columns[0].default.as_deref(), Some("ObjectId()"));
+    }
+
+    #[test]
+    fn only_unauthorized_errors_retry_the_authorized_listing() {
+        assert!(is_unauthorized(&Error::sql(
+            Some("Unauthorized"),
+            "not authorized"
+        )));
+        assert!(is_unauthorized(&Error::sql(Some("13"), "not authorized")));
+        assert!(!is_unauthorized(&Error::sql(
+            Some("NamespaceNotFound"),
+            "x"
+        )));
+        assert!(!is_unauthorized(&Error::sql(None::<String>, "x")));
+        assert!(!is_unauthorized(&Error::Cancelled));
     }
 
     #[test]
