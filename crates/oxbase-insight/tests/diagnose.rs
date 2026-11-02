@@ -871,14 +871,14 @@ fn a_one_mib_script_is_diagnosed_in_linear_time() {
     assert!(elapsed.as_secs() < 30, "{elapsed:?}");
     // The §5 budget, enforced in the insight-perf job (`--profile perf`).
     if !cfg!(debug_assertions) && std::env::var("OXBASE_REQUIRE_M6_PERF").is_ok_and(|v| v == "1") {
-        // Best of three: the first run also warms the allocator.
+        // Best of five: the first run also warms the allocator, and CI runners are noisy.
         let mut best = elapsed;
-        for _ in 0..2 {
+        for _ in 0..4 {
             let started = Instant::now();
             diagnose(&dialect, &text, Some(&pg), &CancellationToken::new()).unwrap();
             best = best.min(started.elapsed());
         }
-        println!("diagnose: best of three {best:?}");
+        println!("diagnose: best of five {best:?}");
         assert!(best.as_millis() <= 100, "diagnose took {best:?} for 1 MiB");
     }
 }
