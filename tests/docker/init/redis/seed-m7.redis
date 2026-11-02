@@ -1,0 +1,27 @@
+# M7 fixture keys (docs/m7-contracts.md §9.2, tests/fixtures.toml [m7.redis]). Piped to redis-cli
+# by entrypoint.sh after seed.redis, on an empty data volume; the marker key is set only after
+# both files loaded without errors. RedisJSON (m7:json) and the ACL user m7_reader are created
+# by entrypoint.sh itself (the module is optional; ACL users are not kept in the AOF).
+# Live tests never change these keys: they write their own, named with a token.
+SELECT 0
+SET m7:string hello
+SET m7:binary "\x00\xff\xfe\n"
+HSET m7:hash f1 v1 f2 v2 f3 "grüße"
+RPUSH m7:list a b c
+SADD m7:set a b c
+ZADD m7:zset 1 a 2 b 3 c
+XADD m7:stream 1767261600000-0 k v1
+XADD m7:stream 1767261600000-1 k v2
+SET m7:ttl expires EX 86400
+# 200 000 elements "e1" .. "e200000" and members "m1" .. "m200000" (score n), pushed by a script
+# in batches of 1000 so this file stays small.
+EVAL "local n = tonumber(ARGV[1]) for i = 1, n, 1000 do local t = {} for j = i, math.min(i + 999, n) do t[#t + 1] = 'e' .. j end redis.call('RPUSH', KEYS[1], unpack(t)) end return redis.call('LLEN', KEYS[1])" 1 m7:big:list 200000
+EVAL "local n = tonumber(ARGV[1]) for i = 1, n, 1000 do local t = {} for j = i, math.min(i + 999, n) do t[#t + 1] = j t[#t + 1] = 'm' .. j end redis.call('ZADD', KEYS[1], unpack(t)) end return redis.call('ZCARD', KEYS[1])" 1 m7:big:zset 200000
+SET m7:ns:a:1 a1
+SET m7:ns:a:2 a2
+SET m7:ns:b:1 b1
+SET m7:ns:leaf leaf
+HSET m7:edit:seed v 1
+SELECT 1
+SET m7:db1:key one
+SELECT 0

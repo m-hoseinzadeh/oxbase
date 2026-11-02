@@ -47,18 +47,38 @@ until cli ping 2>/dev/null | grep -q PONG; do
     sleep 1
 done
 
+# M7: the read-only ACL user of [m7.redis] (rules `on ~m7:* +@read`). ACL users live in the
+# server's memory, not in the AOF, so this runs on every start
+# (before the seed marker, which the health check waits for).
+if [ "$(cli ACL SETUSER m7_reader reset on '>'"$OXBASE_REDIS_PASSWORD" '~m7:*' '+@read')" != "OK" ]; then
+    echo "oxbase-init: could not create the ACL user m7_reader" >&2
+    exit 1
+fi
+
 if [ "$(cli EXISTS oxbase_test:fixture:seeded)" = "0" ]; then
     # No marker: start from an empty DB 0 so a reseed after a partial run cannot duplicate list
     # entries or collide with existing stream IDs.
     echo "oxbase-init: loading seed"
     cli -n 0 FLUSHDB >/dev/null
+    cli -n 1 FLUSHDB >/dev/null
     # redis-cli exits 0 even when a piped command fails, so force the "(error)" prefix with
     # --no-raw and check for it; the marker key is written only after a clean run.
-    out="$(grep -v '^#' /oxbase-init/seed.redis | grep -v '^[[:space:]]*$' | cli --no-raw)"
-    if printf '%s\n' "$out" | grep -q '^(error)'; then
-        echo "oxbase-init: seed failed:" >&2
-        printf '%s\n' "$out" | grep '^(error)' >&2
-        exit 1
+    # M7: seed-m7.redis (docs/m7-contracts.md §9.2) follows the M0 seed.
+    for seed in seed.redis seed-m7.redis; do
+        [ -f "/oxbase-init/$seed" ] || continue
+        out="$(grep -v '^#' "/oxbase-init/$seed" | grep -v '^[[:space:]]*$' | cli --no-raw)"
+        if printf '%s\n' "$out" | grep -q '^(error)'; then
+            echo "oxbase-init: $seed failed:" >&2
+            printf '%s\n' "$out" | grep '^(error)' >&2
+            exit 1
+        fi
+    done
+    # M7: the RedisJSON key is optional ([m7.redis] json_optional): images without the module
+    # answer "unknown command", which is not an error of the seed.
+    if cli -n 0 JSON.SET m7:json '$' '{"a":1,"b":[true,null]}' 2>/dev/null | grep -q OK; then
+        echo "oxbase-init: m7:json created (RedisJSON present)"
+    else
+        echo "oxbase-init: no RedisJSON module, m7:json skipped"
     fi
     if [ "$(cli -n 0 SET oxbase_test:fixture:seeded 1)" != "OK" ]; then
         echo "oxbase-init: could not write the seed marker" >&2
