@@ -7,9 +7,9 @@ import { lazy, type RefObject, Suspense } from "react";
 import type { CacheState, Engine } from "../../api";
 import { ICON_SM } from "../../components/icons";
 import type { FormatOutcome } from "./insight/controller";
-import type { SqlLanguage } from "./language";
+import type { EditorLanguage, SqlLanguage } from "./language";
 
-export type { FormatOutcome, SqlLanguage };
+export type { EditorLanguage, FormatOutcome, SqlLanguage };
 
 /** Commands bound to editor keys. */
 export type EditorCommand = "runAll" | "runCurrent";
@@ -51,7 +51,7 @@ export interface EditorInsight {
 
 export interface SqlEditorProps {
   initialValue: string;
-  language: SqlLanguage;
+  language: EditorLanguage;
   /** Filled once the editor is ready; cleared when it goes away. */
   editorRef: RefObject<SqlEditorHandle | null>;
   onCommand?: ((command: EditorCommand) => void) | undefined;
@@ -63,6 +63,10 @@ export interface SqlEditorProps {
   testId?: string | undefined;
   /** Turns code insight on (query editors). */
   insight?: EditorInsight | undefined;
+  /** Called with the whole text after every change (the builder's JSON fields). */
+  onChange?: ((text: string) => void) | undefined;
+  /** A small field editor: no line numbers, gutter or folding (the builder's JSON fields). */
+  compact?: boolean | undefined;
 }
 
 const MonacoSqlEditor = lazy(() => import("./MonacoSqlEditor"));

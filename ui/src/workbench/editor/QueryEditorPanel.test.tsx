@@ -340,6 +340,30 @@ describe("QueryEditorPanel", () => {
     expect(screen.queryByRole("dialog")).toBeNull();
   });
 
+  it("asks before a statement the language guards and runs it again confirmed (M7)", async () => {
+    await renderPanel();
+    const original = tauriCore.invoke.getMockImplementation();
+    tauriCore.invoke.mockImplementation(async (cmd, args) => {
+      const options = (args as { options?: { confirmDestructive?: boolean } | null })?.options;
+      if (cmd === "query_run" && !options?.confirmDestructive) {
+        throw {
+          category: "invalid_input",
+          message: "confirmation required: statement 1: db.m7_edit.drop() drops the collection",
+        };
+      }
+      return original?.(cmd, args);
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Run" }));
+    const dialog = await screen.findByRole("dialog", { name: "Run anyway?" });
+    expect(dialog).toHaveTextContent("db.m7_edit.drop() drops the collection");
+    fireEvent.click(within(dialog).getByTestId("confirm-action"));
+    await waitFor(() => expect(calls("query_run")).toHaveLength(2));
+    expect(calls("query_run")[1]).toMatchObject({
+      script: SCRIPT,
+      options: { confirmDestructive: true },
+    });
+  });
+
   it("needs an open connection", () => {
     tauriCore.invoke.mockResolvedValue([]);
     render(<QueryEditorPanel editorId="editor-2" />);

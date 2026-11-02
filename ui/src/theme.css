@@ -66,6 +66,8 @@
   --engine-mariadb: #b58553;
   --engine-sqlite: #7d8aa0;
   --engine-mssql: #dc5a61;
+  --engine-mongodb: #4fa860;
+  --engine-redis: #e0605a;
   --engine-other: #7d8aa0;
   --engine-fg: #0b1222;
 
@@ -134,6 +136,8 @@
   --engine-mariadb: #8a5a2b;
   --engine-sqlite: #4b5563;
   --engine-mssql: #a4262c;
+  --engine-mongodb: #2f7a3e;
+  --engine-redis: #b4232a;
   --engine-other: #6b7280;
   --engine-fg: #ffffff;
 
@@ -202,6 +206,8 @@
     --engine-mariadb: #8a5a2b;
     --engine-sqlite: #4b5563;
     --engine-mssql: #a4262c;
+    --engine-mongodb: #2f7a3e;
+    --engine-redis: #b4232a;
     --engine-other: #6b7280;
     --engine-fg: #ffffff;
 
@@ -1028,6 +1034,14 @@ textarea:disabled {
 
 .engine-badge--mssql {
   background: var(--engine-mssql);
+}
+
+.engine-badge--mongodb {
+  background: var(--engine-mongodb);
+}
+
+.engine-badge--redis {
+  background: var(--engine-redis);
 }
 
 /* -------------------------------------------------------------------------- modal dialogs */

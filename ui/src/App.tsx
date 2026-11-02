@@ -17,15 +17,23 @@ import { TableDesignerPanel } from "./workbench/designer/TableDesignerPanel";
 import { QueryEditorPanel } from "./workbench/editor/QueryEditorPanel";
 import { HistoryPanel } from "./workbench/history/HistoryPanel";
 import {
+  type CollectionPanelParams,
+  type ConsolePanelParams,
   type DesignerPanelParams,
   designerTitle,
+  type KeyBrowserParams,
   newEditorId,
   openQueryEditor,
+  type PubSubPanelParams,
   type QueryEditorParams,
   setDockviewApi,
   showHistory,
   type TableDataPanelParams,
 } from "./workbench/layout";
+import { CollectionPanel } from "./workbench/nosql/CollectionPanel";
+import { ConsolePanel } from "./workbench/nosql/console/ConsolePanel";
+import { KeyBrowserPanel } from "./workbench/nosql/keys/KeyBrowserPanel";
+import { PubSubPanel } from "./workbench/nosql/pubsub/PubSubPanel";
 import { openImport } from "./workbench/transfer/store";
 import { TransferHost } from "./workbench/transfer/TransferHost";
 import { ObjectTreePanel } from "./workbench/tree/ObjectTreePanel";
@@ -64,6 +72,51 @@ function DesignerTab({ params, api }: IDockviewPanelProps<DesignerPanelParams>) 
   );
 }
 
+function CollectionTab({ params }: IDockviewPanelProps<CollectionPanelParams>) {
+  const [editorId] = useState(() => params.editorId || newEditorId());
+  if (!params.sessionId || !params.collection) {
+    return (
+      <p className="results__empty">This tab lost its collection. Open it again from the tree.</p>
+    );
+  }
+  return (
+    <CollectionPanel
+      editorId={editorId}
+      sessionId={params.sessionId}
+      collection={params.collection}
+    />
+  );
+}
+
+function KeysTab({ params }: IDockviewPanelProps<KeyBrowserParams>) {
+  const [editorId] = useState(() => params.editorId || newEditorId());
+  if (!params.sessionId) {
+    return (
+      <p className="results__empty">This tab lost its connection. Open it again from the tree.</p>
+    );
+  }
+  return <KeyBrowserPanel {...params} editorId={editorId} />;
+}
+
+function ConsoleTab({ params }: IDockviewPanelProps<ConsolePanelParams>) {
+  const [editorId] = useState(() => params.editorId || newEditorId());
+  if (!params.sessionId) {
+    return (
+      <p className="results__empty">This tab lost its connection. Open it again from the tree.</p>
+    );
+  }
+  return <ConsolePanel {...params} editorId={editorId} />;
+}
+
+function PubSubTab({ params }: IDockviewPanelProps<PubSubPanelParams>) {
+  if (!params.sessionId) {
+    return (
+      <p className="results__empty">This tab lost its connection. Open it again from the tree.</p>
+    );
+  }
+  return <PubSubPanel sessionId={params.sessionId} />;
+}
+
 const components: Record<string, FunctionComponent<IDockviewPanelProps>> = {
   connections: () => <ConnectionsPanel />,
   objects: () => <ObjectTreePanel />,
@@ -72,6 +125,10 @@ const components: Record<string, FunctionComponent<IDockviewPanelProps>> = {
   query: QueryPanel,
   tableData: TableDataTab,
   designer: DesignerTab,
+  collection: CollectionTab,
+  keys: KeysTab,
+  console: ConsoleTab,
+  pubsub: PubSubTab,
 };
 
 // Structural variables come from dockview's light theme; colours are overridden in
