@@ -3,22 +3,25 @@
 .schema-cache {
   display: inline-flex;
   align-items: center;
-  gap: var(--space-1);
-  margin-left: var(--space-2);
+  gap: 2px;
+  flex-shrink: 0;
   white-space: nowrap;
 }
 
 .schema-cache__status {
   display: inline-flex;
   align-items: center;
-  gap: var(--space-1);
+  gap: 6px;
+  padding-left: var(--space-1);
   color: var(--color-fg-muted);
+  font-size: var(--text-sm);
+  font-variant-numeric: tabular-nums;
   cursor: default;
 }
 
 .schema-cache__dot {
-  width: 8px;
-  height: 8px;
+  width: 7px;
+  height: 7px;
   border-radius: 50%;
   background: var(--color-fg-faint);
   flex: none;
@@ -28,9 +31,16 @@
   background: var(--color-success);
 }
 
-.schema-cache__status[data-state="stale"] .schema-cache__dot,
+.schema-cache__status[data-state="ready"] .schema-cache__dot {
+  box-shadow: 0 0 0 3px var(--color-success-bg);
+}
+
+.schema-cache__status[data-state="stale"] .schema-cache__dot {
+  background: var(--color-warning);
+}
+
 .schema-cache__status[data-state="building"] .schema-cache__dot {
-  background: var(--color-accent);
+  background: var(--color-info);
 }
 
 .schema-cache__status[data-state="building"] .schema-cache__dot {
@@ -42,8 +52,9 @@
   background: var(--color-danger);
 }
 
-.schema-cache__refresh {
-  min-width: 26px;
+.schema-cache__refresh:focus-visible {
+  outline: 2px solid var(--color-focus);
+  outline-offset: -1px;
 }
 
 @keyframes schema-cache-pulse {
@@ -65,19 +76,45 @@
   text-underline-offset: 3px;
 }
 
-/* Completion icons: tables, views and columns stand out from keywords and functions. */
-.monaco-editor .suggest-widget .codicon-symbol-struct::before,
+/* Completion and hover popups: the elevated surface of menus (Monaco paints the colours from
+   theme-bridge.ts; these add the shared radius and shadow). */
+.monaco-editor .suggest-widget,
+.monaco-editor .monaco-hover,
+.monaco-editor .suggest-details-container .suggest-details {
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-popover);
+}
+
+.monaco-editor .suggest-widget .monaco-list .monaco-list-row {
+  border-radius: var(--radius-sm);
+}
+
+/* Completion icons: tables, views and columns stand out from keywords and functions, in the
+   object tree's colours. */
+.monaco-editor .suggest-widget .codicon-symbol-struct::before {
+  color: var(--icon-table);
+}
+
 .monaco-editor .suggest-widget .codicon-symbol-interface::before {
-  color: var(--engine-postgres);
+  color: var(--icon-view);
 }
 
 .monaco-editor .suggest-widget .codicon-symbol-field::before {
-  color: var(--color-accent);
+  color: var(--icon-column);
 }
 
 .monaco-editor .suggest-widget .codicon-symbol-folder::before,
 .monaco-editor .suggest-widget .codicon-symbol-module::before {
-  color: var(--engine-mariadb);
+  color: var(--icon-schema);
+}
+
+.monaco-editor .suggest-widget .codicon-symbol-function::before,
+.monaco-editor .suggest-widget .codicon-symbol-method::before {
+  color: var(--icon-routine);
+}
+
+.monaco-editor .suggest-widget .codicon-symbol-snippet::before {
+  color: var(--color-accent);
 }
 
 /* --- snippet manager -------------------------------------------------------------------- */
@@ -91,6 +128,7 @@
   flex: 1;
   min-height: 0;
   padding: 0;
+  border-top: 1px solid var(--color-border);
 }
 
 .snippets {
@@ -108,34 +146,43 @@
 }
 
 .snippets__heading {
-  margin: var(--space-2) var(--space-1) var(--space-1);
-  font-size: 11px;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
+  margin: var(--space-3) var(--space-2) var(--space-1);
   color: var(--color-fg-muted);
+  font-size: var(--text-xs);
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.snippets__heading:first-of-type {
+  margin-top: var(--space-1);
 }
 
 .snippets__list {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
   margin: 0;
   padding: 0;
   list-style: none;
 }
 
 .snippets__item {
+  position: relative;
   display: flex;
-  width: 100%;
-  font: inherit;
-  color: inherit;
-  text-align: left;
-  border: none;
-  background: none;
-  align-items: baseline;
-  justify-content: space-between;
+  align-items: center;
   gap: var(--space-2);
-  padding: var(--space-1) var(--space-2);
-  border-radius: 4px;
+  width: 100%;
+  min-height: var(--control-md);
+  padding: 0 var(--space-2);
+  border: none;
+  border-radius: var(--radius-md);
+  background: none;
+  color: var(--color-fg);
+  font: inherit;
+  text-align: left;
   cursor: pointer;
+  transition: background-color var(--duration-fast) var(--ease-out);
 }
 
 .snippets__item:hover {
@@ -144,8 +191,18 @@
 
 .snippets__item--active,
 .snippets__item--active:hover {
-  background: var(--color-accent);
-  color: var(--color-accent-fg);
+  background: var(--color-selection);
+}
+
+.snippets__item--active::before {
+  content: "";
+  position: absolute;
+  top: 6px;
+  bottom: 6px;
+  left: 0;
+  width: 2px;
+  border-radius: 2px;
+  background: var(--color-focus);
 }
 
 .snippets__item:focus-visible {
@@ -153,23 +210,48 @@
   outline-offset: -2px;
 }
 
+.snippets__icon {
+  flex-shrink: 0;
+  color: var(--color-fg-faint);
+}
+
 .snippets__name {
+  flex: 1;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.snippets__prefix {
+.snippets__prefix,
+.snippets__prefix-chip {
+  flex-shrink: 0;
+  padding: 1px 6px;
+  border-radius: var(--radius-sm);
+  background: var(--color-bg-muted);
+  color: var(--color-fg-muted);
   font-family: var(--font-mono);
-  font-size: 11px;
-  opacity: 0.8;
+  font-size: var(--text-xs);
+}
+
+.snippets__item--active .snippets__prefix {
+  background: var(--color-bg);
 }
 
 .snippets__detail {
   flex: 1;
   min-width: 0;
   overflow: auto;
-  padding: var(--space-4);
+  padding: var(--space-4) var(--space-5);
+  background: var(--color-bg-elevated);
+}
+
+.snippets__detail > .empty-state {
+  height: 100%;
+}
+
+.snippets__empty-hint {
+  max-width: 320px;
 }
 
 .snippets__form {
@@ -181,7 +263,7 @@
 .snippets__body,
 .snippets__preview {
   font-family: var(--font-mono);
-  font-size: 12px;
+  font-size: var(--text-sm);
 }
 
 .snippets__body {
@@ -192,15 +274,34 @@
 .snippets__preview {
   margin: 0;
   padding: var(--space-3);
-  white-space: pre-wrap;
-  background: var(--color-bg-subtle);
   border: 1px solid var(--color-border);
-  border-radius: 4px;
+  border-radius: var(--radius-md);
+  background: var(--color-bg);
+  line-height: 1.6;
+  white-space: pre-wrap;
+}
+
+.snippets__view {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.snippets__view > p {
+  margin: 0;
 }
 
 .snippets__title {
-  margin: 0 0 var(--space-1);
-  font-size: 14px;
+  margin: 0;
+  font-size: var(--text-lg);
+  font-weight: 600;
+}
+
+.snippets__meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
 }
 
 .snippets__engines {
@@ -213,12 +314,15 @@
 }
 
 .snippets__engines legend {
-  padding: 0;
   margin-bottom: var(--space-1);
+  padding: 0;
+  color: var(--color-fg-muted);
+  font-size: var(--text-sm);
   font-weight: 500;
 }
 
 .snippets__empty {
-  margin: var(--space-1);
-  color: var(--color-fg-muted);
+  margin: var(--space-1) var(--space-2);
+  color: var(--color-fg-faint);
+  font-size: var(--text-sm);
 }

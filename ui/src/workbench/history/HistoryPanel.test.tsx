@@ -5,7 +5,7 @@ import { refreshAll, resetConnectionsStore } from "../../connections/store";
 import type { ConnectionProfile, SessionSummary } from "../../connections/types";
 import { tauriCore } from "../../test/tauriMock";
 import { notifyHistoryChanged } from "../events";
-import { HISTORY_PAGE, HistoryPanel, nextPageBefore } from "./HistoryPanel";
+import { HISTORY_PAGE, HistoryPanel, nextPageBefore, relativeTime } from "./HistoryPanel";
 
 vi.mock("@tauri-apps/api/core", async () => (await import("../../test/tauriMock")).tauriCore);
 vi.mock("@tauri-apps/plugin-dialog", () => ({ open: vi.fn() }));
@@ -141,6 +141,21 @@ describe("HistoryPanel", () => {
     expect(historyCalls()[0]).toEqual({ limit: HISTORY_PAGE });
   });
 
+  it("offers reopen and delete on the hovered row without selecting it", async () => {
+    const list = await renderPanel();
+    const second = within(list).getAllByRole("option")[1] as HTMLElement;
+    expect(within(second).queryByRole("button", { name: "Reopen in editor" })).toBeNull();
+    fireEvent.mouseEnter(second);
+    fireEvent.click(within(second).getByRole("button", { name: "Reopen in editor" }));
+    expect(layout.openQueryEditor).toHaveBeenCalledWith(
+      expect.objectContaining({ sql: "UPDATE users SET name = 'x'" }),
+    );
+    expect(second).toHaveAttribute("aria-selected", "false");
+    fireEvent.click(within(second).getByRole("button", { name: "Delete from history" }));
+    await waitFor(() => expect(shown()).toHaveLength(2));
+    expect(tauriCore.invoke).toHaveBeenCalledWith("history_delete", { ids: ["h-2"] });
+  });
+
   it("searches after typing settles", async () => {
     await renderPanel();
     fireEvent.change(screen.getByRole("searchbox", { name: "Search history" }), {
@@ -242,5 +257,23 @@ describe("HistoryPanel", () => {
     entries = [entry(0, { sql: "SELECT now()" })];
     act(() => notifyHistoryChanged());
     await waitFor(() => expect(shown()).toHaveLength(1));
+  });
+});
+
+describe("relativeTime", () => {
+  const now = Date.UTC(2026, 9, 31, 12, 0, 0);
+  const ago = (ms: number) => new Date(now - ms).toISOString();
+
+  it("says how long ago a run started", () => {
+    expect(relativeTime(ago(10_000), now)).toBe("just now");
+    expect(relativeTime(ago(5 * 60_000), now)).toBe("5 min ago");
+    expect(relativeTime(ago(3 * 3_600_000), now)).toBe("3 h ago");
+    expect(relativeTime(ago(26 * 3_600_000), now)).toBe("yesterday");
+    expect(relativeTime(ago(4 * 86_400_000), now)).toBe("4 days ago");
+  });
+
+  it("shows the date of older entries and keeps text it cannot parse", () => {
+    expect(relativeTime(ago(30 * 86_400_000), now)).toMatch(/^2026-10-0\d \d\d:\d\d$/);
+    expect(relativeTime("not a date", now)).toBe("not a date");
   });
 });
