@@ -280,7 +280,7 @@ impl ShellSession {
 #[derive(Debug)]
 enum Output {
     None,
-    Request(DocumentQuery),
+    Request(Box<DocumentQuery>),
     Documents(Vec<bson::Document>),
     Value(bson::Bson),
     Write { affected: u64, row: bson::Document },
@@ -343,7 +343,9 @@ fn parse_output(text: &str) -> Result<Output> {
         serde_json::from_str(text).map_err(|e| Error::internal(format!("shell result: {e}")))?;
     let kind = value.get("kind").and_then(Json::as_str).unwrap_or("none");
     Ok(match kind {
-        "request" => Output::Request(request(value.get("request").unwrap_or(&Json::Null))?),
+        "request" => Output::Request(Box::new(request(
+            value.get("request").unwrap_or(&Json::Null),
+        )?)),
         "documents" => {
             let docs = value
                 .get("docs")

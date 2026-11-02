@@ -226,7 +226,7 @@ impl Engine {
             options.filename = Some("oxbase-prelude".into());
             options.strict = false;
             ctx.eval_with_options::<(), _>(PRELUDE, options)
-                .map_err(|e| describe_setup_error(&ctx, e))
+                .map_err(|e| describe_setup_error(&ctx, &e))
         });
         loaded.map_err(|e| Error::internal(format!("the shell prelude failed: {e}")))?;
         Ok(Self {
@@ -384,14 +384,14 @@ fn line_of(stack: &str) -> Option<u32> {
 }
 
 /// The message of an exception thrown while loading the prelude.
-fn describe_setup_error(ctx: &Ctx<'_>, e: rquickjs::Error) -> String {
+fn describe_setup_error(ctx: &Ctx<'_>, e: &rquickjs::Error) -> String {
     if !matches!(e, rquickjs::Error::Exception) {
         return e.to_string();
     }
     let value = ctx.catch();
-    value
-        .as_object()
-        .map(|o| {
+    value.as_object().map_or_else(
+        || "exception".to_owned(),
+        |o| {
             let get = |k: &str| {
                 o.get::<_, Option<Coerced<String>>>(k)
                     .ok()
@@ -400,8 +400,8 @@ fn describe_setup_error(ctx: &Ctx<'_>, e: rquickjs::Error) -> String {
                     .unwrap_or_default()
             };
             format!("{}: {} {}", get("name"), get("message"), get("stack"))
-        })
-        .unwrap_or_else(|| "exception".to_owned())
+        },
+    )
 }
 
 #[cfg(test)]

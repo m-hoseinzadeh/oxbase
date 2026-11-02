@@ -308,9 +308,12 @@ async fn helpers_become_typed_bson() {
         doc.get_datetime("t").unwrap().timestamp_millis(),
         1_704_164_645_000
     );
-    let uuid = doc.get_binary_generic("u").unwrap();
-    assert_eq!(uuid[0], 0x01);
-    assert_eq!(uuid.len(), 16);
+    let Some(bson::Bson::Binary(uuid)) = doc.get("u") else {
+        panic!("a UUID: {doc}");
+    };
+    assert_eq!(u8::from(uuid.subtype), 4);
+    assert_eq!(uuid.bytes[0], 0x01);
+    assert_eq!(uuid.bytes.len(), 16);
     assert_eq!(
         doc.get_binary_generic("b").unwrap(),
         &[0x00_u8, 0xff, 0xfe, 0x0a]

@@ -461,6 +461,14 @@ fn guard_for(words: &[String], args: &[Arg]) -> StatementGuard {
 
 /// `line` with its secrets replaced, or `None` when it has none.
 fn redact_line(line: &str) -> Option<String> {
+    // The line ending stays out of the arguments (an unterminated quote must not swallow it).
+    let (line, ending) = if let Some(body) = line.strip_suffix("\r\n") {
+        (body, "\r\n")
+    } else if let Some(body) = line.strip_suffix('\n') {
+        (body, "\n")
+    } else {
+        (line, "")
+    };
     let args = lex(line);
     let secrets = secret_args(&args);
     if secrets.is_empty() {
@@ -481,6 +489,7 @@ fn redact_line(line: &str) -> Option<String> {
         at = arg.span.end;
     }
     out.push_str(&line[at..]);
+    out.push_str(ending);
     Some(out)
 }
 
@@ -737,6 +746,7 @@ mod tests {
                 "SENTINEL SET oxmaster auth-pass ***",
             ),
             ("AUTH \"unterminated", "AUTH ***"),
+            ("AUTH x\"y\r\nGET a", "AUTH ***\r\nGET a"),
         ];
         for (line, want) in cases {
             assert_eq!(RedisConsole.redact_secrets(line), want, "{line}");
