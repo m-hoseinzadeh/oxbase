@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { StatusBar } from "./StatusBar";
 import { tauriCore } from "./test/tauriMock";
@@ -23,5 +23,17 @@ describe("StatusBar", () => {
     render(<StatusBar />);
     expect(await screen.findByText("Core unavailable (browser preview)")).toBeInTheDocument();
     expect(tauriCore.invoke).not.toHaveBeenCalled();
+  });
+
+  it("switches the theme and remembers the choice", () => {
+    tauriCore.isTauri.mockReturnValue(false);
+    render(<StatusBar />);
+    const light = screen.getByRole("button", { name: "Light theme" });
+    fireEvent.click(light);
+    expect(light).toHaveAttribute("aria-pressed", "true");
+    expect(document.documentElement.dataset.theme).toBe("light");
+    expect(localStorage.getItem("oxbase.theme")).toBe("light");
+    fireEvent.click(screen.getByRole("button", { name: "Dark theme" }));
+    expect(document.documentElement.dataset.theme).toBe("dark");
   });
 });

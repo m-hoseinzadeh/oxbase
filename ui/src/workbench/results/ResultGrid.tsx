@@ -35,6 +35,7 @@ import {
   useState,
 } from "react";
 import type { ColumnInfo } from "../../api";
+import { normalizeColor, subscribeTheme } from "../theme-bridge";
 import { type CopyNotify, cellsForSelection, NULL_COPY_TEXT } from "./copy";
 import { cellDisplayText, columnTypeLabel, formatCell, initialColumnWidth } from "./format";
 import { dataCellOf } from "./gridCoords";
@@ -43,6 +44,11 @@ import { fromGridSelection, type GridRowSelection, toGridSelection } from "./row
 
 /** Rows assumed visible before the grid reports its real viewport. */
 const MIN_VIEWPORT_ROWS = 60;
+/** Dense grid metrics (docs/design-system.md: 28 px controls, 4 px grid). */
+const ROW_HEIGHT = 28;
+const HEADER_HEIGHT = 32;
+/** NULL draws as a faint italic word, so it never reads as the text "NULL". */
+const NULL_FONT_STYLE = "italic 12.5px";
 
 function columnIcon(column: ColumnInfo): GridColumnIcon {
   const t = column.dataType;
@@ -58,8 +64,10 @@ function columnIcon(column: ColumnInfo): GridColumnIcon {
 }
 
 /** `#rrggbb` with an alpha, for the selection tint (Glide parses colours itself). */
-function withAlpha(hex: string, alpha: number): string {
-  const m = /^#([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i.exec(hex);
+function withAlpha(colour: string, alpha: number): string {
+  // Built CSS is minified (`#fff`), so normalise before reading the channels.
+  const hex = normalizeColor(colour) ?? "";
+  const m = /^#([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})/i.exec(hex);
   if (!m) return `rgba(37, 99, 235, ${alpha})`;
   const [r, g, b] = [m[1], m[2], m[3]].map((h) => Number.parseInt(h ?? "0", 16));
   return `rgba(${r}, ${g}, ${b}, ${alpha})`;
@@ -79,7 +87,8 @@ function readTheme(): Partial<Theme> {
   const bg = cssVar(style, "--color-bg", "#ffffff");
   const subtle = cssVar(style, "--color-bg-subtle", "#f4f5f7");
   const border = cssVar(style, "--color-border", "#d8dbe1");
-  const accent = cssVar(style, "--color-accent", "#2563eb");
+  // Selection is "where you are": the focus blue, not the green action accent.
+  const accent = cssVar(style, "--color-focus", "#38bdf8");
   return {
     accentColor: accent,
     accentLight: withAlpha(accent, 0.18),
@@ -87,7 +96,9 @@ function readTheme(): Partial<Theme> {
     textMedium: muted,
     textLight: faint,
     textHeader: muted,
-    textHeaderSelected: cssVar(style, "--color-accent-fg", "#ffffff"),
+    textHeaderSelected: fg,
+    textBubble: fg,
+    textGroupHeader: muted,
     bgIconHeader: muted,
     fgIconHeader: bg,
     bgCell: bg,
@@ -95,13 +106,20 @@ function readTheme(): Partial<Theme> {
     bgHeader: subtle,
     bgHeaderHasFocus: cssVar(style, "--color-bg-muted", "#e9ebef"),
     bgHeaderHovered: cssVar(style, "--color-bg-muted", "#e9ebef"),
+    bgBubble: cssVar(style, "--color-bg-muted", "#e9ebef"),
+    bgBubbleSelected: bg,
+    bgSearchResult: withAlpha(cssVar(style, "--color-warning", "#fbbf24"), 0.24),
     borderColor: border,
+    horizontalBorderColor: border,
     drilldownBorder: border,
     linkColor: accent,
     fontFamily: cssVar(style, "--font-mono", "monospace"),
-    baseFontStyle: "12px",
+    baseFontStyle: "12.5px",
     headerFontStyle: "600 12px",
-    editorFontSize: "12px",
+    editorFontSize: "12.5px",
+    cellHorizontalPadding: 10,
+    cellVerticalPadding: 4,
+    headerIconSize: 16,
   };
 }
 
@@ -151,15 +169,16 @@ export interface GridEditing {
   }): ReactNode;
 }
 
+function useEditColours(): EditColours {
+  const [colours, setColours] = useState(readEditColours);
+  useEffect(() => subscribeTheme(() => setColours(readEditColours())), []);
+  return colours;
+}
+
 function useGridTheme(): Partial<Theme> {
   const [theme, setTheme] = useState(readTheme);
-  useEffect(() => {
-    const media = window.matchMedia?.("(prefers-color-scheme: dark)");
-    if (!media) return;
-    const update = () => setTheme(readTheme());
-    media.addEventListener("change", update);
-    return () => media.removeEventListener("change", update);
-  }, []);
+  // Theme changes (user choice or OS while "system") re-read the CSS tokens.
+  useEffect(() => subscribeTheme(() => setTheme(readTheme())), []);
   return theme;
 }
 
@@ -232,7 +251,7 @@ export function ResultGrid({
   const [selection, setSelection] = useState<GridSelection>(() =>
     selectedRows ? toGridSelection(selectedRows) : NO_SELECTION,
   );
-  const colours = useMemo(readEditColours, []);
+  const colours = useEditColours();
   const editRef = useRef(edit);
   editRef.current = edit;
 
@@ -268,6 +287,15 @@ export function ResultGrid({
     [columns, widths],
   );
 
+  // NULL: the faint text colour in italics (not the faded style, which would drop below 4.5:1).
+  const nullTheme = useMemo<Partial<Theme>>(
+    () => ({
+      ...(theme.textLight ? { textDark: theme.textLight } : {}),
+      baseFontStyle: NULL_FONT_STYLE,
+    }),
+    [theme.textLight],
+  );
+
   const storedCell = useCallback(
     (col: number, row: number): GridCell => {
       const ref = pager.cell(row, col);
@@ -280,7 +308,7 @@ export function ResultGrid({
           displayData: "NULL",
           copyData: NULL_COPY_TEXT,
           allowOverlay: false,
-          style: "faded",
+          themeOverride: nullTheme,
           contentAlign: value.numeric ? "right" : "left",
         };
       }
@@ -293,7 +321,7 @@ export function ResultGrid({
         ...(value.numeric ? { contentAlign: "right" as const } : {}),
       };
     },
-    [pager, columns],
+    [pager, columns, nullTheme],
   );
 
   const getCellContent = useCallback(
@@ -310,7 +338,11 @@ export function ResultGrid({
           displayData: override.placeholder ?? (isNull ? "NULL" : cellDisplayText(text)),
           copyData: isNull ? NULL_COPY_TEXT : text,
           allowOverlay: true,
-          ...(isNull || override.placeholder ? { style: "faded" as const } : {}),
+          ...(override.placeholder
+            ? { style: "faded" as const }
+            : isNull
+              ? { themeOverride: nullTheme }
+              : {}),
         };
       } else {
         cell = storedCell(col, row);
@@ -322,10 +354,12 @@ export function ResultGrid({
         ...cell,
         allowOverlay: true,
         readonly: !editable,
-        ...(highlight ? { themeOverride: { bgCell: colours[highlight] } } : {}),
+        ...(highlight
+          ? { themeOverride: { ...cell.themeOverride, bgCell: colours[highlight] } }
+          : {}),
       } as GridCell;
     },
-    [edit, storedCell, colours],
+    [edit, storedCell, colours, nullTheme],
   );
 
   // The overlay editor is one stable component; the cell it edits is recorded when Glide asks
@@ -444,6 +478,8 @@ export function ResultGrid({
               }
             : {})}
           rowMarkers="number"
+          rowHeight={ROW_HEIGHT}
+          headerHeight={HEADER_HEIGHT}
           smoothScrollX
           smoothScrollY
           theme={theme}

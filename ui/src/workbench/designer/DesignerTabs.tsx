@@ -4,6 +4,15 @@
  * `TableDesign` it is given and keeps every item's `origin`; what the engine cannot do
  * (`DesignerCapabilities`) is disabled with the reason as its title.
  */
+import {
+  ChevronDown,
+  ChevronUp,
+  CircleAlert,
+  Ellipsis,
+  Plus,
+  Trash2,
+  TriangleAlert,
+} from "lucide-react";
 import { Fragment, useId, useState } from "react";
 import type {
   CheckDef,
@@ -19,6 +28,7 @@ import type {
   ServerVersion,
   TableDesign,
 } from "../../api";
+import { ICON_SM } from "../../components/icons";
 import {
   allowed,
   boolExtra,
@@ -72,6 +82,7 @@ function IssueText({ issues }: { issues: DesignIssue[] }) {
           key={`${i.path}:${i.message}`}
           className={`designer__issue designer__issue--${i.severity}`}
         >
+          {i.severity === "error" ? <CircleAlert {...ICON_SM} /> : <TriangleAlert {...ICON_SM} />}
           {i.message}
         </span>
       ))}
@@ -220,30 +231,35 @@ export function ColumnsEditor({
                   <td className="designer__order">
                     <button
                       type="button"
-                      className="button button--small"
+                      className="icon-button icon-button--small"
                       aria-label={`Move ${col.column.name || "column"} up`}
                       disabled={disabled || !canReorder || index === 0}
                       title={
                         canReorder
-                          ? undefined
+                          ? "Move up"
                           : supportHint(caps.reorderColumns, "Reordering columns")
                       }
                       onClick={() =>
                         onChange({ ...design, columns: moveItem(design.columns, index, -1) })
                       }
                     >
-                      ↑
+                      <ChevronUp {...ICON_SM} />
                     </button>
                     <button
                       type="button"
-                      className="button button--small"
+                      className="icon-button icon-button--small"
                       aria-label={`Move ${col.column.name || "column"} down`}
+                      title={
+                        canReorder
+                          ? "Move down"
+                          : supportHint(caps.reorderColumns, "Reordering columns")
+                      }
                       disabled={disabled || !canReorder || index === design.columns.length - 1}
                       onClick={() =>
                         onChange({ ...design, columns: moveItem(design.columns, index, 1) })
                       }
                     >
-                      ↓
+                      <ChevronDown {...ICON_SM} />
                     </button>
                   </td>
                   <td>
@@ -299,41 +315,43 @@ export function ColumnsEditor({
                       onChange={(e) => togglePk(col.column.name, e.target.checked)}
                     />
                   </td>
-                  <td className="designer__default">
-                    <select
-                      aria-label={`Column ${index + 1} default kind`}
-                      value={mode}
-                      disabled={
-                        disabled ||
-                        !can(caps.alterColumnDefault) ||
-                        col.column.generated !== undefined
-                      }
-                      title={defaultHint}
-                      onChange={(e) =>
-                        setColumn(
-                          index,
-                          withDefault(col, e.target.value as DefaultMode, defaultText),
-                        )
-                      }
-                    >
-                      <option value="none">No default</option>
-                      <option value="value">Value</option>
-                      <option value="expression">Expression</option>
-                    </select>
-                    {mode !== "none" ? (
-                      <input
-                        type="text"
-                        aria-label={`Column ${index + 1} default`}
-                        className={mode === "expression" ? "designer__expr" : undefined}
-                        value={defaultText}
-                        placeholder={
-                          mode === "value" ? "plain value (quoted for you)" : "SQL expression"
+                  <td>
+                    <div className="designer__default">
+                      <select
+                        aria-label={`Column ${index + 1} default kind`}
+                        value={mode}
+                        disabled={
+                          disabled ||
+                          !can(caps.alterColumnDefault) ||
+                          col.column.generated !== undefined
                         }
-                        disabled={disabled || !can(caps.alterColumnDefault)}
-                        spellCheck={false}
-                        onChange={(e) => setColumn(index, withDefault(col, mode, e.target.value))}
-                      />
-                    ) : null}
+                        title={defaultHint}
+                        onChange={(e) =>
+                          setColumn(
+                            index,
+                            withDefault(col, e.target.value as DefaultMode, defaultText),
+                          )
+                        }
+                      >
+                        <option value="none">No default</option>
+                        <option value="value">Value</option>
+                        <option value="expression">Expression</option>
+                      </select>
+                      {mode !== "none" ? (
+                        <input
+                          type="text"
+                          aria-label={`Column ${index + 1} default`}
+                          className={mode === "expression" ? "designer__expr" : undefined}
+                          value={defaultText}
+                          placeholder={
+                            mode === "value" ? "plain value (quoted for you)" : "SQL expression"
+                          }
+                          disabled={disabled || !can(caps.alterColumnDefault)}
+                          spellCheck={false}
+                          onChange={(e) => setColumn(index, withDefault(col, mode, e.target.value))}
+                        />
+                      ) : null}
+                    </div>
                   </td>
                   <td>
                     <input
@@ -354,23 +372,24 @@ export function ColumnsEditor({
                   <td className="designer__actions">
                     <button
                       type="button"
-                      className="button button--small"
+                      className="icon-button icon-button--small"
                       aria-expanded={details === index}
                       aria-label={`More options of column ${index + 1}`}
+                      title="More options"
                       disabled={disabled}
                       onClick={() => setDetails(details === index ? null : index)}
                     >
-                      …
+                      <Ellipsis {...ICON_SM} />
                     </button>
                     <button
                       type="button"
-                      className="button button--small"
+                      className="icon-button icon-button--small"
                       aria-label={`Remove column ${index + 1}`}
                       disabled={disabled || !can(caps.dropColumn)}
-                      title={dropHint}
+                      title={dropHint ?? "Remove column"}
                       onClick={() => remove(index)}
                     >
-                      ×
+                      <Trash2 {...ICON_SM} />
                     </button>
                   </td>
                 </tr>
@@ -416,12 +435,13 @@ export function ColumnsEditor({
       <div className="designer__add">
         <button
           type="button"
-          className="button"
+          className="button button--ghost button--small"
           disabled={disabled || !canAdd}
           title={canAdd ? undefined : supportHint(caps.addColumn, "Adding a column")}
           onClick={() => onChange({ ...design, columns: [...design.columns, newColumn()] })}
         >
-          + Column
+          <Plus {...ICON_SM} />
+          Add column
         </button>
       </div>
     </div>
@@ -490,6 +510,7 @@ function ColumnNameInput({
       />
       {problem ? (
         <span id={errorId} className="designer__issue designer__issue--error" role="alert">
+          <CircleAlert {...ICON_SM} />
           {problem}
         </span>
       ) : null}
@@ -1074,16 +1095,16 @@ export function IndexesEditor({
                   <td className="designer__actions">
                     <button
                       type="button"
-                      className="button button--small"
+                      className="icon-button icon-button--small"
                       aria-label={`Remove index ${index + 1}`}
                       disabled={
                         disabled ||
                         (!isNew && item.origin !== undefined && !allowed(caps.dropIndex))
                       }
                       title={
-                        item.origin !== undefined
+                        (item.origin !== undefined
                           ? supportHint(caps.dropIndex, "Dropping an index")
-                          : undefined
+                          : undefined) ?? "Remove index"
                       }
                       onClick={() =>
                         onChange({
@@ -1092,7 +1113,7 @@ export function IndexesEditor({
                         })
                       }
                     >
-                      ×
+                      <Trash2 {...ICON_SM} />
                     </button>
                   </td>
                 </tr>
@@ -1119,12 +1140,13 @@ export function IndexesEditor({
       <div className="designer__add">
         <button
           type="button"
-          className="button"
+          className="button button--ghost button--small"
           disabled={disabled || !canAdd}
           title={canAdd ? undefined : supportHint(caps.addIndex, "Adding an index")}
           onClick={() => onChange({ ...design, indexes: [...design.indexes, { def: newIndex() }] })}
         >
-          + Index
+          <Plus {...ICON_SM} />
+          Add index
         </button>
       </div>
     </div>
@@ -1194,8 +1216,9 @@ export function ForeignKeysEditor({
               </span>
               <button
                 type="button"
-                className="button button--small"
+                className="icon-button icon-button--small"
                 aria-label={`Remove foreign key ${index + 1}`}
+                title="Remove foreign key"
                 disabled={
                   disabled || (!isNew && item.origin !== undefined && !allowed(caps.dropForeignKey))
                 }
@@ -1206,7 +1229,7 @@ export function ForeignKeysEditor({
                   })
                 }
               >
-                ×
+                <Trash2 {...ICON_SM} />
               </button>
             </div>
             <div className="designer__card-row">
@@ -1289,7 +1312,7 @@ export function ForeignKeysEditor({
       <div className="designer__add">
         <button
           type="button"
-          className="button"
+          className="button button--ghost button--small"
           disabled={disabled || !canAdd}
           title={canAdd ? undefined : supportHint(caps.addForeignKey, "Adding a foreign key")}
           onClick={() =>
@@ -1299,7 +1322,8 @@ export function ForeignKeysEditor({
             })
           }
         >
-          + Foreign key
+          <Plus {...ICON_SM} />
+          Add foreign key
         </button>
       </div>
     </div>
@@ -1320,9 +1344,10 @@ export function ChecksEditor({ design, onChange, caps, issues, isNew, disabled }
   return (
     <div className="designer__section">
       {!caps.checksEnforced ? (
-        <p className="banner banner--warning">
-          This database version does not enforce CHECK constraints.
-        </p>
+        <div className="banner banner--warning" role="note">
+          <TriangleAlert {...ICON_SM} className="banner__icon" />
+          <p>This database version does not enforce CHECK constraints.</p>
+        </div>
       ) : null}
       {design.checks.length === 0 ? <p className="filter__empty">No checks.</p> : null}
       {design.checks.map((item, index) => {
@@ -1359,8 +1384,9 @@ export function ChecksEditor({ design, onChange, caps, issues, isNew, disabled }
               <span className="designer__inline-label">)</span>
               <button
                 type="button"
-                className="button button--small"
+                className="icon-button icon-button--small"
                 aria-label={`Remove check ${index + 1}`}
+                title="Remove check"
                 disabled={
                   disabled || (!isNew && item.origin !== undefined && !allowed(caps.dropCheck))
                 }
@@ -1368,7 +1394,7 @@ export function ChecksEditor({ design, onChange, caps, issues, isNew, disabled }
                   onChange({ ...design, checks: design.checks.filter((_, i) => i !== index) })
                 }
               >
-                ×
+                <Trash2 {...ICON_SM} />
               </button>
             </div>
             <IssueText issues={rowIssues} />
@@ -1378,7 +1404,7 @@ export function ChecksEditor({ design, onChange, caps, issues, isNew, disabled }
       <div className="designer__add">
         <button
           type="button"
-          className="button"
+          className="button button--ghost button--small"
           disabled={disabled || !canAdd}
           title={canAdd ? undefined : supportHint(caps.addCheck, "Adding a check")}
           onClick={() =>
@@ -1388,7 +1414,8 @@ export function ChecksEditor({ design, onChange, caps, issues, isNew, disabled }
             })
           }
         >
-          + Check
+          <Plus {...ICON_SM} />
+          Add check
         </button>
       </div>
     </div>

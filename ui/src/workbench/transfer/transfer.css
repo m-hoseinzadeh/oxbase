@@ -1,6 +1,9 @@
-/* M5: import wizard, export dialog, progress view, and the context menu. */
+/*
+ * M5: import wizard, export dialog, progress view, and the context menu. Tokens only
+ * (theme.css); see docs/design-system.md.
+ */
 
-/* --- dialogs ---------------------------------------------------------------------------- */
+/* --- dialogs ----------------------------------------------------------------------------- */
 
 .modal--transfer {
   width: min(960px, calc(100vw - 32px));
@@ -27,57 +30,122 @@
 
 .modal--transfer .banner,
 .modal--transfer-narrow .banner {
-  border: 1px solid var(--color-border);
-  border-radius: 4px;
   padding: var(--space-2) var(--space-3);
 }
 
-.modal--transfer input[type="number"],
-.modal--transfer-narrow input[type="number"] {
-  font: inherit;
-  padding: var(--space-1) var(--space-2);
-  border: 1px solid var(--color-border);
-  border-radius: 4px;
-  background: var(--color-input-bg);
-  color: var(--color-fg);
+.modal--transfer .field__error,
+.modal--transfer-narrow .field__error {
+  display: flex;
+  align-items: center;
+  gap: 6px;
 }
 
-/* --- steps ------------------------------------------------------------------------------ */
+/* --- step indicator ---------------------------------------------------------------------- */
 
 .transfer-steps {
   display: flex;
-  gap: var(--space-1);
-  margin: 0;
-  padding: 0;
-  list-style: none;
-  counter-reset: step;
+  align-items: center;
   flex-shrink: 0;
+  margin: 0;
+  padding: 0 0 var(--space-3);
+  border-bottom: 1px solid var(--color-border);
+  list-style: none;
 }
 
 .transfer-steps__item {
-  counter-increment: step;
+  display: flex;
+  align-items: center;
+  flex: 1 1 0;
+  min-width: 0;
+}
+
+.transfer-steps__item:last-child {
+  flex: 0 0 auto;
+}
+
+/* The line to the next step; filled once this step is done. */
+.transfer-steps__item:not(:last-child)::after {
+  content: "";
   flex: 1;
-  padding: var(--space-1) var(--space-2);
-  border-bottom: 2px solid var(--color-border);
+  min-width: var(--space-2);
+  height: 1px;
+  margin: 0 var(--space-2);
+  background: var(--color-border-strong);
+}
+
+.transfer-steps__item--done:not(:last-child)::after {
+  background: var(--color-success);
+}
+
+.transfer-steps__button {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-shrink: 0;
+  height: var(--control-md);
+  padding: 0 var(--space-2) 0 2px;
+  border: none;
+  border-radius: 999px;
+  background: none;
   color: var(--color-fg-faint);
-  font-size: 12px;
+  font: inherit;
+  font-size: var(--text-sm);
+  font-weight: 500;
   white-space: nowrap;
 }
 
-.transfer-steps__item::before {
-  content: counter(step) ". ";
+button.transfer-steps__button {
+  cursor: pointer;
+  transition:
+    background-color var(--duration-fast) var(--ease-out),
+    color var(--duration-fast) var(--ease-out);
 }
 
-.transfer-steps__item--done {
-  border-bottom-color: var(--color-fg-faint);
+button.transfer-steps__button:hover {
+  background: var(--color-bg-muted);
+  color: var(--color-fg);
+}
+
+.transfer-steps__marker {
+  display: inline-grid;
+  place-items: center;
+  flex-shrink: 0;
+  width: 22px;
+  height: 22px;
+  border: 1px solid var(--color-border-control);
+  border-radius: 50%;
+  color: var(--color-fg-muted);
+  font-size: var(--text-xs);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  transition:
+    background-color var(--duration-fast) var(--ease-out),
+    border-color var(--duration-fast) var(--ease-out),
+    color var(--duration-fast) var(--ease-out);
+}
+
+.transfer-steps__item--done .transfer-steps__button {
   color: var(--color-fg-muted);
 }
 
-.transfer-steps__item[aria-current="step"] {
-  border-bottom-color: var(--color-accent);
+.transfer-steps__item--done .transfer-steps__marker {
+  border-color: var(--color-success);
+  background: var(--color-success-bg);
+  color: var(--color-success);
+}
+
+.transfer-steps__item[aria-current="step"] .transfer-steps__button {
   color: var(--color-fg);
   font-weight: 600;
 }
+
+.transfer-steps__item[aria-current="step"] .transfer-steps__marker {
+  border-color: var(--color-accent);
+  background: var(--color-accent);
+  color: var(--color-accent-fg);
+}
+
+/* --- steps ------------------------------------------------------------------------------- */
 
 .transfer-step {
   display: flex;
@@ -94,6 +162,7 @@
 
 .transfer-step--split {
   flex-direction: row;
+  gap: var(--space-4);
   overflow: hidden;
 }
 
@@ -101,9 +170,10 @@
   display: flex;
   flex-direction: column;
   gap: var(--space-3);
-  flex: 0 0 240px;
+  flex: 0 0 248px;
+  padding-right: var(--space-4);
+  border-right: 1px solid var(--color-border);
   overflow: auto;
-  padding-right: var(--space-1);
 }
 
 .transfer-step__main {
@@ -116,37 +186,137 @@
 }
 
 .transfer-step__status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 18px;
+  margin: 0;
   color: var(--color-fg-muted);
-  font-size: 12px;
-  min-height: 1.4em;
+  font-size: var(--text-sm);
+  font-variant-numeric: tabular-nums;
 }
 
+/* The file picker card. */
 .transfer-file {
   display: flex;
   align-items: center;
   gap: var(--space-3);
+  padding: var(--space-4);
+  border: 1px dashed var(--color-border-control);
+  border-radius: var(--radius-lg);
+  background: var(--color-bg-subtle);
+  transition: border-color var(--duration-fast) var(--ease-out);
+}
+
+.transfer-file--picked {
+  border-style: solid;
+  border-color: var(--color-border-strong);
+}
+
+.transfer-file__icon {
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+  width: 40px;
+  height: 40px;
+  border-radius: var(--radius-md);
+  background: var(--color-bg-muted);
+  color: var(--color-fg-muted);
+}
+
+.transfer-file--picked .transfer-file__icon {
+  background: var(--color-info-bg);
+  color: var(--color-info);
+}
+
+.transfer-file__text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1;
+  min-width: 0;
+}
+
+.transfer-file__title {
+  font-weight: 600;
 }
 
 .transfer-file__name {
   font-family: var(--font-mono);
+  font-weight: 600;
   overflow-wrap: anywhere;
+}
+
+.transfer-file__size {
+  color: var(--color-fg-muted);
+  font-weight: 400;
+  font-variant-numeric: tabular-nums;
+}
+
+.transfer-file__hint {
+  color: var(--color-fg-muted);
+  font-size: var(--text-sm);
+}
+
+/* The export source card. */
+.transfer-source-card {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-bg-subtle);
+}
+
+.transfer-source-card .transfer-file__icon {
+  width: 32px;
+  height: 32px;
+  background: var(--color-info-bg);
+  color: var(--color-info);
 }
 
 .transfer-source {
   margin: 0;
   font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.transfer-source__rows {
+  color: var(--color-fg-muted);
+  font-weight: 400;
+  font-variant-numeric: tabular-nums;
 }
 
 .transfer-label {
+  color: var(--color-fg-muted);
+  font-size: var(--text-sm);
   font-weight: 500;
 }
 
-/* --- option forms ----------------------------------------------------------------------- */
+/* --- option forms ------------------------------------------------------------------------ */
 
 .transfer-form {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: var(--space-3) var(--space-4);
+  align-items: start;
+}
+
+.transfer-form__checks {
   display: flex;
   flex-direction: column;
-  gap: var(--space-3);
+  gap: var(--space-2);
+}
+
+.transfer-form > .transfer-form__checks,
+.transfer-form > p,
+.transfer-form > .field__hint {
+  grid-column: 1 / -1;
+}
+
+.transfer-form .field {
+  flex: none;
 }
 
 .transfer-form__inline {
@@ -160,10 +330,13 @@
 
 input.transfer-form__char {
   width: 48px;
+  font-family: var(--font-mono);
+  text-align: center;
 }
 
 .transfer-form__number {
   width: 110px;
+  font-variant-numeric: tabular-nums;
 }
 
 .transfer-size {
@@ -176,51 +349,50 @@ input.transfer-form__char {
   width: 72px;
 }
 
-.transfer-form__checks {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-2);
-}
-
 .transfer-form__end {
   align-self: flex-end;
-  padding-bottom: var(--space-1);
+  padding-bottom: 6px;
 }
 
-.transfer-radio {
-  display: inline-flex;
-  align-items: center;
-  gap: var(--space-1);
-  padding: var(--space-1) var(--space-3);
-}
-
-.transfer-radio:has(input:checked) {
-  background: var(--color-accent);
-  color: var(--color-accent-fg);
-}
-
+/* Grouped options (bad rows, transactions, values; the export's file and rows). */
 .transfer-options {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-  gap: var(--space-4);
+  gap: var(--space-3);
   flex-shrink: 0;
 }
 
-.transfer-options legend {
-  font-weight: 600;
-  margin-bottom: var(--space-1);
+.transfer-group.fieldset {
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3) var(--space-3);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
 }
 
-/* --- tables (preview, mapping, plan, error log) ----------------------------------------- */
+.transfer-group legend {
+  padding: 0 var(--space-1);
+  color: var(--color-fg-muted);
+  font-size: var(--text-xs);
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.transfer-group .checkbox {
+  flex-wrap: wrap;
+}
+
+/* --- tables (preview, mapping, plan, error log) ------------------------------------------ */
 
 .transfer-preview,
 .transfer-mapping,
 .transfer-errors {
   flex: 1;
   min-height: 120px;
-  overflow: auto;
   border: 1px solid var(--color-border);
-  border-radius: 4px;
+  border-radius: var(--radius-md);
+  background: var(--color-bg);
+  overflow: auto;
 }
 
 .transfer-errors {
@@ -228,20 +400,38 @@ input.transfer-form__char {
   max-height: 240px;
 }
 
+.transfer-errors__head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px var(--space-2);
+  border-bottom: 1px solid var(--color-border);
+  background: var(--color-danger-bg);
+  color: var(--color-danger);
+  font-size: var(--text-sm);
+  font-weight: 600;
+}
+
+.transfer-errors__more {
+  padding: var(--space-1) var(--space-2);
+}
+
 .transfer-table {
-  border-collapse: collapse;
   width: 100%;
-  font-size: 12px;
+  border-collapse: separate;
+  border-spacing: 0;
+  font-size: var(--text-sm);
 }
 
 .transfer-table th,
 .transfer-table td {
-  padding: 3px var(--space-2);
+  max-width: 320px;
+  height: 26px;
+  padding: 2px var(--space-2);
   border-bottom: 1px solid var(--color-border);
   text-align: left;
-  vertical-align: top;
+  vertical-align: middle;
   white-space: nowrap;
-  max-width: 320px;
   overflow: hidden;
   text-overflow: ellipsis;
 }
@@ -249,115 +439,265 @@ input.transfer-form__char {
 .transfer-table thead th {
   position: sticky;
   top: 0;
+  z-index: var(--z-sticky);
+  border-bottom-color: var(--color-border-strong);
   background: var(--color-bg-subtle);
+  color: var(--color-fg-muted);
+  font-size: var(--text-xs);
   font-weight: 600;
-  z-index: 1;
 }
 
 .transfer-table tbody th {
   font-weight: 500;
 }
 
+.transfer-preview .transfer-table thead th {
+  color: var(--color-fg);
+}
+
+.transfer-preview .transfer-table td {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.transfer-table tbody tr:hover td,
+.transfer-table tbody tr:hover th {
+  background: var(--row-hover-bg);
+}
+
+/* The preview is a compact data grid: values in the monospace face. */
 .transfer-table__name,
 .transfer-table__type {
   display: block;
 }
 
 .transfer-table__type {
-  color: var(--color-fg-muted);
-  font-weight: 400;
+  color: var(--color-fg-faint);
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: var(--text-xs);
+  font-weight: 400;
 }
 
 .transfer-table__null {
   color: var(--color-fg-faint);
-  font-style: italic;
 }
 
-.transfer-table__sample {
+.transfer-table__sample,
+.transfer-table__mono {
   color: var(--color-fg-muted);
   font-family: var(--font-mono);
 }
 
-.transfer-table__invalid {
+.transfer-table__num {
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+.transfer-table tbody tr.transfer-table__invalid td,
+.transfer-table tbody tr.transfer-table__invalid th {
   background: var(--color-danger-bg);
 }
 
 .transfer-table td .field__error {
   white-space: normal;
+  font-size: var(--text-xs);
 }
 
 .transfer-mapping select,
 .transfer-mapping input[type="text"] {
   min-width: 160px;
-  padding: 1px var(--space-1);
+  min-height: var(--control-sm);
+  height: var(--control-sm);
+  font-size: var(--text-sm);
+}
+
+.transfer-mapping input[type="text"] {
+  font-family: var(--font-mono);
+}
+
+.transfer-mapping td:first-child {
+  width: 1%;
+  text-align: center;
 }
 
 .transfer-ddl {
-  margin: 0;
-  padding: var(--space-2);
   max-height: 160px;
-  overflow: auto;
+  margin: 0;
+  padding: var(--space-2) var(--space-3);
   border: 1px solid var(--color-border);
-  border-radius: 4px;
+  border-radius: var(--radius-md);
   background: var(--color-bg-subtle);
-  font-family: var(--font-mono);
-  font-size: 12px;
+  font: var(--text-sm) / 1.5 var(--font-mono);
   white-space: pre-wrap;
+  overflow: auto;
 }
 
 .transfer-summary {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
-  gap: var(--space-2) var(--space-4);
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: var(--space-3) var(--space-4);
+  flex-shrink: 0;
   margin: 0;
+  padding: var(--space-3);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-bg-subtle);
 }
 
 .transfer-summary dt {
   color: var(--color-fg-muted);
-  font-size: 12px;
+  font-size: var(--text-xs);
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
 }
 
 .transfer-summary dd {
-  margin: 0;
+  margin: 2px 0 0;
   overflow-wrap: anywhere;
 }
 
-/* --- progress --------------------------------------------------------------------------- */
+.transfer-summary__num {
+  font-size: var(--text-lg);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+/* The final report's headline: status, then success / warning / error counts. */
+.transfer-result {
+  align-items: center;
+}
+
+.transfer-result .banner__icon {
+  margin-top: 0;
+}
+
+.transfer-result__badges {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-left: auto;
+  font-variant-numeric: tabular-nums;
+}
+
+/* --- progress ---------------------------------------------------------------------------- */
 
 .transfer-progress {
   display: flex;
   flex-direction: column;
+  gap: var(--space-3);
+  flex-shrink: 0;
+  padding: var(--space-4);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  background: var(--color-bg-subtle);
+}
+
+.transfer-progress__head {
+  display: flex;
+  align-items: center;
   gap: var(--space-2);
 }
 
+.transfer-progress__spinner {
+  flex-shrink: 0;
+  color: var(--color-accent);
+}
+
 .transfer-progress__label {
+  flex: 1;
+  min-width: 0;
   margin: 0;
   font-weight: 600;
   overflow-wrap: anywhere;
 }
 
+.transfer-progress__percent {
+  font-size: var(--text-xl);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
 .transfer-progress__bar {
+  appearance: none;
+  display: block;
   width: 100%;
-  height: 10px;
-  accent-color: var(--color-accent);
+  height: 6px;
+  border: none;
+  border-radius: 999px;
+  background: var(--color-bg-muted);
+  color: var(--color-accent);
+  overflow: hidden;
+}
+
+.transfer-progress__bar::-webkit-progress-bar {
+  border-radius: 999px;
+  background: var(--color-bg-muted);
+}
+
+.transfer-progress__bar::-webkit-progress-value {
+  border-radius: 999px;
+  background: var(--color-accent);
+  transition: width var(--duration) var(--ease-out);
+}
+
+.transfer-progress__bar::-moz-progress-bar {
+  border-radius: 999px;
+  background: var(--color-accent);
+}
+
+/* Unknown total: a band sweeps across the track. */
+.transfer-progress__bar:indeterminate {
+  background: linear-gradient(90deg, transparent 0%, var(--color-accent) 50%, transparent 100%)
+    var(--color-bg-muted);
+  background-size: 40% 100%;
+  background-repeat: no-repeat;
+  animation: transfer-sweep 1.4s var(--ease-out) infinite;
+}
+
+.transfer-progress__bar:indeterminate::-webkit-progress-bar {
+  background: transparent;
+}
+
+.transfer-progress__bar:indeterminate::-moz-progress-bar {
+  background: transparent;
+}
+
+@keyframes transfer-sweep {
+  from {
+    background-position: -40% 0;
+  }
+
+  to {
+    background-position: 140% 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .transfer-progress__bar:indeterminate {
+    animation: none;
+    background-position: 50% 0;
+  }
 }
 
 .transfer-progress__figures {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
-  gap: var(--space-2) var(--space-4);
+  grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+  gap: var(--space-3) var(--space-4);
   margin: 0;
 }
 
 .transfer-progress__figure dt {
   color: var(--color-fg-muted);
-  font-size: 12px;
+  font-size: var(--text-xs);
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
 }
 
 .transfer-progress__figure dd {
-  margin: 0;
+  margin: 2px 0 0;
+  font-weight: 500;
   font-variant-numeric: tabular-nums;
 }
 
@@ -366,7 +706,7 @@ input.transfer-form__char {
   font-weight: 600;
 }
 
-/* --- result status export button -------------------------------------------------------- */
+/* --- result status export button --------------------------------------------------------- */
 
 .results__status:has(.results__export) {
   display: flex;
@@ -376,41 +716,4 @@ input.transfer-form__char {
 
 .results__export {
   margin-left: auto;
-}
-
-/* --- context menu ----------------------------------------------------------------------- */
-
-.context-menu {
-  position: fixed;
-  z-index: 1100;
-  display: flex;
-  flex-direction: column;
-  min-width: 180px;
-  padding: var(--space-1) 0;
-  background: var(--color-bg);
-  color: var(--color-fg);
-  border: 1px solid var(--color-border);
-  border-radius: 6px;
-  box-shadow: 0 8px 24px rgb(0 0 0 / 20%);
-}
-
-.context-menu__item {
-  font: inherit;
-  padding: var(--space-1) var(--space-3);
-  border: none;
-  background: none;
-  color: inherit;
-  text-align: left;
-  cursor: pointer;
-}
-
-.context-menu__item:hover,
-.context-menu__item:focus-visible {
-  background: var(--color-bg-muted);
-  outline: none;
-}
-
-.context-menu__item[aria-disabled="true"] {
-  opacity: 0.5;
-  cursor: default;
 }

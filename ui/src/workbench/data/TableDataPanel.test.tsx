@@ -503,7 +503,7 @@ describe("TableDataPanel", () => {
     fireEvent.click(screen.getByRole("button", { name: /Filter & sort/ }));
     const filter = screen.getByTestId("filter-builder");
 
-    fireEvent.click(within(filter).getByRole("button", { name: "+ Condition" }));
+    fireEvent.click(within(filter).getByRole("button", { name: "Condition" }));
     fireEvent.change(within(filter).getByRole("combobox", { name: "Column" }), {
       target: { value: "id" },
     });
@@ -521,17 +521,17 @@ describe("TableDataPanel", () => {
       target: { value: "10" },
     });
 
-    fireEvent.click(within(filter).getByRole("button", { name: "+ Group" }));
+    fireEvent.click(within(filter).getByRole("button", { name: "Group" }));
     const group = within(filter).getByRole("group", { name: "Group" });
     fireEvent.click(within(group).getByRole("checkbox", { name: "NOT" }));
-    fireEvent.click(within(group).getByRole("button", { name: "+ Raw SQL" }));
+    fireEvent.click(within(group).getByRole("button", { name: "Raw SQL" }));
     expect(within(group).getByText("RAW SQL")).toBeInTheDocument();
     fireEvent.change(within(group).getByRole("textbox", { name: "Raw SQL condition" }), {
       target: { value: "note LIKE 'x%'" },
     });
 
     const sort = screen.getByTestId("sort-builder");
-    fireEvent.click(within(sort).getByRole("button", { name: "+ Sort key" }));
+    fireEvent.click(within(sort).getByRole("button", { name: "Add sort key" }));
     fireEvent.change(within(sort).getByRole("combobox", { name: "Sort column 1" }), {
       target: { value: "name" },
     });

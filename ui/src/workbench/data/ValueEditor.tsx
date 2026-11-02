@@ -4,8 +4,10 @@
  * Everything is edited as text in the core's grammar (docs/m3-contracts.md §5); NULL is a
  * separate state, never an empty string.
  */
+import { TriangleAlert } from "lucide-react";
 import { type KeyboardEvent, useEffect, useRef } from "react";
 import type { CellInput, DataType, InputKind } from "../../api";
+import { ICON_SM } from "../../components/icons";
 import {
   formatJson,
   isXmlType,
@@ -163,7 +165,7 @@ export function ValueEditor({
       ) : (
         <button
           type="button"
-          className="value-editor__state"
+          className={`value-editor__state value-editor__state--${value.type}`}
           disabled={disabled}
           onKeyDown={onKeyDown}
           aria-label={`${label}: ${value.type === "null" ? "NULL" : "DEFAULT"}, click to type a value`}
@@ -204,7 +206,7 @@ export function ValueEditor({
         {now && value.type === "text" ? (
           <button
             type="button"
-            className="button button--small"
+            className="button button--ghost button--small"
             disabled={disabled}
             onClick={() => onChange({ type: "text", text: now })}
           >
@@ -214,7 +216,7 @@ export function ValueEditor({
         {kind.type === "uuid" && value.type === "text" ? (
           <button
             type="button"
-            className="button button--small"
+            className="button button--ghost button--small"
             disabled={disabled}
             title="A new random UUID"
             onClick={() => onChange({ type: "text", text: newUuid() })}
@@ -225,7 +227,7 @@ export function ValueEditor({
         {kind.type === "json" && value.type === "text" ? (
           <button
             type="button"
-            className="button button--small"
+            className="button button--ghost button--small"
             disabled={disabled || problem !== null}
             onClick={() => onChange({ type: "text", text: formatJson(text) })}
           >
@@ -235,6 +237,7 @@ export function ValueEditor({
       </div>
       {problem ? (
         <p className="value-editor__hint" role="note">
+          <TriangleAlert {...ICON_SM} />
           {problem}
         </p>
       ) : null}

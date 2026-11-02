@@ -4,8 +4,10 @@
  * it. A stored cell starts from its exact edit text (`row_get_form`), not the shortened grid
  * text; typing a character on a selected cell starts from that character.
  */
+import { CircleAlert, LoaderCircle } from "lucide-react";
 import { type KeyboardEvent, useEffect, useRef, useState } from "react";
 import type { CellInput, EditColumn } from "../../api";
+import { ICON_SM } from "../../components/icons";
 import { ValueEditor } from "./ValueEditor";
 import { sameInput } from "./valueInput";
 
@@ -95,11 +97,14 @@ export function CellEditor({
   return (
     <div className="cell-editor" data-testid="cell-editor">
       <div className="cell-editor__head">
-        <strong>{column.name}</strong>
+        <strong className="cell-editor__name">{column.name}</strong>
         <span className="cell-editor__type">{column.nativeType}</span>
       </div>
       {value === null ? (
-        <p className="cell-editor__loading">Loading…</p>
+        <p className="cell-editor__loading">
+          <LoaderCircle {...ICON_SM} className="spin" />
+          Loading…
+        </p>
       ) : (
         <ValueEditor
           kind={column.input}
@@ -114,9 +119,14 @@ export function CellEditor({
         />
       )}
       {loadError ? (
-        <p className="value-editor__hint">Could not load the value: {loadError}</p>
+        <p className="value-editor__hint">
+          <CircleAlert {...ICON_SM} />
+          Could not load the value: {loadError}
+        </p>
       ) : null}
-      <p className="cell-editor__keys">Enter to keep · Esc to cancel</p>
+      <p className="cell-editor__keys">
+        <kbd className="kbd">Enter</kbd> keep <kbd className="kbd">Esc</kbd> cancel
+      </p>
     </div>
   );
 }

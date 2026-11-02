@@ -384,6 +384,31 @@ async function screenshot(name) {
   }
 }
 
+/**
+ * Screenshots for design review: the current screen in the dark theme, then in the light theme
+ * (switched with the status bar's theme buttons, so Monaco and the grid re-theme too), then back
+ * to dark. Never fails the run.
+ */
+async function gallery(name) {
+  const pick = (label) =>
+    wd.execute(
+      `const b = document.querySelector('button[aria-label="${label}"]'); if (b) b.click(); return !!b;`,
+    );
+  try {
+    await pick("Dark theme");
+    await sleep(300);
+    await screenshot(`ui-${name}-dark`);
+    if (await pick("Light theme")) {
+      await sleep(300);
+      await screenshot(`ui-${name}-light`);
+      await pick("Dark theme");
+      await sleep(300);
+    }
+  } catch (error) {
+    log(`gallery ${name}: ${error.message}`);
+  }
+}
+
 async function dumpDom(name) {
   try {
     // Values of password fields are dropped (React mirrors an input's value into its attribute).
@@ -1736,13 +1761,16 @@ function markdownSummary() {
 async function main() {
   await mkdir(config.outDir, { recursive: true });
   let ok = await step("Window loads and shows the core version", launch);
+  if (ok) await gallery("01-welcome");
   if (ok) ok = await step("Connect to the PostgreSQL fixture (prompted password)", connect);
   if (ok) ok = await step("Run a 1,000,000-row query (Channel events, row counter)", runBigQuery);
   if (ok) ok = await step("Arrow page decodes in the webview (first cell is 1)", firstCell);
   if (ok) ok = await step("Scroll the grid (pages load at each position)", scrollGrid);
+  if (ok) await gallery("02-query-results");
   if (ok) ok = await step("Page latency through IPC + Arrow decode", measurePages);
   if (ok) ok = await step("Cancel a running large query", cancelRun);
   if (ok) ok = await step("Edit a table cell (M3 table data UI)", editCell);
+  if (ok) await gallery("03-table-data");
   if (ok) {
     await step(
       "Import a CSV and export a query result to CSV (M5 file handles)",

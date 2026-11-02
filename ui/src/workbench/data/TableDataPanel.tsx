@@ -12,6 +12,29 @@
  * - Form view edits the current row field by field; JSON view shows the current or selected
  *   rows.
  */
+import {
+  Braces,
+  Check,
+  CircleAlert,
+  CircleCheck,
+  CircleX,
+  CopyPlus,
+  Download,
+  Funnel,
+  LoaderCircle,
+  Lock,
+  type LucideIcon,
+  PencilRuler,
+  Plus,
+  RefreshCw,
+  Rows3,
+  Square,
+  Table2,
+  Trash2,
+  TriangleAlert,
+  Undo2,
+  X,
+} from "lucide-react";
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import {
   type CellInput,
@@ -38,10 +61,12 @@ import {
   setNewCell,
   tableDataOpen,
 } from "../../api";
+import { ICON, ICON_LG, ICON_SM } from "../../components/icons";
 import { Modal } from "../../components/Modal";
 import { toCommandError } from "../../connections/api";
 import { useConnections } from "../../connections/store";
 import { openTableDesigner } from "../layout";
+import { qualifiedName as qualified } from "../names";
 import { ResultPager } from "../results/pager";
 import { timedQueryPage } from "../results/perf";
 import { type CellOverride, type GridEditing, ResultGrid } from "../results/ResultGrid";
@@ -93,16 +118,18 @@ export interface TableDataParams {
 
 type View = "grid" | "form" | "json";
 
+const VIEWS: { id: View; label: string; icon: LucideIcon }[] = [
+  { id: "grid", label: "Grid", icon: Table2 },
+  { id: "form", label: "Form", icon: Rows3 },
+  { id: "json", label: "JSON", icon: Braces },
+];
+
 /** Most rows the JSON view shows for a selection. */
 export const MAX_JSON_ROWS = 100;
 
 interface AppliedQuery {
   filter?: Filter;
   sort: SortKey[];
-}
-
-function qualified(table: ObjectRef): string {
-  return [table.schema ?? table.catalog, table.name].filter(Boolean).join(".");
 }
 
 function inputOfText(text: string | null | undefined): CellInput {
@@ -673,99 +700,140 @@ export function TableDataPanel({ editorId, sessionId, table }: TableDataParams) 
   return (
     <section className="table-data" aria-label={`Table ${qualified(table)}`}>
       <div className="toolbar table-data__toolbar" role="toolbar" aria-label="Table data actions">
-        <button type="button" className="button" onClick={refresh} disabled={active}>
+        <button
+          type="button"
+          className="button button--ghost"
+          onClick={refresh}
+          disabled={active}
+          title="Reload the rows"
+        >
+          <RefreshCw {...ICON} />
           Refresh
-        </button>
-        <button type="button" className="button" onClick={stop} disabled={!active}>
-          Stop
         </button>
         <button
           type="button"
-          className="button"
-          aria-expanded={showBuilders}
-          onClick={() => setShowBuilders((v) => !v)}
+          className="icon-button"
+          onClick={stop}
+          disabled={!active}
+          aria-label="Stop"
+          title="Stop loading"
         >
-          Filter &amp; sort{conditionCount > 0 ? ` (${conditionCount})` : ""}
+          <Square {...ICON} />
         </button>
-        <span className="toolbar__divider" aria-hidden="true" />
-        <button type="button" className="button" disabled={!editable} onClick={addRow}>
+        <button
+          type="button"
+          className="button button--ghost"
+          aria-expanded={showBuilders}
+          aria-pressed={showBuilders}
+          onClick={() => setShowBuilders((v) => !v)}
+          title="Filter and sort the rows"
+        >
+          <Funnel {...ICON} />
+          Filter &amp; sort
+          {conditionCount > 0 ? " " : null}
+          {conditionCount > 0 ? (
+            <span className="count-badge">
+              <span className="visually-hidden">(</span>
+              {conditionCount}
+              <span className="visually-hidden">)</span>
+            </span>
+          ) : null}
+        </button>
+        <span className="toolbar__separator" aria-hidden="true" />
+        <button
+          type="button"
+          className="button button--ghost"
+          disabled={!editable}
+          onClick={addRow}
+          title="Add a new row"
+        >
+          <Plus {...ICON} />
           Add row
         </button>
         <button
           type="button"
-          className="button"
+          className="button button--ghost"
           disabled={!editable || !currentRow}
           onClick={() => void duplicateRow()}
+          title="Add a copy of the current row"
         >
+          <CopyPlus {...ICON} />
           Duplicate row
         </button>
         <button
           type="button"
-          className="button"
+          className="button button--ghost table-data__delete"
           disabled={!editable || selectedCount === 0}
           onClick={deleteSelected}
+          title="Mark the selected rows for deletion"
         >
+          <Trash2 {...ICON} />
           Delete {selectedCount > 1 ? `${selectedCount} rows` : "row"}
         </button>
         <button
           type="button"
-          className="button"
+          className="icon-button"
           disabled={!editable || !currentRow}
           onClick={revertCurrent}
+          aria-label="Revert row"
+          title="Revert row: drop the pending changes of the current row"
         >
-          Revert row
+          <Undo2 {...ICON} />
         </button>
-        <span className="toolbar__divider" aria-hidden="true" />
+        <span className="toolbar__separator" aria-hidden="true" />
         <button
           type="button"
           className="button button--primary"
           disabled={!editable || pendingCount === 0}
           onClick={() => void apply()}
           data-testid="apply-edits"
+          title="Save every pending change in one transaction"
         >
-          {applying ? "Applying…" : `Apply${pendingCount ? ` (${pendingCount})` : ""}`}
+          {applying ? <LoaderCircle {...ICON} className="spin" /> : <Check {...ICON} />}
+          {applying ? (
+            "Applying…"
+          ) : (
+            <>
+              Apply
+              {pendingCount > 0 ? " " : null}
+              {pendingCount > 0 ? (
+                <span className="count-badge count-badge--on-accent">
+                  <span className="visually-hidden">(</span>
+                  {pendingCount}
+                  <span className="visually-hidden">)</span>
+                </span>
+              ) : null}
+            </>
+          )}
         </button>
         <button
           type="button"
-          className="button"
+          className="button button--ghost"
           disabled={applying || (pendingCount === 0 && problems.length === 0)}
           onClick={discard}
+          title="Drop every pending change"
         >
+          <X {...ICON} />
           Discard
         </button>
-        <span className="toolbar__divider" aria-hidden="true" />
+        <span className="toolbar__separator" aria-hidden="true" />
         <div className="segmented" role="tablist" aria-label="View">
-          {(["grid", "form", "json"] as const).map((v) => (
+          {VIEWS.map((v) => (
             <button
-              key={v}
+              key={v.id}
               type="button"
               role="tab"
-              aria-selected={view === v}
+              aria-selected={view === v.id}
               className="segmented__item"
-              onClick={() => setView(v)}
+              onClick={() => setView(v.id)}
             >
-              {v === "grid" ? "Grid" : v === "form" ? "Form" : "JSON"}
+              <v.icon {...ICON_SM} />
+              {v.label}
             </button>
           ))}
         </div>
-        <button
-          type="button"
-          className="button"
-          onClick={() => openTableDesigner({ sessionId, table })}
-          disabled={table.kind !== "table"}
-        >
-          Design
-        </button>
-        <button
-          type="button"
-          className="button"
-          onClick={exportTable}
-          title="Export every row with the filter and sort applied here"
-        >
-          Export…
-        </button>
         <span
-          className="query-editor__status"
+          className="query-editor__status table-data__status"
           role="status"
           aria-live="polite"
           data-testid="table-data-status"
@@ -773,6 +841,25 @@ export function TableDataPanel({ editorId, sessionId, table }: TableDataParams) 
           {status}
           {pendingCount > 0 ? ` · ${changesSummary(changes)} pending` : ""}
         </span>
+        <button
+          type="button"
+          className="icon-button"
+          onClick={() => openTableDesigner({ sessionId, table })}
+          disabled={table.kind !== "table"}
+          aria-label="Design table"
+          title="Design the table"
+        >
+          <PencilRuler {...ICON} />
+        </button>
+        <button
+          type="button"
+          className="icon-button"
+          onClick={exportTable}
+          aria-label="Export"
+          title="Export every row with the filter and sort applied here"
+        >
+          <Download {...ICON} />
+        </button>
       </div>
 
       {showBuilders ? (
@@ -794,17 +881,24 @@ export function TableDataPanel({ editorId, sessionId, table }: TableDataParams) 
           <div className="table-data__builder-actions">
             <button
               type="button"
-              className="button button--primary"
+              className="button button--primary button--small"
               onClick={applyBuilders}
               disabled={active}
             >
+              <Check {...ICON_SM} />
               Apply filter
             </button>
-            <button type="button" className="button" onClick={clearBuilders} disabled={active}>
+            <button
+              type="button"
+              className="button button--ghost button--small"
+              onClick={clearBuilders}
+              disabled={active}
+            >
               Clear
             </button>
             {filterProblems.length > 0 ? (
               <span className="filter__problem" role="alert">
+                <CircleAlert {...ICON_SM} />
                 Fix the marked conditions first.
               </span>
             ) : null}
@@ -814,41 +908,87 @@ export function TableDataPanel({ editorId, sessionId, table }: TableDataParams) 
 
       {readOnlyReason ? (
         <div className="banner banner--info" role="status" data-testid="read-only-banner">
-          <strong>Read-only:</strong> {readOnlyReason}
+          <Lock {...ICON_SM} className="banner__icon" />
+          <p>
+            <strong>Read-only:</strong> {readOnlyReason}
+          </p>
         </div>
       ) : null}
       {!readOnlyReason && editability?.warning ? (
-        <div className="banner banner--info" role="status" data-testid="edit-warning-banner">
-          <strong>Note:</strong> {editability.warning}
+        <div className="banner banner--warning" role="status" data-testid="edit-warning-banner">
+          <TriangleAlert {...ICON_SM} className="banner__icon" />
+          <p>
+            <strong>Note:</strong> {editability.warning}
+          </p>
         </div>
       ) : null}
       {notice ? (
         <div className="banner banner--ok" role="status">
-          {notice}
+          <CircleCheck {...ICON_SM} className="banner__icon" />
+          <p>{notice}</p>
         </div>
       ) : null}
       {applyError || problems.length > 0 ? (
         <div className="banner banner--error" role="alert" data-testid="apply-errors">
-          {applyError ? <p className="banner__title">{applyError}</p> : null}
-          {problems.length > 0 ? (
-            <ul className="banner__list">
-              {problems.map((p) => (
-                <li key={`${p.index}`} className={`apply-problem apply-problem--${p.status}`}>
-                  <strong>{editLabel(changes, p.edit)}:</strong> {p.message}
-                </li>
-              ))}
-            </ul>
-          ) : null}
+          <CircleAlert {...ICON_SM} className="banner__icon" />
+          <div className="banner__content">
+            {applyError ? <p className="banner__title">{applyError}</p> : null}
+            {problems.length > 0 ? (
+              <ul className="banner__list apply-problems">
+                {problems.map((p) => (
+                  <li key={`${p.index}`} className={`apply-problem apply-problem--${p.status}`}>
+                    <CircleX {...ICON_SM} className="apply-problem__icon" />
+                    <span>
+                      <strong>{editLabel(changes, p.edit)}:</strong> {p.message}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            ) : null}
+          </div>
         </div>
+      ) : null}
+      {pendingCount > 0 || problems.length > 0 ? (
+        <ul className="change-legend" aria-label="Pending change colours">
+          <li className="change-legend__item">
+            <span className="change-legend__swatch change-legend__swatch--changed" />
+            Changed
+          </li>
+          <li className="change-legend__item">
+            <span className="change-legend__swatch change-legend__swatch--inserted" />
+            New
+          </li>
+          <li className="change-legend__item">
+            <span className="change-legend__swatch change-legend__swatch--deleted" />
+            Deleted
+          </li>
+          {problems.length > 0 ? (
+            <li className="change-legend__item">
+              <span className="change-legend__swatch change-legend__swatch--error" />
+              Failed
+            </li>
+          ) : null}
+        </ul>
       ) : null}
 
       <div className="table-data__body">
         {run.status === "failed" && !result ? (
-          <p className="results__empty" role="alert">
-            Could not open the table: {run.error?.message}
-          </p>
+          <div className="empty-state" role="alert">
+            <span className="empty-state__icon">
+              <CircleAlert {...ICON_LG} />
+            </span>
+            <p className="empty-state__title">Could not open the table</p>
+            <p className="empty-state__hint">{run.error?.message}</p>
+          </div>
         ) : !result || !pager ? (
-          <p className="results__empty">{active ? "Loading rows…" : "No rows."}</p>
+          active ? (
+            <div className="table-data__loading" role="status">
+              <LoaderCircle {...ICON} className="spin" />
+              Loading rows…
+            </div>
+          ) : (
+            <p className="results__empty">No rows.</p>
+          )
         ) : view === "grid" ? (
           <div className="results__grid">
             <ResultGrid

@@ -3,6 +3,23 @@
  * and the results area. Each tab is one `EditorId` in the core, so it has its own database
  * session (opened by the core on the first run, closed with the tab).
  */
+import {
+  Braces,
+  CircleCheck,
+  CircleSlash,
+  CircleX,
+  Database,
+  Download,
+  Info,
+  LoaderCircle,
+  type LucideIcon,
+  Play,
+  Plug,
+  Square,
+  TextCursorInput,
+  TextSelect,
+  WandSparkles,
+} from "lucide-react";
 import { useCallback, useEffect, useReducer, useRef, useState } from "react";
 import {
   isTerminalEvent,
@@ -12,6 +29,7 @@ import {
   statementAt,
   treeChildren,
 } from "../../api";
+import { ICON_SM } from "../../components/icons";
 import { toCommandError } from "../../connections/api";
 import { useConnections } from "../../connections/store";
 import { ENGINE_INFO } from "../../connections/types";
@@ -42,6 +60,18 @@ interface DatabaseList {
   /** The session's own database (the `current` listing extra). */
   current: string | null;
 }
+
+type StatusTone = "idle" | "running" | "finished" | "failed" | "cancelled" | "hint";
+
+/** The run status icon in the toolbar (the text says the same; colour is never the only cue). */
+const STATUS_ICON: Record<StatusTone, LucideIcon | null> = {
+  idle: null,
+  running: LoaderCircle,
+  finished: CircleCheck,
+  failed: CircleX,
+  cancelled: CircleSlash,
+  hint: Info,
+};
 
 const NO_DATABASES: DatabaseList = { status: "idle", names: [], current: null };
 
@@ -331,20 +361,44 @@ export function QueryEditorPanel({
   const disabled = !session || active;
 
   let status = "";
+  let statusTone: StatusTone = "idle";
   if (!session) {
     status = sessions.length === 0 ? "Open a connection to run queries." : "Choose a connection.";
   } else if (active) {
     const n = run.current;
     status = `Running${n === null ? "" : ` statement ${n + 1} of ${run.statements.length}`}…`;
-  } else if (run.status === "finished") status = "Finished";
-  else if (run.status === "failed") status = "Failed";
-  else if (run.status === "cancelled") status = "Cancelled";
+    statusTone = "running";
+  } else if (run.status === "finished") {
+    status = "Finished";
+    statusTone = "finished";
+  } else if (run.status === "failed") {
+    status = "Failed";
+    statusTone = "failed";
+  } else if (run.status === "cancelled") {
+    status = "Cancelled";
+    statusTone = "cancelled";
+  }
+  if (hint) statusTone = "hint";
+  const StatusIcon = STATUS_ICON[statusTone];
 
   return (
     <section className="query-editor" aria-label="Query editor">
       <div className="toolbar query-editor__toolbar" role="toolbar" aria-label="Query actions">
-        <label className="query-editor__picker">
+        <label
+          className="query-editor__picker query-editor__picker--connection"
+          title="Connection the query runs on"
+        >
           <span className="visually-hidden">Connection</span>
+          {session ? (
+            <span
+              className={`engine-badge engine-badge--${session.engine} query-editor__engine`}
+              aria-hidden="true"
+            >
+              {ENGINE_INFO[session.engine].short}
+            </span>
+          ) : (
+            <Plug {...ICON_SM} className="query-editor__picker-icon" />
+          )}
           <select
             aria-label="Connection"
             value={sessionId ?? ""}
@@ -362,8 +416,13 @@ export function QueryEditorPanel({
             ))}
           </select>
         </label>
-        <label className="query-editor__picker">
+        <label className="query-editor__picker" title="Database the query runs in">
           <span className="visually-hidden">Database</span>
+          {databases.status === "loading" ? (
+            <LoaderCircle {...ICON_SM} className="query-editor__picker-icon spin" />
+          ) : (
+            <Database {...ICON_SM} className="query-editor__picker-icon" />
+          )}
           <select
             aria-label="Database"
             value={selectedDatabase}
@@ -385,78 +444,103 @@ export function QueryEditorPanel({
             ))}
           </select>
         </label>
-        <span className="toolbar__divider" aria-hidden="true" />
+        <span className="toolbar__separator" aria-hidden="true" />
         <button
           type="button"
-          className="button button--primary"
+          className="button button--primary query-editor__run"
           data-testid="run-button"
           disabled={disabled}
           onClick={runAll}
-          title="Run all (Ctrl+Shift+Enter)"
+          title="Run the whole script (Ctrl+Shift+Enter)"
         >
+          <Play {...ICON_SM} fill="currentColor" />
           Run
-        </button>
-        <button type="button" className="button" disabled={disabled} onClick={runSelection}>
-          Run selection
         </button>
         <button
           type="button"
-          className="button"
+          className="button button--ghost"
           disabled={disabled}
           onClick={() => void runCurrent()}
           title="Run the statement at the cursor (Ctrl+Enter)"
         >
+          <TextCursorInput {...ICON_SM} />
           Run current
         </button>
         <button
           type="button"
-          className="button"
+          className="button button--ghost"
+          disabled={disabled}
+          onClick={runSelection}
+          title="Run the selected SQL (Ctrl+Enter with a selection)"
+        >
+          <TextSelect {...ICON_SM} />
+          Run selection
+        </button>
+        <button
+          type="button"
+          className={active ? "button button--danger" : "button button--ghost"}
           data-testid="cancel-button"
           disabled={!active}
           onClick={cancel}
+          title="Stop the running query"
         >
+          <Square {...ICON_SM} fill={active ? "currentColor" : "none"} />
           Stop
         </button>
-        <span className="toolbar__divider" aria-hidden="true" />
+        <span className="toolbar__separator" aria-hidden="true" />
         <button
           type="button"
-          className="button"
-          disabled={!session}
-          onClick={() => void exportQuery()}
-          title="Export every row of the query at the cursor (or the selection)"
-        >
-          Export…
-        </button>
-        <span className="toolbar__divider" aria-hidden="true" />
-        <button
-          type="button"
-          className="button"
+          className="button button--ghost"
           data-testid="format-button"
           disabled={!insightOn}
           onClick={() => void format()}
           title="Format the selection's statements, or all (Shift+Alt+F)"
         >
+          <WandSparkles {...ICON_SM} />
           Format
         </button>
         <button
           type="button"
-          className="button"
+          className="button button--ghost"
           data-testid="snippets-button"
           onClick={() => setSnippetsOpen(true)}
-          title="Manage SQL snippets"
+          title="Manage SQL snippets (type a prefix, or Ctrl+Space for completions)"
         >
+          <Braces {...ICON_SM} />
           Snippets…
         </button>
-        <SchemaCacheIndicator view={cache} connected={insightOn && session !== null} />
+        <button
+          type="button"
+          className="button button--ghost"
+          disabled={!session}
+          onClick={() => void exportQuery()}
+          title="Export every row of the query at the cursor (or the selection)"
+        >
+          <Download {...ICON_SM} />
+          Export…
+        </button>
+        <span className="query-editor__spacer" />
         <span
           className="query-editor__status"
           role="status"
           aria-live="polite"
           data-testid="run-status"
+          data-state={statusTone}
+          title={hint ?? status}
         >
-          {hint ?? status}
-          {elapsed !== null && run.status !== "idle" ? ` · ${formatMs(elapsed)}` : ""}
+          {StatusIcon ? (
+            <StatusIcon
+              {...ICON_SM}
+              className={`query-editor__status-icon${statusTone === "running" ? " spin" : ""}`}
+            />
+          ) : null}
+          <span className="query-editor__status-text">{hint ?? status}</span>
+          {elapsed !== null && run.status !== "idle" ? (
+            <span className="query-editor__elapsed">{` · ${formatMs(elapsed)}`}</span>
+          ) : null}
         </span>
+        <span className="toolbar__separator" aria-hidden="true" />
+        <SchemaCacheIndicator view={cache} connected={insightOn && session !== null} />
       </div>
       <div className="query-editor__split">
         <div className="query-editor__editor" style={{ flexBasis: `${split * 100}%` }}>

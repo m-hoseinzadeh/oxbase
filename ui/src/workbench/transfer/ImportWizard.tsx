@@ -5,6 +5,20 @@
  * replace) → column mapping with type overrides and skips → summary (the core's plan) → run
  * with progress and cancel → report with the error log.
  */
+import {
+  ArrowLeft,
+  ArrowRight,
+  Check,
+  CircleAlert,
+  CircleCheck,
+  CircleX,
+  FileText,
+  FolderOpen,
+  LoaderCircle,
+  Play,
+  Table2,
+  TriangleAlert,
+} from "lucide-react";
 import { type ReactNode, useEffect, useId, useReducer, useRef, useState } from "react";
 import {
   type ColumnDef,
@@ -31,6 +45,7 @@ import {
   type TargetMode,
   type TransactionPolicy,
 } from "../../api";
+import { ICON, ICON_LG, ICON_SM } from "../../components/icons";
 import { Modal } from "../../components/Modal";
 import { cancelRequest, newRequestId, toCommandError } from "../../connections/api";
 import { useConnections } from "../../connections/store";
@@ -304,12 +319,15 @@ function Warnings({ items, title }: { items: string[]; title: string }) {
   if (items.length === 0) return null;
   return (
     <div className="banner banner--warning" role="status">
-      <p className="banner__title">{title}</p>
-      <ul className="banner__list">
-        {items.map((w) => (
-          <li key={w}>{w}</li>
-        ))}
-      </ul>
+      <TriangleAlert {...ICON_SM} className="banner__icon" />
+      <div className="banner__content">
+        <p className="banner__title">{title}</p>
+        <ul className="banner__list">
+          {items.map((w) => (
+            <li key={w}>{w}</li>
+          ))}
+        </ul>
+      </div>
     </div>
   );
 }
@@ -318,6 +336,11 @@ function ErrorLog({ errors, truncated }: { errors: ImportRowError[]; truncated: 
   if (errors.length === 0) return null;
   return (
     <div className="transfer-errors">
+      <div className="transfer-errors__head">
+        <CircleX {...ICON_SM} />
+        Error log
+        <span className="badge badge--danger">{formatCount(errors.length)}</span>
+      </div>
       <table className="transfer-table" aria-label="Error log">
         <thead>
           <tr>
@@ -330,7 +353,7 @@ function ErrorLog({ errors, truncated }: { errors: ImportRowError[]; truncated: 
           {errors.map((e, i) => (
             // biome-ignore lint/suspicious/noArrayIndexKey: a row may have several errors.
             <tr key={i}>
-              <td>{formatCount(e.row)}</td>
+              <td className="transfer-table__num">{formatCount(e.row)}</td>
               <td>{e.column ?? ""}</td>
               <td>{e.message}</td>
             </tr>
@@ -338,7 +361,7 @@ function ErrorLog({ errors, truncated }: { errors: ImportRowError[]; truncated: 
         </tbody>
       </table>
       {truncated ? (
-        <p className="field__hint">
+        <p className="field__hint transfer-errors__more">
           Only the first {formatCount(errors.length)} errors are listed.
         </p>
       ) : null}
@@ -627,32 +650,51 @@ export function ImportWizard({ init, onClose }: { init: ImportInit; onClose: () 
   // --- views ------------------------------------------------------------------------------
 
   const stepIndex = STEPS.findIndex((s) => s.id === step);
+  /** Earlier steps can be revisited until the import starts. */
+  const canGoBack = step !== "run";
+
+  function goBackTo(to: Step) {
+    if (!canGoBack) return;
+    if (step === "summary") dropPlan();
+    setStep(to);
+  }
 
   function fileStep(): ReactNode {
     return (
       <div className="transfer-step">
-        <p>
-          Choose a CSV, TSV, JSON, Excel (XLSX) or Parquet file. The file is read where it is; it is
-          never copied.
-        </p>
-        <div className="transfer-file">
+        <div className={`transfer-file${file ? " transfer-file--picked" : ""}`}>
+          <span className="transfer-file__icon">
+            <FileText {...ICON_LG} />
+          </span>
+          <div className="transfer-file__text">
+            {file ? (
+              <span className="transfer-file__name" data-testid="picked-file">
+                {file.name}
+                {file.size !== undefined ? (
+                  <span className="transfer-file__size">{` · ${formatBytes(file.size)}`}</span>
+                ) : null}
+              </span>
+            ) : (
+              <span className="transfer-file__title">No file chosen</span>
+            )}
+            <span className="transfer-file__hint">
+              CSV, TSV, JSON, Excel (XLSX) or Parquet. The file is read where it is; it is never
+              copied.
+            </span>
+          </div>
           <button
             type="button"
-            className="button button--primary"
+            className={`button ${file ? "" : "button--primary"}`}
             onClick={() => void pickFile()}
             disabled={picking}
           >
+            {picking ? <LoaderCircle {...ICON} className="spin" /> : <FolderOpen {...ICON} />}
             {file ? "Choose another file…" : "Choose file…"}
           </button>
-          {file ? (
-            <span className="transfer-file__name" data-testid="picked-file">
-              {file.name}
-              {file.size !== undefined ? ` · ${formatBytes(file.size)}` : ""}
-            </span>
-          ) : null}
         </div>
         {pickError ? (
           <p className="field__error" role="alert">
+            <CircleAlert {...ICON_SM} />
             {pickError}
           </p>
         ) : null}
@@ -692,6 +734,7 @@ export function ImportWizard({ init, onClose }: { init: ImportInit; onClose: () 
           </div>
           {preview.status === "error" ? (
             <p className="field__error" role="alert" data-testid="preview-error">
+              <CircleAlert {...ICON_SM} />
               Could not read the file: {preview.message}
             </p>
           ) : null}
@@ -1000,16 +1043,19 @@ export function ImportWizard({ init, onClose }: { init: ImportInit; onClose: () 
         </div>
         {showProblems && problems.length > 0 ? (
           <div className="banner banner--error" role="alert" data-testid="mapping-problems">
-            <p className="banner__title">Fix the mapping first:</p>
-            <ul className="banner__list">
-              {problems.map((p) => (
-                <li key={`${p.source ?? "all"}:${p.message}`}>{p.message}</li>
-              ))}
-            </ul>
+            <CircleAlert {...ICON_SM} className="banner__icon" />
+            <div className="banner__content">
+              <p className="banner__title">Fix the mapping first:</p>
+              <ul className="banner__list">
+                {problems.map((p) => (
+                  <li key={`${p.source ?? "all"}:${p.message}`}>{p.message}</li>
+                ))}
+              </ul>
+            </div>
           </div>
         ) : null}
         <div className="transfer-options">
-          <fieldset className="fieldset">
+          <fieldset className="fieldset transfer-group">
             <legend>Bad rows</legend>
             <label className="checkbox">
               <input
@@ -1039,7 +1085,7 @@ export function ImportWizard({ init, onClose }: { init: ImportInit; onClose: () 
               />
             </label>
           </fieldset>
-          <fieldset className="fieldset">
+          <fieldset className="fieldset transfer-group">
             <legend>Transactions</legend>
             <select
               aria-label="Transactions"
@@ -1071,7 +1117,7 @@ export function ImportWizard({ init, onClose }: { init: ImportInit; onClose: () 
               </label>
             ) : null}
           </fieldset>
-          <fieldset className="fieldset">
+          <fieldset className="fieldset transfer-group">
             <legend>Values</legend>
             <label className="checkbox">
               <input
@@ -1142,9 +1188,15 @@ export function ImportWizard({ init, onClose }: { init: ImportInit; onClose: () 
             </dd>
           </div>
         </dl>
-        {plan.status === "loading" ? <p role="status">Checking the import…</p> : null}
+        {plan.status === "loading" ? (
+          <p className="transfer-step__status" role="status">
+            <LoaderCircle {...ICON_SM} className="spin" />
+            Checking the import…
+          </p>
+        ) : null}
         {plan.status === "error" ? (
           <p className="field__error" role="alert" data-testid="plan-error">
+            <CircleAlert {...ICON_SM} />
             The import cannot run: {plan.message}
           </p>
         ) : null}
@@ -1187,7 +1239,7 @@ export function ImportWizard({ init, onClose }: { init: ImportInit; onClose: () 
                   <tr key={c.source}>
                     <td>{c.sourceName}</td>
                     <td>{c.target}</td>
-                    <td>
+                    <td className="transfer-table__mono">
                       {typeLabel(c.sourceType)} → {typeLabel(c.targetType)}
                     </td>
                     <td>{c.conversion ?? ""}</td>
@@ -1197,18 +1249,21 @@ export function ImportWizard({ init, onClose }: { init: ImportInit; onClose: () 
             </table>
             {plan.plan.destructive ? (
               <div className="banner banner--error" role="alert" data-testid="destructive-warning">
-                <p className="banner__title">
-                  This import cannot be fully undone: if it fails or is cancelled, the rows that
-                  were in {qualifiedName(plan.plan.table)} may be gone.
-                </p>
-                <label className="checkbox">
-                  <input
-                    type="checkbox"
-                    checked={confirmed}
-                    onChange={(e) => setConfirmed(e.target.checked)}
-                  />
-                  I understand; import anyway
-                </label>
+                <TriangleAlert {...ICON_SM} className="banner__icon" />
+                <div className="banner__content">
+                  <p className="banner__title">
+                    This import cannot be fully undone: if it fails or is cancelled, the rows that
+                    were in {qualifiedName(plan.plan.table)} may be gone.
+                  </p>
+                  <label className="checkbox">
+                    <input
+                      type="checkbox"
+                      checked={confirmed}
+                      onChange={(e) => setConfirmed(e.target.checked)}
+                    />
+                    I understand; import anyway
+                  </label>
+                </div>
               </div>
             ) : null}
           </>
@@ -1264,12 +1319,43 @@ export function ImportWizard({ init, onClose }: { init: ImportInit; onClose: () 
     return (
       <div className="transfer-step" data-testid="import-report">
         <div
-          className={`banner ${run.status === "finished" ? "banner--ok" : run.status === "failed" ? "banner--error" : "banner--warning"}`}
+          className={`banner transfer-result ${run.status === "finished" ? "banner--ok" : run.status === "failed" ? "banner--error" : "banner--warning"}`}
           role={run.status === "failed" ? "alert" : "status"}
         >
-          <p className="banner__title">{title}</p>
-          {run.error ? <p>{run.error.message}</p> : null}
-          {report && run.status !== "finished" ? <p>{report.leftBehind}</p> : null}
+          {run.status === "finished" ? (
+            <CircleCheck {...ICON} className="banner__icon" />
+          ) : run.status === "failed" ? (
+            <CircleX {...ICON} className="banner__icon" />
+          ) : (
+            <TriangleAlert {...ICON} className="banner__icon" />
+          )}
+          <div className="banner__content">
+            <p className="banner__title">{title}</p>
+            {run.error ? <p>{run.error.message}</p> : null}
+            {report && run.status !== "finished" ? <p>{report.leftBehind}</p> : null}
+          </div>
+          {report ? (
+            <span className="transfer-result__badges">
+              <span className="badge badge--success">
+                <Check {...ICON_SM} />
+                {formatCount(report.rowsCommitted)} committed
+              </span>
+              {report.rowsSkipped > 0 ? (
+                <span className="badge badge--warning">
+                  <TriangleAlert {...ICON_SM} />
+                  {formatCount(report.rowsSkipped)} skipped
+                </span>
+              ) : null}
+              {report.errors.length > 0 ? (
+                <span className="badge badge--danger">
+                  <CircleX {...ICON_SM} />
+                  {formatCount(report.errors.length)}
+                  {report.errorsTruncated ? "+" : ""}{" "}
+                  {report.errors.length === 1 ? "error" : "errors"}
+                </span>
+              ) : null}
+            </span>
+          ) : null}
         </div>
         {report ? (
           <>
@@ -1284,15 +1370,21 @@ export function ImportWizard({ init, onClose }: { init: ImportInit; onClose: () 
               </div>
               <div>
                 <dt>Rows read</dt>
-                <dd data-testid="report-rows-read">{formatCount(report.rowsRead)}</dd>
+                <dd className="transfer-summary__num" data-testid="report-rows-read">
+                  {formatCount(report.rowsRead)}
+                </dd>
               </div>
               <div>
                 <dt>Rows committed</dt>
-                <dd data-testid="report-rows-committed">{formatCount(report.rowsCommitted)}</dd>
+                <dd className="transfer-summary__num" data-testid="report-rows-committed">
+                  {formatCount(report.rowsCommitted)}
+                </dd>
               </div>
               <div>
                 <dt>Rows skipped</dt>
-                <dd data-testid="report-rows-skipped">{formatCount(report.rowsSkipped)}</dd>
+                <dd className="transfer-summary__num" data-testid="report-rows-skipped">
+                  {formatCount(report.rowsSkipped)}
+                </dd>
               </div>
               <div>
                 <dt>Read</dt>
@@ -1321,6 +1413,7 @@ export function ImportWizard({ init, onClose }: { init: ImportInit; onClose: () 
 
   const back = (to: Step) => (
     <button type="button" className="button" onClick={() => setStep(to)}>
+      <ArrowLeft {...ICON} />
       Back
     </button>
   );
@@ -1339,6 +1432,7 @@ export function ImportWizard({ init, onClose }: { init: ImportInit; onClose: () 
             onClick={() => setStep("format")}
           >
             Next
+            <ArrowRight {...ICON} />
           </button>
         </>
       );
@@ -1357,6 +1451,7 @@ export function ImportWizard({ init, onClose }: { init: ImportInit; onClose: () 
             onClick={() => setStep("target")}
           >
             Next
+            <ArrowRight {...ICON} />
           </button>
         </>
       );
@@ -1375,6 +1470,7 @@ export function ImportWizard({ init, onClose }: { init: ImportInit; onClose: () 
             onClick={() => void toMapping()}
           >
             {loadingTarget ? "Loading the table…" : "Next"}
+            {loadingTarget ? <LoaderCircle {...ICON} className="spin" /> : <ArrowRight {...ICON} />}
           </button>
         </>
       );
@@ -1388,6 +1484,7 @@ export function ImportWizard({ init, onClose }: { init: ImportInit; onClose: () 
           {back("target")}
           <button type="button" className="button button--primary" onClick={() => void toSummary()}>
             Next
+            <ArrowRight {...ICON} />
           </button>
         </>
       );
@@ -1399,6 +1496,7 @@ export function ImportWizard({ init, onClose }: { init: ImportInit; onClose: () 
             Cancel
           </button>
           <button type="button" className="button" onClick={backFromSummary}>
+            <ArrowLeft {...ICON} />
             Back
           </button>
           <button
@@ -1408,6 +1506,7 @@ export function ImportWizard({ init, onClose }: { init: ImportInit; onClose: () 
             disabled={plan.status !== "ok" || !planCurrent || (plan.plan.destructive && !confirmed)}
             onClick={() => void start()}
           >
+            <Play {...ICON} />
             Start import
           </button>
         </>
@@ -1422,6 +1521,7 @@ export function ImportWizard({ init, onClose }: { init: ImportInit; onClose: () 
           disabled={run.cancelling}
           onClick={cancel}
         >
+          {run.cancelling ? <LoaderCircle {...ICON} className="spin" /> : <CircleX {...ICON} />}
           {run.cancelling ? "Cancelling…" : "Cancel import"}
         </button>
       ) : (
@@ -1435,6 +1535,7 @@ export function ImportWizard({ init, onClose }: { init: ImportInit; onClose: () 
                 onClose();
               }}
             >
+              <Table2 {...ICON} />
               Open table
             </button>
           ) : null}
@@ -1458,15 +1559,38 @@ export function ImportWizard({ init, onClose }: { init: ImportInit; onClose: () 
   return (
     <Modal title="Import data" onClose={close} className="modal--transfer" footer={footer}>
       <ol className="transfer-steps" aria-label="Steps">
-        {STEPS.map((s, i) => (
-          <li
-            key={s.id}
-            className={`transfer-steps__item${i < stepIndex ? " transfer-steps__item--done" : ""}`}
-            aria-current={s.id === step ? "step" : undefined}
-          >
-            {s.label}
-          </li>
-        ))}
+        {STEPS.map((s, i) => {
+          const isDone = i < stepIndex;
+          const marker = (
+            <span className="transfer-steps__marker" aria-hidden="true">
+              {isDone ? <Check {...ICON_SM} /> : i + 1}
+            </span>
+          );
+          return (
+            <li
+              key={s.id}
+              className={`transfer-steps__item${isDone ? " transfer-steps__item--done" : ""}`}
+              aria-current={s.id === step ? "step" : undefined}
+            >
+              {isDone && canGoBack ? (
+                <button
+                  type="button"
+                  className="transfer-steps__button"
+                  title={`Back to ${s.label}`}
+                  onClick={() => goBackTo(s.id)}
+                >
+                  {marker}
+                  <span className="transfer-steps__label">{s.label}</span>
+                </button>
+              ) : (
+                <span className="transfer-steps__button">
+                  {marker}
+                  <span className="transfer-steps__label">{s.label}</span>
+                </span>
+              )}
+            </li>
+          );
+        })}
       </ol>
       {body[step]()}
     </Modal>

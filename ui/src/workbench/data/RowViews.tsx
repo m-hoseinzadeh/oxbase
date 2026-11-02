@@ -3,7 +3,17 @@
  * the selected rows) of a table-data tab. Values include pending edits; the panel supplies
  * them.
  */
+import {
+  Braces,
+  ChevronLeft,
+  ChevronRight,
+  CircleAlert,
+  Copy,
+  KeyRound,
+  LoaderCircle,
+} from "lucide-react";
 import type { CellInput, EditColumn } from "../../api";
+import { ICON, ICON_SM } from "../../components/icons";
 import { ValueEditor } from "./ValueEditor";
 
 export interface FormFieldView {
@@ -40,33 +50,41 @@ export function RowForm({
   return (
     <section className="row-form" aria-label="Form view" data-testid="form-view">
       <div className="row-form__head">
-        <button
-          type="button"
-          className="button button--small"
-          aria-label="Previous row"
-          disabled={!onPrev}
-          onClick={onPrev}
-        >
-          ‹
-        </button>
+        <div className="row-form__nav">
+          <button
+            type="button"
+            className="icon-button"
+            aria-label="Previous row"
+            title="Previous row"
+            disabled={!onPrev}
+            onClick={onPrev}
+          >
+            <ChevronLeft {...ICON} />
+          </button>
+          <button
+            type="button"
+            className="icon-button"
+            aria-label="Next row"
+            title="Next row"
+            disabled={!onNext}
+            onClick={onNext}
+          >
+            <ChevronRight {...ICON} />
+          </button>
+        </div>
         <h3 className="row-form__title">{title}</h3>
-        <button
-          type="button"
-          className="button button--small"
-          aria-label="Next row"
-          disabled={!onNext}
-          onClick={onNext}
-        >
-          ›
-        </button>
         {status ? <span className={`row-badge row-badge--${status}`}>{status}</span> : null}
       </div>
       {error ? (
         <p className="row-form__error" role="alert">
+          <CircleAlert {...ICON_SM} />
           {error}
         </p>
       ) : fields === null ? (
-        <p className="results__empty">Loading…</p>
+        <p className="row-views__loading" role="status">
+          <LoaderCircle {...ICON_SM} className="spin" />
+          Loading…
+        </p>
       ) : fields.length === 0 ? (
         <p className="results__empty">No row selected.</p>
       ) : (
@@ -78,10 +96,18 @@ export function RowForm({
             >
               <div className="row-form__label">
                 <span className="row-form__name">
+                  {f.column.key ? (
+                    <span className="row-form__key" title="Key column">
+                      <KeyRound {...ICON_SM} />
+                      <span className="visually-hidden"> key</span>
+                    </span>
+                  ) : null}
                   {f.column.name}
-                  {f.column.key ? <span className="row-form__key"> key</span> : null}
                 </span>
-                <span className="row-form__type">{f.column.nativeType}</span>
+                <span className="row-form__type">
+                  {f.column.nativeType}
+                  {f.column.nullable ? "" : " · not null"}
+                </span>
               </div>
               <ValueEditor
                 kind={f.column.input}
@@ -115,25 +141,31 @@ export function JsonView({ title, json, error, note }: JsonViewProps) {
   return (
     <section className="json-view" aria-label="JSON view">
       <div className="row-form__head">
+        <Braces {...ICON_SM} className="row-form__icon" />
         <h3 className="row-form__title">{title}</h3>
         <button
           type="button"
-          className="button button--small"
+          className="button button--ghost button--small row-form__end"
           disabled={json === null}
           onClick={() => {
             if (json !== null) void navigator.clipboard?.writeText(json).catch(() => {});
           }}
         >
+          <Copy {...ICON_SM} />
           Copy
         </button>
       </div>
       {note ? <p className="field__hint">{note}</p> : null}
       {error ? (
         <p className="row-form__error" role="alert">
+          <CircleAlert {...ICON_SM} />
           {error}
         </p>
       ) : json === null ? (
-        <p className="results__empty">Loading…</p>
+        <p className="row-views__loading" role="status">
+          <LoaderCircle {...ICON_SM} className="spin" />
+          Loading…
+        </p>
       ) : (
         <pre className="json-view__text" data-testid="json-view">
           {json}

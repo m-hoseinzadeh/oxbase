@@ -3,7 +3,28 @@
  * secrets redacted). Search, filter by connection, reopen in an editor, delete, clear, and turn
  * recording off.
  */
-import { type KeyboardEvent, useCallback, useEffect, useId, useRef, useState } from "react";
+import {
+  CircleCheck,
+  CircleSlash,
+  CircleX,
+  Eraser,
+  History,
+  LoaderCircle,
+  type LucideIcon,
+  Search,
+  SearchX,
+  SquareArrowOutUpRight,
+  Trash2,
+} from "lucide-react";
+import {
+  type KeyboardEvent,
+  type MouseEvent,
+  useCallback,
+  useEffect,
+  useId,
+  useRef,
+  useState,
+} from "react";
 import {
   type HistoryEntry,
   type HistoryQuery,
@@ -14,6 +35,7 @@ import {
   historyList,
   historySetSettings,
 } from "../../api";
+import { ICON_LG, ICON_SM } from "../../components/icons";
 import { Modal } from "../../components/Modal";
 import { toCommandError } from "../../connections/api";
 import { useConnections } from "../../connections/store";
@@ -32,6 +54,32 @@ const STATUS_LABEL: Record<HistoryEntry["status"], string> = {
   error: "Failed",
   cancelled: "Cancelled",
 };
+
+const STATUS_ICON: Record<HistoryEntry["status"], LucideIcon> = {
+  ok: CircleCheck,
+  error: CircleX,
+  cancelled: CircleSlash,
+};
+
+/**
+ * How long ago `iso` was, for the list: `just now`, `5 min ago`, `3 h ago`, `yesterday`,
+ * `4 days ago`; older entries (and future ones, from a clock change) show the date and time.
+ */
+export function relativeTime(iso: string, now: number = Date.now()): string {
+  const at = Date.parse(iso);
+  if (Number.isNaN(at)) return iso;
+  const seconds = Math.floor((now - at) / 1000);
+  if (seconds < -60) return formatDateTime(iso);
+  if (seconds < 45) return "just now";
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) return `${minutes} min ago`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 24) return `${hours} h ago`;
+  const days = Math.round(hours / 24);
+  if (days === 1) return "yesterday";
+  if (days < 7) return `${days} days ago`;
+  return formatDateTime(iso).slice(0, 16);
+}
 
 /**
  * The `before` bound for the page after an entry that started at `startedAt`: the end of that
@@ -54,6 +102,8 @@ export function HistoryPanel() {
   const [hasMore, setHasMore] = useState(false);
   const [selected, setSelected] = useState<ReadonlySet<string>>(new Set());
   const [focused, setFocused] = useState<string | null>(null);
+  /** The row under the pointer: only it and the selected or focused rows render actions. */
+  const [hovered, setHovered] = useState<string | null>(null);
   const [settings, setSettings] = useState<HistorySettings | null>(null);
   const [confirmClear, setConfirmClear] = useState(false);
   const loadSeq = useRef(0);
@@ -146,16 +196,25 @@ export function HistoryPanel() {
     }
   }
 
-  async function deleteSelected() {
-    const ids = [...selected];
+  async function deleteEntries(ids: string[]) {
     if (ids.length === 0) return;
     try {
       await historyDelete(ids);
-      setSelected(new Set());
+      setSelected((current) => new Set([...current].filter((id) => !ids.includes(id))));
     } catch (e) {
       setError(toCommandError(e).message);
     }
     await reload();
+  }
+
+  function deleteSelected() {
+    return deleteEntries([...selected]);
+  }
+
+  /** A row's hover action: does not select the row or reach its double-click. */
+  function rowAction(event: MouseEvent, action: () => void) {
+    event.stopPropagation();
+    action();
   }
 
   async function clearAll() {
@@ -233,17 +292,21 @@ export function HistoryPanel() {
 
   const focusedEntry = entries.find((e) => e.id === focused) ?? null;
 
+  const now = Date.now();
+
   return (
     <section className="panel panel--history" aria-label="History">
-      <div className="toolbar" role="toolbar" aria-label="History actions">
-        <input
-          type="search"
-          className="history__search"
-          placeholder="Search SQL"
-          aria-label="Search history"
-          value={search}
-          onChange={(e) => setSearch(e.target.value)}
-        />
+      <div className="toolbar history__toolbar" role="toolbar" aria-label="History actions">
+        <span className="history__search">
+          <Search {...ICON_SM} className="history__search-icon" />
+          <input
+            type="search"
+            placeholder="Search SQL"
+            aria-label="Search history"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+          />
+        </span>
         <select
           aria-label="Connection filter"
           className="history__filter"
@@ -257,28 +320,35 @@ export function HistoryPanel() {
             </option>
           ))}
         </select>
+        <span className="toolbar__separator" aria-hidden="true" />
         <button
           type="button"
-          className="button"
+          className="button button--ghost"
           disabled={!focusedEntry}
           onClick={() => focusedEntry && reopen(focusedEntry)}
+          title="Open the focused query in a new editor (Enter)"
         >
+          <SquareArrowOutUpRight {...ICON_SM} />
           Open in editor
         </button>
         <button
           type="button"
-          className="button"
+          className="button button--ghost"
           disabled={selected.size === 0}
           onClick={() => void deleteSelected()}
+          title="Delete the selected queries (Delete)"
         >
+          <Trash2 {...ICON_SM} />
           Delete
         </button>
         <button
           type="button"
-          className="button"
+          className="button button--ghost"
           disabled={entries.length === 0}
           onClick={() => setConfirmClear(true)}
+          title="Remove every saved query of the connection shown"
         >
+          <Eraser {...ICON_SM} />
           Clear…
         </button>
         <label className="checkbox history__recording">
@@ -294,6 +364,7 @@ export function HistoryPanel() {
 
       {settings && !settings.enabled ? (
         <p className="history__notice" role="status">
+          <CircleSlash {...ICON_SM} />
           Recording is off: new queries are not saved.
         </p>
       ) : null}
@@ -306,6 +377,15 @@ export function HistoryPanel() {
 
       {entries.length === 0 ? (
         <div className="empty-state">
+          <span className="empty-state__icon">
+            {status === "loading" ? (
+              <LoaderCircle {...ICON_LG} className="spin" />
+            ) : appliedSearch ? (
+              <SearchX {...ICON_LG} />
+            ) : (
+              <History {...ICON_LG} />
+            )}
+          </span>
           <p className="empty-state__title">
             {status === "loading" ? "Loading history…" : "No history"}
           </p>
@@ -322,42 +402,95 @@ export function HistoryPanel() {
           tabIndex={0}
           aria-activedescendant={focusedEntry ? `${domId}-${focusedEntry.id}` : undefined}
           onKeyDown={onListKeyDown}
+          onMouseLeave={() => setHovered(null)}
         >
-          {entries.map((entry) => (
-            // biome-ignore lint/a11y/useKeyWithClickEvents: the listbox handles the keyboard.
-            <div
-              key={entry.id}
-              id={`${domId}-${entry.id}`}
-              role="option"
-              tabIndex={-1}
-              aria-selected={selected.has(entry.id)}
-              className={`history__item${entry.id === focused ? " history__item--focused" : ""}`}
-              onClick={(e) => onClickEntry(entry, e.ctrlKey || e.metaKey)}
-              onDoubleClick={() => reopen(entry)}
-              title={entry.sql.length > 2000 ? `${entry.sql.slice(0, 2000)}…` : entry.sql}
-            >
-              <span
-                className={`history__status history__status--${entry.status}`}
-                role="img"
-                aria-label={STATUS_LABEL[entry.status]}
-              />
-              <span className="history__body">
-                <code className="history__sql">{sqlPreview(entry.sql, 300)}</code>
-                <span className="history__meta">
-                  {formatDateTime(entry.startedAt)} · {formatMs(entry.durationMs)}
-                  {entry.rows !== undefined ? ` · ${entry.rows.toLocaleString("en-US")} rows` : ""}
-                  {" · "}
-                  {profileName(entry.profileId)}
-                  {entry.database ? ` / ${entry.database}` : ""}
+          {entries.map((entry) => {
+            const StatusIcon = STATUS_ICON[entry.status];
+            return (
+              // biome-ignore lint/a11y/useKeyWithClickEvents: the listbox handles the keyboard.
+              <div
+                key={entry.id}
+                id={`${domId}-${entry.id}`}
+                role="option"
+                tabIndex={-1}
+                aria-selected={selected.has(entry.id)}
+                className={`history__item${entry.id === focused ? " history__item--focused" : ""}`}
+                onClick={(e) => onClickEntry(entry, e.ctrlKey || e.metaKey)}
+                onDoubleClick={() => reopen(entry)}
+                onMouseEnter={() => setHovered(entry.id)}
+                title={entry.sql.length > 2000 ? `${entry.sql.slice(0, 2000)}…` : entry.sql}
+              >
+                <span
+                  className={`history__status history__status--${entry.status}`}
+                  role="img"
+                  aria-label={STATUS_LABEL[entry.status]}
+                >
+                  <StatusIcon {...ICON_SM} />
                 </span>
-                {entry.error ? <span className="history__error">{entry.error}</span> : null}
-              </span>
-            </div>
-          ))}
+                <span className="history__body">
+                  <code className="history__sql">{sqlPreview(entry.sql, 300)}</code>
+                  <span className="history__meta">
+                    <time
+                      className="history__time"
+                      dateTime={entry.startedAt}
+                      title={formatDateTime(entry.startedAt)}
+                    >
+                      {relativeTime(entry.startedAt, now)}
+                    </time>
+                    <span className="history__chip" title="Duration">
+                      {formatMs(entry.durationMs)}
+                    </span>
+                    {entry.rows !== undefined ? (
+                      <span className="history__chip" title="Rows">
+                        {`${entry.rows.toLocaleString("en-US")} rows`}
+                      </span>
+                    ) : null}
+                    <span className="history__target">
+                      {profileName(entry.profileId)}
+                      {entry.database ? ` / ${entry.database}` : ""}
+                    </span>
+                  </span>
+                  {entry.error ? <span className="history__error">{entry.error}</span> : null}
+                </span>
+                <span className="history__actions">
+                  {selected.has(entry.id) || entry.id === focused || entry.id === hovered ? (
+                    <>
+                      <button
+                        type="button"
+                        className="icon-button icon-button--small"
+                        tabIndex={-1}
+                        aria-label="Reopen in editor"
+                        title="Reopen in editor (Enter)"
+                        onClick={(e) => rowAction(e, () => reopen(entry))}
+                        onDoubleClick={(e) => e.stopPropagation()}
+                      >
+                        <SquareArrowOutUpRight {...ICON_SM} />
+                      </button>
+                      <button
+                        type="button"
+                        className="icon-button icon-button--small history__delete"
+                        tabIndex={-1}
+                        aria-label="Delete from history"
+                        title="Delete from history"
+                        onClick={(e) => rowAction(e, () => void deleteEntries([entry.id]))}
+                        onDoubleClick={(e) => e.stopPropagation()}
+                      >
+                        <Trash2 {...ICON_SM} />
+                      </button>
+                    </>
+                  ) : null}
+                </span>
+              </div>
+            );
+          })}
         </div>
       )}
       {hasMore && entries.length > 0 ? (
-        <button type="button" className="button history__more" onClick={() => void loadMore()}>
+        <button
+          type="button"
+          className="button button--ghost button--small history__more"
+          onClick={() => void loadMore()}
+        >
           Load more
         </button>
       ) : null}
@@ -381,6 +514,7 @@ export function HistoryPanel() {
                 className="button button--danger"
                 onClick={() => void clearAll()}
               >
+                <Eraser {...ICON_SM} />
                 Clear
               </button>
             </>

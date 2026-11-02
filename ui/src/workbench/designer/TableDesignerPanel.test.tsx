@@ -274,7 +274,7 @@ async function renderDesigner(
   if (!props.isNew) await screen.findByRole("table", { name: "Columns" });
   await waitFor(() => expect(calls("capabilities_get")).toHaveLength(1));
   await waitFor(() =>
-    expect(screen.getByRole("button", { name: "+ Column" })).not.toHaveAttribute("title"),
+    expect(screen.getByRole("button", { name: "Add column" })).not.toHaveAttribute("title"),
   );
 }
 
@@ -309,7 +309,7 @@ describe("TableDesignerPanel", () => {
     // Applying a non-destructive script still asks first.
     fireEvent.click(screen.getByRole("button", { name: "Apply" }));
     const dialog = screen.getByRole("dialog", { name: "Apply the changes?" });
-    expect(dialog).toHaveTextContent("1 statement will run on items in one transaction.");
+    expect(dialog).toHaveTextContent("1 statement will run on public.items in one transaction.");
     fireEvent.click(within(dialog).getByRole("button", { name: "Apply" }));
     await screen.findByText("Applied 1 statement.");
     expect(calls("designer_apply")).toEqual([
@@ -377,7 +377,7 @@ describe("TableDesignerPanel", () => {
         notes: ["MySQL commits each DDL statement; a failure leaves earlier statements applied."],
       });
     await renderDesigner();
-    fireEvent.click(screen.getByRole("button", { name: "+ Column" }));
+    fireEvent.click(screen.getByRole("button", { name: "Add column" }));
     const warning = await screen.findByTestId("non-atomic-warning");
     expect(warning).toHaveTextContent("Not transactional");
     expect(warning).toHaveTextContent("a failure leaves earlier statements applied");
@@ -435,11 +435,11 @@ describe("TableDesignerPanel", () => {
     expect(screen.getByRole("button", { name: "Move id down" })).toBeDisabled();
 
     // A new column can be named.
-    fireEvent.click(screen.getByRole("button", { name: "+ Column" }));
+    fireEvent.click(screen.getByRole("button", { name: "Add column" }));
     expect(screen.getByRole("textbox", { name: "Column 3 name" })).toBeEnabled();
 
     fireEvent.click(screen.getByRole("tab", { name: /Checks/ }));
-    expect(screen.getByRole("button", { name: "+ Check" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Add check" })).toBeDisabled();
     expect(screen.getByRole("textbox", { name: "Check 1 expression" })).toBeDisabled();
   });
 
@@ -452,7 +452,7 @@ describe("TableDesignerPanel", () => {
       target: { value: "orders" },
     });
     fireEvent.click(screen.getByRole("tab", { name: /Columns/ }));
-    fireEvent.click(screen.getByRole("button", { name: "+ Column" }));
+    fireEvent.click(screen.getByRole("button", { name: "Add column" }));
     renameColumnInput(1, "id");
     fireEvent.change(screen.getByRole("combobox", { name: "Column 1 type" }), {
       target: { value: "bigint" },
@@ -653,7 +653,7 @@ describe("TableDesignerPanel", () => {
     );
     expect(screen.getByRole("checkbox", { name: "Column 1 auto increment" })).toBeDisabled();
     // A new column may use them.
-    fireEvent.click(screen.getByRole("button", { name: "+ Column" }));
+    fireEvent.click(screen.getByRole("button", { name: "Add column" }));
     fireEvent.click(screen.getByRole("button", { name: "More options of column 3" }));
     expect(screen.getByRole("combobox", { name: "Column 3 identity" })).toBeEnabled();
   });

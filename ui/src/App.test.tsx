@@ -23,7 +23,7 @@ describe("App layout", () => {
   it("renders the Connections and Objects panels, the Welcome tab and the status bar", async () => {
     render(<App />);
     expect(await screen.findByText("No connections yet")).toBeInTheDocument();
-    expect(screen.getByRole("heading", { name: "Welcome to oxbase" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Welcome to Oxbase" })).toBeInTheDocument();
     expect(screen.getByText("Connections")).toBeInTheDocument();
     expect(screen.getByText("Welcome")).toBeInTheDocument();
     expect(await screen.findByTestId("core-version")).toHaveTextContent("Core unavailable");

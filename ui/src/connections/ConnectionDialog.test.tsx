@@ -50,6 +50,8 @@ describe("ConnectionDialog validation", () => {
     expect(field("Connection name")).toHaveFocus();
     expect(screen.getByRole("tab", { name: "General" })).toHaveAttribute("aria-selected", "true");
     expect(field("Port")).toHaveValue("5432");
+    expect(screen.getByRole("group", { name: "Database type" })).toBeInTheDocument();
+    expect(screen.getByRole("radio", { name: "PostgreSQL" })).toBeChecked();
   });
 
   it("blocks saving without a name and explains why", async () => {
@@ -109,7 +111,7 @@ describe("ConnectionDialog validation", () => {
   it("switches to a file picker for SQLite and disables network tabs", async () => {
     dialogOpen.mockResolvedValue("/data/app.db");
     renderDialog();
-    fireEvent.change(field("Database type"), { target: { value: "sqlite" } });
+    fireEvent.click(screen.getByRole("radio", { name: "SQLite" }));
     expect(screen.queryByLabelText("Host")).not.toBeInTheDocument();
     expect(screen.getByRole("tab", { name: "SSH" })).toBeDisabled();
     fireEvent.click(screen.getByRole("button", { name: "Browse for the database file" }));
@@ -246,7 +248,7 @@ describe("ConnectionDialog for SQL Server", () => {
 
   function chooseSqlServer() {
     renderDialog();
-    fireEvent.change(field("Database type"), { target: { value: "mssql" } });
+    fireEvent.click(screen.getByRole("radio", { name: "SQL Server" }));
   }
 
   it("shows the SQL Server fields with port 1433 and the instance hint", () => {
@@ -306,7 +308,7 @@ describe("ConnectionDialog for SQL Server", () => {
     const saved = { id: "0190f000-0000-7000-8000-000000000002" };
     mockCommands({ save_profile: () => saved });
     const { onSaved } = renderDialog();
-    fireEvent.change(field("Database type"), { target: { value: "mssql" } });
+    fireEvent.click(screen.getByRole("radio", { name: "SQL Server" }));
     type("Connection name", "sql");
     type("Instance name (optional)", "SQLEXPRESS");
     type("Port", "14330");

@@ -3,6 +3,7 @@
  * with add, edit, duplicate, delete and insert. Built-in snippets are read-only. Snippets show
  * in completion at statement starts by their prefix.
  */
+import { Braces, Copy, CornerDownLeft, Lock, Plus, Save, Trash2 } from "lucide-react";
 import {
   type FormEvent,
   type ReactNode,
@@ -20,6 +21,7 @@ import {
   snippetList,
   snippetSave,
 } from "../../../api";
+import { ICON_LG, ICON_SM } from "../../../components/icons";
 import { Modal } from "../../../components/Modal";
 import { toCommandError } from "../../../connections/api";
 import { ENGINE_INFO } from "../../../connections/types";
@@ -229,6 +231,11 @@ export function SnippetManager({ engine, onClose, onInsert }: SnippetManagerProp
           className={`snippets__item${active ? " snippets__item--active" : ""}`}
           onClick={() => select({ type: "snippet", id: snippet.id })}
         >
+          {snippet.builtin ? (
+            <Lock {...ICON_SM} className="snippets__icon" />
+          ) : (
+            <Braces {...ICON_SM} className="snippets__icon" />
+          )}
           <span className="snippets__name">{snippet.name}</span>
           <code className="snippets__prefix">{snippet.prefix}</code>
         </button>
@@ -321,8 +328,9 @@ export function SnippetManager({ engine, onClose, onInsert }: SnippetManagerProp
     detail = (
       <div className="snippets__view">
         <h3 className="snippets__title">{selected.name}</h3>
-        <p className="field__hint">
-          Prefix <code>{selected.prefix}</code> · {enginesText(selected.engines)}
+        <p className="field__hint snippets__meta">
+          Prefix <code className="snippets__prefix-chip">{selected.prefix}</code> ·{" "}
+          {enginesText(selected.engines)}
           {selected.builtin ? " · built in" : ""}
         </p>
         {selected.description ? <p>{selected.description}</p> : null}
@@ -331,10 +339,16 @@ export function SnippetManager({ engine, onClose, onInsert }: SnippetManagerProp
     );
   } else {
     detail = (
-      <p className="snippets__empty">
-        Choose a snippet, or add your own. Type a snippet's prefix at the start of a statement to
-        insert it.
-      </p>
+      <div className="empty-state">
+        <span className="empty-state__icon">
+          <Braces {...ICON_LG} />
+        </span>
+        <p className="empty-state__title">No snippet chosen</p>
+        <p className="empty-state__hint snippets__empty-hint">
+          Choose a snippet, or add your own. Type a snippet's prefix at the start of a statement to
+          insert it.
+        </p>
+      </div>
     );
   }
 
@@ -347,23 +361,26 @@ export function SnippetManager({ engine, onClose, onInsert }: SnippetManagerProp
           onClick={() => select({ type: "new" })}
           disabled={busy}
         >
+          <Plus {...ICON_SM} />
           New snippet
         </button>
       </span>
       {selected && onInsert ? (
         <button
           type="button"
-          className="button"
+          className={draft ? "button" : "button button--primary"}
           onClick={() => {
             onInsert(selected.body);
             onClose();
           }}
         >
+          <CornerDownLeft {...ICON_SM} />
           Insert
         </button>
       ) : null}
       {selected?.builtin ? (
         <button type="button" className="button" onClick={() => duplicate(selected)}>
+          <Copy {...ICON_SM} />
           Duplicate
         </button>
       ) : null}
@@ -374,11 +391,13 @@ export function SnippetManager({ engine, onClose, onInsert }: SnippetManagerProp
           onClick={() => void remove(selected)}
           disabled={busy}
         >
+          <Trash2 {...ICON_SM} />
           {confirmDelete ? "Confirm delete" : "Delete"}
         </button>
       ) : null}
       {draft ? (
         <button type="submit" form={formId} className="button button--primary" disabled={busy}>
+          <Save {...ICON_SM} />
           Save
         </button>
       ) : null}

@@ -383,9 +383,7 @@ export function tableNameFromFile(fileName: string): string {
 }
 
 /** `schema.name` (or `catalog.name`) for messages. */
-export function qualifiedName(table: ObjectRef): string {
-  return [table.schema ?? table.catalog, table.name].filter(Boolean).join(".");
-}
+export { qualifiedName } from "../names";
 
 // --- target ---------------------------------------------------------------------------------
 
