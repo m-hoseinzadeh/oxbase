@@ -30,8 +30,14 @@
 # Regenerated certificates/keys reach a running container only when it is recreated (the entrypoint
 # wrappers copy them at start); fixtures-up.sh recreates the affected services automatically.
 #
-# Memory: limits sum to 6208 MiB (~6.1 GiB, ssh's 64 MiB included; mssql alone needs >= 2 GiB) so
-# the stack fits next to other workloads on a 15 GB machine.
+# Memory: limits sum to 6656 MiB (~6.5 GiB, ssh's 64 MiB and the M7 redis-cluster / redis-sentinel
+# 448 MiB included; mssql alone needs >= 2 GiB) so the stack fits next to other workloads on a
+# 15 GB machine.
+#
+# M7 (docs/m7-contracts.md §9): mongodb gets TLS on its port (allowTLS) and the 02-m7.js seed,
+# redis a TLS-only port 6380 (published 15480), the seed-m7.redis keys and the ACL user m7_reader;
+# both are SSH targets of the bastion (mongodb:27017, redis:6379, redis:6380) and SANs of the
+# server certificate. redis-cluster and redis-sentinel run on the host network (Linux only).
 
 name: oxbase-fixtures
 
@@ -363,7 +369,8 @@ services:
         read_only: true
     # The init-phase mongod also listens on 127.0.0.1:27017, so a plain ping would go green too
     # early. Require the final server (--bind_ip_all, reported as
-    # net.bindIp "*") and the seed's completion marker.
+    # net.bindIp "*") and the completion markers of both seeds (01-seed.js, M7: 02-m7.js). A data
+    # volume from before M7 has no "m7" marker and stays unhealthy: scripts/fixtures-down.sh.
     healthcheck:
       test:
         - CMD-SHELL
@@ -373,7 +380,7 @@ services:
           'const o = db.adminCommand({getCmdLineOpts: 1}).parsed;
           const ok = db.adminCommand({ping: 1}).ok === 1
           && o.net && (o.net.bindIpAll === true || o.net.bindIp === "*")
-          && db.getSiblingDB("oxbase_test").fixture_meta.countDocuments({_id: "seed"}) === 1;
+          && db.getSiblingDB("oxbase_test").fixture_meta.countDocuments({_id: {$$in: ["seed", "m7"]}}) === 2;
           if (!ok) quit(1);'
       interval: 3s
       timeout: 10s
@@ -392,8 +399,9 @@ services:
     environment:
       OXBASE_REDIS_PASSWORD: Oxbase_Fixture_Pw_2026
     # The image has no init-script hook: the wrapper copies the TLS files (owned by redis),
-    # starts redis-server, loads the seed once (when the marker key is absent), and forwards
-    # stop signals.
+    # starts redis-server, loads the seed once (when the marker key is absent), the M7 seed once
+    # (its own marker), creates the ACL user m7_reader on every start, and forwards stop signals.
+    # Healthy once both markers and the ACL user exist.
     entrypoint: ["/bin/sh", "/oxbase-init/entrypoint.sh"]
     command:
       - redis-server
@@ -446,7 +454,8 @@ services:
         - CMD-SHELL
         - >-
           redis-cli --no-auth-warning -a Oxbase_Fixture_Pw_2026 ping | grep -q PONG &&
-          [ "$$(redis-cli --no-auth-warning -a Oxbase_Fixture_Pw_2026 EXISTS oxbase_test:fixture:seeded)" = "1" ]
+          [ "$$(redis-cli --no-auth-warning -a Oxbase_Fixture_Pw_2026 EXISTS oxbase_test:fixture:seeded oxbase_test:fixture:m7_seeded)" = "2" ] &&
+          redis-cli --no-auth-warning -a Oxbase_Fixture_Pw_2026 ACL GETUSER m7_reader | grep -q flags
       interval: 3s
       timeout: 5s
       retries: 40
@@ -456,6 +465,72 @@ services:
       resources:
         limits:
           memory: 256m
+
+  # M7 Redis Cluster (tests/fixtures.toml [m7.redis_cluster], docs/m7-contracts.md §9.3): three
+  # masters, no replicas, as three redis-server processes in one container on the host network
+  # (127.0.0.1:15501-15503, cluster bus +10000), announcing 127.0.0.1 so CLUSTER SLOTS gives
+  # addresses the tests can dial. init/redis/cluster.sh creates the cluster on the first start
+  # (`redis-cli --cluster create ... --cluster-yes`) and writes the 100 seed keys on every start.
+  # Host networking needs a Linux Docker engine (the CI runners); no SSH route (one tunnel
+  # reaches one node).
+  redis-cluster:
+    <<: *common
+    image: redis:8.10.3-alpine
+    container_name: oxbase-fixtures-redis-cluster
+    network_mode: host
+    environment:
+      OXBASE_REDIS_PASSWORD: Oxbase_Fixture_Pw_2026
+      OXBASE_CLUSTER_PORTS: "15501 15502 15503"
+      OXBASE_CLUSTER_SEED_KEYS: "100"
+      OXBASE_CLUSTER_KEY_PREFIX: "m7:cluster:"
+    entrypoint: ["/bin/sh", "/oxbase-init/cluster.sh"]
+    volumes:
+      - ./init/redis:/oxbase-init:ro
+    # Healthy once every node reports cluster_state:ok and the seed marker exists.
+    healthcheck:
+      test: ["CMD", "/bin/sh", "/oxbase-init/cluster.sh", "health"]
+      interval: 3s
+      timeout: 10s
+      retries: 40
+      start_period: 60s
+      start_interval: 1s
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+
+  # M7 Redis Sentinel (tests/fixtures.toml [m7.redis_sentinel], docs/m7-contracts.md §9.3):
+  # master 127.0.0.1:15511, replica :15512, sentinel :15526 (quorum 1, master "oxmaster",
+  # auth-pass, no sentinel password) as three processes in one container on the host network,
+  # so the sentinel reports an address the tests can dial. init/redis/sentinel.sh writes the seed
+  # key m7:sentinel on every start. No SSH route.
+  redis-sentinel:
+    <<: *common
+    image: redis:8.10.3-alpine
+    container_name: oxbase-fixtures-redis-sentinel
+    network_mode: host
+    environment:
+      OXBASE_REDIS_PASSWORD: Oxbase_Fixture_Pw_2026
+      OXBASE_SENTINEL_MASTER_PORT: "15511"
+      OXBASE_SENTINEL_REPLICA_PORT: "15512"
+      OXBASE_SENTINEL_PORT: "15526"
+      OXBASE_SENTINEL_MASTER_NAME: oxmaster
+      OXBASE_SENTINEL_SEED_KEY: "m7:sentinel"
+    entrypoint: ["/bin/sh", "/oxbase-init/sentinel.sh"]
+    volumes:
+      - ./init/redis:/oxbase-init:ro
+    # Healthy once the replica is linked, the sentinel names the master and the seed key exists.
+    healthcheck:
+      test: ["CMD", "/bin/sh", "/oxbase-init/sentinel.sh", "health"]
+      interval: 3s
+      timeout: 10s
+      retries: 40
+      start_period: 60s
+      start_interval: 1s
+    deploy:
+      resources:
+        limits:
+          memory: 192m
 
   # M1 SSH bastion (tests/fixtures.toml [ssh]). Login "oxbase" with the password or either test
   # key (target/fixtures/ssh). Host key is fixed, so known_hosts / fingerprint pinning works.

@@ -8,7 +8,9 @@
 #   scripts/ci-fixtures.sh down               # stop and remove containers, networks and volumes
 #
 # Services are the compose service names (postgres, mysql, mariadb, mssql, mongodb, redis,
-# ssh). The import-perf job starts only `postgres mysql` (docs/m5-contracts.md §9.3).
+# redis-cluster, redis-sentinel, ssh). The import-perf job starts only `postgres mysql`
+# (docs/m5-contracts.md §9.3). `up` without names starts all of them, the M7 Redis cluster and
+# sentinel (host networking, docs/m7-contracts.md §9.3) included.
 #
 # Env: OXBASE_COMPOSE_FILE (default tests/docker/compose.yml),
 #      OXBASE_FIXTURES_WAIT_SECS (default 600; SQL Server is slow on cold runners),

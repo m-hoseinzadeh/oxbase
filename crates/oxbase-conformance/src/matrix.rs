@@ -21,13 +21,20 @@ pub const PENDING_NOT_RUN: &str = "pending (Fetcher registered; not run)";
 pub const PENDING_ROUNDTRIP: &str = "pending (no round trip for this kind in M3)";
 /// Detail of an applicable `capabilities` cell of a kind outside the M3 designer kinds.
 pub const PENDING_CAPABILITIES: &str = "pending (no live capability probe for this kind yet)";
+/// Detail of a `roundtrip` / `capabilities` cell of an engine without a DDL designer.
+pub const NO_DESIGNER: &str = "no DDL designer: the engine registers no DdlGenerator";
 
-/// The milestone that brings `engine`'s driver, for engines that have none yet.
-pub const fn driver_milestone(engine: Engine) -> Option<&'static str> {
-    match engine {
-        Engine::Postgres | Engine::MySql | Engine::MariaDb | Engine::Sqlite | Engine::MsSql => None,
-        Engine::MongoDb | Engine::Redis => Some("M7"),
-    }
+/// Whether `engine` registered its dialect cells (a tree layout) but no [`DdlGenerator`] for
+/// any kind: an engine without a DDL designer (MongoDB and Redis in M7), whose `roundtrip` /
+/// `capabilities` cells are not applicable. An engine that registered nothing yet keeps them
+/// pending.
+///
+/// [`DdlGenerator`]: oxbase_dialect::DdlGenerator
+pub fn has_no_designer(registry: &DialectRegistry, engine: Engine) -> bool {
+    registry.tree_layout(engine).is_ok()
+        && ObjectKind::ALL
+            .iter()
+            .all(|&k| registry.ddl(engine, k).is_err())
 }
 
 /// Why an applicable matrix cell is still pending before the run fills it in.
@@ -37,9 +44,6 @@ pub fn pending_detail(
     kind: ObjectKind,
     check: Check,
 ) -> String {
-    if let Some(m) = driver_milestone(engine) {
-        return format!("pending ({m}: no driver yet)");
-    }
     let designer = DESIGNER_KINDS.contains(&kind);
     let detail = match check {
         Check::Roundtrip | Check::Capabilities if designer => {
@@ -162,13 +166,19 @@ pub fn plan_engine(name: &str, engine: Engine) -> Vec<Cell> {
 }
 
 /// Every cell for one engine, in [`ObjectKind::ALL`] x [`Check::ALL`] order. Cells the
-/// registry marks not applicable stay not applicable; the rest start as pending.
+/// registry marks not applicable stay not applicable, and so do the `roundtrip` /
+/// `capabilities` cells of an engine without a DDL designer ([`has_no_designer`]); the rest
+/// start as pending.
 pub fn plan_engine_in(registry: &DialectRegistry, name: &str, engine: Engine) -> Vec<Cell> {
     let mut cells = Vec::with_capacity(ObjectKind::ALL.len() * Check::ALL.len());
+    let no_designer = has_no_designer(registry, engine);
     for kind in ObjectKind::ALL {
         let applies = adapter::applies(registry, engine, kind);
         for check in Check::ALL {
-            let (status, detail) = if applies {
+            let designer_check = matches!(check, Check::Roundtrip | Check::Capabilities);
+            let (status, detail) = if applies && designer_check && no_designer {
+                (CellStatus::NotApplicable, Some(NO_DESIGNER.to_owned()))
+            } else if applies {
                 (
                     CellStatus::Pending,
                     Some(pending_detail(registry, engine, kind, check)),
@@ -247,11 +257,13 @@ mod tests {
             detail(ObjectKind::View, Check::Capabilities).as_deref(),
             Some(PENDING_CAPABILITIES)
         );
+        // Every engine has a driver since M7: Redis cells name what is missing, like the rest.
         let redis = plan("r", Engine::Redis);
-        assert_eq!(
-            redis[0].detail.as_deref(),
-            Some("pending (M7: no driver yet)")
-        );
+        let key_fetch = redis
+            .iter()
+            .find(|c| c.object_kind == ObjectKind::Key && c.check == Check::FetchList)
+            .unwrap();
+        assert_eq!(key_fetch.detail.as_deref(), Some(PENDING_NO_FETCHER));
         let user = cells
             .iter()
             .find(|c| c.object_kind == ObjectKind::User)
@@ -262,6 +274,51 @@ mod tests {
                 .iter()
                 .all(|c| matches!(c.status, CellStatus::Pending | CellStatus::NotApplicable))
         );
+    }
+
+    #[test]
+    fn engines_without_a_ddl_designer_have_no_roundtrip_cells() {
+        let mut reg = adapter::provisional_registry();
+        // Nothing registered yet: pending like any other engine.
+        assert!(!has_no_designer(&reg, Engine::MongoDb));
+        reg.register_fetcher(
+            Engine::MongoDb,
+            ObjectKind::Table,
+            std::sync::Arc::new(NoFetch),
+        );
+        assert!(!has_no_designer(&reg, Engine::MongoDb));
+        reg.register_tree_layout(
+            Engine::MongoDb,
+            oxbase_dialect::TreeLayout::new(oxbase_dialect::DatabaseScope::Catalog),
+        );
+        assert!(has_no_designer(&reg, Engine::MongoDb));
+        let cells = plan_engine_in(&reg, "m", Engine::MongoDb);
+        let table = |check| {
+            cells
+                .iter()
+                .find(|c| c.object_kind == ObjectKind::Table && c.check == check)
+                .unwrap()
+        };
+        assert_eq!(table(Check::Roundtrip).status, CellStatus::NotApplicable);
+        assert_eq!(table(Check::Capabilities).status, CellStatus::NotApplicable);
+        assert_eq!(table(Check::Roundtrip).detail.as_deref(), Some(NO_DESIGNER));
+        assert_eq!(table(Check::FetchList).status, CellStatus::Pending);
+        assert_eq!(
+            table(Check::FetchList).detail.as_deref(),
+            Some(PENDING_NOT_RUN)
+        );
+        // Kinds the engine does not have stay plain n/a.
+        let column = cells
+            .iter()
+            .find(|c| c.object_kind == ObjectKind::Column && c.check == Check::Roundtrip)
+            .unwrap();
+        assert_eq!(column.status, CellStatus::NotApplicable);
+        assert_eq!(column.detail, None);
+        // The SQL engines of the real registry all have a designer.
+        let real = adapter::registry();
+        for engine in crate::guard::M4_ENGINES {
+            assert!(!has_no_designer(&real, engine), "{engine}");
+        }
     }
 
     #[test]

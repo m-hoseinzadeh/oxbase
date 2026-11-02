@@ -83,7 +83,7 @@ use crate::adapter;
 use crate::connect::{Ctx, millis};
 use crate::fixtures::{Fixtures, M3EngineSeed, ResolvedEngine};
 use crate::guard::{self, M4_ENGINES};
-use crate::matrix::{Cell, CellStatus, Check, driver_milestone};
+use crate::matrix::{Cell, CellStatus, Check};
 use crate::runner::RunOptions;
 
 /// The engines whose round trip M3 delivers (`docs/m3-contracts.md` §12).
@@ -174,12 +174,9 @@ pub fn missing_roles(registry: &DialectRegistry, engine: Engine, kind: ObjectKin
     out
 }
 
-/// The designer kinds whose cells can run on `engine`: it has a driver, the kind applies and
-/// every role is registered.
+/// The designer kinds whose cells can run on `engine`: the kind applies and every role is
+/// registered.
 pub fn runnable_kinds(registry: &DialectRegistry, engine: Engine) -> Vec<ObjectKind> {
-    if driver_milestone(engine).is_some() {
-        return Vec::new();
-    }
     DESIGNER_KINDS
         .into_iter()
         .filter(|&k| {

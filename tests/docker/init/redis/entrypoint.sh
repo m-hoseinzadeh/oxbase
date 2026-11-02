@@ -4,6 +4,9 @@
 # entrypoint (arguments come from the compose `command`), loads /oxbase-init/seed.redis once (when
 # the marker key is absent; data persists via AOF on the volume), and forwards stop signals.
 # The marker key oxbase_test:fixture:seeded is set here, only after the whole seed ran without errors.
+# M7: then /oxbase-init/seed-m7.redis once (marker oxbase_test:fixture:m7_seeded, so a volume
+# seeded before M7 gets the M7 keys too), m7:json when RedisJSON is loaded, and on every start the
+# ACL user m7_reader (ACL rules live in memory only, not in the AOF).
 set -eu
 
 # M7: the TLS port (--tls-port in compose) reads the test CA / server certificate / key from
@@ -47,19 +50,30 @@ until cli ping 2>/dev/null | grep -q PONG; do
     sleep 1
 done
 
-if [ "$(cli EXISTS oxbase_test:fixture:seeded)" = "0" ]; then
-    # No marker: start from an empty DB 0 so a reseed after a partial run cannot duplicate list
-    # entries or collide with existing stream IDs.
-    echo "oxbase-init: loading seed"
-    cli -n 0 FLUSHDB >/dev/null
-    # redis-cli exits 0 even when a piped command fails, so force the "(error)" prefix with
-    # --no-raw and check for it; the marker key is written only after a clean run.
-    out="$(grep -v '^#' /oxbase-init/seed.redis | grep -v '^[[:space:]]*$' | cli --no-raw)"
+# Pipes a seed file (comments and blank lines dropped) into redis-cli. redis-cli exits 0 even
+# when a piped command fails, so the "(error)" prefix is forced with --no-raw and checked.
+load_seed() {
+    out="$(grep -v '^#' "$1" | grep -v '^[[:space:]]*$' | cli --no-raw)"
     if printf '%s\n' "$out" | grep -q '^(error)'; then
-        echo "oxbase-init: seed failed:" >&2
+        echo "oxbase-init: $1 failed:" >&2
         printf '%s\n' "$out" | grep '^(error)' >&2
         exit 1
     fi
+}
+
+# M7 (docs/m7-contracts.md §9.2): the read-only ACL user, on every start.
+if [ "$(cli ACL SETUSER m7_reader reset on ">$OXBASE_REDIS_PASSWORD" '~m7:*' '+@read')" != "OK" ]; then
+    echo "oxbase-init: could not create the ACL user m7_reader" >&2
+    exit 1
+fi
+
+if [ "$(cli EXISTS oxbase_test:fixture:seeded)" = "0" ]; then
+    # No marker: start from empty databases so a reseed after a partial run cannot duplicate list
+    # entries or collide with existing stream IDs (the M7 seed also writes database 1).
+    echo "oxbase-init: loading seed"
+    cli FLUSHALL >/dev/null
+    load_seed /oxbase-init/seed.redis
+    # The marker key is written only after a clean run.
     if [ "$(cli -n 0 SET oxbase_test:fixture:seeded 1)" != "OK" ]; then
         echo "oxbase-init: could not write the seed marker" >&2
         exit 1
@@ -67,6 +81,24 @@ if [ "$(cli EXISTS oxbase_test:fixture:seeded)" = "0" ]; then
     echo "oxbase-init: seed complete"
 else
     echo "oxbase-init: seed already present, skipping"
+fi
+
+if [ "$(cli -n 0 EXISTS oxbase_test:fixture:m7_seeded)" = "0" ]; then
+    echo "oxbase-init: loading the M7 seed"
+    load_seed /oxbase-init/seed-m7.redis
+    # m7:json needs RedisJSON ([m7.redis] json_optional): set it when the command exists.
+    if [ "$(cli -n 0 JSON.SET m7:json '$' '{"a": 1, "b": [true, null]}' 2>/dev/null)" = "OK" ]; then
+        echo "oxbase-init: m7:json set (RedisJSON loaded)"
+    else
+        echo "oxbase-init: RedisJSON not loaded; m7:json skipped"
+    fi
+    if [ "$(cli -n 0 SET oxbase_test:fixture:m7_seeded 1)" != "OK" ]; then
+        echo "oxbase-init: could not write the M7 seed marker" >&2
+        exit 1
+    fi
+    echo "oxbase-init: M7 seed complete"
+else
+    echo "oxbase-init: M7 seed already present, skipping"
 fi
 
 # `wait` returns early when a trapped signal arrives; keep waiting until the server has exited,

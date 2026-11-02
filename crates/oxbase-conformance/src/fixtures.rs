@@ -89,6 +89,9 @@ pub struct Fixtures {
     /// M4: SQL Server seed names (`[m4]` and `[m4.<engine>]`).
     #[serde(default)]
     pub m4: Option<M4Fixture>,
+    /// M7: MongoDB and Redis seed names, the Redis cluster and sentinel (`[m7]`).
+    #[serde(default)]
+    pub m7: Option<M7Fixture>,
     /// Where the file came from, for error messages. Not part of the TOML.
     #[serde(skip)]
     pub origin: String,
@@ -119,6 +122,8 @@ pub struct EngineFixture {
     /// M1: a user the server accepts only over TLS (`[engines.<name>.tls_user]`).
     #[serde(default)]
     pub tls_user: Option<Credentials>,
+    /// M7: a TLS-only port next to the plain one (Redis `--tls-port`), published on the host.
+    pub tls_port: Option<u16>,
     #[serde(flatten)]
     pub extra: toml::Table,
 }
@@ -438,6 +443,147 @@ impl M4Fixture {
     }
 }
 
+/// The `[m7]` table (shape documented next to it in `tests/fixtures.toml`). Every field is
+/// optional and unknown keys are kept in `other`, like [`M3Fixture`]; the engine tables are
+/// typed, so a wrong type is reported by [`Fixtures::parse`]. `Debug` shows only the names of
+/// the other keys (the cluster and sentinel tables hold the fixture password).
+#[derive(Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct M7Fixture {
+    /// Rows the streaming checks read (`m7_big`, `m7:big:list`).
+    pub large_rows: Option<u64>,
+    pub stale_after_secs: Option<u64>,
+    /// `[m7.mongodb]`: the MongoDB seed (02-m7.js).
+    pub mongodb: Option<M7MongoSeed>,
+    /// `[m7.redis]`: the Redis seed (seed-m7.redis).
+    pub redis: Option<M7RedisSeed>,
+    /// `[m7.redis_cluster]`, `[m7.redis_sentinel]` and anything else, as written.
+    #[serde(flatten)]
+    pub other: BTreeMap<String, toml::Value>,
+}
+
+/// `[m7.mongodb]`: where the MongoDB seed objects live. `Debug` leaves out `other` (it holds
+/// the seed user's password).
+#[derive(Clone, Default, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct M7MongoSeed {
+    pub init_script: Option<String>,
+    /// The database every seed collection, view and role lives in.
+    pub database: Option<String>,
+    pub collections: Vec<String>,
+    /// The 200 000-document collection (streaming and cancel checks).
+    pub big_collection: Option<String>,
+    pub view: Option<String>,
+    pub view_on: Option<String>,
+    /// Index names; each belongs to the collection its name starts with (`<collection>_`).
+    pub indexes: Vec<String>,
+    /// A user created in the `admin` database.
+    pub user: Option<String>,
+    /// A role of `database`.
+    pub role: Option<String>,
+    pub big_count: Option<u64>,
+    /// Everything else, as written (`user_password`, shell statements, counts).
+    #[serde(flatten)]
+    pub other: BTreeMap<String, toml::Value>,
+}
+
+/// The database a MongoDB user created by the seed lives in.
+pub const MONGO_USER_DATABASE: &str = "admin";
+
+/// `[m7.redis]`: the Redis seed keys. `Debug` leaves out `other` (it holds the ACL user's
+/// password).
+#[derive(Clone, Default, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct M7RedisSeed {
+    pub seed_script: Option<String>,
+    /// The logical database of `keys` (`"0"`).
+    pub database: Option<String>,
+    pub databases: Option<u32>,
+    /// Keys of `database` the tree must show (every type, the big keys, the namespace tree).
+    pub keys: Vec<String>,
+    /// A RedisJSON key, absent when the image has no RedisJSON (`json_optional`).
+    pub json_key: Option<String>,
+    pub json_optional: bool,
+    pub big_list: Option<String>,
+    pub big_zset: Option<String>,
+    pub big_count: Option<u64>,
+    pub ttl_key: Option<String>,
+    pub namespace_root: Option<String>,
+    pub namespace_separator: Option<String>,
+    /// A key of database 1.
+    pub db1_key: Option<String>,
+    pub acl_user: Option<String>,
+    /// Everything else, as written (`acl_password`, pub/sub names).
+    #[serde(flatten)]
+    pub other: BTreeMap<String, toml::Value>,
+}
+
+impl std::fmt::Debug for M7Fixture {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("M7Fixture")
+            .field("large_rows", &self.large_rows)
+            .field("stale_after_secs", &self.stale_after_secs)
+            .field("mongodb", &self.mongodb)
+            .field("redis", &self.redis)
+            .field("other_keys", &self.other.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for M7MongoSeed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("M7MongoSeed")
+            .field("database", &self.database)
+            .field("collections", &self.collections)
+            .field("big_collection", &self.big_collection)
+            .field("view", &self.view)
+            .field("indexes", &self.indexes)
+            .field("user", &self.user)
+            .field("role", &self.role)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for M7RedisSeed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("M7RedisSeed")
+            .field("database", &self.database)
+            .field("keys", &self.keys)
+            .field("json_key", &self.json_key)
+            .field("big_list", &self.big_list)
+            .field("namespace_separator", &self.namespace_separator)
+            .field("db1_key", &self.db1_key)
+            .field("acl_user", &self.acl_user)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Fixtures {
+    /// The `[m7]` MongoDB seed, for MongoDB fixtures.
+    pub fn m7_mongo(&self, engine: Engine) -> Option<&M7MongoSeed> {
+        if engine != Engine::MongoDb {
+            return None;
+        }
+        self.m7.as_ref()?.mongodb.as_ref()
+    }
+
+    /// The `[m7]` Redis seed, for Redis fixtures.
+    pub fn m7_redis(&self, engine: Engine) -> Option<&M7RedisSeed> {
+        if engine != Engine::Redis {
+            return None;
+        }
+        self.m7.as_ref()?.redis.as_ref()
+    }
+
+    /// Whether the fixtures seed tree objects for the fixture `name`: an `[m2.<engine>]` table
+    /// (SQL engines) or the `[m7]` seed of its engine (MongoDB, Redis).
+    pub fn has_tree_seed(&self, name: &str, engine: Engine) -> bool {
+        self.m2_seed(name, engine).is_some()
+            || self.m7_mongo(engine).is_some()
+            || self.m7_redis(engine).is_some()
+    }
+}
+
 impl Fixtures {
     /// The M4 table of the fixture `name` (falling back to the engine kind's name), with the
     /// shared `[m4]` table.
@@ -477,6 +623,7 @@ impl std::fmt::Debug for EngineFixture {
             .field("database", &self.database)
             .field("path", &self.path)
             .field("tls_user", &self.tls_user)
+            .field("tls_port", &self.tls_port)
             .finish_non_exhaustive()
     }
 }
@@ -517,6 +664,7 @@ impl Fixtures {
         fixtures.validate_m2()?;
         fixtures.validate_m3()?;
         fixtures.validate_m4()?;
+        fixtures.validate_m7()?;
         Ok(fixtures)
     }
 
@@ -580,6 +728,32 @@ impl Fixtures {
                 && let Err(e) = t.clone().try_into::<M4EngineSeed>()
             {
                 return Err(self.invalid(format!("m4.{name}: {}", e.to_string().trim())));
+            }
+        }
+        Ok(())
+    }
+
+    /// Rejects an `[m7]` whose MongoDB or Redis seed names a key the checks need with the wrong
+    /// shape: an index that belongs to no seed collection, or a big collection that is not one.
+    fn validate_m7(&self) -> Result<(), FixturesError> {
+        let Some(m7) = &self.m7 else {
+            return Ok(());
+        };
+        if let Some(mongo) = &m7.mongodb {
+            for index in &mongo.indexes {
+                if crate::seeds::index_collection(&mongo.collections, index).is_none() {
+                    return Err(self.invalid(format!(
+                        "m7.mongodb.indexes: {index:?} does not start with a seed collection \
+                         name and `_`"
+                    )));
+                }
+            }
+            if let Some(big) = &mongo.big_collection
+                && !mongo.collections.contains(big)
+            {
+                return Err(self.invalid(format!(
+                    "m7.mongodb.big_collection: {big:?} is not in `collections`"
+                )));
             }
         }
         Ok(())
@@ -886,6 +1060,13 @@ path = "target/fixtures/t.sqlite"
             .expect("server_dns_sans=(...) in scripts/fixtures-certs.sh");
         let dns: Vec<&str> = dns_line.split_whitespace().collect();
         assert!(sans.contains(&"mssql"), "[tls] server_sans: {sans:?}");
+        // M7: the MongoDB and Redis service names (VerifyFull through the bastion).
+        for name in ["mongodb", "redis"] {
+            assert!(
+                sans.contains(&name),
+                "[tls] server_sans lacks {name}: {sans:?}"
+            );
+        }
         for san in sans
             .iter()
             .filter(|s| s.parse::<std::net::IpAddr>().is_err())
@@ -936,6 +1117,25 @@ path = "target/fixtures/t.sqlite"
                 assert!(text.is_ascii(), "{script} is not ASCII");
             }
         }
+        // M7 (docs/m7-contracts.md §9): SSH targets, the Redis TLS port, both seeds and their
+        // scripts, and no password in Debug.
+        for name in ["mongodb", "redis", "redis_tls"] {
+            assert!(ssh.targets.contains_key(name), "[ssh.targets] lacks {name}");
+        }
+        assert!(fx.engines["redis"].tls_port.is_some(), "redis tls_port");
+        let mongo = fx.m7_mongo(Engine::MongoDb).expect("[m7.mongodb]");
+        assert_eq!(mongo.big_collection.as_deref(), Some("m7_big"));
+        assert_eq!(mongo.indexes.len(), 5);
+        let redis = fx.m7_redis(Engine::Redis).expect("[m7.redis]");
+        assert_eq!(redis.big_list.as_deref(), Some("m7:big:list"));
+        for script in [&mongo.init_script, &redis.seed_script] {
+            let script = script.as_deref().expect("[m7] seed script");
+            assert!(in_workspace(script).is_file(), "{script} is missing");
+        }
+        let m7 = fx.m7.as_ref().unwrap();
+        assert!(m7.other.contains_key("redis_cluster") && m7.other.contains_key("redis_sentinel"));
+        let dbg = format!("{m7:?}");
+        assert!(!dbg.contains("Oxbase_Fixture_Pw_2026"), "{dbg}");
         let dbg = format!("{ssh:?} {:?}", fx.engines["postgres"]);
         assert!(!dbg.contains(&ssh.password), "{dbg}");
         for e in &engines {
@@ -997,6 +1197,41 @@ also_future = 1
         let bad = text.replace("database = \"m4db\"", "database = 3");
         let err = Fixtures::parse(&bad, "m4").unwrap_err().to_string();
         assert!(err.contains("m4.sqlite"), "{err}");
+    }
+
+    #[test]
+    fn m7_table_parses_and_rejects_what_the_checks_would_misread() {
+        let base = "schema_version = 1\n[m7]\nlarge_rows = 10\n[m7.mongodb]\n\
+                    database = \"db\"\ncollections = [\"c_big\", \"c\"]\n\
+                    big_collection = \"c_big\"\nindexes = [\"c_big_g\", \"c_x\"]\n\
+                    user_password = \"secret-pw\"\n[m7.redis]\nkeys = [\"a:b\"]\n\
+                    acl_password = \"secret-pw\"\n[m7.redis_cluster]\npassword = \"secret-pw\"\n";
+        let fx = Fixtures::parse(base, "m7").unwrap();
+        let mongo = fx.m7_mongo(Engine::MongoDb).unwrap();
+        assert_eq!(mongo.big_collection.as_deref(), Some("c_big"));
+        assert_eq!(fx.m7_redis(Engine::Redis).unwrap().keys, ["a:b"]);
+        assert!(fx.m7_redis(Engine::Sqlite).is_none());
+        assert!(fx.has_tree_seed("mongo", Engine::MongoDb));
+        assert!(!fx.has_tree_seed("lite", Engine::Sqlite));
+        let dbg = format!("{fx:?}");
+        assert!(!dbg.contains("secret-pw"), "{dbg}");
+        for (bad, want) in [
+            (
+                base.replace("\"c_x\"", "\"other_x\""),
+                "m7.mongodb.indexes: \"other_x\"",
+            ),
+            (
+                base.replace("big_collection = \"c_big\"", "big_collection = \"nope\""),
+                "m7.mongodb.big_collection: \"nope\"",
+            ),
+            (
+                base.replace("large_rows = 10", "large_rows = \"x\""),
+                "cannot parse",
+            ),
+        ] {
+            let err = Fixtures::parse(&bad, "m7").unwrap_err().to_string();
+            assert!(err.contains(want), "got {err:?}, want {want:?}");
+        }
     }
 
     #[test]
