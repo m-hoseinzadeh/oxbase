@@ -35,6 +35,7 @@ import {
   useState,
 } from "react";
 import type { ColumnInfo } from "../../api";
+import { subscribeTheme } from "../theme-bridge";
 import { type CopyNotify, cellsForSelection, NULL_COPY_TEXT } from "./copy";
 import { cellDisplayText, columnTypeLabel, formatCell, initialColumnWidth } from "./format";
 import { dataCellOf } from "./gridCoords";
@@ -79,7 +80,8 @@ function readTheme(): Partial<Theme> {
   const bg = cssVar(style, "--color-bg", "#ffffff");
   const subtle = cssVar(style, "--color-bg-subtle", "#f4f5f7");
   const border = cssVar(style, "--color-border", "#d8dbe1");
-  const accent = cssVar(style, "--color-accent", "#2563eb");
+  // Selection is "where you are": the focus blue, not the green action accent.
+  const accent = cssVar(style, "--color-focus", "#38bdf8");
   return {
     accentColor: accent,
     accentLight: withAlpha(accent, 0.18),
@@ -87,7 +89,7 @@ function readTheme(): Partial<Theme> {
     textMedium: muted,
     textLight: faint,
     textHeader: muted,
-    textHeaderSelected: cssVar(style, "--color-accent-fg", "#ffffff"),
+    textHeaderSelected: fg,
     bgIconHeader: muted,
     fgIconHeader: bg,
     bgCell: bg,
@@ -99,9 +101,10 @@ function readTheme(): Partial<Theme> {
     drilldownBorder: border,
     linkColor: accent,
     fontFamily: cssVar(style, "--font-mono", "monospace"),
-    baseFontStyle: "12px",
+    baseFontStyle: "12.5px",
     headerFontStyle: "600 12px",
-    editorFontSize: "12px",
+    editorFontSize: "12.5px",
+    cellHorizontalPadding: 10,
   };
 }
 
@@ -151,15 +154,16 @@ export interface GridEditing {
   }): ReactNode;
 }
 
+function useEditColours(): EditColours {
+  const [colours, setColours] = useState(readEditColours);
+  useEffect(() => subscribeTheme(() => setColours(readEditColours())), []);
+  return colours;
+}
+
 function useGridTheme(): Partial<Theme> {
   const [theme, setTheme] = useState(readTheme);
-  useEffect(() => {
-    const media = window.matchMedia?.("(prefers-color-scheme: dark)");
-    if (!media) return;
-    const update = () => setTheme(readTheme());
-    media.addEventListener("change", update);
-    return () => media.removeEventListener("change", update);
-  }, []);
+  // Theme changes (user choice or OS while "system") re-read the CSS tokens.
+  useEffect(() => subscribeTheme(() => setTheme(readTheme())), []);
   return theme;
 }
 
@@ -232,7 +236,7 @@ export function ResultGrid({
   const [selection, setSelection] = useState<GridSelection>(() =>
     selectedRows ? toGridSelection(selectedRows) : NO_SELECTION,
   );
-  const colours = useMemo(readEditColours, []);
+  const colours = useEditColours();
   const editRef = useRef(edit);
   editRef.current = edit;
 

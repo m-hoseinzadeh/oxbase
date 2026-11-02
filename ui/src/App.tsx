@@ -5,7 +5,10 @@ import {
   type IDockviewPanelProps,
   themeLight,
 } from "dockview-react";
+import { Database, FileInput, History, Plug, SquarePen } from "lucide-react";
 import { type FunctionComponent, useEffect, useState } from "react";
+import { ICON } from "./components/icons";
+import { requestNewConnection } from "./connections/requests";
 import { ConnectionsPanel } from "./panels/ConnectionsPanel";
 import { WelcomePanel } from "./panels/WelcomePanel";
 import { StatusBar } from "./StatusBar";
@@ -106,16 +109,42 @@ export function App() {
   useEffect(() => () => setDockviewApi(null), []);
   return (
     <div className="app">
-      <header className="app__toolbar" role="toolbar" aria-label="Workbench">
-        <button type="button" className="button" onClick={() => openQueryEditor()}>
-          New query
-        </button>
-        <button type="button" className="button" onClick={showHistory}>
-          History
-        </button>
-        <button type="button" className="button" onClick={() => openImport()}>
-          Import…
-        </button>
+      <header className="app__bar">
+        <div className="app__brand">
+          <span className="app__mark" aria-hidden="true">
+            <Database size={14} strokeWidth={2.25} />
+          </span>
+          <span className="app__name">Oxbase</span>
+        </div>
+        <div className="app__toolbar" role="toolbar" aria-label="Workbench">
+          <button
+            type="button"
+            className="button button--ghost"
+            title="New connection"
+            onClick={() => requestNewConnection()}
+          >
+            <Plug {...ICON} />
+            New connection
+          </button>
+          <button
+            type="button"
+            className="button button--ghost"
+            title="New query"
+            onClick={() => openQueryEditor()}
+          >
+            <SquarePen {...ICON} />
+            New query
+          </button>
+          <span className="toolbar__separator" aria-hidden="true" />
+          <button type="button" className="button button--ghost" onClick={() => openImport()}>
+            <FileInput {...ICON} />
+            Import…
+          </button>
+          <button type="button" className="button button--ghost" onClick={showHistory}>
+            <History {...ICON} />
+            History
+          </button>
+        </div>
       </header>
       <main className="app__workspace">
         <DockviewReact components={components} onReady={onReady} theme={theme} />

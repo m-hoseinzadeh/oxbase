@@ -1,13 +1,10 @@
 /** {@link SqlEditor} on Monaco. Loaded lazily by `SqlEditor`. */
 import { useEffect, useRef } from "react";
+import { applyMonacoTheme, cssToken, monacoThemeName, subscribeTheme } from "../theme-bridge";
 import { hasInsight } from "./insight/controller";
 import { attachInsight, type InsightAttachment } from "./insight/monacoInsight";
 import { monaco } from "./monacoSetup";
 import type { SqlEditorProps } from "./SqlEditor";
-
-function prefersDark(): boolean {
-  return window.matchMedia?.("(prefers-color-scheme: dark)").matches ?? false;
-}
 
 export default function MonacoSqlEditor({
   initialValue,
@@ -35,15 +32,20 @@ export default function MonacoSqlEditor({
   useEffect(() => {
     const element = host.current;
     if (!element) return;
+    applyMonacoTheme(monaco);
     const instance = monaco.editor.create(element, {
       value: initial.current.value,
       language: initial.current.language,
-      theme: prefersDark() ? "vs-dark" : "vs",
+      theme: monacoThemeName(),
       automaticLayout: true,
       minimap: { enabled: false },
       scrollBeyondLastLine: false,
       fixedOverflowWidgets: true,
       fontSize: 13,
+      fontFamily: cssToken("--font-mono", "monospace"),
+      fontLigatures: false,
+      lineHeight: 20,
+      padding: { top: 8 },
       tabSize: 2,
       renderLineHighlight: "line",
       ariaLabel: ariaLabel ?? "SQL editor",
@@ -134,11 +136,10 @@ export default function MonacoSqlEditor({
         : {}),
     };
 
-    const media = window.matchMedia?.("(prefers-color-scheme: dark)");
-    const onScheme = () => monaco.editor.setTheme(prefersDark() ? "vs-dark" : "vs");
-    media?.addEventListener("change", onScheme);
+    // Theme changes (user choice or OS while "system") re-read the CSS tokens.
+    const unsubscribe = subscribeTheme(() => applyMonacoTheme(monaco));
     return () => {
-      media?.removeEventListener("change", onScheme);
+      unsubscribe();
       attachment.current?.dispose();
       attachment.current = null;
       editorRef.current = null;

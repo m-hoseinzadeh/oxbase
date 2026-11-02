@@ -2,50 +2,58 @@
  * Workbench panels (object tree, query editor, results, history). Uses the tokens of theme.css.
  * Tree icons are drawn with CSS only (shapes, gradients, clip paths): no image assets.
  */
-:root {
-  --icon-database: #2f7d5b;
-  --icon-schema: #7a5bb5;
-  --icon-folder: #b8892c;
-  --icon-table: #2563eb;
-  --icon-view: #0e8a8a;
-  --icon-column: #6b7280;
-  --icon-index: #a15c1c;
-  --icon-key: #b7791f;
-  --icon-check: #15803d;
-  --icon-routine: #9333ea;
-  --icon-trigger: #c2410c;
-  --icon-sequence: #0f766e;
-  --row-selected-bg: color-mix(in srgb, var(--color-accent) 16%, transparent);
-  --row-hover-bg: var(--color-bg-muted);
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    --icon-database: #5fbf8f;
-    --icon-schema: #a78bdb;
-    --icon-folder: #d9ad55;
-    --icon-table: #6f9cf2;
-    --icon-view: #4fc1c1;
-    --icon-column: #9aa3b0;
-    --icon-index: #d98f4e;
-    --icon-key: #e2b04a;
-    --icon-check: #4ade80;
-    --icon-routine: #c084fc;
-    --icon-trigger: #fb923c;
-    --icon-sequence: #2dd4bf;
-  }
-}
+/* Colour tokens (tree icons, row states) live in theme.css so the theme switch drives them. */
 
 /* --- app toolbar ---------------------------------------------------------------------- */
+
+.app__bar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-4);
+  height: var(--app-bar-height);
+  padding: 0 var(--space-3);
+  border-bottom: 1px solid var(--color-border);
+  background: var(--color-bg-subtle);
+  flex-shrink: 0;
+}
+
+.app__brand {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding-right: var(--space-2);
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+.app__mark {
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  border-radius: var(--radius-sm);
+  background: var(--color-accent);
+  color: var(--color-accent-fg);
+}
+
+.app__name {
+  font-size: var(--text-lg);
+}
 
 .app__toolbar {
   display: flex;
   align-items: center;
-  gap: var(--space-1);
-  padding: var(--space-1) var(--space-2);
-  border-bottom: 1px solid var(--color-border);
-  background: var(--color-bg-subtle);
-  flex-shrink: 0;
+  gap: 2px;
+  min-width: 0;
+  color: var(--color-fg-muted);
+}
+
+.app__toolbar .button {
+  color: var(--color-fg-muted);
+}
+
+.app__toolbar .button:hover:not(:disabled) {
+  color: var(--color-fg);
 }
 
 .button--small {

@@ -11,6 +11,7 @@ import {
 import { CATEGORY_LABEL, ConnectionDialog, TLS_MODES } from "../connections/ConnectionDialog";
 import { EngineBadge } from "../connections/EngineBadge";
 import { promptedSecrets } from "../connections/form";
+import { onNewConnectionRequest } from "../connections/requests";
 import { refreshAll, refreshProfiles, refreshSessions, useConnections } from "../connections/store";
 import {
   type CommandError,
@@ -215,6 +216,9 @@ export function ConnectionsPanel() {
     const target = profiles[next];
     if (target) setSelectedId(target.id);
   }
+
+  // The app bar and welcome screen ask for a new connection through the request bus.
+  useEffect(() => onNewConnectionRequest(() => setDialog({ kind: "edit" })), []);
 
   const noCore = profilesStatus === "error" && profilesError?.category === "unsupported";
 

@@ -1,6 +1,41 @@
+import { Monitor, Moon, Sun } from "lucide-react";
+import { ICON_SM } from "./components/icons";
 import { useConnections } from "./connections/store";
 import { getAppInfo, NoCoreError } from "./ipc";
 import { errorMessage, useAsync } from "./useAsync";
+import {
+  setThemePreference,
+  type ThemePreference,
+  useThemePreference,
+} from "./workbench/theme-bridge";
+
+const THEMES: { value: ThemePreference; label: string; Icon: typeof Moon }[] = [
+  { value: "dark", label: "Dark theme", Icon: Moon },
+  { value: "light", label: "Light theme", Icon: Sun },
+  { value: "system", label: "Follow the system theme", Icon: Monitor },
+];
+
+function ThemeSwitch() {
+  const current = useThemePreference();
+  return (
+    <fieldset className="theme-switch">
+      <legend className="visually-hidden">Theme</legend>
+      {THEMES.map(({ value, label, Icon }) => (
+        <button
+          key={value}
+          type="button"
+          aria-pressed={current === value}
+          aria-label={label}
+          title={label}
+          className="theme-switch__option"
+          onClick={() => setThemePreference(value)}
+        >
+          <Icon {...ICON_SM} />
+        </button>
+      ))}
+    </fieldset>
+  );
+}
 
 export function StatusBar() {
   const info = useAsync(getAppInfo);
@@ -25,12 +60,18 @@ export function StatusBar() {
 
   return (
     <footer className="status-bar" data-testid="status-bar">
+      <span className="status-bar__item" data-testid="open-connections" aria-live="polite">
+        <span
+          className={open > 0 ? "status-dot" : "status-dot status-dot--idle"}
+          aria-hidden="true"
+        />
+        {open === 1 ? "1 open connection" : `${open} open connections`}
+      </span>
+      <span className="status-bar__spacer" />
       <span className="status-bar__item" data-testid="core-version">
         {text}
       </span>
-      <span className="status-bar__item" data-testid="open-connections" aria-live="polite">
-        {open === 1 ? "1 open connection" : `${open} open connections`}
-      </span>
+      <ThemeSwitch />
     </footer>
   );
 }
