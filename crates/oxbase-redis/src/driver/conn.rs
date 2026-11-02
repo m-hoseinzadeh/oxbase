@@ -1001,7 +1001,7 @@ async fn fact(link: &mut Link, cmd: Cmd) -> Option<Value> {
             )
             .await
         }
-        single => single.req_packed_command(&cmd).await,
+        single @ Link::Single { .. } => single.req_packed_command(&cmd).await,
     };
     match reply {
         Ok(Value::ServerError(_)) | Err(_) => None,

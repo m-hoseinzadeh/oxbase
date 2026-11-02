@@ -584,8 +584,10 @@ fn scored(value: Value, cursor: Option<String>) -> std::result::Result<Table, Va
         });
     let flat = items.len() % 2 == 0
         && items
-            .chunks_exact(2)
-            .all(|p| bulk(&p[0]) && score(&p[1]).is_some());
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .all(|[member, score_value]| bulk(member) && score(score_value).is_some());
     let pairs: Vec<(Value, Value)> = if nested {
         items
             .into_iter()
