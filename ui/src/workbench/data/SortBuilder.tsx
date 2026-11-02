@@ -2,6 +2,8 @@
  * The sort builder: an ordered list of sort keys (column, direction, where NULLs go). When the
  * engine has no native `NULLS FIRST / LAST`, the core emulates it; the builder says so.
  */
+import { ArrowUpDown, ChevronDown, ChevronUp, Plus, X } from "lucide-react";
+import { ICON_SM } from "../../components/icons";
 import { type FilterColumn, move, newSortKey, type SortDraftKey } from "./filterModel";
 
 export interface SortBuilderProps {
@@ -20,6 +22,12 @@ export function SortBuilder({ keys, columns, onChange, nullsNative, disabled }: 
     onChange(keys.map((k, i) => (i === index ? { ...k, ...patch } : k)));
   return (
     <fieldset className="sort" data-testid="sort-builder" aria-label="Sort">
+      <div className="builder__head">
+        <span className="builder__title">
+          <ArrowUpDown {...ICON_SM} />
+          Sort
+        </span>
+      </div>
       {keys.length === 0 ? <p className="filter__empty">Table order (no sort).</p> : null}
       <ol className="sort__keys">
         {keys.map((key, index) => (
@@ -60,41 +68,45 @@ export function SortBuilder({ keys, columns, onChange, nullsNative, disabled }: 
             </select>
             <button
               type="button"
-              className="button button--small"
+              className="icon-button icon-button--small"
               aria-label={`Move sort key ${index + 1} up`}
+              title="Move up"
               disabled={disabled || index === 0}
               onClick={() => onChange(move(keys, index, -1))}
             >
-              ↑
+              <ChevronUp {...ICON_SM} />
             </button>
             <button
               type="button"
-              className="button button--small"
+              className="icon-button icon-button--small"
               aria-label={`Move sort key ${index + 1} down`}
+              title="Move down"
               disabled={disabled || index === keys.length - 1}
               onClick={() => onChange(move(keys, index, 1))}
             >
-              ↓
+              <ChevronDown {...ICON_SM} />
             </button>
             <button
               type="button"
-              className="button button--small"
+              className="icon-button icon-button--small"
               aria-label={`Remove sort key ${index + 1}`}
+              title="Remove sort key"
               disabled={disabled}
               onClick={() => onChange(keys.filter((_, i) => i !== index))}
             >
-              ×
+              <X {...ICON_SM} />
             </button>
           </li>
         ))}
       </ol>
       <button
         type="button"
-        className="button button--small"
+        className="button button--ghost button--small sort__add"
         disabled={disabled || columns.length === 0}
         onClick={() => onChange([...keys, newSortKey(free)])}
       >
-        + Sort key
+        <Plus {...ICON_SM} />
+        Add sort key
       </button>
       {!nullsNative && keys.some((k) => k.nulls !== "default") ? (
         <p className="field__hint">NULL ordering is emulated on this database.</p>
