@@ -5,7 +5,7 @@ React + TypeScript UI. v1 targets PostgreSQL, MySQL, MariaDB, SQLite, SQL Server
 Redis on Linux, macOS and Windows. The core is headless, so every feature also works from
 `oxbase-cli` and from tests. See [PLAN.md](PLAN.md) for the architecture and milestones.
 
-## What works (M5)
+## What works (M6)
 
 On PostgreSQL, MySQL, MariaDB, SQLite and SQL Server (M1 connections: plain, TLS, SSH,
 keychain secrets; SQL Server since M4):
@@ -88,6 +88,27 @@ Contracts: [docs/m3-contracts.md](docs/m3-contracts.md),
   formula-looking text against spreadsheet formula injection (on by default). Files are chosen
   in native dialogs shown by the Rust side; the UI only holds opaque file handles. Contracts
   and every deviation: [docs/m5-contracts.md](docs/m5-contracts.md).
+
+- **Code insight** (M6) in the query editor, for all five SQL engines: **completion** of
+  keywords, schemas, tables, views, CTEs, aliases, columns (with type, nullability and keys),
+  functions with signatures, types, procedures and snippets, from the cursor's context (which
+  clause, which tables are in scope, qualifiers like `o.` or `sales.`) and a per-connection
+  **schema cache**. The cache reads the whole catalog in a fixed number of queries on its own
+  session, is saved in the app database (instant after a restart), and refreshes by itself
+  after a designer apply, an import that creates a table, or DDL run in the editor (also when
+  it is committed later); the toolbar shows its state and has a refresh button.
+  **Diagnostics** (400 ms after the last edit): unterminated strings, identifiers and comments
+  and unbalanced parentheses are errors; unknown tables, schemas and columns, ambiguous columns,
+  wrong argument counts of built-in functions and `UPDATE` / `DELETE` without `WHERE` are at
+  most warnings, and only hints whenever the cache cannot be sure. **Hover** shows a table's
+  columns, a column's type and keys, a function's signature. **Format** (Shift+Alt+F or the
+  toolbar; selection or whole script) lays out clauses, lists, joins, subqueries and `CASE`
+  arms and never changes meaning: its output must lex to the same tokens as the input apart
+  from whitespace and keyword case, with comments kept, or the text is left alone.
+  **Snippets**: 19 built-in ones and your own (toolbar **Snippets**). Parsing is a tolerant,
+  hand-written parser over the same lexer as the statement splitter (tree-sitter was evaluated
+  and not used, see [docs/m6-contracts.md](docs/m6-contracts.md) §2.1). Numbers: see *Code
+  insight (M6)* below.
 
 ## Layout
 
@@ -431,6 +452,47 @@ instead. A failed connection check always fails the run. Other knobs:
 pending M2 / M3 cell fails) and `OXBASE_CONFORMANCE_REQUIRE_M4=1` (the 5-engine guard: every
 M1-M3 cell of the five SQL engines must pass and nothing may be skipped); CI sets all three.
 
+### Code insight (M6)
+
+Last verified 2026-11-02 in the M6 integration runs: full-lane CI run 41364795338 on
+`milestone/m6` at eb62f80 (green; its Conformance job passed on the second attempt after a
+Docker Hub rate limit on the first) and Bundle run 41364798320 on the same commit (green).
+
+The exit check, job **Insight perf (5k-table completion)** (`OXBASE_REQUIRE_M6_PERF=1`):
+`context_at` + `complete` from text and cursor to the ranked list, 15 scenarios
+(`[[m6.perf.scenarios]]` in `tests/fixtures.toml`: statement start, `FROM` empty / prefix /
+fuzzy / schema-qualified, select list, qualified columns, `JOIN` target and `ON`, `WHERE`,
+`INSERT` columns, `UPDATE SET`, CTE columns, function prefix, a cursor after a 500-statement
+script) over 16 pairs of related tables, 240 cursor positions, 3 000 timed runs:
+
+| Where | Catalog | p50 | p95 | max | Budget |
+|---|---|---|---|---|---|
+| `complete_perf.rs`, `--profile perf` | synthetic, 5 000 tables x 20 columns, 500 routines (built in 51 ms, ~20 MiB) | 0.18 ms | 1.49 ms | 1.97 ms | p95 50 ms per scenario |
+| `complete_perf.rs`, `--release` | same | 0.18 ms | 1.51 ms | 1.82 ms | same |
+| `schema_cache_perf.rs`, `InsightService::complete` (gate, blocking pool, UTF-16) | live PostgreSQL, 5 018 relations, 100 056 columns | 0.23 ms | 1.02 ms | 1.47 ms | same |
+| Webview smoke, 50 `insight_complete` calls through Tauri IPC | e2e PostgreSQL database | 1 ms | 2 ms | 2 ms | p95 150 ms |
+
+A cancelled completion returned 0.6 ms after the cancel (limit 5 ms). The live 5k-table
+PostgreSQL catalog (`m6_perf`, 5 000 tables x 20 columns, each with a foreign key) was read
+through the real catalog reader in 524 ms (limit 15 s) into an 18.2 MiB index (budget 64 MiB;
+6.4 MiB snapshot) and reloaded from the app database in 43 ms. In the app (webview smoke)
+`customers` was listed 70 ms after typing `SELECT * FROM cust`, WebDriver polling included.
+
+Schema-cache live tests (Conformance job, all five engines): the catalog reader reads every
+seeded object (columns, keys, foreign keys, routines, sequences, types, case rules, partial
+scopes, cancel); an editor `CREATE` / `DROP`, a designer apply and an import create reached the
+cache in 311 to 444 ms (limit 2 s; the 300 ms refresh coalescing included), and a `CREATE`
+inside a transaction committed by a later run 0 to 338 ms after the `COMMIT`.
+
+Diagnostics: the valid-SQL corpus (`crates/oxbase-insight/tests/corpus/`, 205 PostgreSQL, 197
+MySQL / MariaDB, 169 SQLite and 166 SQL Server statement lines; at least 150 statements per
+dialect) gives zero errors and zero warnings with and without a matching cache. The formatter's
+properties (`check_format` token equivalence and idempotence) hold over the corpus with all 96
+option combinations and over every prefix, every single-token deletion and random insertions.
+Tests: 1 205 Rust tests passed on Linux and macOS and 1 203 on Windows (235 live / perf tests
+ignored there and run in the Conformance and perf jobs), 1 021 in the Conformance job, 284 UI
+tests.
+
 ## App data
 
 Profiles live in `connections.json` in the config directory (`OXBASE_CONFIG_DIR` overrides it).
@@ -515,12 +577,16 @@ value after a reload.
   **Full lane**, on pull requests, pushes to main, weekly and manual runs: fmt + clippy on Linux;
   `cargo test --workspace` on Linux, macOS and Windows; the OS keychain tests
   (`scripts/keychain-tests.sh`) on Linux, macOS and Windows; UI lint, typecheck, test and build;
-  the conformance harness and the M1-M5 live tests against the Docker fixtures; the webview
+  the conformance harness and the M1-M6 live tests against the Docker fixtures; the webview
   smoke test (Linux; also on the fast lane of `wip/*-e2e`, `wip/*-app` and `wip/*-integrate`);
   `cargo deny` (advisories, bans, licenses, sources); the `import-perf` job (M5, the 1 GB CSV
   import exit check, `docs/m5-contracts.md` §9, with `OXBASE_REQUIRE_M5_PERF=1`): full lane,
-  plus the fast lane of `wip/*-perf` and `wip/*-integrate`. M6 adds an `insight-perf` job
-  (completion latency on a 5k-table catalog, `docs/m6-contracts.md` §5).
+  plus the fast lane of `wip/*-perf` and `wip/*-integrate`; the `insight-perf` job (M6,
+  `docs/m6-contracts.md` §5, with `OXBASE_REQUIRE_M6_PERF=1`): completion latency on the
+  synthetic 5k-table catalog in the perf and release profiles, the diagnostics (1 MiB) and
+  formatter (100 KiB) budgets, then the live 5k-table PostgreSQL schema; full lane, plus the
+  fast lane of `wip/*-perf`, `wip/*-complete`, `wip/*-cache` and `wip/*-integrate`. The webview
+  smoke test requires the M6 completion step (`OXBASE_E2E_REQUIRE_M6=1`).
 - `.github/workflows/bundle.yml` (push to main, manual): Tauri dev bundles for Linux x86_64,
   Windows x86_64 and macOS aarch64/x86_64, uploaded as workflow artifacts.
   `scripts/ci-verify-signing.mjs` checks what was produced: `codesign --verify --deep --strict`,

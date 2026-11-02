@@ -278,6 +278,12 @@ fn the_valid_corpus_has_no_errors_or_warnings() {
             let cache = sample(engine);
             for (label, cache) in [("no cache", None), ("sample cache", Some(&cache))] {
                 let diags = diagnose(&dialect, &text, cache, &CancellationToken::new()).unwrap();
+                let flagged = diags.iter().filter(|d| d.severity >= Warning).count();
+                println!(
+                    "valid corpus {file} ({engine:?}, {label}): {statements} statements, \
+                     {flagged} errors or warnings, {} hints",
+                    diags.len() - flagged
+                );
                 for d in diags.iter().filter(|d| d.severity >= Warning) {
                     let line = text[..d.range.start].matches('\n').count() + 1;
                     problems.push(format!(
@@ -858,9 +864,21 @@ fn a_one_mib_script_is_diagnosed_in_linear_time() {
     let diags = diagnose(&dialect, &text, Some(&pg), &CancellationToken::new()).unwrap();
     let elapsed = started.elapsed();
     println!(
-        "diagnose: {} KiB, {} findings, {elapsed:?} (debug build; the 100 ms budget is for release)",
+        "diagnose: {} KiB, {} findings, {elapsed:?} (budget 100 ms in a release-like build)",
         text.len() / 1024,
         diags.len()
     );
     assert!(elapsed.as_secs() < 30, "{elapsed:?}");
+    // The §5 budget, enforced in the insight-perf job (`--profile perf`).
+    if !cfg!(debug_assertions) && std::env::var("OXBASE_REQUIRE_M6_PERF").is_ok_and(|v| v == "1") {
+        // Best of three: the first run also warms the allocator.
+        let mut best = elapsed;
+        for _ in 0..2 {
+            let started = Instant::now();
+            diagnose(&dialect, &text, Some(&pg), &CancellationToken::new()).unwrap();
+            best = best.min(started.elapsed());
+        }
+        println!("diagnose: best of three {best:?}");
+        assert!(best.as_millis() <= 100, "diagnose took {best:?} for 1 MiB");
+    }
 }

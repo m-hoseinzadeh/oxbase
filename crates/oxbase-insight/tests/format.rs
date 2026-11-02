@@ -514,10 +514,13 @@ fn properties(d: &Dialect, text: &str, o: FormatOptions) -> Result<(), String> {
 struct Violations {
     seen: Vec<String>,
     count: usize,
+    /// Inputs checked (each formatted twice and checked once).
+    checked: usize,
 }
 
 impl Violations {
     fn check(&mut self, d: &Dialect, text: &str, o: FormatOptions) {
+        self.checked += 1;
         if let Err(e) = properties(d, text, o) {
             self.count += 1;
             if self.seen.len() < 25 && !self.seen.contains(&e) {
@@ -526,7 +529,12 @@ impl Violations {
         }
     }
 
-    fn assert_none(&self) {
+    fn assert_none(&self, what: &str) {
+        eprintln!(
+            "formatter properties ({what}): {} inputs checked (check_format + idempotence), {} \
+             violations",
+            self.checked, self.count
+        );
         assert!(
             self.count == 0,
             "{} violations, first ones:\n{}",
@@ -551,7 +559,7 @@ fn corpus_with_every_option_combination() {
             }
         }
     }
-    violations.assert_none();
+    violations.assert_none("corpus x every option combination");
 }
 
 /// A tiny deterministic random generator (xorshift) for the fuzz test.
@@ -615,7 +623,7 @@ fn fuzzed_inputs_keep_the_invariants() {
             }
         }
     }
-    violations.assert_none();
+    violations.assert_none("prefixes, token deletions, random insertions");
 }
 
 /// A script of at least 100 KiB made of the corpus statements of `engine`.

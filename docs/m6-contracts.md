@@ -199,6 +199,15 @@ a lagged receiver) refreshes the whole database. Refreshes of one key coalesce f
 services get the bus through a setter the cache stream adds (`with_schema_events`), wired in
 `crates/app-tauri/src/backend.rs` (the bus is created there today).
 
+As built (integration): `QueryService` reports each successful statement to
+`SchemaEvents::statement_succeeded`, which publishes its changes at once and remembers them per
+(editor session, database); a later `COMMIT` / `END` / `ROLLBACK` / `ABORT` of that session
+publishes them again (above 64 remembered changes: a full refresh), so DDL inside an explicit
+transaction reaches the cache after the commit. An unqualified relation change refreshes every
+cached schema with that name (an unqualified `CREATE` every non-system schema); a created name
+still missing after the partial read triggers a full refresh. Deleting a profile in the app runs
+`profiles::delete_profile_and_caches` (`forget_profile`).
+
 `schema_changes` (done) is lexical and best effort: `CREATE` / `ALTER` / `DROP` / `RENAME` /
 `sp_rename` with modifiers (`OR REPLACE`, `OR ALTER`, `TEMP`, `UNIQUE`, `MATERIALIZED`, MySQL
 `DEFINER = ...`), `IF [NOT] EXISTS`, `DROP TABLE a, b`, `RENAME TABLE a TO b`, `ALTER ... RENAME

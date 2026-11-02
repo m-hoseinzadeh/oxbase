@@ -430,6 +430,30 @@ must pass the token-equivalence check) and built-in snippets; `oxbase-services` 
 schema built through the real catalog. Six streams (cache, context, complete, diagnose, format,
 app) fill the skeletons.
 
+**M6 as built (notes, 2026-11-02).** The exit check passed in the CI job `insight-perf`
+(Linux, `OXBASE_REQUIRE_M6_PERF=1`; full-lane run 41364795338 on `milestone/m6` at eb62f80,
+green, Bundle run 41364798320 green): `context_at` + `complete` over 240 cursor positions of
+15 scenarios on a synthetic 5 000-table x 20-column catalog took p50 0.18 ms / p95 1.49 ms /
+max 1.97 ms in the perf profile (release: p95 1.51 ms), against 50 ms; on a live PostgreSQL
+schema of 5 000 tables x 20 columns read through the real catalog reader (524 ms, 18.2 MiB
+index, reload from the app database 43 ms) the same scenarios through `InsightService::complete`
+took p50 0.23 ms / p95 1.02 ms / max 1.47 ms; through Tauri IPC in the webview smoke test p95
+2 ms. The README (*Code insight (M6)*) has the rest of the numbers. Where the build differs from
+the text above or from `docs/m6-contracts.md` (its §12 lists the planned deviations):
+
+- No tree-sitter: a tolerant hand-written parser over the `oxbase-sql` lexer (contracts §2.1).
+  Completion reads the parser's outline and `context_at`; diagnostics and hover use their own
+  statement analyzer (`oxbase_insight::diagnose::analyze`) over the same tokens, so the "one
+  lexer" invariant holds but two structural readers of a statement exist.
+- The schema cache republishes DDL changes of an editor session when its transaction ends
+  (`COMMIT` / `ROLLBACK`), so DDL inside an explicit transaction reaches the cache after the
+  commit; an unqualified `CREATE` refreshes every schema with that name and falls back to a
+  full refresh when the new name is still missing. Deleting a profile drops its caches and
+  persisted snapshots (`delete_profile_and_caches`).
+- The perf tests time the real pipeline only (no hand-built contexts); the `insight-perf` job
+  also enforces the diagnostics (1 MiB in 100 ms) and formatter (100 KiB in 200 ms) budgets
+  and runs the live 5k-table PostgreSQL variant unconditionally.
+
 Order of work: M0–M3 prove the architecture. M4 and M7 are where the per-database matrix gets tested for real. M8 and M10 reuse the Comparator and DdlGenerator cells and get much cheaper if M3 is done right.
 
 ## 7. Main risks

@@ -368,6 +368,11 @@ jobs:
       - name: Completion latency on the synthetic 5k-table cache (release)
         run: cargo test -p oxbase-insight --release --locked --test complete_perf -- --ignored --nocapture
 
+      # The other §5 budgets (diagnose 1 MiB within 100 ms, format 100 KiB within 200 ms) and
+      # the formatter / diagnostics property counts, printed.
+      - name: Diagnostics and formatter budgets and properties (perf profile)
+        run: cargo test -p oxbase-insight --profile perf --locked --test diagnose --test format -- --include-ignored --nocapture
+
       - name: Build the live perf test (perf profile)
         run: cargo test -p oxbase-services --profile perf --locked --test schema_cache_perf --no-run
 
