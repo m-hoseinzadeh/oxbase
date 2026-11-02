@@ -6,6 +6,25 @@
 # The marker key oxbase_test:fixture:seeded is set here, only after the whole seed ran without errors.
 set -eu
 
+# M7: the TLS port (--tls-port in compose) reads the test CA / server certificate / key from
+# /etc/oxbase-tls. The bind-mounted host files keep the host user's owner and mode 0600, which
+# the redis user the image drops to cannot read, so copies owned by redis are made first (as
+# tests/docker/tls/entrypoint.sh does for the SQL engines).
+if [ -d /oxbase-tls-src ]; then
+    for f in ca.pem server.pem server-key.pem; do
+        if [ ! -s "/oxbase-tls-src/$f" ]; then
+            echo "oxbase-init: missing /oxbase-tls-src/$f - run scripts/fixtures-certs.sh" >&2
+            exit 1
+        fi
+    done
+    mkdir -p /etc/oxbase-tls
+    cp /oxbase-tls-src/ca.pem /oxbase-tls-src/server.pem /oxbase-tls-src/server-key.pem /etc/oxbase-tls/
+    chown -R redis:redis /etc/oxbase-tls
+    chmod 0750 /etc/oxbase-tls
+    chmod 0644 /etc/oxbase-tls/ca.pem /etc/oxbase-tls/server.pem
+    chmod 0600 /etc/oxbase-tls/server-key.pem
+fi
+
 docker-entrypoint.sh "$@" &
 pid=$!
 trap 'kill -TERM "$pid" 2>/dev/null || true' TERM INT

@@ -351,8 +351,9 @@ services:
     container_name: oxbase-fixtures-redis
     environment:
       OXBASE_REDIS_PASSWORD: Oxbase_Fixture_Pw_2026
-    # The image has no init-script hook: the wrapper starts redis-server, loads the seed once
-    # (when the marker key is absent), and forwards stop signals.
+    # The image has no init-script hook: the wrapper copies the TLS files (owned by redis),
+    # starts redis-server, loads the seed once (when the marker key is absent), and forwards
+    # stop signals.
     entrypoint: ["/bin/sh", "/oxbase-init/entrypoint.sh"]
     command:
       - redis-server
@@ -364,11 +365,42 @@ services:
       - 128mb
       - --maxmemory-policy
       - noeviction
+      # M7 (docs/m7-contracts.md §9.1, [engines.redis] tls_port): a TLS-only port next to the
+      # plain one, with the [tls] server certificate; client certificates optional.
+      - --tls-port
+      - "6380"
+      - --tls-cert-file
+      - /etc/oxbase-tls/server.pem
+      - --tls-key-file
+      - /etc/oxbase-tls/server-key.pem
+      - --tls-ca-cert-file
+      - /etc/oxbase-tls/ca.pem
+      - --tls-auth-clients
+      - optional
     ports:
       - "127.0.0.1:15479:6379"
+      - "127.0.0.1:15480:6380"
     volumes:
       - redis-data:/data
       - ./init/redis:/oxbase-init:ro
+      - type: bind
+        source: ../../target/fixtures/tls/ca.pem
+        target: /oxbase-tls-src/ca.pem
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ../../target/fixtures/tls/server.pem
+        target: /oxbase-tls-src/server.pem
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ../../target/fixtures/tls/server-key.pem
+        target: /oxbase-tls-src/server-key.pem
+        read_only: true
+        bind:
+          create_host_path: false
     healthcheck:
       test:
         - CMD-SHELL

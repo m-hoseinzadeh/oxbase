@@ -6,7 +6,7 @@ use oxbase_driver::DriverRegistry;
 use oxbase_types::Engine;
 
 /// A registry with every driver this build ships: PostgreSQL, MySQL, MariaDB (served by the
-/// MySQL driver), SQLite and SQL Server.
+/// MySQL driver), SQLite, SQL Server and Redis (M7).
 pub fn default_drivers() -> DriverRegistry {
     let mut drivers = DriverRegistry::new();
     drivers.register(Arc::new(oxbase_pg::PgDriver::new()));
@@ -18,7 +18,7 @@ pub fn default_drivers() -> DriverRegistry {
     // M7: the mongo-driver and redis-driver streams each uncomment their own line (and extend
     // the test below) when their driver connects (docs/m7-contracts.md §1).
     // oxbase_mongo::register(&mut drivers);
-    // oxbase_redis::register(&mut drivers);
+    oxbase_redis::register(&mut drivers);
     drivers
 }
 
@@ -27,7 +27,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_drivers_cover_the_m1_and_m4_engines() {
+    fn default_drivers_cover_the_m1_m4_and_m7_engines() {
         let drivers = default_drivers();
         assert_eq!(
             drivers.engines(),
@@ -36,7 +36,8 @@ mod tests {
                 Engine::MySql,
                 Engine::MariaDb,
                 Engine::Sqlite,
-                Engine::MsSql
+                Engine::MsSql,
+                Engine::Redis
             ]
         );
     }
