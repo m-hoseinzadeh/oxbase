@@ -87,7 +87,7 @@ async fn open_document_query(
     let token = guard.token();
     let handle = isolated(Vec::new(), async move {
         documents
-            .open(target, request, options.unwrap_or_default(), token)
+            .open(target, &request, options.unwrap_or_default(), token)
             .await
     })
     .await;
@@ -235,7 +235,7 @@ pub async fn key_scan_open(
         editor: editor_id,
     };
     let handle = isolated(Vec::new(), async move {
-        keys.open_scan(target, request, options.unwrap_or_default(), token)
+        keys.open_scan(target, &request, options.unwrap_or_default(), token)
             .await
     })
     .await;
@@ -285,7 +285,7 @@ pub async fn key_value_open(
         editor: editor_id,
     };
     let opened = isolated(Vec::new(), async move {
-        keys.open_value(target, key, options.unwrap_or_default(), token)
+        keys.open_value(target, &key, options.unwrap_or_default(), token)
             .await
     })
     .await;

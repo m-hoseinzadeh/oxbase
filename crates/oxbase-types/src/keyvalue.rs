@@ -186,8 +186,10 @@ pub fn from_hex(hex: &str) -> Result<Vec<u8>> {
         return Err(Error::invalid_input("hex text needs two digits per byte"));
     }
     bytes
-        .chunks_exact(2)
-        .map(|pair| match (digit(pair[0]), digit(pair[1])) {
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&[hi, lo]| match (digit(hi), digit(lo)) {
             (Some(hi), Some(lo)) => Ok((hi << 4) | lo),
             _ => Err(Error::invalid_input("hex text may only hold 0-9 and a-f")),
         })

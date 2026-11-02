@@ -110,6 +110,15 @@ Contracts: [docs/m3-contracts.md](docs/m3-contracts.md),
   and not used, see [docs/m6-contracts.md](docs/m6-contracts.md) §2.1). Numbers: see *Code
   insight (M6)* below.
 
+**In progress (M7): MongoDB and Redis.** The contracts are fixed in
+[docs/m7-contracts.md](docs/m7-contracts.md): MongoDB through the official `mongodb` crate
+behind an in-process SOCKS5 dialer (so SSH and every TLS mode work like the SQL engines), a
+document grid with tree / JSON views, a find / aggregate builder and a sandboxed mongo-shell
+subset (QuickJS); Redis through the `redis` crate (standalone, cluster, sentinel, RESP3), a
+`SCAN`-based key browser with typed editors, a console and pub/sub. The engine crates,
+services, commands and UI wrappers exist; the drivers, cells and screens land with the M7
+streams, and the engines are registered at M7 integration.
+
 ## Layout
 
 ```
@@ -130,7 +139,7 @@ crates/
   oxbase-conformance                              cross-engine conformance harness
   app-tauri                                       Tauri 2 shell (no logic)
 ui/                                               React + TS + Vite front end
-tests/fixtures.toml                               test DB connection params, M2-M4 seed object
+tests/fixtures.toml                               test DB connection params, M2-M4 and M7 seed
                                                   names, the M5 import / export expectations and
                                                   the M6 insight perf scenarios (single source of
                                                   truth)
@@ -231,6 +240,15 @@ M3 and M4 seeds: `[m3]` names the round-trip scratch tables and the editable see
 `[m2.mssql]`, `[m3.mssql]` and `[m4]` (M4) name the SQL Server seeds (schemas `m2`, `m3`, `m4` of
 `oxbase_test`, applied by the container's entrypoint wrapper), the TLS-only login `oxbase_tls`
 (enforced by a logon trigger) and the SSH target `mssql:1433`; see `docs/m4-contracts.md` §5.
+
+M7 (contracts in `docs/m7-contracts.md` §9): `[m7.mongodb]` and `[m7.redis]` name the
+MongoDB and Redis seeds (a document collection covering every mapped BSON type, a
+200 000-document collection, a view, indexes, a user and role; a key of every Redis type, two
+200 000-element keys, a namespace tree, a key in database 1, an ACL user), `[ssh.targets]` gains
+`mongodb:27017`, `redis:6379` and `redis:6380` (TLS), MongoDB runs with optional TLS
+(`allowTLS`) and Redis with a TLS-only port on `127.0.0.1:15480`, and `[m7.redis_cluster]` /
+`[m7.redis_sentinel]` describe a 3-master cluster on 15501-15503 and a sentinel setup on 15511,
+15512 and 15526 (host networking). The conformance stream implements them in the compose file.
 
 M5 adds no seed objects: import and export tests create and drop scratch tables
 `m5_t_<case>_<token>` (`[m5]`). `[m5.files."<name>"]` lists what each sample in `tests/data/m5`

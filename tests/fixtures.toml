@@ -130,6 +130,14 @@ auth_source = "admin"
 # Admin command document (JSON); read `version` from the reply.
 version_query = '{"buildInfo": 1}'
 version_prefix = "7.0.45"
+# M7 (docs/m7-contracts.md §9.1): TLS on the same port, optional for clients
+# (`--tlsMode allowTLS`), so plain and TLS connections both work, like the other engines'
+# servers. mongod reads one PEM holding the [tls] server certificate *and* key
+# (`tls_certificate_key_file`, written by scripts/fixtures-certs.sh into [tls] dir) and the
+# fixture CA (`--tlsCAFile`, `--tlsAllowConnectionsWithoutCertificates`). A wrong server name
+# must fail VerifyFull; MongoDB cannot require TLS per user, so there is no tls_user.
+tls_mode = "allowTLS"
+tls_certificate_key_file = "server-combined.pem"
 
 [engines.redis]
 kind = "redis"
@@ -144,6 +152,12 @@ database = "0"
 # Read `redis_version` from the reply.
 version_query = "INFO server"
 version_prefix = "8.10.3"
+# M7 (docs/m7-contracts.md §9.1): a TLS-only port next to the plain one (`--tls-port 6380`,
+# `--tls-cert-file` / `--tls-key-file` = the [tls] server certificate and key,
+# `--tls-ca-cert-file` = the fixture CA, `--tls-auth-clients optional`). Published on
+# 127.0.0.1:15480. A plain connection to it fails; VerifyFull with the fixture CA passes.
+tls_port = 15480
+tls_container_port = 6380
 
 [engines.sqlite]
 kind = "sqlite"
@@ -205,6 +219,10 @@ postgres = { host = "postgres", port = 5432 }
 mysql = { host = "mysql", port = 3306 }
 mariadb = { host = "mariadb", port = 3306 }
 mssql = { host = "mssql", port = 1433 }
+# M7: MongoDB (plain or TLS on one port) and Redis (plain 6379, TLS-only 6380).
+mongodb = { host = "mongodb", port = 27017 }
+redis = { host = "redis", port = 6379 }
+redis_tls = { host = "redis", port = 6380 }
 
 # --- M2: seed objects for the object tree, fetchers and query runs -------------------------
 # Only the NAMES live here, so the dialect streams, the conformance harness and the live tests
@@ -792,3 +810,133 @@ name = "long-script"
 text = "SELECT t.<|> FROM {table} t"
 expect = "column"
 repeat = 500
+
+# --- M7: MongoDB and Redis (docs/m7-contracts.md §9) -----------------------------------------
+# Names and shapes only, like [m2] / [m3]. The conformance stream writes the init scripts
+# (tests/docker/init/mongodb/02-m7.js, tests/docker/init/redis/seed-m7.redis and the cluster /
+# sentinel scripts), the compose services and the certificate SANs. Live tests never change
+# seed documents or keys: they write their own, named with a token (10 base36 characters from
+# time and pid), and remove them in a guard; leftovers older than stale_after_secs are removed
+# at start.
+[m7]
+stale_after_secs = 3600
+# Rows the streaming checks read (find on m7_big, LRANGE / ZRANGE of the big keys, a SCAN).
+large_rows = 200000
+
+# TLS server certificate SANs M7 adds to [tls] server_sans. Kept apart until the conformance
+# stream adds them to scripts/fixtures-certs.sh (server_dns_sans) in the same change, because
+# the fixtures self-test requires both lists to agree.
+[m7.tls]
+server_sans_add = ["mongodb", "redis"]
+
+# Database oxbase_test, created by 02-m7.js (after the M0 seed 01-seed.js).
+#
+#   m7_docs   12 documents covering every BSON type the grid maps (oxbase_dialect::document):
+#             _id ObjectId (fixed hex values 65a0000000000000000000NN, NN = 01..12, so tests can
+#             address them); name string; n int32 in docs 1-6 and int64 (NumberLong) in 7-12
+#             (one Int64 column); price Decimal128 ("12.50", "0.10", ...); at Date
+#             (2026-01-01T00:00:00Z + NN days); bin BinData subtype 0 (bytes 00 ff NN);
+#             uuid BinData subtype 4; tags array of strings; meta embedded document
+#             {city, zip, geo: {lat, lon}}; mixed: string in doc 1, int32 in doc 2, double in
+#             doc 3, null in doc 4, object in doc 5, array in doc 6, missing in 7-12 (one
+#             `mixed` column); flag bool; only_late: a field present only in doc 12 (outside
+#             a 10-document sample).
+#   m7_big    200 000 documents {_id: int32 1..200000, g: int32 (_id % 100), s: "row-<_id>"}
+#             inserted in batches; streaming, cancel and paging checks.
+#   m7_edit   3 seed documents {_id: int32 1..3, name: "seed-<n>", v: int32 n}; edit tests
+#             insert their own with _id = "t<token>-<n>" (string) and never touch 1-3.
+#   m7_view   view on m7_docs: [{$match: {flag: true}}, {$project: {name: 1, n: 1}}].
+#   indexes   m7_docs_name_idx {name: 1}; m7_docs_tags_idx {tags: 1} (multikey);
+#             m7_docs_at_ttl {at: 1} expireAfterSeconds 3153600000 (100 years: nothing
+#             expires); m7_big_g_idx {g: 1}; m7_docs_meta_city_uq {"meta.city": 1} unique,
+#             partialFilterExpression {"meta.city": {$exists: true}}.
+#   user      m7_reader (password Oxbase_Fixture_Pw_2026, roles read@oxbase_test), created
+#             in admin; role m7_role (in oxbase_test: find on m7_docs).
+[m7.mongodb]
+init_script = "tests/docker/init/mongodb/02-m7.js"
+database = "oxbase_test"
+collections = ["m7_docs", "m7_big", "m7_edit"]
+view = "m7_view"
+view_on = "m7_docs"
+indexes = ["m7_docs_name_idx", "m7_docs_tags_idx", "m7_docs_at_ttl", "m7_docs_meta_city_uq", "m7_big_g_idx"]
+user = "m7_reader"
+user_password = "Oxbase_Fixture_Pw_2026"
+role = "m7_role"
+docs_count = 12
+big_count = 200000
+edit_seed_count = 3
+# Shell statements the exit-check tests run (exact expected values in docs/m7-contracts.md
+# §11).
+shell_count = "db.m7_docs.countDocuments({})"
+shell_find = "db.m7_big.find({g: 7}).sort({_id: 1}).limit(5)"
+shell_aggregate = "db.m7_big.aggregate([{$group: {_id: null, total: {$sum: \"$g\"}}}])"
+
+# Keys of database 0 unless noted, created by seed-m7.redis (after the M0 seed).
+#
+#   m7:string        "hello"                       m7:binary   bytes 00 ff fe 0a ("\x00\xff\xfe\n")
+#   m7:hash          f1=v1 f2=v2 f3="grüße"         m7:list     a b c
+#   m7:set           a b c                         m7:zset     a 1, b 2, c 3
+#   m7:stream        2 entries 1767261600000-0 {k: v1}, 1767261600000-1 {k: v2}
+#   m7:ttl           "expires" with EXPIRE 86400 (set at seed time; the job is shorter)
+#   m7:json          {"a": 1, "b": [true, null]} with JSON.SET (RedisJSON ships with Redis 8)
+#   m7:big:list      200 000 elements "e1" .. "e200000" (RPUSH in batches)
+#   m7:big:zset      200 000 members "m1" .. "m200000", score = n
+#   m7:ns:a:1, m7:ns:a:2, m7:ns:b:1, m7:ns:leaf    strings: the namespace tree
+#                    m7: → m7:ns: → {m7:ns:a: (2 keys), m7:ns:b: (1 key), m7:ns:leaf}
+#   m7:edit:seed     hash {v: 1}; edit tests write m7:edit:t<token>:* only
+#   database 1:      m7:db1:key "one" (the tree lists databases 0..15 and reads db 1)
+#   ACL user         m7_reader, password Oxbase_Fixture_Pw_2026, rules `on ~m7:* +@read`
+[m7.redis]
+seed_script = "tests/docker/init/redis/seed-m7.redis"
+database = "0"
+databases = 16
+keys = ["m7:string", "m7:binary", "m7:hash", "m7:list", "m7:set", "m7:zset", "m7:stream", "m7:ttl", "m7:big:list", "m7:big:zset", "m7:ns:a:1", "m7:ns:a:2", "m7:ns:b:1", "m7:ns:leaf", "m7:edit:seed"]
+json_key = "m7:json"
+json_optional = true
+big_list = "m7:big:list"
+big_zset = "m7:big:zset"
+big_count = 200000
+ttl_key = "m7:ttl"
+namespace_root = "m7:"
+namespace_separator = ":"
+db1_key = "m7:db1:key"
+acl_user = "m7_reader"
+acl_password = "Oxbase_Fixture_Pw_2026"
+pubsub_channel = "m7:news"
+pubsub_pattern = "m7:*"
+
+# Redis Cluster: three masters, no replicas (`--cluster-replicas 0`), Redis 8.10.3. The nodes
+# run with `network_mode: host` (Linux CI runners): each listens on 127.0.0.1:<port> and its
+# cluster bus on <port> + 10000, and announces 127.0.0.1, so CLUSTER SLOTS answers addresses
+# the tests can dial (no NAT mapping needed). `--requirepass` / `--masterauth` the fixture
+# password, user default. A one-shot service runs `redis-cli --cluster create ... --cluster-yes`
+# once all three answer, then the seed (100 keys m7:cluster:{0..99} plus m7:cluster:hash).
+# Ports 15501-15503 and 25501-25503 were free on the runner image and locally (ss -ltn,
+# 2026-11-02). Health: CLUSTER INFO says cluster_state:ok on every node.
+[m7.redis_cluster]
+image = "redis:8.10.3-alpine"
+host = "127.0.0.1"
+ports = [15501, 15502, 15503]
+bus_port_offset = 10000
+user = "default"
+password = "Oxbase_Fixture_Pw_2026"
+masters = 3
+seed_keys = 100
+key_prefix = "m7:cluster:"
+
+# Redis Sentinel: one master, one replica, one sentinel (quorum 1), Redis 8.10.3,
+# `network_mode: host` like the cluster so the sentinel reports an address the tests can dial.
+# Master 127.0.0.1:15511 (requirepass), replica 127.0.0.1:15512 (`--replicaof 127.0.0.1 15511`,
+# masterauth), sentinel 127.0.0.1:15526 (`sentinel monitor oxmaster 127.0.0.1 15511 1`,
+# `sentinel auth-pass oxmaster <password>`, no password of its own: profile option
+# sentinel_auth = none). Seed: m7:sentinel = "master". No failover is exercised in CI.
+[m7.redis_sentinel]
+image = "redis:8.10.3-alpine"
+host = "127.0.0.1"
+master_port = 15511
+replica_port = 15512
+sentinel_port = 15526
+master_name = "oxmaster"
+user = "default"
+password = "Oxbase_Fixture_Pw_2026"
+seed_key = "m7:sentinel"

@@ -47,7 +47,7 @@ impl KeyService {
     pub async fn open_scan(
         &self,
         target: RunTarget,
-        request: KeyScanRequest,
+        request: &KeyScanRequest,
         options: RunOptions,
         cancel: CancellationToken,
     ) -> Result<RunHandle> {
@@ -58,8 +58,8 @@ impl KeyService {
             .query
             .dialects()
             .key_value_store(base.summary().engine)?;
-        let source = store.scan(&request)?;
-        let text = store.scan_text(&request);
+        let source = store.scan(request)?;
+        let text = store.scan_text(request);
         let options = RunOptions {
             database: Some(request.database.clone()),
             record_history: false,
@@ -75,18 +75,18 @@ impl KeyService {
     pub async fn open_value(
         &self,
         target: RunTarget,
-        key: KeyAddress,
+        key: &KeyAddress,
         options: RunOptions,
         cancel: CancellationToken,
     ) -> Result<(RunHandle, KeyInfo)> {
-        let info = self.info(target.session, &key, cancel.clone()).await?;
+        let info = self.info(target.session, key, cancel.clone()).await?;
         let base = self.base(target.session)?;
         let store = self
             .query
             .dialects()
             .key_value_store(base.summary().engine)?;
-        let source = store.read_value(&key, info.key_type)?;
-        let text = store.read_text(&key, info.key_type);
+        let source = store.read_value(key, info.key_type)?;
+        let text = store.read_text(key, info.key_type);
         let options = RunOptions {
             database: Some(key.database.clone()),
             record_history: false,

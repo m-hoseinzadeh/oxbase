@@ -231,7 +231,8 @@ pub struct RunOptions {
     pub keep_previous: bool,
     /// M7: run statements the editor language marks as needing confirmation (Redis
     /// `FLUSHDB`, mongo-shell `dropDatabase()`); the UI sets it after asking (default
-    /// `false`; see the module docs).
+    /// `false`, then not serialized; see the module docs).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub confirm_destructive: bool,
 }
 

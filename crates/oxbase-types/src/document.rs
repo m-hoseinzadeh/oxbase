@@ -42,6 +42,10 @@ pub const MAX_DOCUMENT_EDITS: usize = 10_000;
 /// an ordinary query run: events, pages, cancel and close as for `query_run`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "a request is built once per run; boxing would only complicate the payload type"
+)]
 pub enum DocumentQuery {
     Find(FindRequest),
     Aggregate(AggregateRequest),

@@ -1345,3 +1345,190 @@ async fn a_later_statement_of_the_run_keeps_the_session_after_an_unfinished_stop
     );
     assert_eq!(connects(&h), 2, "the session is kept");
 }
+
+// ---------------------------------------------------------------------------------------------
+// M7: result sources and editor languages of engines without SQL
+// ---------------------------------------------------------------------------------------------
+
+/// A source of ten rows `(id, name)` that never touches the connection's statement path.
+struct TenRows;
+
+#[async_trait]
+impl ResultSource for TenRows {
+    async fn open(&self, c: &dyn Connection, cancel: CancellationToken) -> Result<ResultStream> {
+        let _ = c;
+        if cancel.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        let items: Vec<Result<ResultItem>> = vec![
+            Ok(ResultItem::Schema(schema())),
+            Ok(ResultItem::Batch(rows_batch(1, 10))),
+        ];
+        Ok(stream::iter(items).boxed())
+    }
+}
+
+#[tokio::test]
+async fn result_sources_run_like_a_statement() {
+    let h = Harness::new(|_| {}).await;
+    let handle = h
+        .service
+        .run_source(
+            h.target("source"),
+            "scan everything".to_owned(),
+            Arc::new(TenRows),
+            no_history(),
+        )
+        .await
+        .unwrap();
+    let id = handle.id;
+    let events = drain(handle.events).await;
+    assert_eq!(
+        shape(&events),
+        [
+            "started 1",
+            "stmt 0",
+            "result 0 of 0 (2 cols)",
+            "done 0: 10",
+            "ok 0 None",
+            "finished"
+        ]
+    );
+    let RunEvent::Started { statements, .. } = &events[0] else {
+        panic!("{events:?}");
+    };
+    assert_eq!(statements[0].end_byte, "scan everything".len());
+    check_rows(&h.service.page(id, 0, 0, 100).await.unwrap(), 1);
+    assert_eq!(h.statements_run(), Vec::<String>::new());
+}
+
+/// A console language: one statement per line; `FLUSHALL` needs confirmation, `MONITOR` is
+/// blocked.
+struct TestConsole;
+
+impl oxbase_dialect::ScriptLanguage for TestConsole {
+    fn name(&self) -> &'static str {
+        "test-console"
+    }
+
+    fn editor_language(&self) -> &'static str {
+        "plaintext"
+    }
+
+    fn split(&self, text: &str) -> Vec<oxbase_sql::Statement> {
+        let mut out = Vec::new();
+        let mut offset = 0;
+        for line in text.split_inclusive('\n') {
+            let range = offset..offset + line.len();
+            offset = range.end;
+            if let Some(trimmed) = oxbase_dialect::script::trim_range(text, range.clone()) {
+                out.push(oxbase_dialect::script::statement(
+                    text,
+                    trimmed,
+                    range.end,
+                    StatementKind::Other,
+                ));
+            }
+        }
+        out
+    }
+
+    fn redact_secrets<'a>(&self, text: &'a str) -> std::borrow::Cow<'a, str> {
+        std::borrow::Cow::Borrowed(text)
+    }
+
+    fn guard(&self, statement: &oxbase_sql::Statement) -> StatementGuard {
+        match statement.text.as_str() {
+            "FLUSHALL" => StatementGuard::Confirm("FLUSHALL deletes every key".to_owned()),
+            "MONITOR" => StatementGuard::Blocked("MONITOR never ends".to_owned()),
+            _ => StatementGuard::Allowed,
+        }
+    }
+}
+
+#[tokio::test]
+async fn engines_without_sql_run_their_registered_language() {
+    let profile = ConnectionProfile::new(
+        "redis",
+        Engine::Redis,
+        ProfileAddress::Network {
+            host: "redis.invalid".into(),
+            port: Some(6379),
+        },
+    );
+    let h = Harness::with_profile(profile, |_| {}).await;
+    // No language registered: no editor.
+    let err = h
+        .service
+        .run(h.target("console"), "PING", no_history())
+        .await
+        .unwrap_err();
+    assert_eq!(err.category(), ErrorCategory::Unsupported);
+
+    let mut dialects = DialectRegistry::new();
+    dialects.register_script_language(Engine::Redis, Arc::new(TestConsole));
+    let dialects = Arc::new(dialects);
+    let service = QueryService::new(
+        Arc::clone(&h.manager),
+        Arc::clone(&dialects),
+        Arc::new(HistoryService::new(h.repo.clone())),
+        QueryConfig {
+            spill_dir: h.spill.path().join("results-m7"),
+            rows_event_interval: Duration::ZERO,
+            ..QueryConfig::default()
+        },
+    );
+    let handle = service
+        .run(h.target("console"), "PING\n\nGET a\n", no_history())
+        .await
+        .unwrap();
+    let events = drain(handle.events).await;
+    assert_eq!(
+        shape(&events),
+        [
+            "started 2",
+            "stmt 0",
+            "ok 0 Some(0)",
+            "stmt 1",
+            "ok 1 Some(0)",
+            "finished"
+        ]
+    );
+
+    let err = service
+        .run(h.target("console"), "GET a\nFLUSHALL", no_history())
+        .await
+        .unwrap_err();
+    assert_eq!(err.category(), ErrorCategory::InvalidInput);
+    assert!(
+        err.to_string()
+            .contains(&format!("{CONFIRMATION_REQUIRED}statement 2")),
+        "{err}"
+    );
+    let err = service
+        .run(h.target("console"), "MONITOR", no_history())
+        .await
+        .unwrap_err();
+    assert_eq!(err.category(), ErrorCategory::InvalidInput);
+    assert!(!h.statements_run().iter().any(|s| s.ends_with("FLUSHALL")));
+
+    let confirmed = RunOptions {
+        confirm_destructive: true,
+        ..no_history()
+    };
+    let handle = service
+        .run(h.target("console"), "FLUSHALL", confirmed)
+        .await
+        .unwrap();
+    assert_eq!(
+        shape(&drain(handle.events).await).last().unwrap(),
+        "finished"
+    );
+    assert!(h.statements_run().iter().any(|s| s.ends_with("FLUSHALL")));
+
+    let span = QueryService::statement_at_with(&dialects, Engine::Redis, "PING\n\nGET a", 6)
+        .unwrap()
+        .unwrap();
+    assert_eq!(span.index, 1);
+    assert!(QueryService::statement_at(Engine::Redis, "PING", 0).is_err());
+}

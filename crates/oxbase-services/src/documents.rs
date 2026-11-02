@@ -45,7 +45,7 @@ impl DocumentService {
     pub async fn open(
         &self,
         target: RunTarget,
-        request: DocumentQuery,
+        request: &DocumentQuery,
         options: RunOptions,
         cancel: CancellationToken,
     ) -> Result<RunHandle> {
@@ -60,8 +60,8 @@ impl DocumentService {
             .query
             .dialects()
             .document_store(base.summary().engine)?;
-        let source = store.query(&request)?;
-        let text = store.request_text(&request);
+        let source = store.query(request)?;
+        let text = store.request_text(request);
         check_cancelled(&cancel)?;
         self.query.run_source(target, text, source, options).await
     }

@@ -464,6 +464,35 @@ the text above or from `docs/m6-contracts.md` (its §12 lists the planned deviat
   line that may be an alias) and `missing-if-exists` (hint). They need no cache, so they also
   appear without one (contracts §4.5, §12).
 
+**M7 contracts (Design step, 2026-11-02).** `docs/m7-contracts.md` fixes the MongoDB and Redis
+contracts. Drivers: `mongodb` 3.9.1 (official, Apache-2.0) with `rustls-tls` (ring) built in but
+unused: it verifies TLS only against the host it dials and has no chain-only mode, platform
+roots or in-memory keys, so every client goes through an **in-process SOCKS5 dialer** (the
+crate's `socks5-proxy` hook; loopback, per-client random credentials) that dials the SSH tunnel
+and runs the TLS handshake with `oxbase_net::tls` against the real server name; SCRAM-SHA-1/256,
+X.509 and PLAIN; cancel by comment-tagged operations, `$currentOp` + `killOp` and dropping the
+cursor; SRV in M7 without SSH. `redis` 1.8.1 (BSD-3-Clause, stable; 2.0 is a release
+candidate) with `tokio-rustls-comp` + `tls-rustls-insecure` on the process-default ring
+provider; the dial / name split goes through its `AsyncDNSResolver` hook; RESP3 on 6.0+,
+cluster and sentinel (no SSH for those), cancel by `CLIENT UNBLOCK` / `SCRIPT KILL` or a
+replaced connection. `rquickjs` 0.14.0 (MIT; QuickJS-ng built with `cc`, pre-generated bindings
+for every CI target) runs a sandboxed mongo-shell subset (no host modules, memory / stack / CPU
+limits, interrupt on cancel, one thread per session). `serde_json` gains `preserve_order`
+(MongoDB sort and document field order); `deny.toml` allows BSL-1.0 (`xxhash-rust` via redis).
+Model: collections are `Table` (labelled "Collections" through the new `TreeLayout::with_label`),
+Redis key namespaces are `Schema` refs and keys `Key`; documents become Arrow pages with columns
+inferred from a sample, JSON text for nested and mixed values and a hidden `$document` column
+with the whole document; Redis values stream per type in chunks. Query languages are
+engine-neutral: a per-engine `ScriptLanguage` (split, guards with a confirmation flow, history
+redaction) behind `oxbase_services::script::StatementSource`, so the shell and the console run
+through the M2 `query_run` path, and `QueryService::run_source` runs dialect-built
+`ResultSource`s (find / aggregate requests, `SCAN` key browsing, typed value reads). Editing:
+optimistic document edits (no transactions on standalone servers) and atomic `WATCH` / `MULTI`
+key edits; pub/sub on dedicated connections with a bounded, lossy buffer over a Tauri
+`Channel`. Fixtures add TLS for both engines, SSH targets, seeds, a 3-master Redis cluster and
+a sentinel setup. Seven streams (mongo-driver, redis-driver, mongo, redis, shell, app,
+conformance) fill the skeletons.
+
 Order of work: M0–M3 prove the architecture. M4 and M7 are where the per-database matrix gets tested for real. M8 and M10 reuse the Comparator and DdlGenerator cells and get much cheaper if M3 is done right.
 
 ## 7. Main risks
