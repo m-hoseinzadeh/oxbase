@@ -152,11 +152,12 @@ pub(crate) async fn read_info(
         one("OBJECT ENCODING"),
         one("MEMORY USAGE"),
     );
+    // Boxed: four session commands side by side would make a large future.
     let (key_type, ttl, encoding, memory) = futures::join!(
-        c.command(&type_cmd, cancel),
-        c.command(&ttl_cmd, cancel),
-        c.command(&encoding_cmd, cancel),
-        c.command(&memory_cmd, cancel),
+        Box::pin(c.command(&type_cmd, cancel)),
+        Box::pin(c.command(&ttl_cmd, cancel)),
+        Box::pin(c.command(&encoding_cmd, cancel)),
+        Box::pin(c.command(&memory_cmd, cancel)),
     );
     let Some(key_type) = key_type_of(&key_type?) else {
         return Ok(None);
@@ -166,7 +167,7 @@ pub(crate) async fn read_info(
         return Ok(None);
     }
     let length = match length_command(key_type) {
-        Some(name) => match c.command(&one(name), cancel).await {
+        Some(name) => match Box::pin(c.command(&one(name), cancel)).await {
             Ok(v) => int_of(&v).and_then(|n| u64::try_from(n).ok()),
             Err(e) if e.is_cancelled() => return Err(e),
             Err(_) => None,

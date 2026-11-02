@@ -139,7 +139,8 @@ impl ScanState {
     async fn next(&mut self, cancel: &CancellationToken) -> Result<Step> {
         loop {
             check(cancel)?;
-            if self.node >= self.nodes.nodes.len() || self.limit.is_some_and(|l| self.emitted >= l)
+            if self.node >= self.nodes.endpoints.len()
+                || self.limit.is_some_and(|l| self.emitted >= l)
             {
                 return Ok((Vec::new(), false));
             }
@@ -190,8 +191,8 @@ impl ScanState {
                 self.emitted += 1;
                 rows.push((key, key_type, ttl));
             }
-            let more = self.node < self.nodes.nodes.len()
-                && !self.limit.is_some_and(|l| self.emitted >= l);
+            let more = self.node < self.nodes.endpoints.len()
+                && self.limit.is_none_or(|l| self.emitted < l);
             if rows.is_empty() {
                 if more {
                     continue;

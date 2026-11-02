@@ -299,13 +299,13 @@ async fn read_messages(
         tokio::select! {
             biased;
             () = stop.cancelled() => return,
-            msg = messages.next() => match msg {
-                Some(msg) => forward.push(message_event(&msg)),
-                None => {
+            msg = messages.next() => {
+                let Some(msg) = msg else {
                     forward.finish(Some(LOST.to_owned()));
                     return;
-                }
-            },
+                };
+                forward.push(message_event(&msg));
+            }
         }
     }
 }

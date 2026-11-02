@@ -285,7 +285,7 @@ pub(crate) fn json_bytes(bytes: &[u8]) -> serde_json::Value {
 /// Where scans run: the masters of a cluster, else the one server.
 pub(crate) struct Nodes {
     pub handle: RedisHandle,
-    pub nodes: Vec<Endpoint>,
+    pub endpoints: Vec<Endpoint>,
     pub cluster: bool,
 }
 
@@ -293,7 +293,7 @@ impl Nodes {
     /// The nodes of `c`'s session (`CLUSTER SLOTS` on a cluster).
     pub(crate) async fn of(c: &RedisConnection, cancel: &CancellationToken) -> Result<Self> {
         let handle = c.handle();
-        let nodes = if c.is_cluster() {
+        let endpoints = if c.is_cluster() {
             handle.masters(cancel).await?
         } else {
             // `command_on` ignores the node outside a cluster.
@@ -305,7 +305,7 @@ impl Nodes {
         };
         Ok(Self {
             handle,
-            nodes,
+            endpoints,
             cluster: c.is_cluster(),
         })
     }
@@ -331,7 +331,7 @@ impl Nodes {
         }
         let reply = self
             .handle
-            .command_on(&self.nodes[index], &c, cancel)
+            .command_on(&self.endpoints[index], &c, cancel)
             .await?;
         let (cursor, keys) = scan_reply(reply)?;
         Ok((cursor, keys.into_iter().filter_map(into_bytes).collect()))

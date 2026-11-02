@@ -533,7 +533,7 @@ mod tests {
         c.args_iter()
             .map(|a| match a {
                 redis::Arg::Simple(b) => b.to_vec(),
-                redis::Arg::Cursor => b"<cursor>".to_vec(),
+                _ => b"<cursor>".to_vec(),
             })
             .collect()
     }

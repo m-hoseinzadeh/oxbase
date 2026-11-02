@@ -220,7 +220,7 @@ pub(crate) fn parse_keyspace(text: &str) -> BTreeMap<u32, u64> {
 async fn key_count(c: &RedisConnection, cancel: &CancellationToken) -> Result<u64> {
     let nodes = Nodes::of(c, cancel).await?;
     let mut total = 0_u64;
-    for node in &nodes.nodes {
+    for node in &nodes.endpoints {
         let reply = c.command_on(node, &redis::cmd("DBSIZE"), cancel).await?;
         total += int_of(&reply)
             .and_then(|n| u64::try_from(n).ok())
@@ -250,7 +250,7 @@ impl Level {
         pattern.push(b'*');
         let mut all = BTreeSet::new();
         let mut cut = false;
-        'nodes: for index in 0..nodes.nodes.len() {
+        'nodes: for index in 0..nodes.endpoints.len() {
             let mut cursor = b"0".to_vec();
             loop {
                 check(cancel)?;
