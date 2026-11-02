@@ -25,8 +25,9 @@
 //!   inline PEM and keychain client keys all as M1 §3) and verifies
 //!   [`ConnectParams::tls_server_name`] for the profile's server endpoint, or the requested
 //!   host for other members (`tls.server_name` overrides only the profile's own host). `Prefer`
-//!   tries TLS and falls back to plain TCP on a handshake failure (MongoDB has no in-band
-//!   negotiation); [`MongoConnection::tls_in_use`] reports what the first connection got.
+//!   tries TLS on every connection and falls back to plain TCP for that connection when the
+//!   handshake fails or does not finish within 5 s (MongoDB has no in-band negotiation);
+//!   [`MongoConnection::tls_in_use`] reports what the first connection got.
 //! - The bytes between the driver and the dialer cross the loopback interface unencrypted
 //!   inside this process's own sockets; TLS covers everything from the dialer to the server.
 //!
@@ -64,8 +65,10 @@
 //!   with the same rules as [`crate::request::RequestSource`] (Extended JSON values with the
 //!   `$regex` operator exception, `batchSize` 1000, the operation comment), or a **command
 //!   request** `{"type": "command", "database": "admin", "command": {"ping": 1}}` (the
-//!   driver's own form: one `runCommand`, its reply as one row; cursor-returning commands
-//!   belong in find / aggregate requests). The driver runs both itself (private
+//!   driver's own form: one `runCommand`, its reply as one row; a command that returns a
+//!   cursor shows its first batch, then the driver closes the server cursor and says so in a
+//!   notice, since find / aggregate requests are the streaming form; a `comment` in the
+//!   command is kept after the operation comment). The driver runs both itself (private
 //!   `driver::{statement, run, convert}`), so they work without the shell;
 //! - a **shell statement**: anything else, evaluated by the session's
 //!   [`crate::shell::ShellSession`] (`db` = [`MongoConnection::current_database`]).
@@ -84,7 +87,9 @@
 //! counter>"`. `cancel_running` and the token: stop reading (dropping the cursor sends
 //! `killCursors`), then, on another pooled connection of the same client (through the
 //! dialer, so through SSH), find the operation with `$currentOp {ownOps: true}` matching that
-//! comment and `killOp` it (users may always kill their own operations). The stream ends with
+//! comment and `killOp` it (users may always kill their own operations; when nothing matches
+//! yet, the search runs once more 200 ms later, for an operation still on its way). The
+//! stream ends with
 //! one `Error::Cancelled` within 2 s; the session stays usable. A JavaScript loop of the shell
 //! is interrupted by the shell's interrupt handler (see [`crate::shell`]).
 //!
@@ -93,7 +98,8 @@
 //! Cursors read with `batchSize` 1000 (the first batch smaller when the result is small); each
 //! server batch becomes Arrow batches as it arrives, so a 200 000-document find streams into
 //! the result store without being held in memory; the run's `maxRows` / disk cap drop the
-//! cursor (→ `killCursors`).
+//! stream, which stops the statement at once (also while it waits for a slow batch): its
+//! operation is killed by comment and the cursor dropped (→ `killCursors`).
 
 mod convert;
 mod dialer;

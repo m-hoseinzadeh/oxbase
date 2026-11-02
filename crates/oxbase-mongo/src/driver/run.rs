@@ -1,7 +1,14 @@
 //! Running JSON statements (driver module docs, *Statements*, *Cancel*, *Streaming*): one task
 //! per statement reads the cursor and feeds Arrow batches into a bounded channel that backs the
 //! [`ResultStream`]; the token stops it, kills the server operation by its comment, and ends
-//! the stream with one `Cancelled`.
+//! the stream with one `Cancelled`. A consumer that drops the stream (`maxRows`, the disk cap)
+//! stops it the same way, without the `Cancelled`.
+//!
+//! Every operation of a run carries the run's comment `oxbase:<connection id>:<n>`; a command
+//! request's own `comment` is kept after it (`oxbase:<id>:<n> <the user's comment>`), so the
+//! kill filter is the run's comment followed by a space or the end. A command that returns a
+//! cursor (`listCollections`, `find`, ...) shows its first batch; the driver then closes the
+//! server cursor in the command's session and says so in a notice.
 
 use std::pin::pin;
 use std::time::Duration;
@@ -21,6 +28,9 @@ use super::statement::{self, BATCH_ROWS, Statement};
 const CHANNEL_CAPACITY: usize = 4;
 /// Longest the `$currentOp` + `killOp` round trips of a cancel may take.
 pub(crate) const KILL_TIMEOUT: Duration = Duration::from_millis(1500);
+/// Wait before the second `$currentOp` when the first found nothing (the operation may still
+/// be on its way to the server).
+const KILL_RETRY_DELAY: Duration = Duration::from_millis(200);
 
 type Sender = mpsc::Sender<Result<ResultItem>>;
 
@@ -64,29 +74,43 @@ pub(crate) fn spawn(
     .boxed()
 }
 
+/// How a statement task ended.
+enum Outcome {
+    Finished(std::result::Result<(), Halt>),
+    Cancelled,
+    /// The consumer dropped the stream while the statement was still working.
+    Abandoned,
+}
+
 async fn run(ctx: &RunContext, statement: Statement, token: &CancellationToken, tx: &Sender) {
     let mut work = Box::pin(execute(ctx, statement, tx));
     let outcome = tokio::select! {
         biased;
-        () = token.cancelled() => None,
-        r = &mut work => Some(r),
+        () = token.cancelled() => Outcome::Cancelled,
+        () = tx.closed() => Outcome::Abandoned,
+        r = &mut work => Outcome::Finished(r),
     };
-    match outcome {
-        Some(Ok(()) | Err(Halt::Gone)) => {}
-        Some(Err(Halt::Failed(e))) => {
+    let cancelled = match outcome {
+        Outcome::Finished(Ok(()) | Err(Halt::Gone)) => return,
+        Outcome::Finished(Err(Halt::Failed(e))) => {
             let _ = tx.send(Err(e)).await;
+            return;
         }
-        None => {
-            // Kill the server operation while its future (and cursor) is still alive, then let
-            // the cursor drop (the driver sends killCursors for an open cursor).
-            let filter = Bson::String(ctx.comment.clone());
-            if let Err(e) = tokio::time::timeout(KILL_TIMEOUT, kill_ops(&ctx.client, filter)).await
-            {
-                tracing::debug!(error = %e, "MongoDB cancel: killOp did not finish in time");
-            }
-            drop(work);
-            let _ = tx.send(Err(Error::Cancelled)).await;
-        }
+        Outcome::Cancelled => true,
+        Outcome::Abandoned => false,
+    };
+    // Kill the server operation while its future (and cursor) is still alive, then let the
+    // cursor drop (the driver sends killCursors for an open cursor).
+    // A cancel looks twice (the operation may still be on its way); a dropped stream once.
+    let kill = kill_ops_with_retry(&ctx.client, run_comments(&ctx.comment), cancelled);
+    match tokio::time::timeout(KILL_TIMEOUT, kill).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => tracing::debug!(error = %e, "MongoDB cancel: killOp failed"),
+        Err(_) => tracing::debug!("MongoDB cancel: killOp did not finish in time"),
+    }
+    drop(work);
+    if cancelled {
+        let _ = tx.send(Err(Error::Cancelled)).await;
     }
 }
 
@@ -106,19 +130,35 @@ async fn execute(
             database,
             mut command,
         } => {
-            if !command.contains_key("comment") {
-                command.insert("comment", comment);
-            }
+            // Replaces the user's comment in place (key order kept), keeping its text.
+            let comment = command_comment(&ctx.comment, command.get("comment"));
+            command.insert("comment", comment);
+            // An explicit session, so a cursor the command opens can be closed in it.
+            let mut session = ctx.client.start_session().await.map_err(map)?;
             let reply = ctx
                 .client
                 .database(&database)
                 .run_command(command)
+                .session(&mut session)
                 .await
                 .map_err(map)?;
+            let closed = close_reply_cursor(ctx, &mut session, &reply).await;
             let layout = Layout::infer(std::slice::from_ref(&reply), None);
             send(tx, ResultItem::Schema(layout.schema())).await?;
             let (batch, _) = layout.batch(&[reply])?;
-            send(tx, ResultItem::Batch(batch)).await
+            send(tx, ResultItem::Batch(batch)).await?;
+            if closed {
+                send(
+                    tx,
+                    ResultItem::Notice(Notice::info(
+                        "the command returned a cursor: only its first batch is shown and the \
+                         server cursor was closed (a find or aggregate request streams every \
+                         document)",
+                    )),
+                )
+                .await?;
+            }
+            Ok(())
         }
         Statement::Query(query) => {
             let collection = query.collection();
@@ -155,6 +195,49 @@ async fn execute(
             stream_documents(cursor, projection.as_ref(), ctx.sample_size, tx).await
         }
     }
+}
+
+/// The `comment` of a command request: the run's comment, then the user's own comment (its
+/// text, or relaxed Extended JSON) after a space.
+fn command_comment(ours: &str, user: Option<&Bson>) -> Bson {
+    Bson::String(match user {
+        None => ours.to_owned(),
+        Some(Bson::String(text)) => format!("{ours} {text}"),
+        Some(other) => format!("{ours} {}", other.clone().into_relaxed_extjson()),
+    })
+}
+
+/// When `reply` holds an open cursor (`cursor.id` not 0), closes it with `killCursors` in the
+/// command's session. Returns whether there was one.
+async fn close_reply_cursor(
+    ctx: &RunContext,
+    session: &mut mongodb::ClientSession,
+    reply: &Document,
+) -> bool {
+    let Ok(cursor) = reply.get_document("cursor") else {
+        return false;
+    };
+    let id = match cursor.get("id") {
+        Some(Bson::Int64(id)) => *id,
+        Some(Bson::Int32(id)) => i64::from(*id),
+        _ => 0,
+    };
+    if id == 0 {
+        return false;
+    }
+    let Some((database, collection)) = cursor.get_str("ns").ok().and_then(|ns| ns.split_once('.'))
+    else {
+        return true;
+    };
+    let kill = doc! {"killCursors": collection, "cursors": [id]};
+    let db = ctx.client.database(database);
+    if let Err(e) = db.run_command(kill).session(session).await {
+        tracing::debug!(
+            error = %map_error(&e, &ctx.redactor),
+            "MongoDB: killCursors after a command failed"
+        );
+    }
+    true
 }
 
 /// Streams documents as one result set: the first `sample_size` infer the layout, then
@@ -248,6 +331,34 @@ pub(crate) async fn kill_ops(client: &Client, filter: Bson) -> Result<usize> {
     Ok(killed)
 }
 
+/// [`kill_ops`], tried once more after [`KILL_RETRY_DELAY`] when it found nothing and `retry`.
+async fn kill_ops_with_retry(client: &Client, filter: Bson, retry: bool) -> Result<usize> {
+    let killed = kill_ops(client, filter.clone()).await?;
+    if killed > 0 || !retry {
+        return Ok(killed);
+    }
+    tokio::time::sleep(KILL_RETRY_DELAY).await;
+    kill_ops(client, filter).await
+}
+
+/// The `$regex` filter that matches the comments of one run: `comment` alone, or followed by
+/// a space and a command request's own comment.
+pub(crate) fn run_comments(comment: &str) -> Bson {
+    Bson::Document(doc! {"$regex": format!("^{}(?: |$)", regex_escape(comment))})
+}
+
+/// `text` with the PCRE metacharacters escaped.
+fn regex_escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if "\\^$.|?*+()[]{}".contains(c) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// The `$regex` filter that matches every comment of the connection `id`.
 pub(crate) fn connection_comments(id: &str) -> Bson {
     Bson::Document(doc! {"$regex": format!("^oxbase:{id}:")})
@@ -304,5 +415,40 @@ mod tests {
             connection_comments("ab12"),
             Bson::Document(doc! {"$regex": "^oxbase:ab12:"})
         );
+    }
+
+    #[test]
+    fn run_comment_filter_matches_the_run_and_a_wrapped_user_comment_only() {
+        assert_eq!(
+            run_comments("oxbase:ab12:1"),
+            Bson::Document(doc! {"$regex": "^oxbase:ab12:1(?: |$)"})
+        );
+        assert_eq!(regex_escape("a.b(c)$"), "a\\.b\\(c\\)\\$");
+    }
+
+    #[test]
+    fn command_comments_keep_the_users_comment_after_the_runs() {
+        assert_eq!(
+            command_comment("oxbase:ab:2", None),
+            Bson::String("oxbase:ab:2".into())
+        );
+        assert_eq!(
+            command_comment("oxbase:ab:2", Some(&Bson::String("mine".into()))),
+            Bson::String("oxbase:ab:2 mine".into())
+        );
+        assert_eq!(
+            command_comment("oxbase:ab:2", Some(&Bson::Document(doc! {"tag": 1_i32}))),
+            Bson::String(r#"oxbase:ab:2 {"tag":1}"#.into())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dropped_consumer_closes_the_channel() {
+        let (tx, rx) = mpsc::channel::<Result<ResultItem>>(CHANNEL_CAPACITY);
+        drop(rx);
+        // `run` selects on this: it resolves at once when the stream is gone.
+        tokio::time::timeout(Duration::from_secs(1), tx.closed())
+            .await
+            .unwrap();
     }
 }

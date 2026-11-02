@@ -12,8 +12,8 @@
 //!    profile is tunnelled (a tunnel reaches one server);
 //! 3. runs the TLS handshake with `oxbase_net::tls::client_config` when the profile asks for
 //!    TLS, verifying [`ConnectParams::tls_server_name`] for the profile's own endpoint and the
-//!    requested host for other members (`Prefer` falls back to plain TCP when the handshake
-//!    fails);
+//!    requested host for other members (`Prefer` falls back to plain TCP, per connection,
+//!    when the handshake fails or does not finish within [`PREFER_HANDSHAKE_TIMEOUT`]);
 //! 4. answers the SOCKS request and copies bytes both ways until either side closes or the
 //!    dialer stops.
 //!
@@ -25,7 +25,7 @@ use std::fmt;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -63,6 +63,9 @@ const REP_ADDRESS_NOT_SUPPORTED: u8 = 8;
 
 /// Longest the SOCKS greeting and request of the client may take.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// `Prefer`: longest the TLS handshake may take before the connection falls back to plain TCP
+/// (capped by the connect timeout), so a server that never answers it leaves time for plain.
+const PREFER_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// What the first finished connection to a server used (for `tls_in_use`).
 const TLS_UNKNOWN: u8 = 0;
@@ -92,9 +95,6 @@ struct Shared {
     username: String,
     password: String,
     tls_state: AtomicU8,
-    /// `Prefer` only: the server answered the TLS handshake with garbage once; later
-    /// connections go plain straight away.
-    prefer_plain: AtomicBool,
     last_error: Mutex<Option<String>>,
     /// Counts dial failures, so the connect step can stop waiting at the first one.
     failures: watch::Sender<u64>,
@@ -159,7 +159,6 @@ impl Dialer {
             username: random_token(),
             password: random_token(),
             tls_state: AtomicU8::new(TLS_UNKNOWN),
-            prefer_plain: AtomicBool::new(false),
             last_error: Mutex::new(None),
             failures,
         });
@@ -418,10 +417,6 @@ async fn connect_upstream(
         shared.note_tls(false);
         return Ok(Upstream::Plain(tcp));
     };
-    if setup.mode == TlsMode::Prefer && shared.prefer_plain.load(Ordering::Acquire) {
-        let tcp = dial_tcp(shared, target, &dial).await?;
-        return Ok(Upstream::Plain(tcp));
-    }
     let name = if own {
         let host = shared
             .server_tls_name
@@ -438,15 +433,21 @@ async fn connect_upstream(
     .map_err(|e| (REP_GENERAL_FAILURE, format!("TLS for {target}: {e}")))?;
     let tcp = dial_tcp(shared, target, &dial).await?;
     let connector = TlsConnector::from(Arc::clone(&setup.config));
-    let handshake = tokio::time::timeout(shared.connect_timeout, connector.connect(name, tcp));
-    match handshake.await {
+    let prefer = setup.mode == TlsMode::Prefer;
+    let limit = if prefer {
+        shared.connect_timeout.min(PREFER_HANDSHAKE_TIMEOUT)
+    } else {
+        shared.connect_timeout
+    };
+    match tokio::time::timeout(limit, connector.connect(name, tcp)).await {
         Ok(Ok(tls)) => {
             shared.note_tls(true);
             Ok(Upstream::Tls(Box::new(tls)))
         }
-        Ok(Err(e)) if setup.mode == TlsMode::Prefer => {
-            tracing::debug!(error = %e, "MongoDB dialer: TLS refused, falling back to plain TCP");
-            shared.prefer_plain.store(true, Ordering::Release);
+        // `Prefer`: this connection only goes plain (a later one tries TLS again), whether the
+        // handshake failed or never finished.
+        Ok(Err(_)) | Err(_) if prefer => {
+            tracing::debug!("MongoDB dialer: no TLS under Prefer, this connection goes plain");
             let tcp = dial_tcp(shared, target, &dial).await?;
             shared.note_tls(false);
             Ok(Upstream::Plain(tcp))

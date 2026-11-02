@@ -550,7 +550,12 @@ async fn json_requests_run_through_execute() {
     let set = &out.result_sets[0];
     let total = set.batches[0].column(set.schema.index_of("total").unwrap());
     assert_eq!(total.as_primitive::<Int64Type>().value(0), 6);
-    assert!(set.batches[0].column(0).is_null(0), "_id: null");
+    assert!(!set.batches[0].column(0).is_null(0), "_id: present");
+    assert_eq!(
+        set.batches[0].column(0).as_string::<i32>().value(0),
+        "null",
+        "_id: null is JSON text in a null-only column"
+    );
 
     let out = run(
         &c,
@@ -562,6 +567,41 @@ async fn json_requests_run_through_execute() {
     let set = &out.result_sets[0];
     let n = set.batches[0].column(set.schema.index_of("n").unwrap());
     assert_eq!(n.as_primitive::<Int32Type>().value(0), 3);
+
+    // A cursor-returning command: its first batch, then the server cursor is closed (a getMore
+    // finds nothing) and a notice says so. The user's own comment is kept.
+    let out = run(
+        &c,
+        &format!(
+            r#"{{"type": "command", "database": "{DATABASE}", "command": {{"find": "{name}", "batchSize": 1, "comment": "mine"}}}}"#
+        ),
+    )
+    .await;
+    let set = &out.result_sets[0];
+    assert_eq!(set.num_rows(), 1);
+    let cursor = set.batches[0].column(set.schema.index_of("cursor").unwrap());
+    let cursor: serde_json::Value =
+        serde_json::from_str(cursor.as_string::<i32>().value(0)).unwrap();
+    let id = cursor["id"].as_i64().expect("cursor id");
+    assert_ne!(id, 0, "batchSize 1 of 3 documents leaves a cursor open");
+    assert!(
+        out.notices
+            .iter()
+            .any(|n| n.message.contains("first batch")),
+        "{:?}",
+        out.notices
+    );
+    let get_more = format!(
+        r#"{{"type": "command", "database": "{DATABASE}", "command": {{"getMore": {{"$numberLong": "{id}"}}, "collection": "{name}"}}}}"#
+    );
+    let err = collect(
+        c.execute(&get_more, &[], CancellationToken::new())
+            .await
+            .unwrap(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.sql_code(), Some("CursorNotFound"), "{err}");
 
     // Server errors keep their code name; requests are checked before they are sent.
     let err = collect(

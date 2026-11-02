@@ -4,6 +4,13 @@
 //! values, NULL plus a count for values that do not fit their column, and the `$document`
 //! column (canonical Extended JSON of the whole document) last.
 //!
+//! A missing field is NULL. An explicit BSON `null` is NULL in typed columns and the JSON text
+//! `null` in JSON text columns (so the grid tells it apart from a missing field there). A
+//! column that held only nulls in the sample is a JSON text column tagged `mixed`
+//! (`oxbase.bson_types = null`) that takes any later value. A document field named like the
+//! document column (`$document`, allowed since MongoDB 5.0) gets no column of its own; the
+//! document column holds it.
+//!
 //! The driver's request statements and command replies use it; `crate::arrow::DocumentLayout`
 //! is the crate-wide entry point with the same rules (mongo stream).
 
@@ -137,6 +144,9 @@ impl Layout {
         let mut seen: HashMap<String, Seen> = HashMap::new();
         for doc in sample {
             for (key, value) in doc {
+                if key == DOCUMENT_COLUMN {
+                    continue;
+                }
                 let entry = seen.entry(key.clone()).or_insert_with(|| {
                     order.push(key.clone());
                     Seen::default()
@@ -212,6 +222,10 @@ impl Layout {
             let mut values: Vec<Option<&Bson>> = Vec::with_capacity(rows);
             for doc in documents {
                 values.push(match doc.get(&column.name) {
+                    // JSON text columns write the JSON `null` (or `{"$undefined": true}`).
+                    Some(v @ (Bson::Null | Bson::Undefined)) if column.kind == Kind::Json => {
+                        Some(v)
+                    }
                     None | Some(Bson::Null | Bson::Undefined) => None,
                     Some(v) if column.fits(v.element_type()) => Some(v),
                     Some(_) => {
@@ -264,10 +278,8 @@ fn column_for(name: &str, seen: &Seen) -> (Column, Field) {
             _ => (Kind::Json, DataType::Utf8),
         };
         (kind, Some(t), data_type, type_name(t))
-    } else if types.is_empty() {
-        // Only nulls: a JSON column that any later value fits.
-        (Kind::Json, None, DataType::Utf8, "null")
     } else {
+        // Several types, or only nulls: a JSON column that any later value fits.
         (Kind::Json, None, DataType::Utf8, "mixed")
     };
     let mut metadata = HashMap::from([
@@ -277,7 +289,7 @@ fn column_for(name: &str, seen: &Seen) -> (Column, Field) {
     if kind == Kind::Json {
         metadata.insert(META_EXTENSION_NAME.to_owned(), JSON_EXTENSION.to_owned());
     }
-    if types.len() > 1 && kind == Kind::Json {
+    if kind == Kind::Json && accepts.is_none() {
         let mut listed: Vec<&str> = types.iter().map(|t| type_name(*t)).collect();
         if seen.nulls {
             listed.push("null");
@@ -309,7 +321,9 @@ fn build(kind: Kind, values: &[Option<&Bson>]) -> ArrayRef {
             for v in values.iter().copied() {
                 match v {
                     None => b.append_null(),
-                    Some(Bson::ObjectId(oid)) => b.append_value(oid.to_hex()),
+                    Some(Bson::ObjectId(oid)) if kind == Kind::ObjectId => {
+                        b.append_value(oid.to_hex());
+                    }
                     Some(Bson::String(s)) if kind != Kind::Json => b.append_value(s),
                     Some(Bson::Decimal128(d)) if kind == Kind::Decimal => {
                         b.append_value(d.to_string());
@@ -572,7 +586,7 @@ mod tests {
         assert_eq!(mixed.value(0), r#""text""#);
         assert_eq!(mixed.value(1), "5");
         assert_eq!(mixed.value(2), "2.5");
-        assert!(mixed.is_null(3));
+        assert_eq!(mixed.value(3), "null", "an explicit null is JSON text");
         assert_eq!(mixed.value(4), r#"{"a":1}"#);
         assert_eq!(mixed.value(5), "[1,2]");
         assert!(mixed.is_null(6), "missing");
@@ -630,6 +644,52 @@ mod tests {
         assert_eq!(type_name(ElementType::MinKey), "minKey");
         let docs = vec![doc! {"only_null": Bson::Null}];
         let layout = Layout::infer(&docs, None);
-        assert_eq!(meta(&layout, "only_null", META_BSON_TYPE), Some("null"));
+        assert_eq!(meta(&layout, "only_null", META_BSON_TYPE), Some("mixed"));
+        assert_eq!(meta(&layout, "only_null", META_BSON_TYPES), Some("null"));
+    }
+
+    #[test]
+    fn object_ids_in_json_columns_stay_extended_json() {
+        let oid = ObjectId::parse_str("65a000000000000000000001").unwrap();
+        let digits = ObjectId::parse_str("650000000000000000000001").unwrap();
+        // `_id` mixes ObjectId and int; `owner` is null-only in the sample.
+        let sample = vec![
+            doc! {"_id": oid, "owner": Bson::Null},
+            doc! {"_id": 2_i32, "owner": Bson::Null},
+        ];
+        let layout = Layout::infer(&sample, None);
+        assert_eq!(meta(&layout, "_id", META_BSON_TYPE), Some("mixed"));
+        assert_eq!(meta(&layout, "_id", META_BSON_TYPES), Some("objectId,int"));
+        assert_eq!(meta(&layout, "owner", META_BSON_TYPE), Some("mixed"));
+        let later = vec![doc! {"_id": digits, "owner": digits}, doc! {"_id": 3_i32}];
+        let (batch, misfits) = layout.batch(&sample).unwrap();
+        assert_eq!(misfits, 0);
+        let id = batch.column(0).as_string::<i32>();
+        assert_eq!(id.value(0), r#"{"$oid":"65a000000000000000000001"}"#);
+        assert_eq!(id.value(1), "2");
+        let owner = batch.column(1).as_string::<i32>();
+        assert_eq!(owner.value(0), "null");
+        let (batch, misfits) = layout.batch(&later).unwrap();
+        assert_eq!(misfits, 0, "a null-only column takes any later value");
+        let id = batch.column(0).as_string::<i32>();
+        assert_eq!(id.value(0), r#"{"$oid":"650000000000000000000001"}"#);
+        let owner = batch.column(1).as_string::<i32>();
+        assert_eq!(owner.value(0), r#"{"$oid":"650000000000000000000001"}"#);
+        assert!(owner.is_null(1), "a missing field stays NULL");
+        for row in 0..2 {
+            let text = batch.column(0).as_string::<i32>().value(row);
+            serde_json::from_str::<serde_json::Value>(text).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_field_named_like_the_document_column_has_no_column() {
+        let docs = vec![doc! {"_id": 1_i32, "$document": "user data", "n": Bson::Null}];
+        let layout = Layout::infer(&docs, None);
+        assert_eq!(names(&layout), ["_id", "n", "$document"]);
+        let (batch, _) = layout.batch(&docs).unwrap();
+        let document = batch.column(2).as_string::<i32>().value(0);
+        assert!(document.contains("user data"), "{document}");
+        assert_eq!(batch.column(1).as_string::<i32>().value(0), "null");
     }
 }
