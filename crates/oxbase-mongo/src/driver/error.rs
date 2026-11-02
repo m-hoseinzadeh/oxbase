@@ -63,9 +63,9 @@ pub(crate) fn map_error(e: &MongoError, redactor: &Redactor) -> Error {
         ErrorKind::Shutdown => Error::connection("the MongoDB connection is closed"),
         ErrorKind::InvalidArgument { message, .. }
         | ErrorKind::InvalidTlsConfig { message, .. } => Error::invalid_input(text(message)),
-        ErrorKind::BsonDeserialization(err) => Error::invalid_input(text(&err.to_string())),
-        ErrorKind::BsonSerialization(err) => Error::invalid_input(text(&err.to_string())),
-        ErrorKind::Bson(err) => Error::invalid_input(text(&err.to_string())),
+        ErrorKind::BsonDeserialization(err)
+        | ErrorKind::BsonSerialization(err)
+        | ErrorKind::Bson(err) => Error::invalid_input(text(&err.to_string())),
         ErrorKind::IncompatibleServer { message, .. } => Error::unsupported(text(message)),
         ErrorKind::SessionsNotSupported => {
             Error::unsupported("this MongoDB deployment does not support sessions")

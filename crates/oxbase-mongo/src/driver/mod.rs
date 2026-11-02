@@ -540,10 +540,9 @@ impl Connection for MongoConnection {
         // Operations other cells and the shell started with this connection's comments.
         let filter = run::connection_comments(&self.shared.id);
         match tokio::time::timeout(run::KILL_TIMEOUT, run::kill_ops(&self.client, filter)).await {
-            Ok(Ok(_)) => Ok(()),
             Ok(Err(e)) if tokens.is_empty() => Err(e),
-            // The runs' own cancel already killed their operations.
-            Ok(Err(_)) | Err(_) => Ok(()),
+            // Done, or the runs' own cancel already killed their operations.
+            _ => Ok(()),
         }
     }
 
