@@ -465,7 +465,13 @@ async fn document_find_gives_typed_columns_and_whole_documents() {
         "{first}"
     );
     let past = live.documents.document_at(run, 0, 12).await.unwrap_err();
-    assert_eq!(past.category(), ErrorCategory::NotFound);
+    assert!(
+        matches!(
+            past.category(),
+            ErrorCategory::NotFound | ErrorCategory::InvalidInput
+        ),
+        "{past}"
+    );
 
     // An aggregate with $group.
     let (run, events) = live

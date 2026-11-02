@@ -94,20 +94,22 @@ async fn find_gives_the_column_table_of_the_contract() {
     let document = schema.field_with_name(DOCUMENT_COLUMN).unwrap();
     assert_eq!(meta(document, META_ROLE), Some("document"));
 
-    // `n` holds int32 1-6 and int64 7-12 as one Int64 column.
-    assert_eq!(set.batches.len(), 1, "12 documents fit one batch");
-    let batch = &set.batches[0];
-    let n = batch
-        .column(schema.index_of("n").unwrap())
-        .as_primitive::<Int64Type>();
-    let values: Vec<i64> = (0..n.len()).map(|i| n.value(i)).collect();
+    // `n` holds int32 1-6 and int64 7-12 as one Int64 column (the sample of 10 is one batch,
+    // the rest another).
+    let n_index = schema.index_of("n").unwrap();
+    let doc_index = schema.index_of(DOCUMENT_COLUMN).unwrap();
+    let mut values = Vec::new();
+    let mut documents = Vec::new();
+    for batch in &set.batches {
+        let n = batch.column(n_index).as_primitive::<Int64Type>();
+        values.extend((0..n.len()).map(|i| n.value(i)));
+        let docs = batch.column(doc_index).as_string::<i32>();
+        documents.extend((0..docs.len()).map(|i| docs.value(i).to_owned()));
+    }
     assert_eq!(values, (1..=12).collect::<Vec<i64>>());
 
     // The document column is canonical Extended JSON of the whole document (document_at).
-    let docs = batch
-        .column(schema.index_of(DOCUMENT_COLUMN).unwrap())
-        .as_string::<i32>();
-    let last = docs.value(11);
+    let last = documents[11].as_str();
     assert!(
         last.contains(r#""$oid":"65a000000000000000000012""#),
         "{last}"

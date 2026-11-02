@@ -44,7 +44,7 @@ use arrow_array::RecordBatch;
 use async_trait::async_trait;
 use bson::oid::ObjectId;
 use bson::spec::BinarySubtype;
-use bson::{Binary, Bson, DateTime, Decimal128, Document};
+use bson::{Binary, Bson, DateTime, Decimal128, Document, doc};
 use mongodb::error::ErrorKind;
 use oxbase_dialect::bulk::bind_value;
 use oxbase_dialect::{BulkLimits, BulkLoader, BulkMethod, LoadColumn, LoadSession, LoadTarget};
@@ -147,8 +147,27 @@ async fn create_collection(
     if name.is_empty() {
         return Err(Error::invalid_input("the new collection has no name"));
     }
+    // `create` of an existing collection with the same options succeeds on MongoDB 7.0, so
+    // the existence check is explicit.
     let comment = conn.next_comment();
+    let tag = comment.clone();
     let database = conn.client().database(&db);
+    let filter = doc! {"name": name.as_str()};
+    let existing = guarded(conn, &comment, cancel, async {
+        database
+            .list_collection_names()
+            .filter(filter)
+            .comment(tag)
+            .await
+            .map_err(|e| map(&e))
+    })
+    .await?;
+    if !existing.is_empty() {
+        return Err(Error::invalid_input(format!(
+            "collection {db}.{name} already exists"
+        )));
+    }
+    let comment = conn.next_comment();
     let shown = format!("{db}.{name}");
     guarded(conn, &comment, cancel, async move {
         database.create_collection(name).await.map_err(|e| {
