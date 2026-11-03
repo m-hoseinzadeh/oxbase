@@ -873,12 +873,13 @@ async fn cancel_mid_table(live: &Live) {
     .await;
     live.exec(&format!(
         "INSERT INTO {b} (id, pad) VALUES (1, '{}')",
-        "x".repeat(150)
+        "x".repeat(40)
     ))
     .await;
-    // Doubling: 2^17 rows.
+    // Doubling: 2^20 rows, enough that streaming them outlasts the first rows progress event
+    // (250 ms) on the fixtures.
     let mut rows = 1_u64;
-    for _ in 0..17 {
+    for _ in 0..20 {
         live.exec(&format!(
             "INSERT INTO {b} (id, pad) SELECT id + {rows}, pad FROM {b}"
         ))
