@@ -32,7 +32,8 @@ pub(crate) fn typed(value: Value, column: Option<&ColumnDef>) -> Value {
 /// The exact-match form of `value` in a column of type `data_type`: equal forms are equal
 /// values. Numbers of every variant share one form (canonical decimal text), so an integer
 /// and the same decimal match (SQLite stores `10.00` as an integer); floats compare bit for
-/// bit except `-0.0 == 0.0` and `NaN == NaN`; timestamps with a zone as instants; JSON (also
+/// bit except `-0.0 == 0.0` and `NaN == NaN`; timestamps with a zone as instants (also the
+/// RFC 3339 text SQL Server's driver reads `datetimeoffset` as, which keeps the offset); JSON (also
 /// JSON text in a JSON column) as parsed values with sorted keys and numbers as exact decimals
 /// (no `f64` rounding: `123456789012345678901234` and `1.2345678901234568e23` differ, `1.0`
 /// and `1` match); NULL matches only NULL.
@@ -50,6 +51,8 @@ pub(crate) fn canon(value: &Value, data_type: Option<&DataType>) -> String {
             Some(DataType::Json { .. }) => {
                 json_text_canon(s).map_or_else(|| format!("t:{s}"), |j| format!("j:{j}"))
             }
+            Some(DataType::TimestampTz { .. }) => chrono::DateTime::parse_from_rfc3339(s.trim())
+                .map_or_else(|_| format!("t:{s}"), |t| format!("tz:{}", t.naive_utc())),
             _ => format!("t:{s}"),
         },
         Value::Bytes(b) => {
@@ -456,6 +459,36 @@ mod tests {
         assert_eq!(
             canon(&Value::Json(serde_json::json!({"x": 1.5})), Some(&json)),
             form(r#"{ "x" : 1.50 }"#)
+        );
+    }
+
+    #[test]
+    fn offset_text_compares_as_an_instant() {
+        let tz = DataType::TimestampTz { precision: Some(7) };
+        let form = |text: &str| canon(&Value::Text(text.into()), Some(&tz));
+        // The same instant at another offset (a restore writes +00:00) is the same value.
+        assert_eq!(
+            form("2026-01-01T10:00:00.0000000+05:30"),
+            form("2026-01-01T04:30:00.0000000+00:00")
+        );
+        assert_eq!(
+            form("2026-01-01T10:00:00+05:30"),
+            canon(
+                &Value::TimestampTz(
+                    chrono::DateTime::parse_from_rfc3339("2026-01-01T04:30:00Z").unwrap()
+                ),
+                Some(&tz)
+            )
+        );
+        assert_ne!(
+            form("2026-01-01T10:00:00+05:30"),
+            form("2026-01-01T11:00:00+05:30")
+        );
+        // Not a timestamp: compared as text.
+        assert_eq!(form("soon"), "t:soon");
+        assert_eq!(
+            canon(&Value::Text("2026-01-01T10:00:00+05:30".into()), None),
+            "t:2026-01-01T10:00:00+05:30"
         );
     }
 

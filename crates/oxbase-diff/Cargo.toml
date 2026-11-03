@@ -31,6 +31,8 @@ futures.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
+# SQL Server `datetimeoffset` text compared as an instant (data compare).
+chrono.workspace = true
 
 [dev-dependencies]
 oxbase-driver = { workspace = true, features = ["mock"] }
@@ -38,7 +40,6 @@ oxbase-driver = { workspace = true, features = ["mock"] }
 async-trait.workspace = true
 pretty_assertions.workspace = true
 tokio.workspace = true
-chrono.workspace = true
 # Structure sync script tests (tests/structure_script.rs) and data compare / DML tests run
 # every SQL engine's real cells (and real SQLite files; no Docker).
 oxbase-pg.workspace = true
