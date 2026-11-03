@@ -38,15 +38,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use arrow_array::RecordBatch;
-use arrow_schema::SchemaRef;
+use arrow_schema::{DataType as ArrowType, SchemaRef};
 use chrono::Utc;
 use futures::StreamExt;
 use oxbase_dialect::deps::same_table;
 use oxbase_dialect::sql::SqlWriter;
-use oxbase_dialect::{DdlContext, DialectRegistry, LoadTarget};
+use oxbase_dialect::{DdlContext, DialectRegistry, LoadColumn, LoadTarget};
 use oxbase_driver::{CancellationToken, Connection, ResultItem};
 use oxbase_io::SinkFile;
-use oxbase_types::{DataType, Error, Location, ObjectDef, ObjectKind, ObjectRef, Result, TableDef};
+use oxbase_types::{
+    DataType, Error, Location, ObjectDef, ObjectKind, ObjectRef, Result, ServerVersion, TableDef,
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 
@@ -361,7 +363,7 @@ impl Run<'_> {
         let engine = job.rows.engine();
         let version = job.rows.server_version().clone();
         let writer = job.dialects.dml_writer(engine).ok();
-        let (columns, left_out) = load_columns(table, writer.as_deref(), &version);
+        let (mut columns, left_out) = load_columns(table, writer.as_deref(), &version);
         for (column, why) in left_out {
             warnings.push(format!(
                 "{}: the values of column {column} were not backed up (the server maintains \
@@ -369,12 +371,6 @@ impl Run<'_> {
                 table.obj.display_name()
             ));
         }
-        let target = LoadTarget {
-            table: &table.obj,
-            columns: &columns,
-            version: &version,
-        };
-        let schema = target.schema();
         let quoting = job.dialects.quoting(engine)?;
         let mut w = SqlWriter::new(quoting.as_ref());
         w.push("SELECT ");
@@ -406,9 +402,9 @@ impl Run<'_> {
             )));
         }
 
-        self.archive
-            .begin(index, Arc::clone(&schema), self.cancel)
-            .await?;
+        // The entry starts with the first page: its Arrow types decide which columns keep the
+        // server's text form (`keep_text_forms`).
+        let mut schema: Option<SchemaRef> = None;
         let tx = until_cancelled(self.cancel, job.rows.begin()).await?;
         let mut stream = until_cancelled(
             self.cancel,
@@ -429,7 +425,19 @@ impl Run<'_> {
                     if batch.num_rows() == 0 {
                         continue;
                     }
-                    let converted = to_load_batch(&table.obj, &batch, &schema, &columns, rows)?;
+                    let load = match schema.take() {
+                        Some(load) => load,
+                        None => {
+                            keep_text_forms(&mut columns, &batch);
+                            let begun = load_schema(&table.obj, &columns, &version);
+                            self.archive
+                                .begin(index, Arc::clone(&begun), self.cancel)
+                                .await?;
+                            begun
+                        }
+                    };
+                    let converted = to_load_batch(&table.obj, &batch, &load, &columns, rows)?;
+                    schema = Some(load);
                     rows += u64::try_from(batch.num_rows()).unwrap_or(u64::MAX);
                     self.archive.rows(converted, self.cancel).await?;
                     self.progress.rows += u64::try_from(batch.num_rows()).unwrap_or(u64::MAX);
@@ -439,6 +447,15 @@ impl Run<'_> {
             }
         }
         drop(stream);
+        if schema.is_none() {
+            self.archive
+                .begin(
+                    index,
+                    load_schema(&table.obj, &columns, &version),
+                    self.cancel,
+                )
+                .await?;
+        }
         let (info, written) = self.archive.end(self.cancel).await?;
         // A read-only transaction: ending it either way is fine; a failure here does not touch
         // the rows already read.
@@ -454,6 +471,30 @@ impl Run<'_> {
                 columns: columns.into_iter().map(|c| c.name).collect(),
             },
         ))
+    }
+}
+
+/// The load schema of `columns` (`LoadTarget::schema`).
+fn load_schema(table: &ObjectRef, columns: &[LoadColumn], version: &ServerVersion) -> SchemaRef {
+    LoadTarget {
+        table,
+        columns,
+        version,
+    }
+    .schema()
+}
+
+/// A time-zone-aware column the source driver delivers as text (`batch`, the first page) keeps
+/// that text in the backup: the engine stores more than the instant the load type holds (SQL
+/// Server `datetimeoffset` keeps its offset and 100 ns digits). The restore loads the text and
+/// the server parses it back (`restore`, `stored_text_forms`).
+fn keep_text_forms(columns: &mut [LoadColumn], batch: &RecordBatch) {
+    for (column, field) in columns.iter_mut().zip(batch.schema_ref().fields()) {
+        if matches!(column.data_type, DataType::TimestampTz { .. })
+            && matches!(field.data_type(), ArrowType::Utf8 | ArrowType::LargeUtf8)
+        {
+            column.data_type = DataType::Text;
+        }
     }
 }
 

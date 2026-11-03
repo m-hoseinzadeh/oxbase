@@ -485,6 +485,28 @@ impl<R: Read + Seek> ArchiveReader<R> {
             .map_err(|_| Error::invalid_input(format!("the backup entry {name} is not text")))
     }
 
+    /// The Arrow schema table `index`'s rows were stored with (the load types the restore
+    /// uses). Reads only the stream's schema message; [`Self::table_rows`] checks the entry.
+    pub fn table_schema(&mut self, index: u32) -> Result<SchemaRef> {
+        let object = self
+            .manifest
+            .object(index)
+            .ok_or_else(|| Error::invalid_input(format!("the backup has no object {index}")))?;
+        let data = object.data.clone().ok_or_else(|| {
+            Error::invalid_input(format!(
+                "the backup has no rows for {}",
+                object.object.display_name()
+            ))
+        })?;
+        let entry = self.zip.by_name(&data.entry).map_err(|_| {
+            Error::invalid_input(format!("the backup entry {} is missing", data.entry))
+        })?;
+        let stream = catch_unwind(AssertUnwindSafe(move || StreamReader::try_new(entry, None)))
+            .map_err(|_| panic_error())?
+            .map_err(|e| arrow_error(&e))?;
+        Ok(stream.schema())
+    }
+
     /// Table `index`'s rows, batch by batch (checksum verified at the end: the last item is an
     /// error when it does not match).
     pub fn table_rows(

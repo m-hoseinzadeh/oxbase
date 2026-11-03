@@ -49,7 +49,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use arrow_array::RecordBatch;
+use arrow_schema::{DataType as ArrowType, Schema};
 use futures::StreamExt;
+use oxbase_dialect::bulk::load_arrow_type;
 use oxbase_dialect::deps::same_table;
 use oxbase_dialect::sql::SqlWriter;
 use oxbase_dialect::{
@@ -58,8 +60,8 @@ use oxbase_dialect::{
 };
 use oxbase_driver::{CancellationToken, Connection, ResultItem, Tx, cell_value};
 use oxbase_types::{
-    BoundStatement, Engine, Error, Location, ObjectDef, ObjectKind, ObjectRef, Result, Script,
-    SequenceDef, TableDef, Value, relocate_def,
+    BoundStatement, DataType, Engine, Error, Location, ObjectDef, ObjectKind, ObjectRef, Result,
+    Script, SequenceDef, TableDef, Value, relocate_def,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -911,6 +913,13 @@ impl Restore<'_> {
                     })
             })
             .collect::<Result<Vec<_>>>()?;
+        let path = self.source.clone();
+        let index = p.manifest.index;
+        let stored =
+            tokio::task::spawn_blocking(move || ArchiveReader::open(&path)?.table_schema(index))
+                .await
+                .map_err(|e| Error::internal(format!("reading the backup failed: {e}")))??;
+        let columns = stored_text_forms(columns, &stored);
         let target = LoadTarget {
             table: &table_ref,
             columns: &columns,
@@ -1437,6 +1446,20 @@ fn open_archive(
 
 /// The reader thread of one table: batches into `sender` until the entry ends, an error, or
 /// the receiver goes away.
+/// `columns` with the types the backup stored them as: a column kept as the server's text
+/// (`backup::keep_text_forms`, a time-zone-aware column whose driver reads it as text) loads
+/// as text, and the server parses it back into the column's type.
+fn stored_text_forms(mut columns: Vec<LoadColumn>, stored: &Schema) -> Vec<LoadColumn> {
+    for (column, field) in columns.iter_mut().zip(stored.fields()) {
+        if matches!(field.data_type(), ArrowType::Utf8)
+            && load_arrow_type(&column.data_type) != ArrowType::Utf8
+        {
+            column.data_type = DataType::Text;
+        }
+    }
+    columns
+}
+
 fn read_table(path: &Path, index: u32, sender: &mpsc::Sender<Result<RecordBatch>>) {
     let mut reader = match ArchiveReader::open(path) {
         Ok(r) => r,
@@ -1531,6 +1554,29 @@ impl Lister {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn columns_stored_as_text_load_as_text() {
+        use arrow_schema::{Field, TimeUnit};
+        let tz = DataType::TimestampTz { precision: Some(7) };
+        let columns = vec![
+            LoadColumn::new("id", DataType::INT64),
+            LoadColumn::new("kept", tz.clone()),
+            LoadColumn::new("instant", tz.clone()),
+        ];
+        let stored = Schema::new(vec![
+            Field::new("id", ArrowType::Int64, false),
+            Field::new("kept", ArrowType::Utf8, true),
+            Field::new(
+                "instant",
+                ArrowType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into())),
+                true,
+            ),
+        ]);
+        let out = stored_text_forms(columns, &stored);
+        let types: Vec<_> = out.iter().map(|c| c.data_type.clone()).collect();
+        assert_eq!(types, [DataType::INT64, DataType::Text, tz]);
+    }
 
     #[test]
     fn options_default_to_a_verified_non_destructive_restore() {

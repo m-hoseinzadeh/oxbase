@@ -263,6 +263,7 @@ jobs:
       # M7: the MongoDB / Redis driver, fetch, document, key, pub/sub, cluster, sentinel, shell
       # and console live tests and the services' m7_*_live tests (browse, edit and query on both
       # engines). The REQUIRE switches turn a missing M7 fixture, seed or cell into a failure.
+      # --no-fail-fast: one failing test binary does not hide the results of the others.
       # M8: the oxbase-transfer, oxbase-diff and oxbase-backup live tests (with the services'
       # m8_*_live tests above) against the [m8] seed. OXBASE_SERVICES_REQUIRE_M8=1: a missing
       # M8 fixture, seed or cell fails instead of being pending.
@@ -274,7 +275,7 @@ jobs:
           OXBASE_REDIS_REQUIRE_M7: "1"
           OXBASE_SHELL_REQUIRE_M7_SEED: "1"
           OXBASE_SERVICES_REQUIRE_M8: "1"
-        run: cargo test -p oxbase-net -p oxbase-pg -p oxbase-mysql -p oxbase-sqlite -p oxbase-mssql -p oxbase-mongo -p oxbase-redis -p oxbase-services -p oxbase-io -p oxbase-transfer -p oxbase-diff -p oxbase-backup --locked -- --include-ignored --test-threads 1 --nocapture
+        run: cargo test -p oxbase-net -p oxbase-pg -p oxbase-mysql -p oxbase-sqlite -p oxbase-mssql -p oxbase-mongo -p oxbase-redis -p oxbase-services -p oxbase-io -p oxbase-transfer -p oxbase-diff -p oxbase-backup --locked --no-fail-fast -- --include-ignored --test-threads 1 --nocapture
 
       - name: Dump fixture logs
         if: failure()
