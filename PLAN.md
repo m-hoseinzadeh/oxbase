@@ -562,6 +562,45 @@ structure and data differences on every SQL engine and a PostgreSQL type set for
 (`[m8]`). Six streams (transfer, structure-sync, data-sync, backup, app, conformance) fill the
 skeletons.
 
+**M8 as built (notes, 2026-11-03).** The exit check ("sync between PG↔PG, MySQL↔MySQL and
+MSSQL↔MSSQL produces correct scripts; transfer PG→MySQL works") passed in the CI Conformance
+job (Linux) on scratch copies of the `[m8]` seeds: fast-lane run 41605886760 on
+`wip/m8-integrate` at df06e10 reported 40 M8 cells, 40 pass, 0 fail, 0 pending (seed,
+`sync_structure`, `sync_data` and `backup` on PostgreSQL, MySQL, MariaDB, SQLite and SQL Server,
+and the 20-cell transfer matrix). CI sets `OXBASE_CONFORMANCE_REQUIRE_M8`,
+`OXBASE_SERVICES_REQUIRE_M8` and, in the webview job, `OXBASE_E2E_REQUIRE_M8`, so nothing M8
+passes as pending, and a `dialects.rs` test requires `missing_m8_roles` to be empty for the five
+SQL engines. Structure sync applied every designed item (PostgreSQL 21 statements and SQL
+Server 19 in one transaction, MySQL 13 and MariaDB 14 statements not atomic, SQLite 31 with
+rebuilds) and the re-compare was in sync; data sync found `m8_data` 2 / 5 / 2 and `m8_big`
+1 / 1 / 1 (8 of 10 chunks skipped by the digest), applied 13 statements and re-compared in sync;
+PG → MySQL carried the 24-column `[m8.transfer]` set with the expected column types and
+fidelities in 348 ms; every backup verified and restored 100 036 rows in sync. Services live
+tests: `m8_structure_live` 15, `m8_data_live` 7, `m8_transfer_live` 8, `m8_backup_live` 5, all
+passed; the webview smoke test ran the four M8 steps. The README (*Transfer, sync and backup
+(M8)*) has the numbers. Where the build differs from the text above or from
+`docs/m8-contracts.md`:
+
+- PostgreSQL routine ids carry `pg_get_function_identity_arguments` as it is, argument names
+  included (`function:order_total(p_order integer)`); `[m8.postgres] function_signature` says so.
+- SQL Server module definitions compare without the header's name spelling and without
+  trailing semicolons after the body (a module created from `... END;` reads back as `... END`).
+- The data compare reads SQL Server `datetimeoffset` (RFC 3339 text from the driver) as an
+  instant, like every zoned timestamp; a backup keeps that text, so a restore brings back the
+  offset and the 100 ns digits (the archive stores such a column as `Utf8`, and the restore
+  loads it as text for the server to parse).
+- The per-engine target rules of transfer (key length limits, text-default form, boolean
+  default spelling, UTF-16 lengths, NaN / infinity, whether re-enabling foreign keys checks the
+  rows) live in `oxbase_transfer::cells`, not in a registry role. SQL Server switches foreign
+  keys one by one (not `ALL`, which would also switch check constraints); MySQL / MariaDB
+  loads add `NO_AUTO_VALUE_ON_ZERO` (also for M5 imports: a 0 in an auto-increment column stays
+  0).
+- The per-engine `m8_sync_ddl_live.rs` tests were not written; the create / alter / drop round
+  trips of the new DDL cells run through the services' `m8_structure_live` (scratch pairs, edge
+  cases and the fixture pair on every engine).
+- Golden directories carry `.gitattributes` (`eol=lf`) so Windows checkouts compare byte for
+  byte.
+
 Order of work: M0–M3 prove the architecture. M4 and M7 are where the per-database matrix gets tested for real. M8 and M10 reuse the Comparator and DdlGenerator cells and get much cheaper if M3 is done right.
 
 ## 7. Main risks
