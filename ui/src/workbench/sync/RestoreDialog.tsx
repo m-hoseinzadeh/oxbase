@@ -81,7 +81,8 @@ export function RestoreDialog({ init, onClose }: { init: RestoreInit; onClose: (
   const [dropExisting, setDropExisting] = useState(false);
   const [truncate, setTruncate] = useState(false);
   const [verifyFirst, setVerifyFirst] = useState(true);
-  const [acknowledged, setAcknowledged] = useState(false);
+  // The destructive choices an acknowledgement was given for: it holds for those only.
+  const [acknowledgedFor, setAcknowledgedFor] = useState("");
   const [run, dispatch] = useReducer(restoreReducer, IDLE_RESTORE);
   const alive = useRef(true);
   const fileRef = useRef<PickedFile | null>(null);
@@ -108,13 +109,37 @@ export function RestoreDialog({ init, onClose }: { init: RestoreInit; onClose: (
 
   const m = manifest.status === "ok" ? manifest.manifest : null;
   const sameEngine = sessions.filter((s) => !m || s.engine === m.engine);
-  const destructive = dropExisting || (truncate && content !== "structure_only");
+  const targetSession = sessions.find((s) => s.id === target.sessionId) ?? null;
+  // A target of another engine (say, from the entry point) cannot take this archive.
+  const wrongEngine = m !== null && targetSession !== null && targetSession.engine !== m.engine;
+  // A structure-only archive has no rows to load, whatever the form says.
+  const effectiveContent: RestoreContent =
+    m?.content === "structure_only" ? "structure_only" : content;
+  const loadsData = effectiveContent !== "structure_only";
+  const truncateBeforeLoad = truncate && loadsData;
+  const destructive = dropExisting || truncateBeforeLoad;
   const chosen = m ? m.objects.filter((o) => !excluded.includes(o.index)).map((o) => o.index) : [];
+  const destructiveKey = destructive
+    ? JSON.stringify([
+        file?.handle ?? "",
+        target.sessionId,
+        target.container,
+        effectiveContent,
+        dropExisting,
+        truncateBeforeLoad,
+        chosen,
+      ])
+    : "";
+  // Any change to the destructive choices drops the acknowledgement (also when they change back).
+  if (acknowledgedFor !== "" && acknowledgedFor !== destructiveKey) setAcknowledgedFor("");
+  const acknowledged = destructiveKey !== "" && acknowledgedFor === destructiveKey;
   const canRestore =
     !running &&
     m !== null &&
     file !== null &&
     target.container !== null &&
+    targetSession !== null &&
+    !wrongEngine &&
     chosen.length > 0 &&
     (!destructive || acknowledged);
 
@@ -134,7 +159,10 @@ export function RestoreDialog({ init, onClose }: { init: RestoreInit; onClose: (
       requests.current.push(requestId);
       try {
         const next = await backupList(picked.handle, requestId);
-        if (alive.current) setManifest({ status: "ok", manifest: next });
+        if (alive.current) {
+          setManifest({ status: "ok", manifest: next });
+          setContent(next.content === "structure_only" ? "structure_only" : "structure_and_data");
+        }
       } catch (error) {
         if (alive.current) setManifest({ status: "error", message: toCommandError(error).message });
       }
@@ -168,10 +196,10 @@ export function RestoreDialog({ init, onClose }: { init: RestoreInit; onClose: (
           session: target.sessionId,
           options: {
             container: target.container,
-            content,
+            content: effectiveContent,
             objects: chosen.length === m.objects.length ? [] : chosen,
             dropExisting,
-            truncateBeforeLoad: truncate,
+            truncateBeforeLoad,
             verifyFirst,
             confirmDestructive: destructive && acknowledged,
           },
@@ -354,11 +382,16 @@ export function RestoreDialog({ init, onClose }: { init: RestoreInit; onClose: (
           onChange={setTarget}
         />
         <p className="field__hint">The database or schema must exist already.</p>
+        {wrongEngine && targetSession ? (
+          <Note tone="error" title="Another engine" testId="restore-wrong-engine">
+            {`${targetSession.profile_name} is ${ENGINE_INFO[targetSession.engine]?.label ?? targetSession.engine}; this backup restores into ${ENGINE_INFO[m.engine]?.label ?? m.engine} only.`}
+          </Note>
+        ) : null}
         <div className="field">
           <label htmlFor={`${id}-content`}>Restore</label>
           <select
             id={`${id}-content`}
-            value={content}
+            value={effectiveContent}
             disabled={running}
             onChange={(e) => setContent(e.target.value as RestoreContent)}
           >
@@ -383,8 +416,8 @@ export function RestoreDialog({ init, onClose }: { init: RestoreInit; onClose: (
         <label className="checkbox">
           <input
             type="checkbox"
-            checked={truncate}
-            disabled={running || content === "structure_only"}
+            checked={truncateBeforeLoad}
+            disabled={running || !loadsData}
             onChange={(e) => setTruncate(e.target.checked)}
           />
           Empty tables before loading their rows
@@ -401,7 +434,7 @@ export function RestoreDialog({ init, onClose }: { init: RestoreInit; onClose: (
         {destructive ? (
           <>
             <Note tone="error" title="Destructive restore">
-              {dropExisting && truncate
+              {dropExisting && truncateBeforeLoad
                 ? "Existing objects are dropped and tables emptied in the target."
                 : dropExisting
                   ? "Existing objects with the same names are dropped in the target."
@@ -409,7 +442,7 @@ export function RestoreDialog({ init, onClose }: { init: RestoreInit; onClose: (
             </Note>
             <Acknowledge
               checked={acknowledged}
-              onChange={setAcknowledged}
+              onChange={(on) => setAcknowledgedFor(on ? destructiveKey : "")}
               testId="restore-acknowledge"
             >
               I understand that the target's objects and rows can be lost.

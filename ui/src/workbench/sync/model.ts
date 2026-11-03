@@ -186,26 +186,44 @@ export function defaultSelection(items: DiffItem[], includeDrops: boolean): Set<
   return out;
 }
 
+/**
+ * What a group checkbox turns on: every item that can sync, except target-only objects (drops)
+ * when the compare did not include drops (those are only picked one by one).
+ */
+function groupEligible(item: DiffItem, includeDrops: boolean): boolean {
+  return selectable(item) && (includeDrops || item.status !== "only_in_target");
+}
+
 /** `checked`, `unchecked` or `mixed` for a group checkbox. */
-export function groupState(group: ItemGroup, selection: ReadonlySet<string>): boolean | "mixed" {
-  const ids = group.items.filter(selectable).map((i) => i.id);
-  if (ids.length === 0) return false;
+export function groupState(
+  group: ItemGroup,
+  selection: ReadonlySet<string>,
+  includeDrops = true,
+): boolean | "mixed" {
+  const ids = group.items.filter((i) => groupEligible(i, includeDrops)).map((i) => i.id);
+  const others = group.items.filter(
+    (i) => selectable(i) && !groupEligible(i, includeDrops) && selection.has(i.id),
+  ).length;
   const on = ids.filter((id) => selection.has(id)).length;
-  if (on === 0) return false;
+  if (on === 0) return others > 0 ? "mixed" : false;
   return on === ids.length ? true : "mixed";
 }
 
-/** Selection with every selectable item of `group` turned on or off. */
+/**
+ * Selection with the group turned on (its eligible items, see `groupState`) or off (every
+ * item of the group).
+ */
 export function setGroup(
   selection: ReadonlySet<string>,
   group: ItemGroup,
   on: boolean,
+  includeDrops = true,
 ): Set<string> {
   const next = new Set(selection);
   for (const item of group.items) {
     if (!selectable(item)) continue;
-    if (on) next.add(item.id);
-    else next.delete(item.id);
+    if (on && groupEligible(item, includeDrops)) next.add(item.id);
+    else if (!on) next.delete(item.id);
   }
   return next;
 }
@@ -255,7 +273,7 @@ export interface TransferItem {
   where: string;
 }
 
-/** A column override typed in the mapping step, by object index and source column. */
+/** A column override typed in the mapping step, by source object and source column. */
 export interface OverrideEdit {
   skip?: boolean;
   targetName?: string;
@@ -266,16 +284,35 @@ export interface OverrideEdit {
 
 export type OverrideMap = Record<string, OverrideEdit>;
 
-export function overrideKey(object: number, column: string): string {
-  return `${object}\u0000${column}`;
+/** A stable key of a source table or view (kind, catalog, schema, name). */
+export function refKey(ref: ObjectRef): string {
+  return JSON.stringify([ref.kind, ref.catalog ?? "", ref.schema ?? "", ref.name]);
 }
 
-/** The overrides as the spec carries them (empty edits left out). */
-export function overridesOf(map: OverrideMap): ColumnOverride[] {
+/** The key of a wizard item: its source object, or `query` for the one query source. */
+export function itemKey(item: TransferItem): string {
+  return item.ref ? refKey(item.ref) : "query";
+}
+
+/**
+ * The key of a column override. Overrides follow the source object, not its position in the
+ * list, so removing or adding objects never moves an override onto another table.
+ */
+export function overrideKey(item: string, column: string): string {
+  return `${item}\u0000${column}`;
+}
+
+/**
+ * The overrides as the spec carries them (empty edits left out), with each source object
+ * turned into its index in `items`; overrides of objects no longer in the list are dropped.
+ */
+export function overridesOf(map: OverrideMap, items: TransferItem[]): ColumnOverride[] {
+  const index = new Map(items.map((item, i) => [itemKey(item), i]));
   const out: ColumnOverride[] = [];
   for (const [key, edit] of Object.entries(map)) {
     const cut = key.indexOf("\u0000");
-    const object = Number(key.slice(0, cut));
+    const object = index.get(key.slice(0, cut));
+    if (object === undefined) continue;
     const column = key.slice(cut + 1);
     const o: ColumnOverride = { object, column };
     if (edit.skip) o.skip = true;
@@ -310,7 +347,7 @@ export function buildSpec(
   options: TransferOptions,
   overrides: OverrideMap,
 ): TransferSpec {
-  const o = overridesOf(overrides);
+  const o = overridesOf(overrides, items);
   return {
     objects: sourceObjects(items),
     target,
@@ -510,11 +547,14 @@ export interface PairRow {
   include: boolean;
   /** Key columns typed by the user (comma separated); empty: the table's own key. */
   keyColumns: string;
+  /** The target was found only by ignoring case: the user confirms it by ticking the row. */
+  caseFolded?: boolean;
 }
 
 /**
- * Pairs every source table with the target table of the same name (exact first, then ignoring
- * case); tables without a partner are listed unchecked.
+ * Pairs every source table with the target table of the same name. Exact matches are ticked;
+ * a match found only by ignoring case is offered unticked and marked (on case-sensitive engines
+ * `Orders` and `orders` are different tables); tables without a partner are listed unticked.
  */
 export function autoPairs(sources: ObjectRef[], targets: ObjectRef[]): PairRow[] {
   const exact = new Map(targets.map((t) => [t.name, t]));
@@ -522,8 +562,12 @@ export function autoPairs(sources: ObjectRef[], targets: ObjectRef[]): PairRow[]
   for (const t of targets)
     if (!folded.has(t.name.toLowerCase())) folded.set(t.name.toLowerCase(), t);
   return sources.map((source) => {
-    const target = exact.get(source.name) ?? folded.get(source.name.toLowerCase()) ?? null;
-    return { source, target, include: target !== null, keyColumns: "" };
+    const same = exact.get(source.name);
+    if (same) return { source, target: same, include: true, keyColumns: "" };
+    const loose = folded.get(source.name.toLowerCase()) ?? null;
+    return loose
+      ? { source, target: loose, include: false, keyColumns: "", caseFolded: true }
+      : { source, target: null, include: false, keyColumns: "" };
   });
 }
 

@@ -192,6 +192,15 @@ describe("RestoreDialog", () => {
     expect(start).toBeDisabled();
     fireEvent.click(screen.getByTestId("restore-acknowledge"));
     await waitFor(() => expect(start).toBeEnabled());
+    // Another destructive choice needs its own acknowledgement.
+    const empty = screen.getByLabelText("Empty tables before loading their rows");
+    fireEvent.click(empty);
+    expect(screen.getByTestId("restore-acknowledge")).not.toBeChecked();
+    expect(start).toBeDisabled();
+    fireEvent.click(empty);
+    expect(screen.getByTestId("restore-acknowledge")).not.toBeChecked();
+    fireEvent.click(screen.getByTestId("restore-acknowledge"));
+    await waitFor(() => expect(start).toBeEnabled());
     await act(async () => fireEvent.click(start));
     await waitFor(() => expect(callsOf("backup_restore")).toHaveLength(1));
     expect(callsOf("backup_restore")[0]?.file).toBe("r-1");
@@ -234,6 +243,55 @@ describe("RestoreDialog", () => {
     expect(await screen.findByTestId("restore-result")).toHaveTextContent("1 object, 12 rows");
     unmount();
     expect(callsOf("file_release")).toEqual([{ handle: "r-1" }]);
+  });
+
+  it("restores a structure-only archive without asking for rows", async () => {
+    mockCore({
+      file_pick_open: () => ({ handle: "r-4", name: "s.oxbackup", access: "read", exists: true }),
+      backup_list: (): Manifest => ({
+        ...MANIFEST,
+        content: "structure_only",
+        objects: MANIFEST.objects.map(({ data: _data, ...o }) => o),
+      }),
+      backup_restore: () => "rs-4",
+    });
+    await refreshSessions();
+    render(
+      <RestoreDialog
+        init={{ target: { sessionId: PG_TARGET.id, container: M8_TGT } }}
+        onClose={vi.fn()}
+      />,
+    );
+    await act(async () => fireEvent.click(screen.getByTestId("restore-choose")));
+    await screen.findByTestId("restore-manifest");
+    expect(screen.getByLabelText("Restore")).toHaveValue("structure_only");
+    const empty = screen.getByLabelText("Empty tables before loading their rows");
+    expect(empty).toBeDisabled();
+    expect(empty).not.toBeChecked();
+    const start = screen.getByTestId("restore-start");
+    await waitFor(() => expect(start).toBeEnabled());
+    await act(async () => fireEvent.click(start));
+    await waitFor(() => expect(callsOf("backup_restore")).toHaveLength(1));
+    expect(requestOf<RestoreRequest>("backup_restore", 0).options).toMatchObject({
+      content: "structure_only",
+      truncateBeforeLoad: false,
+      confirmDestructive: false,
+    });
+  });
+
+  it("refuses a target of another engine", async () => {
+    await refreshSessions();
+    render(
+      <RestoreDialog
+        init={{ target: { sessionId: MYSQL.id, container: { kind: "database", name: "m8" } } }}
+        onClose={vi.fn()}
+      />,
+    );
+    await act(async () => fireEvent.click(screen.getByTestId("restore-choose")));
+    expect(await screen.findByTestId("restore-wrong-engine")).toHaveTextContent(
+      "MySQL is MySQL; this backup restores into PostgreSQL only.",
+    );
+    expect(screen.getByTestId("restore-start")).toBeDisabled();
   });
 
   it("verifies only, and shows damaged entries", async () => {

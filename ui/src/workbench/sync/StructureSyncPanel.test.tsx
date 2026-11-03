@@ -222,6 +222,10 @@ describe("StructureSyncPanel", () => {
     await waitFor(() => expect(apply).toBeEnabled());
     fireEvent.click(apply);
     const dialog = screen.getByRole("dialog", { name: "Apply the sync script?" });
+    // The target is named with its connection.
+    expect(within(dialog).getByTestId("structure-confirm-target")).toHaveTextContent(
+      "PG Target · oxbase_test.m8_tgt",
+    );
     expect(within(dialog).getByTestId("structure-destructive")).toHaveTextContent(
       "Drop column m8_tgt.customers.fax",
     );
@@ -242,6 +246,62 @@ describe("StructureSyncPanel", () => {
       expect(callsOf("compare_forget").map((a) => a.compareId)).toContain("cmp-1"),
     );
     expect(screen.getAllByTestId("structure-item")).toHaveLength(1);
+  });
+
+  it("leaves drops out of a group select-all and flags a compare whose inputs changed", async () => {
+    fireEvent.click(await renderPanel());
+    await screen.findByTestId("structure-items");
+    const all = screen.getByLabelText("Sync all tables");
+    fireEvent.click(all);
+    expect(screen.getByLabelText("Sync table customers")).not.toBeChecked();
+    fireEvent.click(all);
+    expect(screen.getByLabelText("Sync table customers")).toBeChecked();
+    // The compare had no drops: the group does not pick the target-only table.
+    expect(screen.getByLabelText("Sync table legacy_notes")).not.toBeChecked();
+    expect(all).toBeChecked();
+    const apply = screen.getByTestId("structure-apply");
+    await waitFor(() => expect(apply).toBeEnabled());
+
+    // Ticking "drop" after the compare makes it out of date: compare again before applying.
+    fireEvent.click(screen.getByLabelText("Drop objects that exist only in the target"));
+    expect(screen.getByTestId("structure-stale")).toHaveTextContent(
+      "target PG Target · oxbase_test.m8_tgt",
+    );
+    expect(apply).toBeDisabled();
+    fireEvent.click(screen.getByLabelText("Drop objects that exist only in the target"));
+    expect(screen.queryByTestId("structure-stale")).not.toBeInTheDocument();
+    // So does pointing the target picker elsewhere.
+    fireEvent.change(screen.getByLabelText("Target schema"), { target: { value: "m8_src" } });
+    expect(await screen.findByTestId("structure-stale")).toBeInTheDocument();
+    expect(apply).toBeDisabled();
+  });
+
+  it("cancels a running apply", async () => {
+    let rejectApply: ((e: unknown) => void) | null = null;
+    mockCore({
+      structure_compare: () => compareResult("cmp-1"),
+      structure_script: (a) =>
+        script((a.request as StructureScriptRequest).selection ?? [], false, true),
+      structure_apply: () =>
+        new Promise((_, reject) => {
+          rejectApply = reject;
+        }),
+      cancel_request: () => {
+        rejectApply?.({ category: "cancelled", message: "cancelled" });
+        return true;
+      },
+    });
+    fireEvent.click(await renderPanel());
+    await screen.findByTestId("structure-items");
+    const apply = screen.getByTestId("structure-apply");
+    await waitFor(() => expect(apply).toBeEnabled());
+    fireEvent.click(apply);
+    await act(async () => fireEvent.click(screen.getByTestId("structure-confirm")));
+    await waitFor(() => expect(callsOf("structure_apply")).toHaveLength(1));
+    const requestId = callsOf("structure_apply")[0]?.requestId;
+    await act(async () => fireEvent.click(await screen.findByTestId("structure-apply-cancel")));
+    expect(callsOf("cancel_request").map((a) => a.requestId)).toContain(requestId);
+    expect(await screen.findByTestId("structure-result")).toHaveTextContent("Sync cancelled");
   });
 
   it("says when the engine's DDL is not transactional", async () => {

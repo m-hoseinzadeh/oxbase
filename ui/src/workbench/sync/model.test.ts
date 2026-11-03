@@ -26,6 +26,7 @@ import {
   IDLE_DATA_COMPARE,
   IDLE_RESTORE,
   IDLE_TRANSFER,
+  itemKey,
   itemsProblem,
   orderedSelection,
   overrideKey,
@@ -33,6 +34,7 @@ import {
   parseKeyColumns,
   planBlockers,
   planDdl,
+  refKey,
   restoreReducer,
   setGroup,
   toggle,
@@ -89,6 +91,14 @@ describe("structure sync model", () => {
     expect(selection.has("table:same")).toBe(false);
     selection = setGroup(selection, tables, false);
     expect(groupState(tables, selection)).toBe(false);
+    // Without drops in the compare, the group leaves target-only objects alone.
+    let noDrops = setGroup(defaultSelection(ITEMS, false), tables, true, false);
+    expect(noDrops.has("table:legacy_notes")).toBe(false);
+    expect(groupState(tables, noDrops, false)).toBe(true);
+    noDrops = toggle(noDrops, "table:legacy_notes");
+    noDrops = setGroup(noDrops, tables, false, false);
+    expect(noDrops.has("table:legacy_notes")).toBe(false);
+    expect(groupState(tables, toggle(noDrops, "table:legacy_notes"), false)).toBe("mixed");
     selection = toggle(selection, "table:customers");
     expect(orderedSelection(ITEMS, selection)).toEqual([
       "table:customers",
@@ -188,18 +198,19 @@ function plan(patch: Partial<TransferPlan> = {}): TransferPlan {
 
 describe("transfer model", () => {
   it("builds the spec: target names only when renamed, filters as raw SQL, overrides", () => {
+    const parent = { ...SRC, name: "m8_parent" };
     const spec = buildSpec(
       [
         { ref: SRC, targetName: "m8_types", where: "" },
-        { ref: { ...SRC, name: "m8_parent" }, targetName: "parents", where: " id > 1 " },
+        { ref: parent, targetName: "parents", where: " id > 1 " },
         { ref: { ...SRC, kind: "view", name: "v" }, targetName: "v", where: "" },
       ],
       { kind: "database", name: "m8_xfer_target" },
       { mode: "append" },
       {
-        [overrideKey(0, "c_uuid")]: { nativeType: " binary(16) " },
-        [overrideKey(0, "c_interval")]: { skip: true },
-        [overrideKey(1, "nothing")]: { targetName: "  " },
+        [overrideKey(refKey(SRC), "c_uuid")]: { nativeType: " binary(16) " },
+        [overrideKey(refKey(SRC), "c_interval")]: { skip: true },
+        [overrideKey(refKey(parent), "nothing")]: { targetName: "  " },
       },
     );
     expect(spec.objects).toEqual([
@@ -216,10 +227,33 @@ describe("transfer model", () => {
       { object: 0, column: "c_interval", skip: true },
       { object: 0, column: "c_uuid", nativeType: "binary(16)" },
     ]);
-    expect(overridesOf({})).toEqual([]);
+    expect(overridesOf({}, [])).toEqual([]);
     expect(
       buildSpec([{ sql: "SELECT 1", targetName: "q", where: "" }], SRC, {}, {}).objects,
     ).toEqual([{ type: "query", sql: "SELECT 1", targetName: "q" }]);
+  });
+
+  it("keeps overrides with their source object when the list changes", () => {
+    const parent = { ...SRC, name: "m8_parent" };
+    const gone = { ...SRC, name: "m8_gone" };
+    const overrides = {
+      [overrideKey(refKey(parent), "name")]: { skip: true },
+      [overrideKey(refKey(gone), "id")]: { skip: true },
+      [overrideKey("query", "x")]: { nativeType: "text" },
+    };
+    // m8_parent was second; with the first object removed it is the first.
+    expect(overridesOf(overrides, [{ ref: parent, targetName: "m8_parent", where: "" }])).toEqual([
+      { object: 0, column: "name", skip: true },
+    ]);
+    expect(
+      overridesOf(overrides, [
+        { ref: SRC, targetName: "m8_types", where: "" },
+        { ref: parent, targetName: "m8_parent", where: "" },
+      ]),
+    ).toEqual([{ object: 1, column: "name", skip: true }]);
+    expect(itemKey({ sql: "SELECT 1", targetName: "q", where: "" })).toBe("query");
+    // The same schema and name in another catalog is another object.
+    expect(refKey({ ...SRC, catalog: "other" })).not.toBe(refKey(SRC));
   });
 
   it("finds problems in the object list", () => {
@@ -342,10 +376,13 @@ describe("data sync model", () => {
       [s("m8_data"), s("MixedCase"), s("only_src")],
       [t("mixedcase"), t("m8_data")],
     );
-    expect(pairs.map((p) => [p.source.name, p.target?.name ?? null, p.include])).toEqual([
-      ["m8_data", "m8_data", true],
-      ["MixedCase", "mixedcase", true],
-      ["only_src", null, false],
+    expect(
+      pairs.map((p) => [p.source.name, p.target?.name ?? null, p.include, p.caseFolded ?? false]),
+    ).toEqual([
+      ["m8_data", "m8_data", true, false],
+      // Found only by ignoring case: offered, but not ticked.
+      ["MixedCase", "mixedcase", false, true],
+      ["only_src", null, false, false],
     ]);
     expect(parseKeyColumns(" a, b ,,")).toEqual(["a", "b"]);
     expect(parseKeyColumns("  ")).toBeNull();

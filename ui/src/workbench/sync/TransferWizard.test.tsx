@@ -197,6 +197,72 @@ describe("TransferWizard", () => {
     );
   });
 
+  it("keeps a column override on its table when an earlier object is removed", async () => {
+    await toMapping();
+    await screen.findAllByTestId("mapping-row");
+    // Skip orders.seen_at (orders is object 1).
+    fireEvent.click(screen.getByRole("button", { name: /orders_copy/ }));
+    const seen = (await screen.findAllByTestId("mapping-row")).find(
+      (r) => r.getAttribute("data-column") === "seen_at",
+    ) as HTMLElement;
+    fireEvent.click(within(seen).getByLabelText("Copy seen_at"));
+    await waitFor(() =>
+      expect(requestOf<TransferRequest>("transfer_plan", -1).spec.overrides).toEqual([
+        { object: 1, column: "seen_at", skip: true },
+      ]),
+    );
+    // Back to the source and drop customers: orders is now object 0 and keeps its skip.
+    fireEvent.click(screen.getByRole("button", { name: "Source" }));
+    fireEvent.click(await screen.findByRole("checkbox", { name: /m8_src\.customers/ }));
+    expect(screen.getByText("1 object selected")).toBeInTheDocument();
+    next();
+    await waitFor(() => expect(screen.getByTestId("transfer-next")).toBeEnabled());
+    next();
+    next();
+    await waitFor(() => {
+      const spec = requestOf<TransferRequest>("transfer_plan", -1).spec;
+      expect(spec.objects).toEqual([{ type: "table", table: ORDERS, targetName: "orders_copy" }]);
+      expect(spec.overrides).toEqual([{ object: 0, column: "seen_at", skip: true }]);
+    });
+    // Adding customers back does not move the skip onto it.
+    fireEvent.click(screen.getByRole("button", { name: "Source" }));
+    fireEvent.click(await screen.findByRole("checkbox", { name: /m8_src\.customers/ }));
+    next();
+    await waitFor(() => expect(screen.getByTestId("transfer-next")).toBeEnabled());
+    next();
+    next();
+    await waitFor(() =>
+      expect(requestOf<TransferRequest>("transfer_plan", -1).spec.overrides).toEqual([
+        { object: 0, column: "seen_at", skip: true },
+      ]),
+    );
+    expect(requestOf<TransferRequest>("transfer_plan", -1).spec.objects[0]).toMatchObject({
+      table: ORDERS,
+    });
+  });
+
+  it("allows only new tables when the target is the source", async () => {
+    await renderWizard();
+    next();
+    fireEvent.change(screen.getByLabelText("Target connection"), {
+      target: { value: PG_SOURCE.id },
+    });
+    const schema = await screen.findByLabelText("Target schema");
+    await waitFor(() => expect(schema).toBeEnabled());
+    fireEvent.change(schema, { target: { value: "m8_src" } });
+    expect(await screen.findByTestId("transfer-same-target")).toHaveTextContent(
+      "Source and target are the same",
+    );
+    next();
+    const mode = screen.getByLabelText("When a target table exists");
+    expect(mode).toHaveValue("create");
+    for (const label of [/^Replace/, /^Append/, /^Empty/]) {
+      expect(within(mode).getByRole("option", { name: label })).toBeDisabled();
+    }
+    fireEvent.change(mode, { target: { value: "replace" } });
+    expect(mode).toHaveValue("create");
+  });
+
   it("reviews the dry run and runs the transfer with per-table progress", async () => {
     await toMapping();
     await screen.findAllByTestId("mapping-row");
@@ -295,9 +361,21 @@ describe("TransferWizard", () => {
     const start = await screen.findByTestId("transfer-start");
     await screen.findByText("This transfer overwrites target data");
     expect(start).toBeDisabled();
+    expect(screen.getByTestId("transfer-destructive-tables")).toHaveTextContent(
+      "MySQL · m8_xfer_target.customers",
+    );
     fireEvent.click(screen.getByTestId("transfer-acknowledge"));
     await waitFor(() => expect(start).toBeEnabled());
-    await act(async () => fireEvent.click(start));
+    // A changed request needs a new confirmation.
+    fireEvent.click(screen.getByRole("button", { name: "Back" }));
+    fireEvent.change(screen.getByLabelText("Rows per batch"), { target: { value: "500" } });
+    next();
+    await screen.findByText("This transfer overwrites target data");
+    expect(screen.getByTestId("transfer-start")).toBeDisabled();
+    expect(screen.getByTestId("transfer-acknowledge")).not.toBeChecked();
+    fireEvent.click(screen.getByTestId("transfer-acknowledge"));
+    await waitFor(() => expect(screen.getByTestId("transfer-start")).toBeEnabled());
+    await act(async () => fireEvent.click(screen.getByTestId("transfer-start")));
     await waitFor(() => expect(callsOf("transfer_run")).toHaveLength(1));
     expect(requestOf<TransferRequest>("transfer_run", 0).confirmDestructive).toBe(true);
   });

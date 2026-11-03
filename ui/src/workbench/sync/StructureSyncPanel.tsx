@@ -20,6 +20,7 @@ import {
   compareForget,
   type DiffItem,
   type ObjectKind,
+  type ObjectRef,
   type StructureApplyReport,
   type StructureCompareResult,
   type StructureOptions,
@@ -52,6 +53,7 @@ import {
   plural,
   STATUS_ACTION,
   SYNC_KIND_CHOICES,
+  sameRef,
   selectable,
   setGroup,
   toggle,
@@ -75,7 +77,18 @@ type ApplyState =
   | { status: "idle" }
   | { status: "running"; requestId: string }
   | { status: "done"; report: StructureApplyReport }
-  | { status: "error"; message: string };
+  | { status: "error"; message: string; cancelled?: boolean };
+
+/** What the compare on screen ran with: its script and apply act on these sides. */
+interface Compared {
+  sourceSession: string;
+  source: ObjectRef;
+  targetSession: string;
+  target: ObjectRef;
+  includeDrops: boolean;
+  /** The compare options as JSON (to notice a later change). */
+  optionsKey: string;
+}
 
 interface OptionsForm {
   kinds: ObjectKind[];
@@ -121,6 +134,7 @@ export function StructureSyncPanel({ params }: { params: SyncPanelParams }) {
   const [confirming, setConfirming] = useState(false);
   const [acknowledged, setAcknowledged] = useState(false);
   const [apply, setApply] = useState<ApplyState>({ status: "idle" });
+  const [compared, setCompared] = useState<Compared | null>(null);
   const scriptEditor = useRef<SqlEditorHandle | null>(null);
   const compareIdRef = useRef<string | null>(null);
   const inflight = useRef<string | null>(null);
@@ -142,6 +156,19 @@ export function StructureSyncPanel({ params }: { params: SyncPanelParams }) {
     containerLabel(source.container) === containerLabel(target.container);
   const canCompare =
     !busy && source.container !== null && target.container !== null && !sameContainer;
+  // The pickers or options moved away from what the compare on screen ran with.
+  const stale =
+    result !== null &&
+    compared !== null &&
+    (compared.sourceSession !== source.sessionId ||
+      compared.targetSession !== target.sessionId ||
+      !sameRef(compared.source, source.container) ||
+      !sameRef(compared.target, target.container) ||
+      compared.optionsKey !== JSON.stringify(structureOptions()));
+  const includeDrops = compared?.includeDrops ?? false;
+  const comparedTarget = compared
+    ? `${sqlSessions.find((x) => x.id === compared.targetSession)?.profile_name ?? "?"} · ${containerLabel(compared.target)}`
+    : "";
 
   // The core keeps compares by id: forget the old one when a new one replaces it, and on close.
   useEffect(() => {
@@ -205,19 +232,29 @@ export function StructureSyncPanel({ params }: { params: SyncPanelParams }) {
     inflight.current = requestId;
     setCompare({ status: "running", requestId });
     setApply({ status: "idle" });
+    const compareOptions = structureOptions();
+    const sides: Compared = {
+      sourceSession: source.sessionId,
+      source: source.container,
+      targetSession: target.sessionId,
+      target: target.container,
+      includeDrops: options.includeDrops,
+      optionsKey: JSON.stringify(compareOptions),
+    };
     try {
       const next = await structureCompare(
         {
-          sourceSession: source.sessionId,
-          source: source.container,
-          targetSession: target.sessionId,
-          target: target.container,
-          options: structureOptions(),
+          sourceSession: sides.sourceSession,
+          source: sides.source,
+          targetSession: sides.targetSession,
+          target: sides.target,
+          options: compareOptions,
         },
         requestId,
       );
       if (inflight.current !== requestId) return;
-      adopt(next, options.includeDrops);
+      setCompared(sides);
+      adopt(next, sides.includeDrops);
     } catch (error) {
       if (inflight.current !== requestId) return;
       const err = toCommandError(error);
@@ -235,8 +272,12 @@ export function StructureSyncPanel({ params }: { params: SyncPanelParams }) {
     if (compare.status === "running") void cancelRequest(compare.requestId).catch(() => {});
   }
 
+  function cancelApply() {
+    if (apply.status === "running") void cancelRequest(apply.requestId).catch(() => {});
+  }
+
   async function runApply() {
-    if (!compareId || script.status !== "ok") return;
+    if (!compareId || script.status !== "ok" || stale) return;
     const requestId = newRequestId();
     inflight.current = requestId;
     setConfirming(false);
@@ -251,9 +292,18 @@ export function StructureSyncPanel({ params }: { params: SyncPanelParams }) {
         requestId,
       );
       setApply({ status: "done", report });
-      adopt(report.recompare, options.includeDrops);
+      // The re-compare ran with the compare's options: drops are pre-selected only if it had them.
+      adopt(report.recompare, includeDrops);
     } catch (error) {
-      setApply({ status: "error", message: toCommandError(error).message });
+      const err = toCommandError(error);
+      setApply({
+        status: "error",
+        message:
+          err.category === "cancelled"
+            ? "The sync was cancelled. Where the engine runs DDL in a transaction nothing changed; otherwise the statements that ran before the cancel stay applied. Compare again to see the target as it is now."
+            : err.message,
+        cancelled: err.category === "cancelled",
+      });
     } finally {
       if (inflight.current === requestId) inflight.current = null;
       setAcknowledged(false);
@@ -469,8 +519,10 @@ export function StructureSyncPanel({ params }: { params: SyncPanelParams }) {
   }
 
   function groupBlock(group: ItemGroup): ReactNode {
-    const state = groupState(group, selection);
-    const can = group.items.some(selectable);
+    const state = groupState(group, selection, includeDrops);
+    const can =
+      state !== false ||
+      group.items.some((i) => selectable(i) && (includeDrops || i.status !== "only_in_target"));
     return (
       <li key={group.kind} className="sync-group">
         <div className="sync-group__head">
@@ -480,7 +532,9 @@ export function StructureSyncPanel({ params }: { params: SyncPanelParams }) {
             aria-label={`Sync all ${group.label.toLowerCase()}`}
             checked={state === true}
             disabled={!can || busy}
-            onChange={(e) => setSelection(setGroup(selection, group, e.target.checked))}
+            onChange={(e) =>
+              setSelection(setGroup(selection, group, e.target.checked, includeDrops))
+            }
           />
           <span className="sync-group__label">{group.label}</span>
           <span className="sync-group__count">{group.items.length}</span>
@@ -628,7 +682,11 @@ export function StructureSyncPanel({ params }: { params: SyncPanelParams }) {
   function applyResult(): ReactNode {
     if (apply.status === "error") {
       return (
-        <Note tone="error" title="The sync failed" testId="structure-result">
+        <Note
+          tone={apply.cancelled ? "warning" : "error"}
+          title={apply.cancelled ? "Sync cancelled" : "The sync failed"}
+          testId="structure-result"
+        >
           {apply.message}
         </Note>
       );
@@ -676,6 +734,11 @@ export function StructureSyncPanel({ params }: { params: SyncPanelParams }) {
           <LoaderCircle {...ICON_SM} className="spin" />
           Reading both sides and comparing…
         </p>
+      ) : null}
+      {stale ? (
+        <Note tone="warning" title="The compare is out of date" testId="structure-stale">
+          {`The source, target or options changed since this compare (target ${comparedTarget}). Compare again before applying.`}
+        </Note>
       ) : null}
       {applyResult()}
       {summary()}
@@ -736,11 +799,22 @@ export function StructureSyncPanel({ params }: { params: SyncPanelParams }) {
           <span className="sync__meta" data-testid="structure-selection">
             {`${plural(selected.length, "object", "objects")} selected`}
           </span>
+          {apply.status === "running" ? (
+            <button
+              type="button"
+              className="button button--danger"
+              data-testid="structure-apply-cancel"
+              onClick={cancelApply}
+            >
+              <CircleX {...ICON} />
+              Cancel
+            </button>
+          ) : null}
           <button
             type="button"
             className="button button--primary"
             data-testid="structure-apply"
-            disabled={busy || selected.length === 0 || script.status !== "ok"}
+            disabled={busy || stale || selected.length === 0 || script.status !== "ok"}
             onClick={() => {
               setAcknowledged(false);
               setConfirming(true);
@@ -755,7 +829,7 @@ export function StructureSyncPanel({ params }: { params: SyncPanelParams }) {
           </button>
         </div>
       ) : null}
-      {confirming && s && result ? (
+      {confirming && s && result && !stale ? (
         <Modal
           title="Apply the sync script?"
           onClose={() => setConfirming(false)}
@@ -780,7 +854,7 @@ export function StructureSyncPanel({ params }: { params: SyncPanelParams }) {
         >
           <p>
             {`${plural(steps.length, "statement", "statements")} for ${plural(selected.length, "object", "objects")} will run on `}
-            <strong>{containerLabel(result.diff.target)}</strong>
+            <strong data-testid="structure-confirm-target">{comparedTarget}</strong>
             {s.atomic ? " in one transaction." : "."}
           </p>
           {!s.transactionalDdl || !s.atomic ? (

@@ -17,7 +17,10 @@ export default function MonacoDiffView({
     original: monaco.editor.ITextModel;
     modified: monaco.editor.ITextModel;
   } | null>(null);
-  const initial = useRef({ original, modified, language });
+  // The latest props: the editor is created once and seeded from what they are at that time
+  // (the effects below keep it in step afterwards).
+  const latest = useRef({ original, modified, language, ariaLabel });
+  latest.current = { original, modified, language, ariaLabel };
 
   useEffect(() => {
     const element = host.current;
@@ -36,11 +39,12 @@ export default function MonacoDiffView({
       fontLigatures: false,
       lineHeight: 20,
       renderOverviewRuler: false,
-      ariaLabel: ariaLabel ?? "DDL differences",
+      ariaLabel: latest.current.ariaLabel ?? "DDL differences",
     });
+    const seed = latest.current;
     const pair = {
-      original: monaco.editor.createModel(initial.current.original, initial.current.language),
-      modified: monaco.editor.createModel(initial.current.modified, initial.current.language),
+      original: monaco.editor.createModel(seed.original, seed.language),
+      modified: monaco.editor.createModel(seed.modified, seed.language),
     };
     instance.setModel(pair);
     editor.current = instance;
@@ -55,6 +59,10 @@ export default function MonacoDiffView({
       editor.current = null;
       models.current = null;
     };
+  }, []);
+
+  useEffect(() => {
+    editor.current?.updateOptions({ ariaLabel: ariaLabel ?? "DDL differences" });
   }, [ariaLabel]);
 
   useEffect(() => {

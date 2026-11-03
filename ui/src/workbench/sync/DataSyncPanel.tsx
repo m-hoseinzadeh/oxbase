@@ -56,6 +56,7 @@ import {
   parseKeyColumns,
   plural,
   qualifiedName,
+  sameRef,
 } from "./model";
 import { Acknowledge, Note, RunBar, WarningList } from "./parts";
 
@@ -70,6 +71,14 @@ type ScriptState =
   | { status: "loading"; requestId: string }
   | { status: "ok"; script: DataScript }
   | { status: "error"; message: string };
+
+/** The sides a compare ran on: what its script and apply act on, whatever the pickers say now. */
+interface ComparedSides {
+  sourceSession: string;
+  source: ObjectRef;
+  targetSession: string;
+  target: ObjectRef;
+}
 
 const OP_LABEL: Record<RowOp, string> = { insert: "Inserts", update: "Updates", delete: "Deletes" };
 
@@ -106,6 +115,9 @@ export function DataSyncPanel({ params }: { params: SyncPanelParams }) {
   const [sampleOp, setSampleOp] = useState<RowOp>("insert");
   const [ops, setOps] = useState({ inserts: true, updates: true, deletes: false });
   const [script, setScript] = useState<ScriptState>({ status: "idle" });
+  const [compared, setCompared] = useState<ComparedSides | null>(null);
+  // The preview request whose answer may still show (a changed choice drops the pending one).
+  const scriptRequest = useRef<string | null>(null);
   const [confirming, setConfirming] = useState(false);
   const [acknowledged, setAcknowledged] = useState(false);
   const [apply, dispatchApply] = useReducer(dataApplyReducer, IDLE_DATA_APPLY);
@@ -124,8 +136,24 @@ export function DataSyncPanel({ params }: { params: SyncPanelParams }) {
   const applying =
     apply.status === "starting" || apply.status === "running" || apply.status === "recomparing";
   const busy = comparing || applying;
-  // Scripts and applies work on a complete compare only.
-  const compareId = compare.status === "finished" ? compare.compareId : null;
+  // Source and target picked as the same database or schema: nothing to compare.
+  const sameContainer =
+    source.sessionId !== "" &&
+    source.sessionId === target.sessionId &&
+    sameRef(source.container, target.container);
+  // The pickers moved away from the sides of the compare on screen: its script and apply would
+  // still act on the compared target, so they wait for a new compare.
+  const stale =
+    compared !== null &&
+    (compared.sourceSession !== source.sessionId ||
+      compared.targetSession !== target.sessionId ||
+      !sameRef(compared.source, source.container) ||
+      !sameRef(compared.target, target.container));
+  // Scripts and applies work on a complete, current compare only.
+  const compareId = compare.status === "finished" && !stale ? compare.compareId : null;
+  const comparedTarget = compared
+    ? `${sqlSessions.find((s) => s.id === compared.targetSession)?.profile_name ?? "?"} · ${containerLabel(compared.target)}`
+    : "";
   const results = Object.values(compare.results).sort((a, b) => a.pair - b.pair);
   const totals = dataTotals(results);
   const active = activePair === null ? null : (compare.results[activePair] ?? null);
@@ -184,10 +212,21 @@ export function DataSyncPanel({ params }: { params: SyncPanelParams }) {
 
   const chosen = pairs.filter((p) => p.include && p.target !== null);
   const canCompare =
-    !busy && chosen.length > 0 && source.container !== null && target.container !== null;
+    !busy &&
+    chosen.length > 0 &&
+    source.container !== null &&
+    target.container !== null &&
+    !sameContainer;
+
+  /** New insert / update / delete choices: a preview of the old ones no longer applies. */
+  function changeOps(patch: Partial<typeof ops>) {
+    setOps({ ...ops, ...patch });
+    scriptRequest.current = null;
+    setScript({ status: "idle" });
+  }
 
   async function runCompare() {
-    if (!canCompare) return;
+    if (!canCompare || !source.container || !target.container) return;
     const request: TablePair[] = chosen.map((p) => {
       const columns = parseKeyColumns(p.keyColumns);
       return {
@@ -197,6 +236,13 @@ export function DataSyncPanel({ params }: { params: SyncPanelParams }) {
       };
     });
     setRequested(chosen);
+    setCompared({
+      sourceSession: source.sessionId,
+      source: source.container,
+      targetSession: target.sessionId,
+      target: target.container,
+    });
+    scriptRequest.current = null;
     setScript({ status: "idle" });
     dispatchApply({ type: "reset" });
     dispatchCompare({ type: "start" });
@@ -234,12 +280,14 @@ export function DataSyncPanel({ params }: { params: SyncPanelParams }) {
   async function previewScript() {
     if (!compareId) return;
     const requestId = newRequestId();
+    scriptRequest.current = requestId;
     setScript({ status: "loading", requestId });
+    const shown = () => alive.current && scriptRequest.current === requestId;
     try {
       const s = await dataScript({ compareId, options: { ...ops, previewLimit: 1000 } }, requestId);
-      if (alive.current) setScript({ status: "ok", script: s });
+      if (shown()) setScript({ status: "ok", script: s });
     } catch (error) {
-      if (alive.current) setScript({ status: "error", message: toCommandError(error).message });
+      if (shown()) setScript({ status: "error", message: toCommandError(error).message });
     }
   }
 
@@ -265,6 +313,7 @@ export function DataSyncPanel({ params }: { params: SyncPanelParams }) {
             const recompare = event.report.recompare;
             if (recompare) {
               dispatchCompare({ type: "adopt", result: recompare });
+              scriptRequest.current = null;
               setScript({ status: "idle" });
             }
           }
@@ -351,7 +400,7 @@ export function DataSyncPanel({ params }: { params: SyncPanelParams }) {
                     disabled={busy}
                     onChange={(e) => {
                       const t = targets.find((x) => x.name === e.target.value) ?? null;
-                      setPair(i, { target: t, include: t !== null });
+                      setPair(i, { target: t, include: t !== null, caseFolded: false });
                     }}
                   >
                     <option value="">No target table</option>
@@ -361,6 +410,16 @@ export function DataSyncPanel({ params }: { params: SyncPanelParams }) {
                       </option>
                     ))}
                   </select>
+                  {p.caseFolded ? (
+                    <span
+                      className="badge badge--warning sync-badge"
+                      data-testid="pair-case-folded"
+                      title="The names differ in case: tick the row if this is the same table."
+                    >
+                      <TriangleAlert {...ICON_SM} />
+                      matched ignoring case
+                    </span>
+                  ) : null}
                 </td>
                 <td>
                   <input
@@ -512,6 +571,8 @@ export function DataSyncPanel({ params }: { params: SyncPanelParams }) {
 
   function samples(): ReactNode {
     if (!active) return null;
+    // `columns` lists the key first; key columns outside it (if any) get their own cells.
+    const extraKey = active.key.flatMap((k, j) => (active.columns.includes(k) ? [] : [{ k, j }]));
     const rows = (active.samples ?? []).filter((s) => s.op === sampleOp);
     const counts = active.counts;
     const n: Record<RowOp, number> = {
@@ -557,7 +618,7 @@ export function DataSyncPanel({ params }: { params: SyncPanelParams }) {
               <table className="transfer-table">
                 <thead>
                   <tr>
-                    {active.key.map((k) => (
+                    {extraKey.map(({ k }) => (
                       <th key={`k-${k}`} scope="col">
                         {k}
                         <span className="visually-hidden"> (key)</span>
@@ -566,6 +627,9 @@ export function DataSyncPanel({ params }: { params: SyncPanelParams }) {
                     {active.columns.map((c) => (
                       <th key={c} scope="col">
                         {c}
+                        {active.key.includes(c) ? (
+                          <span className="visually-hidden"> (key)</span>
+                        ) : null}
                       </th>
                     ))}
                   </tr>
@@ -574,10 +638,9 @@ export function DataSyncPanel({ params }: { params: SyncPanelParams }) {
                   {rows.map((s, i) => (
                     // biome-ignore lint/suspicious/noArrayIndexKey: samples have no id of their own.
                     <tr key={i}>
-                      {s.key.map((k, j) => (
-                        // biome-ignore lint/suspicious/noArrayIndexKey: key columns by position.
-                        <th key={j} scope="row" className="transfer-table__mono">
-                          {cell(k)}
+                      {extraKey.map(({ k, j }) => (
+                        <th key={`k-${k}`} scope="row" className="transfer-table__mono">
+                          {cell(s.key[j])}
                         </th>
                       ))}
                       {sampleCells(active, s)}
@@ -605,7 +668,7 @@ export function DataSyncPanel({ params }: { params: SyncPanelParams }) {
               type="checkbox"
               checked={ops.inserts}
               disabled={busy}
-              onChange={(e) => setOps({ ...ops, inserts: e.target.checked })}
+              onChange={(e) => changeOps({ inserts: e.target.checked })}
             />
             {`Inserts (${totals.inserts.toLocaleString("en-US")})`}
           </label>
@@ -614,7 +677,7 @@ export function DataSyncPanel({ params }: { params: SyncPanelParams }) {
               type="checkbox"
               checked={ops.updates}
               disabled={busy}
-              onChange={(e) => setOps({ ...ops, updates: e.target.checked })}
+              onChange={(e) => changeOps({ updates: e.target.checked })}
             />
             {`Updates (${totals.updates.toLocaleString("en-US")})`}
           </label>
@@ -624,7 +687,7 @@ export function DataSyncPanel({ params }: { params: SyncPanelParams }) {
               checked={ops.deletes}
               disabled={busy}
               data-testid="data-deletes"
-              onChange={(e) => setOps({ ...ops, deletes: e.target.checked })}
+              onChange={(e) => changeOps({ deletes: e.target.checked })}
             />
             {`Deletes (${totals.deletes.toLocaleString("en-US")})`}
           </label>
@@ -791,6 +854,7 @@ export function DataSyncPanel({ params }: { params: SyncPanelParams }) {
               className="button button--primary"
               data-testid="data-compare"
               disabled={!canCompare}
+              title={sameContainer ? "Source and target are the same" : undefined}
               onClick={() => void runCompare()}
             >
               <GitCompareArrows {...ICON} />
@@ -799,6 +863,11 @@ export function DataSyncPanel({ params }: { params: SyncPanelParams }) {
           )}
         </div>
       </div>
+      {sameContainer ? (
+        <Note tone="warning" title="Source and target are the same" testId="data-same">
+          Pick another database or schema as the target.
+        </Note>
+      ) : null}
       <details className="sync__options">
         <summary>Options</summary>
         <div className="sync__options-body">
@@ -855,6 +924,11 @@ export function DataSyncPanel({ params }: { params: SyncPanelParams }) {
       {compare.status === "cancelled" ? (
         <Note tone="warning" title="Compare cancelled">
           Tables compared before the cancel are listed.
+        </Note>
+      ) : null}
+      {stale && compare.status === "finished" ? (
+        <Note tone="warning" title="The source or target changed" testId="data-stale">
+          {`The results below compare against ${comparedTarget}. Compare again before building a script or applying.`}
         </Note>
       ) : null}
       {applyView()}
@@ -917,9 +991,9 @@ export function DataSyncPanel({ params }: { params: SyncPanelParams }) {
             ]
               .filter(Boolean)
               .join(", ")}{" "}
-            will run on <strong>{containerLabel(target.container)}</strong>, in transactions of up
-            to 1,000 statements. Each statement must change exactly one row, else its batch rolls
-            back and the apply stops.
+            will run on <strong data-testid="data-confirm-target">{comparedTarget}</strong>, in
+            transactions of up to 1,000 statements. Each statement must change exactly one row, else
+            its batch rolls back and the apply stops.
           </p>
           {ops.deletes ? (
             <>

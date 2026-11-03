@@ -33,7 +33,7 @@ function diff(pair: number, name: string, counts: [number, number, number]): Tab
     target: table(M8_TGT, name),
     status: { type: "compared" },
     key: ["id"],
-    columns: ["name", "qty"],
+    columns: ["id", "name", "qty"],
     counts: {
       sourceRows: 20,
       targetRows: 20,
@@ -46,15 +46,15 @@ function diff(pair: number, name: string, counts: [number, number, number]): Tab
       counts[0] + counts[1] + counts[2] === 0
         ? []
         : [
-            { op: "insert", key: ["21"], source: ["new row", "3"] },
+            { op: "insert", key: ["21"], source: ["21", "new row", "3"] },
             {
               op: "update",
               key: ["4"],
-              source: ["widget", "10"],
-              target: ["widget", "7"],
+              source: ["4", "widget", "10"],
+              target: ["4", "widget", "7"],
               changed: ["qty"],
             },
-            { op: "delete", key: ["99"], target: ["gone", null] },
+            { op: "delete", key: ["99"], target: ["99", "gone", null] },
           ],
     chunksSkipped: 0,
     elapsedMs: 15,
@@ -169,6 +169,13 @@ describe("DataSyncPanel", () => {
     fireEvent.click(within(data).getByRole("button", { name: "m8_src.m8_data" }));
     const samples = screen.getByTestId("data-samples");
     expect(within(samples).getByText("new row")).toBeInTheDocument();
+    // The key is the first compared column: shown once.
+    expect(
+      within(samples)
+        .getAllByRole("columnheader")
+        .map((h) => h.textContent),
+    ).toEqual(["id (key)", "name", "qty"]);
+    expect(within(samples).getAllByText("21")).toHaveLength(1);
     fireEvent.click(within(samples).getByRole("tab", { name: "Updates (5)" }));
     const changed = samples.querySelector(".sync-cell--changed") as HTMLElement;
     expect(changed).toHaveTextContent("710");
@@ -192,6 +199,49 @@ describe("DataSyncPanel", () => {
       "INSERT INTO m8_tgt.m8_data (id, name) VALUES (21, 'new row');",
     );
     expect(screen.getByTestId("data-script-status")).toHaveTextContent("7 statements");
+  });
+
+  it("drops a preview when the insert, update or delete choices change", async () => {
+    await compareAll();
+    fireEvent.click(await screen.findByTestId("data-preview"));
+    expect(await screen.findByTestId("data-script")).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("data-deletes"));
+    expect(screen.queryByTestId("data-script")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("data-preview"));
+    await waitFor(() => expect(callsOf("data_script")).toHaveLength(2));
+    expect(callsOf("data_script")[1]?.request).toMatchObject({
+      options: { inserts: true, updates: true, deletes: true },
+    });
+  });
+
+  it("names the compared target and waits for a new compare when a picker changes", async () => {
+    await compareAll();
+    fireEvent.click(await screen.findByTestId("data-apply"));
+    const dialog = screen.getByRole("dialog", { name: "Apply the data changes?" });
+    expect(within(dialog).getByTestId("data-confirm-target")).toHaveTextContent(
+      "PG Target · oxbase_test.m8_tgt",
+    );
+    fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    // Point the target picker elsewhere: the compare's apply would still hit m8_tgt.
+    const schema = within(screen.getByTestId("data-target")).getByLabelText("Target schema");
+    fireEvent.change(schema, { target: { value: "m8_src" } });
+    expect(await screen.findByTestId("data-stale")).toHaveTextContent(
+      "compare against PG Target · oxbase_test.m8_tgt",
+    );
+    expect(screen.queryByTestId("data-apply")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("data-preview")).not.toBeInTheDocument();
+  });
+
+  it("does not compare a schema with itself", async () => {
+    await renderPanel();
+    fireEvent.change(screen.getByLabelText("Target connection"), {
+      target: { value: PG_SOURCE.id },
+    });
+    const schema = await within(screen.getByTestId("data-target")).findByLabelText("Target schema");
+    await waitFor(() => expect(schema).toBeEnabled());
+    fireEvent.change(schema, { target: { value: "m8_src" } });
+    expect(await screen.findByTestId("data-same")).toBeInTheDocument();
+    expect(screen.getByTestId("data-compare")).toBeDisabled();
   });
 
   it("needs its own confirmation for deletes, applies and shows the re-compare", async () => {

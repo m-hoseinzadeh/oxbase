@@ -20,6 +20,7 @@ import { type ReactNode, useEffect, useId, useMemo, useReducer, useRef, useState
 import {
   type DataType,
   type ObjectRef,
+  type SourceObject,
   type TablePlan,
   type TransferOptions,
   type TransferPlan,
@@ -53,6 +54,8 @@ import {
   planDdl,
   plural,
   qualifiedName,
+  refKey,
+  sameRef,
   type TransferItem,
   transferReducer,
   transferTotals,
@@ -99,8 +102,11 @@ const STATUS_TEXT = {
   not_run: "Not run",
 } as const;
 
-function refKey(ref: ObjectRef): string {
-  return `${ref.kind}:${qualifiedName(ref)}`;
+/** The override key of a planned object (what `itemKey` gives for the wizard item it came from). */
+function objectKey(o: SourceObject): string {
+  if (o.type === "table") return refKey(o.table);
+  if (o.type === "view") return refKey(o.view);
+  return "query";
 }
 
 export function TransferWizard({ init, onClose }: { init: TransferInit; onClose: () => void }) {
@@ -121,7 +127,8 @@ export function TransferWizard({ init, onClose }: { init: TransferInit; onClose:
   const [options, setOptions] = useState<Required<TransferOptions>>(DEFAULT_TRANSFER_OPTIONS);
   const [overrides, setOverrides] = useState<OverrideMap>({});
   const [plan, setPlan] = useState<PlanState>({ status: "idle" });
-  const [confirmed, setConfirmed] = useState(false);
+  // The request a destructive acknowledgement was given for: it holds for that request only.
+  const [confirmedKey, setConfirmedKey] = useState("");
   const [run, dispatch] = useReducer(transferReducer, IDLE_TRANSFER);
   const [mappingTable, setMappingTable] = useState(0);
   const alive = useRef(true);
@@ -155,7 +162,15 @@ export function TransferWizard({ init, onClose }: { init: TransferInit; onClose:
     let current = true;
     setListing({ status: "loading" });
     listTables(source.sessionId, JSON.parse(sourceKey) as ObjectRef, true, newRequestId()).then(
-      (refs) => current && setListing({ status: "ok", refs }),
+      (refs) => {
+        if (!current) return;
+        setListing({ status: "ok", refs });
+        // Objects of another database or schema do not stay selected.
+        const known = new Set(refs.map(refKey));
+        setChecked((all) =>
+          all.every((k) => known.has(k)) ? all : all.filter((k) => known.has(k)),
+        );
+      },
       (error) => current && setListing({ status: "error", message: toCommandError(error).message }),
     );
     return () => {
@@ -186,6 +201,17 @@ export function TransferWizard({ init, onClose }: { init: TransferInit; onClose:
         }
       : null;
   const requestKey = request ? JSON.stringify(request) : "";
+  // Writing into the container the rows are read from: only "create" (which never touches an
+  // existing table) is safe; replace or truncate would empty a source table before reading it.
+  const sameAsSource =
+    sourceKind === "objects" &&
+    source.sessionId !== "" &&
+    target.sessionId === source.sessionId &&
+    sameRef(target.container, source.container);
+  const modeAllowed = !sameAsSource || options.mode === "create";
+  // Any change to the request drops the acknowledgement (also when it changes back).
+  if (confirmedKey !== "" && confirmedKey !== requestKey) setConfirmedKey("");
+  const confirmed = confirmedKey !== "" && confirmedKey === requestKey;
   const wantsPlan = step === "mapping" || step === "options" || step === "review";
 
   // The plan (dry run) follows the request while the mapping, options and review steps show.
@@ -213,9 +239,24 @@ export function TransferWizard({ init, onClose }: { init: TransferInit; onClose:
 
   const currentPlan = plan.status === "ok" ? plan.plan : null;
   const planIsCurrent = plan.status === "ok" && plan.key === requestKey;
+  // The override key of each planned object, from the request the plan was made for (a plan
+  // still on screen while the next one loads may number the objects differently).
+  const planKey = plan.status === "ok" ? plan.key : "";
+  const planKeys = useMemo(
+    () =>
+      planKey
+        ? (JSON.parse(planKey) as TransferRequest).spec.objects.map(objectKey)
+        : ([] as string[]),
+    [planKey],
+  );
+
+  // The same container on both sides only allows "create".
+  useEffect(() => {
+    if (sameAsSource && options.mode !== "create") setOptions((o) => ({ ...o, mode: "create" }));
+  }, [sameAsSource, options.mode]);
 
   async function start() {
-    if (!request || !currentPlan || !planIsCurrent) return;
+    if (!request || !currentPlan || !planIsCurrent || !modeAllowed) return;
     setStep("run");
     dispatch({ type: "start" });
     try {
@@ -245,10 +286,16 @@ export function TransferWizard({ init, onClose }: { init: TransferInit; onClose:
     onClose();
   }
 
-  function setOverride(object: number, column: string, patch: OverrideEdit) {
-    const key = overrideKey(object, column);
-    const next = { ...(overrides[key] ?? {}), ...patch };
-    setOverrides({ ...overrides, [key]: next });
+  function overrideFor(table: TablePlan, column: string): OverrideEdit {
+    const item = planKeys[table.object];
+    return item === undefined ? {} : (overrides[overrideKey(item, column)] ?? {});
+  }
+
+  function setOverride(table: TablePlan, column: string, patch: OverrideEdit) {
+    const item = planKeys[table.object];
+    if (item === undefined) return;
+    const key = overrideKey(item, column);
+    setOverrides((all) => ({ ...all, [key]: { ...(all[key] ?? {}), ...patch } }));
   }
 
   // --- steps ------------------------------------------------------------------------------
@@ -264,7 +311,9 @@ export function TransferWizard({ init, onClose }: { init: TransferInit; onClose:
           testId="transfer-source"
           emptyHint="Open a connection to a SQL database first (MongoDB and Redis are not transfer sources yet)."
           onChange={(next) => {
-            if (next.sessionId !== source.sessionId || !next.container) setChecked([]);
+            // The picker reports no container while it lists again (also when this step shows
+            // again), so the selection is pruned when the listing arrives, not cleared here.
+            if (next.sessionId !== source.sessionId) setChecked([]);
             setSource(next);
           }}
         />
@@ -382,6 +431,13 @@ export function TransferWizard({ init, onClose }: { init: TransferInit; onClose:
           testId="transfer-target"
           onChange={setTarget}
         />
+        {sameAsSource ? (
+          <Note tone="warning" title="Source and target are the same" testId="transfer-same-target">
+            Tables can only be created under new names here: replacing, emptying or appending to an
+            existing table would change the rows being read. Give each object a new target name on
+            the next step.
+          </Note>
+        ) : null}
         <p className="field__hint">
           Any SQL engine. The database or schema must exist; tables are created in it as the mode
           (next steps) says. Only tables, their keys and indexes travel across engines.
@@ -478,11 +534,16 @@ export function TransferWizard({ init, onClose }: { init: TransferInit; onClose:
           }
         >
           {(Object.keys(MODE_LABEL) as (keyof typeof MODE_LABEL)[]).map((m) => (
-            <option key={m} value={m}>
+            <option key={m} value={m} disabled={sameAsSource && m !== "create"}>
               {MODE_LABEL[m]}
             </option>
           ))}
         </select>
+        {sameAsSource ? (
+          <p className="field__hint">
+            The target is the source database or schema: only new tables can be created.
+          </p>
+        ) : null}
         {options.mode === "replace" || options.mode === "truncate" ? (
           <p className="field__hint sync-danger-hint">
             <TriangleAlert {...ICON_SM} />
@@ -513,7 +574,7 @@ export function TransferWizard({ init, onClose }: { init: TransferInit; onClose:
   }
 
   function columnTypeCell(table: TablePlan, c: TablePlan["columns"][number]): ReactNode {
-    const edit = overrides[overrideKey(table.object, c.source)] ?? {};
+    const edit = overrideFor(table, c.source);
     const choices: DataType[] = typeChoices(c.mapping.dataType);
     return (
       <div className="sync-type">
@@ -523,7 +584,7 @@ export function TransferWizard({ init, onClose }: { init: TransferInit; onClose:
           disabled={c.skipped}
           onChange={(e) => {
             const picked = choices.find((t) => typeKey(t) === e.target.value);
-            if (picked) setOverride(table.object, c.source, { dataType: picked, nativeType: "" });
+            if (picked) setOverride(table, c.source, { dataType: picked, nativeType: "" });
           }}
         >
           {choices.map((t) => (
@@ -538,7 +599,7 @@ export function TransferWizard({ init, onClose }: { init: TransferInit; onClose:
           placeholder={c.mapping.nativeType || "derived"}
           value={edit.nativeType ?? ""}
           disabled={c.skipped}
-          onChange={(e) => setOverride(table.object, c.source, { nativeType: e.target.value })}
+          onChange={(e) => setOverride(table, c.source, { nativeType: e.target.value })}
         />
       </div>
     );
@@ -597,7 +658,7 @@ export function TransferWizard({ init, onClose }: { init: TransferInit; onClose:
                   </thead>
                   <tbody>
                     {table.columns.map((c) => {
-                      const edit = overrides[overrideKey(table.object, c.source)] ?? {};
+                      const edit = overrideFor(table, c.source);
                       return (
                         <tr
                           key={c.source}
@@ -611,7 +672,7 @@ export function TransferWizard({ init, onClose }: { init: TransferInit; onClose:
                               aria-label={`Copy ${c.source}`}
                               checked={!c.skipped}
                               onChange={(e) =>
-                                setOverride(table.object, c.source, { skip: !e.target.checked })
+                                setOverride(table, c.source, { skip: !e.target.checked })
                               }
                             />
                           </td>
@@ -628,7 +689,7 @@ export function TransferWizard({ init, onClose }: { init: TransferInit; onClose:
                               value={edit.targetName ?? c.target}
                               disabled={c.skipped}
                               onChange={(e) =>
-                                setOverride(table.object, c.source, { targetName: e.target.value })
+                                setOverride(table, c.source, { targetName: e.target.value })
                               }
                             />
                           </td>
@@ -761,6 +822,9 @@ export function TransferWizard({ init, onClose }: { init: TransferInit; onClose:
     const p = currentPlan;
     if (!p) return <div className="transfer-step">{planStatus()}</div>;
     const blockers = planBlockers(p);
+    const overwritten = p.tables.filter(
+      (t) => t.exists && (t.mode === "replace" || t.mode === "truncate"),
+    );
     const order = p.order.length > 0 ? p.order : p.tables.map((_, i) => i);
     return (
       <div className="transfer-step transfer-step--split">
@@ -818,12 +882,19 @@ export function TransferWizard({ init, onClose }: { init: TransferInit; onClose:
             <>
               <Note tone="error" title="This transfer overwrites target data">
                 {options.mode === "replace"
-                  ? "Existing target tables are dropped and created again."
-                  : "Existing target tables are emptied before the load."}
+                  ? "Existing target tables are dropped and created again:"
+                  : "Existing target tables are emptied before the load:"}
+                <ul className="banner__list" data-testid="transfer-destructive-tables">
+                  {overwritten.map((t) => (
+                    <li
+                      key={t.object}
+                    >{`${targetSession?.profile_name ?? ""} · ${qualifiedName(t.target)}`}</li>
+                  ))}
+                </ul>
               </Note>
               <Acknowledge
                 checked={confirmed}
-                onChange={setConfirmed}
+                onChange={(on) => setConfirmedKey(on ? requestKey : "")}
                 testId="transfer-acknowledge"
               >
                 I understand that the target rows are lost.
@@ -979,9 +1050,9 @@ export function TransferWizard({ init, onClose }: { init: TransferInit; onClose:
       why: "Choose a source and at least one object",
     },
     target: { to: "objects", ok: target.container !== null, why: "Choose a target" },
+    options: { to: "review", ok: modeAllowed, why: "Only new tables can be created here" },
     objects: { to: "mapping", ok: objectsProblem === null, why: objectsProblem ?? undefined },
     mapping: { to: "options", ok: currentPlan !== null },
-    options: { to: "review", ok: true },
   };
 
   function back(to: Step): ReactNode {
@@ -1023,7 +1094,9 @@ export function TransferWizard({ init, onClose }: { init: TransferInit; onClose:
           type="button"
           className="button button--primary"
           data-testid="transfer-start"
-          disabled={!p || !planIsCurrent || !p.runnable || (p.destructive && !confirmed)}
+          disabled={
+            !p || !planIsCurrent || !p.runnable || !modeAllowed || (p.destructive && !confirmed)
+          }
           onClick={() => void start()}
         >
           <Play {...ICON} />
