@@ -600,6 +600,18 @@ passed; the webview smoke test ran the four M8 steps. The README (*Transfer, syn
   cases and the fixture pair on every engine).
 - Golden directories carry `.gitattributes` (`eol=lf`) so Windows checkouts compare byte for
   byte.
+- The structure-sync goldens (`crates/oxbase-diff/tests/golden/structure_<engine>.sql`) pin the
+  script of hand-built snapshots of the `[m8]` pair only (contract §5.4 also asked for the
+  script generated from the fixture definitions loaded live). The live script differs in
+  detail (names of the scratch copies, defaults and properties the servers report back), so
+  the live tests prove it by applying it and re-comparing to zero differences instead of
+  pinning its text.
+- SQL Server as a transfer target counts `nchar` / `nvarchar` lengths in UTF-16 code units: a
+  `varchar(n)` from another engine becomes `nvarchar(2n)` (widened; `nvarchar(max)` past 4 000
+  code units) so characters outside the BMP fit, a `char(n)` keeps `nchar(n)` and is reported
+  narrowed, and overrides or existing target columns shorter than that are narrowed too
+  (`oxbase_transfer::mapping::utf16_fidelity`). Between two SQL Servers lengths stay as they
+  are (exact).
 
 Order of work: M0–M3 prove the architecture. M4 and M7 are where the per-database matrix gets tested for real. M8 and M10 reuse the Comparator and DdlGenerator cells and get much cheaper if M3 is done right.
 

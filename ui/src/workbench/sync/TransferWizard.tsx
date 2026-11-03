@@ -489,8 +489,8 @@ export function TransferWizard({ init, onClose }: { init: TransferInit; onClose:
               const edit = edits[key] ?? { targetName: ref.name, where: "" };
               return (
                 <tr key={key}>
-                  <th scope="row" className="transfer-table__name">
-                    {qualifiedName(ref)}
+                  <th scope="row">
+                    <span className="transfer-table__name">{qualifiedName(ref)}</span>
                   </th>
                   <td>
                     <input
@@ -676,11 +676,13 @@ export function TransferWizard({ init, onClose }: { init: TransferInit; onClose:
                               }
                             />
                           </td>
-                          <th scope="row" className="transfer-table__name">
-                            {c.source}
+                          <th scope="row">
+                            <span className="transfer-table__name">{c.source}</span>
                           </th>
-                          <td className="transfer-table__type">
-                            {c.sourceNative || typeLabel(c.sourceType)}
+                          <td>
+                            <span className="transfer-table__type">
+                              {c.sourceNative || typeLabel(c.sourceType)}
+                            </span>
                           </td>
                           <td>
                             <input
@@ -989,8 +991,8 @@ export function TransferWizard({ init, onClose }: { init: TransferInit; onClose:
               const total = progress?.totalRows ?? t.estimatedRows;
               return (
                 <tr key={i} data-testid="transfer-table-row" data-table={t.target.name}>
-                  <th scope="row" className="transfer-table__name">
-                    {qualifiedName(t.target)}
+                  <th scope="row">
+                    <span className="transfer-table__name">{qualifiedName(t.target)}</span>
                   </th>
                   <td>
                     <span

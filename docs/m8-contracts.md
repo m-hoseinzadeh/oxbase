@@ -283,9 +283,9 @@ warnings }`; order: dependents' drops (triggers, views, routines), changed / doo
 drops (children first), sequences, table creates (parents first, no FKs) and alters, FK adds,
 routines, views (dependency order), triggers. Golden tests: per engine, the script of the
 `[m8]` pair with every item selected and drops on is pinned in
-`crates/oxbase-diff/tests/golden/structure_<engine>.sql` (generated from the fixture seeds'
-definitions loaded live and also from hand-built snapshots in a unit test, so the pin does
-not need Docker).
+`crates/oxbase-diff/tests/golden/structure_<engine>.sql` (generated from hand-built snapshots
+in a unit test, so the pin does not need Docker; the script of the definitions loaded live is
+not pinned, see §13).
 
 ### 5.5 Service (`oxbase_services::sync::StructureSyncService`)
 
@@ -552,7 +552,8 @@ missing fixture or seed is "pending" unless the stream's `REQUIRE` variable is s
 - **data-sync**: unit: keyset predicates, `DiffStore` round trip (100 000 rows in bounded
   memory), `data_statements` per op per engine writer, value equality rules. Live
   (`m8_data_live.rs`, per engine): `m8_data` 2 / 5 / 2, `m8_big` 1 / 1 / 1 with chunks of
-  10 000 (and at least 9 chunks skipped where a `ChunkHasher` is registered),
+  10 000 (and 8 chunks skipped where a `ChunkHasher` is registered: the designed update
+  and delete fall in two different chunks),
   `m8_composite` 0 / 1 / 0, `m8_nokey` refused; the script preview renders the expected
   statements (golden per engine for `m8_data`); apply with deletes confirmed, then the
   re-compare is in sync; deletes without confirmation are refused; cancel within 2 s.
@@ -582,3 +583,8 @@ missing fixture or seed is "pending" unless the stream's `REQUIRE` variable is s
   collation differs between the two sides is refused by the plan (it would order and compare
   differently).
 - The per-engine `ChunkHasher` is optional; engines without one compare every row.
+- The structure-sync goldens pin the hand-built `[m8]` snapshots only. The script generated
+  from the fixture definitions loaded live is not pinned as text (the scratch copies' names
+  and the defaults / properties each server reports back make it differ in detail); the live
+  tests (`m8_structure_live`, conformance `sync_structure`) prove it instead: it runs without
+  errors and the re-compare reports zero differences.

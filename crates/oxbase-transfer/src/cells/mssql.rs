@@ -4,7 +4,9 @@
 //! → `smallint` (SQL Server `tinyint` is unsigned); unsigned 32-bit → `bigint` (widened),
 //! unsigned 64-bit → `decimal(20,0)` (widened); `decimal` up to 38 digits (unconstrained →
 //! `decimal(38,10)`, narrowed); text → `nvarchar(n)` / `nvarchar(max)` (Unicode); binary →
-//! `varbinary(n)` / `varbinary(max)`; `time(p)` / `datetime2(p)` with p ≤ 7; `timestamp_tz` →
+//! `varbinary(n)` / `varbinary(max)`; `nchar(n)` / `nvarchar(n)` count UTF-16 code units, so a
+//! source length counted in characters needs up to twice as many (`varchar(n)` →
+//! `nvarchar(2n)`, widened; `char(n)` keeps its fixed length, narrowed); `time(p)` / `datetime2(p)` with p ≤ 7; `timestamp_tz` →
 //! `datetimeoffset(p)` (exact); `interval` → `nvarchar(64)` (widened); `uuid` →
 //! `uniqueidentifier`; `json` → `nvarchar(max)` with `ISJSON` not enforced (widened; the 2025
 //! `json` type is used only when the server version has it: exact); arrays → `nvarchar(max)`
@@ -20,7 +22,8 @@
 //! | `int16 unsigned` / `int32 unsigned` / `int64 unsigned` | `int` / `bigint` / `decimal(20,0)` | widened |
 //! | `float32` / `float64` | `real` / `float` | exact |
 //! | `decimal(p,s)`, `p` ≤ 38 | `decimal(p,s)` | exact; longer or unconstrained: `decimal(38,s)`, narrowed |
-//! | `char(n)` / `varchar(n)`, `n` ≤ 4 000 | `nchar(n)` / `nvarchar(n)` | exact; longer: `nvarchar(max)`, widened |
+//! | `char(n)`, `n` ≤ 4 000 | `nchar(n)` | narrowed (lengths count UTF-16 code units: a character outside the BMP takes two); longer: `nvarchar(max)`, widened |
+//! | `varchar(n)`, `2n` ≤ 4 000 | `nvarchar(2n)` | widened (room for `n` characters in UTF-16 code units); longer: `nvarchar(max)`, widened |
 //! | `varchar`, `text` | `nvarchar(max)` | exact |
 //! | `binary(n)` / `varbinary(n)`, `n` ≤ 8 000 | `binary(n)` / `varbinary(n)` | exact; longer: `varbinary(max)`, widened |
 //! | `date`, `time(p)`, `timestamp(p)`, `timestamptz(p)` | `date`, `time(p)`, `datetime2(p)`, `datetimeoffset(p)` | exact |
@@ -28,7 +31,7 @@
 //! | `uuid` | `uniqueidentifier` | exact |
 //! | `json`, `jsonb` | 2025+: `json` (exact); older: `nvarchar(max)` (widened) | |
 //! | `array<e>` | `nvarchar(max)` holding a JSON array | widened |
-//! | `enum(...)` | `nvarchar(n)`, `n` the longest label | widened |
+//! | `enum(...)` | `nvarchar(n)`, `n` the longest label in UTF-16 code units | widened |
 //! | `other(name)`, a SQL Server type | `name` | narrowed (text form) |
 //! | `other(name)` otherwise | - | unsupported |
 
@@ -43,6 +46,9 @@ const MAX_BINARY: u32 = 8_000;
 const MAX_PRECISION: u32 = 38;
 /// Scale of unconstrained decimals.
 const FREE_SCALE: u32 = 10;
+/// Why a `char(n)` from another engine is narrowed on SQL Server.
+const UTF16_FIXED: &str = "nchar lengths count UTF-16 code units, and characters \
+     outside the BMP take two: a value with them can exceed nchar(n) and is refused";
 /// Fractional-second digits SQL Server keeps.
 const MAX_FRACTION: u8 = 7;
 
@@ -180,18 +186,34 @@ impl TypeMapper for MsSqlTypeMapper {
                      integer digits are refused, more than 10 decimal places are refused",
                 ),
             },
+            // Source lengths count characters; SQL Server's count UTF-16 code units, where a
+            // character outside the Basic Multilingual Plane (an emoji) takes two.
             DataType::Char { length } => match length {
-                Some(n) if *n <= MAX_NCHAR => TypeMapping::exact(t.clone()),
+                Some(n) if *n <= MAX_NCHAR => {
+                    TypeMapping::with(t.clone(), "", Fidelity::Narrowed, UTF16_FIXED)
+                }
                 _ => widened(
                     DataType::Text,
                     "longer than nchar(4000) or without a length: stored as nvarchar(max)",
                 ),
             },
             DataType::VarChar { length } => match length {
-                Some(n) if *n <= MAX_NCHAR => TypeMapping::exact(t.clone()),
+                Some(n) if n.saturating_mul(2) <= MAX_NCHAR => {
+                    let units = n * 2;
+                    widened(
+                        DataType::VarChar {
+                            length: Some(units),
+                        },
+                        &format!(
+                            "nvarchar lengths count UTF-16 code units, and characters outside \
+                             the BMP take two: stored as nvarchar({units}) to hold {n} characters"
+                        ),
+                    )
+                }
                 Some(_) => widened(
                     DataType::Text,
-                    "longer than nvarchar(4000): stored as nvarchar(max)",
+                    "nvarchar lengths count UTF-16 code units, and characters outside the BMP \
+                     take two: longer than nvarchar(4000) allows, so stored as nvarchar(max)",
                 ),
                 None => TypeMapping::exact(DataType::Text),
             },
@@ -244,7 +266,7 @@ impl TypeMapper for MsSqlTypeMapper {
             DataType::Enum { labels } => {
                 let longest = labels
                     .iter()
-                    .map(|l| l.chars().count())
+                    .map(|l| l.encode_utf16().count())
                     .max()
                     .unwrap_or(1)
                     .max(1);
@@ -333,6 +355,62 @@ mod tests {
             assert_eq!(m.native_type, c.native_type);
             assert_eq!(m.reason.is_some(), fidelity != Fidelity::Exact);
         }
+    }
+
+    #[test]
+    fn text_lengths_leave_room_for_utf16_surrogate_pairs() {
+        let v = ServerVersion::new(17, 0, 0);
+        // '😀😀' fits a PostgreSQL / MySQL varchar(3) (2 characters) but takes 4 UTF-16 code
+        // units: nvarchar(3) would refuse it, so varchar(3) becomes nvarchar(6), widened.
+        let m = MsSqlTypeMapper.map(&DataType::VarChar { length: Some(3) }, &v);
+        assert_eq!(m.data_type, DataType::VarChar { length: Some(6) });
+        assert_eq!(m.fidelity, Fidelity::Widened);
+        assert!(
+            m.reason.as_deref().is_some_and(|r| r.contains("UTF-16")),
+            "{m:?}"
+        );
+        assert!("😀😀".encode_utf16().count() <= 6);
+        // Past nvarchar(4000) in code units: nvarchar(max).
+        for n in [2_001, 4_000] {
+            let m = MsSqlTypeMapper.map(&DataType::VarChar { length: Some(n) }, &v);
+            assert_eq!(m.data_type, DataType::Text, "{n}");
+            assert_eq!(m.fidelity, Fidelity::Widened);
+        }
+        let m = MsSqlTypeMapper.map(
+            &DataType::VarChar {
+                length: Some(2_000),
+            },
+            &v,
+        );
+        assert_eq!(
+            m.data_type,
+            DataType::VarChar {
+                length: Some(4_000)
+            }
+        );
+        // char(n) keeps its fixed length (and padding) and says it can refuse values.
+        let m = MsSqlTypeMapper.map(&DataType::Char { length: Some(3) }, &v);
+        assert_eq!(m.data_type, DataType::Char { length: Some(3) });
+        assert_eq!(m.fidelity, Fidelity::Narrowed);
+        assert!(
+            m.reason.as_deref().is_some_and(|r| r.contains("UTF-16")),
+            "{m:?}"
+        );
+        // Enum labels are measured in code units.
+        let m = MsSqlTypeMapper.map(
+            &DataType::Enum {
+                labels: vec!["a".to_owned(), "😀😀".to_owned()],
+            },
+            &v,
+        );
+        assert_eq!(m.data_type, DataType::VarChar { length: Some(4) });
+        // Between two SQL Servers the lengths already count UTF-16 code units: exact.
+        let mut c = ColumnDef::new("c", DataType::VarChar { length: Some(3) });
+        c.native_type = "nvarchar(3)".to_owned();
+        assert_eq!(
+            MsSqlTypeMapper.same_engine(&c, &v).fidelity,
+            Fidelity::Exact
+        );
     }
 
     #[test]

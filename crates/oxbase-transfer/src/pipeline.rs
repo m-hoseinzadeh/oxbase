@@ -84,7 +84,7 @@ use crate::cells::target_rules;
 use crate::convert::{BatchConverter, RowIssue};
 use crate::mapping::{
     ColumnPlan, MappingContext, bound_key_columns, case_rules, constraint_name, fidelity_between,
-    map_column, same_container, same_name, target_table,
+    map_column, same_container, same_name, target_table, utf16_fidelity,
 };
 use crate::spec::{
     ErrorMode, FkChecks, IdentityMode, SourceObject, TableMode, TransactionScope, TransferOptions,
@@ -943,6 +943,7 @@ fn match_existing(
             fidelity,
             reason,
         };
+        utf16_fidelity(ctx, &plan.source_type, &mut plan.mapping);
     }
 }
 

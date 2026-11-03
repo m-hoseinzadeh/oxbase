@@ -2729,6 +2729,7 @@ async function m8BackupStep() {
   await appMenu("app-backup", "Back up…");
   const dialog = await waitFor("the backup dialog", () => dialogNamed("Back up"));
   await pickContainer(dialog, "Back up", pgSide("m8_src"));
+  await gallery("08-backup");
   await clickWhenEnabled(dialog, "[data-testid=backup-start]", "Back up…");
   const result = await waitFor(
     "the backup to finish",
@@ -2748,6 +2749,7 @@ async function m8BackupStep() {
   await rm(path.join(m5.dir, "open"), { recursive: true, force: true });
   await mkdir(path.join(m5.dir, "open"), { recursive: true });
   await copyFile(path.join(m5.dir, "save", archive), path.join(m5.dir, "open", archive));
+  await m8RestoreScreens();
 
   await appMenu("app-backup", "Verify a backup…");
   const verify = await waitFor("the verify dialog", () => dialogNamed("Verify a backup"));
@@ -2772,6 +2774,30 @@ async function m8BackupStep() {
   report.m8.backup = { archive, verdict };
   if (!verdict.startsWith("Archive OK")) throw new Error(`verify: ${verdict}`);
   return `${result}; verify: ${verdict}`;
+}
+
+/**
+ * Screenshots of the restore dialog with the archive's manifest shown (never fails). Nothing is
+ * restored: the dialog is cancelled before a target is picked.
+ */
+async function m8RestoreScreens() {
+  let dialog = null;
+  try {
+    await appMenu("app-backup", "Restore…");
+    dialog = await waitFor("the restore dialog", () => dialogNamed("Restore a backup"));
+    await clickWhenEnabled(dialog, "[data-testid=restore-choose]", "Choose backup…");
+    await waitFor("the manifest", () => within(dialog, "[data-testid=restore-manifest]"), {
+      timeoutMs: 30_000,
+    });
+    await gallery("08-restore");
+  } catch (error) {
+    log(`no restore screenshot: ${error.message}`);
+  } finally {
+    if (dialog) {
+      const cancel = await within(dialog, ".modal__footer .modal__footer-start").catch(() => null);
+      if (cancel) await wd.execute("arguments[0].click();", cancel).catch(() => {});
+    }
+  }
 }
 
 /**

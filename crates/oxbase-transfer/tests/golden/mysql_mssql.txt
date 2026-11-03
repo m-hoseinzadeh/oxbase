@@ -11,8 +11,8 @@ float64                  -> float64                              exact
 decimal(18,4)            -> decimal(18,4)                        exact
 decimal(38,10)           -> decimal(38,10)                       exact
 decimal                  -> decimal(38,30)                       narrowed    SQL Server decimals have at most 38 digits: longer values are refused
-char(10)                 -> char(10)                             exact
-varchar(255)             -> varchar(255)                         exact
+char(10)                 -> char(10)                             narrowed    nchar lengths count UTF-16 code units, and characters outside the BMP take two: a value with them can exceed nchar(n) and is refused
+varchar(255)             -> varchar(510)                         widened     nvarchar lengths count UTF-16 code units, and characters outside the BMP take two: stored as nvarchar(510) to hold 255 characters
 varchar                  -> text                                 exact
 text                     -> text                                 exact
 binary(16)               -> binary(16)                           exact
@@ -21,8 +21,8 @@ date                     -> date                                 exact
 time(6)                  -> time(6)                              exact
 timestamp(6)             -> timestamp(6)                         exact
 timestamptz(6)           -> timestamp(6)                         exact
-interval                 -> varchar(64)                          exact
-uuid                     -> char(36)                             exact
+interval                 -> varchar(128)                         widened     nvarchar lengths count UTF-16 code units, and characters outside the BMP take two: stored as nvarchar(128) to hold 64 characters
+uuid                     -> char(36)                             narrowed    nchar lengths count UTF-16 code units, and characters outside the BMP take two: a value with them can exceed nchar(n) and is refused
 json                     -> json                                 exact
 jsonb                    -> jsonb                                exact
 int32[]                  -> json                                 exact

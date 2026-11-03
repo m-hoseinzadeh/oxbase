@@ -179,6 +179,23 @@ describe("TransferWizard", () => {
       "timestamp with time zone",
     );
 
+    // Every cell sits under its own header: the block-display text classes live on spans,
+    // never on the cells (a block cell merges with its neighbour and shifts the row left).
+    for (const row of rows) {
+      const table = row.closest("table") as HTMLTableElement;
+      const headers = Array.from(table.querySelectorAll("thead th")).map((h) => h.textContent);
+      const cells = Array.from(row.children) as HTMLElement[];
+      expect(cells).toHaveLength(headers.length);
+      for (const cell of cells) {
+        expect(cell.className).not.toMatch(/transfer-table__(name|type)/);
+      }
+      const column = row.getAttribute("data-column") ?? "";
+      const at = (header: string) => cells[headers.indexOf(header)] as HTMLElement;
+      expect(at("Source column")).toHaveTextContent(column);
+      expect(within(at("Target column")).getByLabelText(`Target column of ${column}`)).toBeTruthy();
+      expect(within(at("Fidelity")).getByTestId("fidelity-badge")).toBeTruthy();
+    }
+
     // Overrides: skip a column (re-planned), type a native type.
     fireEvent.click(within(seen).getByLabelText("Copy seen_at"));
     await waitFor(() =>

@@ -1959,11 +1959,18 @@ fn lossiness(plan: &TransferPlan) -> String {
         .flat_map(|t| t.columns.iter())
         .filter(|c| !c.skipped && c.mapping.fidelity != Fidelity::Exact)
         .map(|c| {
+            // The mapper leaves the native spelling empty when the target's generator spells
+            // the logical type: show that instead of a blank.
+            let target = if c.mapping.native_type.is_empty() {
+                c.mapping.data_type.to_string()
+            } else {
+                c.mapping.native_type.clone()
+            };
             format!(
                 "{} {} -> {}: {} ({})",
                 c.source,
                 c.source_native,
-                c.mapping.native_type,
+                target,
                 fidelity(c.mapping.fidelity),
                 c.mapping.reason.as_deref().unwrap_or("no reason given")
             )

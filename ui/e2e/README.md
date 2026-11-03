@@ -165,9 +165,11 @@ import / export step (step 9) once the integrator turns it on.
       say Finished (screenshots `ui-08-transfer-run-*`); `SELECT count(*)` through IPC must find
       the `[m8.transfer] types_rows` rows.
     - **Backup and verify** (needs the M5 file hook). **Backup → Back up…** of `m8_src`
-      (`backup-start`; the hook saves `<dir>/save/<name>.oxbackup`); `backup-result` must say
-      "Backup written". The test moves the archive alone into `<dir>/open/`, opens **Backup →
-      Verify a backup…**, chooses it (`restore-choose`), waits for the manifest
+      (screenshots `ui-08-backup-*`; `backup-start`; the hook saves
+      `<dir>/save/<name>.oxbackup`); `backup-result` must say "Backup written". The test moves
+      the archive alone into `<dir>/open/`, opens **Backup → Restore…**, chooses it and waits
+      for the manifest (screenshots `ui-08-restore-*`; never fails; the dialog is cancelled,
+      nothing is restored), then opens **Backup → Verify a backup…**, chooses it (`restore-choose`), waits for the manifest
       (`restore-manifest`) and verifies (`restore-verify`); `verify-result` must say "Archive
       OK".
     - Without `OXBASE_E2E_REQUIRE_M8=1`, missing seeds or any failure of these steps is a skip

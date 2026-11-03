@@ -355,7 +355,8 @@ pub fn map_column(
             name.clone_into(&mut target);
         }
         if let Some(data_type) = &o.data_type {
-            let mapped = ctx.target_mapper.map(data_type, ctx.target_version);
+            let mut mapped = ctx.target_mapper.map(data_type, ctx.target_version);
+            keep_text_length(data_type, &mut mapped);
             let (fidelity, reason) = if mapped.fidelity == Fidelity::Unsupported {
                 (Fidelity::Unsupported, mapped.reason)
             } else {
@@ -371,6 +372,7 @@ pub fn map_column(
             native.clone_into(&mut mapping.native_type);
         }
     }
+    utf16_fidelity(ctx, &source_type, &mut mapping);
     ColumnPlan {
         source: column.name.clone(),
         source_type,
@@ -379,6 +381,57 @@ pub fn map_column(
         mapping,
         overridden,
         skipped,
+    }
+}
+
+/// Keeps the length of `requested` when it and `mapped` are both bounded `varchar`s: a length the
+/// user (an override) or the target's key rules chose is already in the target's own unit, so a
+/// mapper that makes room for a source's character count (SQL Server doubles `varchar(n)` for
+/// UTF-16 code units) must not grow it.
+fn keep_text_length(requested: &DataType, mapped: &mut TypeMapping) {
+    if let (DataType::VarChar { length: Some(_) }, DataType::VarChar { length: Some(_) }) =
+        (requested, &mapped.data_type)
+    {
+        mapped.data_type = requested.clone();
+    }
+}
+
+/// Across engines into a target whose text lengths count UTF-16 code units
+/// ([`TargetRules::utf16_lengths`]: SQL Server `nchar` / `nvarchar`): a source text measured
+/// in characters takes up to two code units per character (outside the Basic Multilingual
+/// Plane), so a bounded target column shorter than that cannot promise every value fits. An
+/// `exact` / `widened` mapping of such a column (an override, an existing target column)
+/// becomes `narrowed` with that reason; anything else is left as it is.
+pub fn utf16_fidelity(ctx: &MappingContext<'_>, source_type: &DataType, mapping: &mut TypeMapping) {
+    if ctx.same_engine()
+        || !ctx.target_rules().utf16_lengths
+        || !matches!(mapping.fidelity, Fidelity::Exact | Fidelity::Widened)
+    {
+        return;
+    }
+    let (DataType::Char { length: Some(n) } | DataType::VarChar { length: Some(n) }) =
+        mapping.data_type
+    else {
+        return;
+    };
+    let units = match source_type {
+        DataType::Char { length: Some(w) } | DataType::VarChar { length: Some(w) } => {
+            w.saturating_mul(2)
+        }
+        DataType::Enum { labels } => labels
+            .iter()
+            .map(|l| u32::try_from(l.encode_utf16().count()).unwrap_or(u32::MAX))
+            .max()
+            .unwrap_or(0),
+        _ => return,
+    };
+    if units > n {
+        mapping.fidelity = Fidelity::Narrowed;
+        mapping.reason = Some(format!(
+            "{} counts text lengths in UTF-16 code units, and characters outside the BMP take \
+             two: values longer than {n} code units are refused",
+            ctx.target_engine.display_name()
+        ));
     }
 }
 
@@ -541,10 +594,11 @@ pub fn bound_key_columns(ctx: &MappingContext<'_>, source: &TableDef, columns: &
             }
             _ => continue,
         };
-        let mapped = ctx.target_mapper.map(&bounded, ctx.target_version);
+        let mut mapped = ctx.target_mapper.map(&bounded, ctx.target_version);
         if mapped.fidelity == Fidelity::Unsupported || unbounded(&mapped.data_type) {
             continue;
         }
+        keep_text_length(&bounded, &mut mapped);
         let (fidelity, _) = fidelity_between(&plan.source_type, &mapped.data_type);
         let reason = format!(
             "a primary-key column: {} cannot key unbounded text or binary, so it is created as \
@@ -1518,6 +1572,88 @@ mod tests {
         bound_key_columns(ctx, source, &mut plans);
         let target = ObjectRef::database("dst").child(ObjectKind::Table, source.obj.name.clone());
         target_table(ctx, source, target, &plans, &TransferOptions::default()).unwrap()
+    }
+
+    #[test]
+    fn utf16_targets_count_code_units() {
+        use crate::cells::mssql::MsSqlTypeMapper;
+        let (pg, ms) = (pg_version(), ServerVersion::new(17, 0, 0));
+        let ctx = MappingContext {
+            source_engine: Engine::Postgres,
+            source_version: &pg,
+            source_mapper: &PgTypeMapper,
+            target_engine: Engine::MsSql,
+            target_version: &ms,
+            target_mapper: &MsSqlTypeMapper,
+        };
+        let name = ColumnDef::new("name", DataType::VarChar { length: Some(3) });
+        // The mapper makes room: nvarchar(6), widened.
+        let plan = map_column(&ctx, &name, None);
+        assert_eq!(
+            plan.mapping.data_type,
+            DataType::VarChar { length: Some(6) }
+        );
+        assert_eq!(plan.mapping.fidelity, Fidelity::Widened);
+        // An override to nvarchar(3) cannot hold '😀😀' (4 code units): narrowed, not exact.
+        let o = ColumnOverride {
+            object: 0,
+            column: "name".into(),
+            skip: false,
+            target_name: None,
+            data_type: Some(DataType::VarChar { length: Some(3) }),
+            native_type: None,
+        };
+        let plan = map_column(&ctx, &name, Some(&o));
+        assert_eq!(plan.mapping.fidelity, Fidelity::Narrowed);
+        assert!(
+            plan.mapping
+                .reason
+                .as_deref()
+                .is_some_and(|r| r.contains("UTF-16 code units")),
+            "{:?}",
+            plan.mapping
+        );
+        // ... and nvarchar(6) is enough.
+        let o = ColumnOverride {
+            data_type: Some(DataType::VarChar { length: Some(6) }),
+            ..o
+        };
+        assert_eq!(
+            map_column(&ctx, &name, Some(&o)).mapping.fidelity,
+            Fidelity::Widened
+        );
+        // PostgreSQL counts characters: varchar(3) into varchar(3) stays exact there.
+        let my = my_version();
+        let to_pg = MappingContext {
+            source_engine: Engine::MySql,
+            source_version: &my,
+            source_mapper: &MYSQL,
+            target_engine: Engine::Postgres,
+            target_version: &pg,
+            target_mapper: &PgTypeMapper,
+        };
+        assert_eq!(
+            map_column(&to_pg, &name, None).mapping.fidelity,
+            Fidelity::Exact
+        );
+
+        // A text key keeps SQL Server's key length (nvarchar(450)), not a doubled one.
+        let source = keyed(
+            "tags",
+            "tags_pkey",
+            ColumnDef::new("code", DataType::Text).not_null(),
+        );
+        let mut plans: Vec<ColumnPlan> = source
+            .columns
+            .iter()
+            .map(|c| map_column(&ctx, c, None))
+            .collect();
+        bound_key_columns(&ctx, &source, &mut plans);
+        assert_eq!(
+            plans[0].mapping.data_type,
+            DataType::VarChar { length: Some(450) }
+        );
+        assert_eq!(plans[0].mapping.fidelity, Fidelity::Narrowed);
     }
 
     #[test]
