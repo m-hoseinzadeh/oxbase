@@ -64,14 +64,17 @@ mod fetch;
 // M6: keywords, functions and types for code insight.
 mod language;
 mod parse;
+// M8: structure sync DDL for views and triggers.
+mod sync_ddl;
 mod types;
 
 use std::sync::Arc;
 
-use oxbase_dialect::compare::RulesComparator;
+use oxbase_dialect::compare::{DefaultRules, RulesComparator};
 use oxbase_dialect::{
     AnsiQuoting, Capabilities, ChildGroup, Comparator, DESIGNER_KINDS, DatabaseScope, DdlGenerator,
-    DesignerCapabilities, DialectRegistry, DmlWriter, Fetcher, Quoting, TreeLayout,
+    DefinitionComparator, DesignerCapabilities, DialectRegistry, DmlWriter, Fetcher, Quoting,
+    TreeLayout,
 };
 use oxbase_types::{Engine, ObjectKind, PropId, ServerVersion, props};
 
@@ -240,6 +243,14 @@ pub fn register(reg: &mut DialectRegistry) {
         // M6: language data for code insight (language.rs).
         .register_language(engine, language::LANGUAGE)
         .mark_not_applicable_except(engine, APPLICABLE);
+
+    // M8: structure sync DDL and comparison of views and triggers (sync_ddl.rs).
+    let sync: Arc<dyn DdlGenerator> = Arc::new(sync_ddl::SqliteSyncDdl);
+    let definitions: Arc<dyn Comparator> = Arc::new(DefinitionComparator(DefaultRules));
+    for kind in sync_ddl::KINDS {
+        reg.register_ddl(engine, kind, Arc::clone(&sync))
+            .register_comparator(engine, kind, Arc::clone(&definitions));
+    }
 }
 
 #[cfg(test)]

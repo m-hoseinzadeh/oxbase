@@ -34,3 +34,8 @@ tempfile.workspace = true
 oxbase-driver = { workspace = true, features = ["mock"] }
 pretty_assertions.workspace = true
 tokio.workspace = true
+# Structure sync script tests (tests/structure_script.rs) run the engines' real DDL cells.
+oxbase-pg.workspace = true
+oxbase-mysql.workspace = true
+oxbase-mssql.workspace = true
+oxbase-sqlite.workspace = true
