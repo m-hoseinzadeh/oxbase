@@ -483,12 +483,13 @@ fn plan_columns(job: &CompareJob<'_>) -> Result<ColumnPlan> {
                 type_name(t)
             )));
         }
-        if let (Some(a), Some(b)) = (&s.collation, &t.collation)
-            && !a.eq_ignore_ascii_case(b)
+        if let (Some(source_collation), Some(target_collation)) = (&s.collation, &t.collation)
+            && !source_collation.eq_ignore_ascii_case(target_collation)
         {
             return Err(Error::invalid_input(format!(
-                "key column '{k}' has collation {a} in the source and {b} in the target; the \
-                 two sides sort keys differently, so key ranges would not line up"
+                "key column '{k}' has collation {source_collation} in the source and \
+                 {target_collation} in the target; the two sides sort keys differently, so key \
+                 ranges would not line up"
             )));
         }
         if let Some(why) = refused(t) {
@@ -1491,7 +1492,7 @@ pub fn data_statements(
             .iter()
             .enumerate()
             .filter(|(c, _)| !(skip_key && key_at.contains(c)))
-            .filter(|(c, _)| !defs[*c].is_some_and(|d| d.generated.is_some()))
+            .filter(|(c, _)| defs[*c].is_none_or(|d| d.generated.is_none()))
             .map(|(c, name)| {
                 (
                     c,

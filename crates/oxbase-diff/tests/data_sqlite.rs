@@ -500,6 +500,11 @@ impl Counting {
     fn peak(&self) -> usize {
         self.peak.load(Ordering::SeqCst)
     }
+
+    /// Forgets what was counted so far (the table definitions' catalog reads).
+    fn reset(&self) {
+        self.peak.store(0, Ordering::SeqCst);
+    }
 }
 
 #[async_trait::async_trait]
@@ -570,6 +575,8 @@ async fn both_sides_stay_within_the_chunk_size() {
         };
         let source_table = load(&f.reg, &source, "m8_big").await;
         let target_table = load(&f.reg, &target, "m8_big").await;
+        source.reset();
+        target.reset();
         let options = DataCompareOptions {
             chunk_rows: 1_000,
             sample_rows: 3,
