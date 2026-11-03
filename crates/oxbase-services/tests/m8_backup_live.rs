@@ -294,7 +294,6 @@ impl Live {
         let (yes, no, bytes) = match self.engine {
             Engine::Postgres => ("true", "false", "'\\x00ff0a'::bytea"),
             Engine::MsSql => ("1", "0", "0x00FF0A"),
-            Engine::Sqlite => ("1", "0", "X'00FF0A'"),
             _ => ("1", "0", "X'00FF0A'"),
         };
         let text = |t: &str| {
