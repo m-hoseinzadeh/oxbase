@@ -425,16 +425,15 @@ impl Run<'_> {
                     if batch.num_rows() == 0 {
                         continue;
                     }
-                    let load = match schema.take() {
-                        Some(load) => load,
-                        None => {
-                            keep_text_forms(&mut columns, &batch);
-                            let begun = load_schema(&table.obj, &columns, &version);
-                            self.archive
-                                .begin(index, Arc::clone(&begun), self.cancel)
-                                .await?;
-                            begun
-                        }
+                    let load = if let Some(load) = schema.take() {
+                        load
+                    } else {
+                        keep_text_forms(&mut columns, &batch);
+                        let begun = load_schema(&table.obj, &columns, &version);
+                        self.archive
+                            .begin(index, Arc::clone(&begun), self.cancel)
+                            .await?;
+                        begun
                     };
                     let converted = to_load_batch(&table.obj, &batch, &load, &columns, rows)?;
                     schema = Some(load);
