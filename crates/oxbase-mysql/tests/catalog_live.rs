@@ -141,7 +141,11 @@ impl Live {
             if self.engine == Engine::MySql && sql.contains("SEQUENCE") {
                 continue;
             }
-            let _ = self.c.execute(&sql, &[], CancellationToken::new()).await;
+            // Drain the result: dropping a result stream cancels its statement, so the drop
+            // could be cancelled before it ran and leave the object behind.
+            if let Ok(stream) = self.c.execute(&sql, &[], CancellationToken::new()).await {
+                let _ = collect(stream).await;
+            }
         }
     }
 }
