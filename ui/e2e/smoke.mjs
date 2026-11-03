@@ -2336,7 +2336,11 @@ async function redisSteps() {
       if (text.includes("(error)"))
         throw new Fatal(`the console shows an error: ${text.slice(-300)}`);
       const reply = await within(consoleTab, "[data-testid=resp-table], [data-testid=resp-lines]");
-      return reply ? text.slice(-200) : null;
+      if (!reply) return null;
+      const shown = (await textIn(consoleTab, "[data-testid=console-output]")) ?? "";
+      const want = ["f1", "v1", "f2", "v2", "f3", "grüße"];
+      if (!want.every((w) => shown.includes(w))) return null;
+      return shown.slice(-200);
     },
     { timeoutMs: 20_000 },
   );

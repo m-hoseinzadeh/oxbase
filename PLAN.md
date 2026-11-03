@@ -501,7 +501,8 @@ fast-lane run 41547092752 on the same commit gave the same cells). CI sets
 `OXBASE_CONFORMANCE_REQUIRE_M7`, `OXBASE_SERVICES_REQUIRE_M7`, `OXBASE_REDIS_REQUIRE_M7`,
 `OXBASE_SHELL_REQUIRE_M7_SEED` and, in the webview job, `OXBASE_E2E_REQUIRE_M7`, so nothing M7
 passes as pending. The 7-engine guard reported nothing open: connection checks 39 pass / 3 n/a
-(SQLite TLS / SSH), MongoDB and Redis included (MongoDB cancel: server operation gone 1 ms
+(SQLite TLS / SSH), MongoDB and Redis included (timings from the fast-lane run 41547092752; the full-lane run measured 107 ms,
+292 ms, 2847 ms and 463 ms for the same four numbers. MongoDB cancel: server operation gone 1 ms
 after the token, `cancel_running` 209 ms; 200 000 documents in 897 ms; Redis `BLPOP 0`
 cancelled in 0-1 ms, 200 000 list elements in 283 ms); `fetch_list` 65 pass (MongoDB 6, Redis
 4). Live tests: `oxbase-mongo` 24, `oxbase-redis` 35, services `m7_*` 8, all passed; the webview
