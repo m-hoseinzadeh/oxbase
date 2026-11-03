@@ -212,7 +212,7 @@ RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps --locked
 cargo build -p app-tauri --locked          # proves the Tauri shell links
                                            # (verified via `pnpm --dir ../../ui tauri build --debug --no-bundle`
                                            #  from crates/app-tauri, which runs the UI build first)
-cargo run -p oxbase-cli -- --version          # prints "oxbase 0.6.1"
+cargo run -p oxbase-cli -- --version          # prints "oxbase 0.7.0"
 cargo deny check                              # licenses, advisories, bans, sources
 cargo tree -i openssl-sys; cargo tree -i aws-lc-sys   # both must find nothing (rustls + ring only)
 scripts/keychain-tests.sh                     # real OS keychain tests (see Conformance harness)
