@@ -432,7 +432,7 @@ async fn refusals_come_before_any_write() {
     };
     let (outcome, log) = try_restore(&path, &unconfirmed, ENGINE).await;
     assert!(outcome.error.unwrap().to_string().contains("confirm"));
-    assert!(log.is_empty());
+    assert_eq!(log, Vec::<String>::new());
 
     let (outcome, log) = try_restore(&path, &options(), Engine::MySql).await;
     let err = outcome.error.unwrap();
@@ -441,7 +441,7 @@ async fn refusals_come_before_any_write() {
             .contains("the backup is from PostgreSQL, the target is MySQL"),
         "{err}"
     );
-    assert!(log.is_empty());
+    assert_eq!(log, Vec::<String>::new());
 
     let unknown = RestoreOptions {
         objects: vec![7],
@@ -449,7 +449,7 @@ async fn refusals_come_before_any_write() {
     };
     let (outcome, log) = try_restore(&path, &unknown, ENGINE).await;
     assert!(outcome.error.unwrap().to_string().contains("no object 7"));
-    assert!(log.is_empty());
+    assert_eq!(log, Vec::<String>::new());
 }
 
 #[tokio::test]

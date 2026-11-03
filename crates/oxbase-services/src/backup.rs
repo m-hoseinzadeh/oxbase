@@ -295,6 +295,8 @@ impl BackupService {
 
     /// Recomputes every checksum of the archive at `path`.
     pub async fn verify(&self, path: &Path, cancel: CancellationToken) -> Result<VerifyReport> {
+        // Request-style: registered with the request's token (no session).
+        let _ticket = self.runs.register_with(&[], cancel.clone());
         let token = cancel.clone();
         let work = read_blocking(path.to_path_buf(), move |r| {
             r.verify(&mut |_| {}, &|| token.is_cancelled())
@@ -304,6 +306,7 @@ impl BackupService {
 
     /// The manifest of the archive at `path` (validated).
     pub async fn list(&self, path: &Path, cancel: CancellationToken) -> Result<Manifest> {
+        let _ticket = self.runs.register_with(&[], cancel.clone());
         let work = read_blocking(path.to_path_buf(), |r| Ok(r.manifest().clone()));
         crate::until_cancelled(&cancel, work).await
     }

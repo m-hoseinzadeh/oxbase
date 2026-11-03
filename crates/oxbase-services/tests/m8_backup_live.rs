@@ -345,9 +345,10 @@ impl Live {
             .comparator(self.engine, ObjectKind::Table)
             .unwrap();
         let diff = comparator.diff(before, after);
-        assert!(
-            diff.is_empty(),
-            "{}: {} differs after the restore: {diff:?}",
+        assert_eq!(
+            diff,
+            [],
+            "{}: {} differs after the restore",
             self.key,
             before.name()
         );
