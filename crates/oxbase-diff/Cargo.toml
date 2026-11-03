@@ -25,6 +25,8 @@ arrow-array.workspace = true
 arrow-schema.workspace = true
 # Differing rows spill to Arrow IPC files (bounded memory for 100k+ row differences).
 arrow-ipc.workspace = true
+# Chunk pages concatenated and filtered into the spill store (data compare).
+arrow-select.workspace = true
 futures.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -34,3 +36,9 @@ tempfile.workspace = true
 oxbase-driver = { workspace = true, features = ["mock"] }
 pretty_assertions.workspace = true
 tokio.workspace = true
+chrono.workspace = true
+# Data compare / DML tests: every SQL engine's grid writer, and real SQLite files (no Docker).
+oxbase-pg.workspace = true
+oxbase-mysql.workspace = true
+oxbase-sqlite.workspace = true
+oxbase-mssql.workspace = true
