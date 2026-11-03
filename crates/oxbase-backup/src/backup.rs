@@ -271,8 +271,8 @@ impl Run<'_> {
             let object = def.object_ref();
             self.progress.current = Some(object.clone());
             self.report(true);
-            let ddl = match job.dialects.ddl(engine, def.kind()) {
-                Ok(generator) => match generator.create(def, &DdlContext::new(&version)) {
+            let ddl = if let Ok(generator) = job.dialects.ddl(engine, def.kind()) {
+                match generator.create(def, &DdlContext::new(&version)) {
                     Ok(script) => Some(script.to_sql(terminator)),
                     Err(e) => {
                         warnings.push(format!(
@@ -282,13 +282,12 @@ impl Run<'_> {
                         ));
                         None
                     }
-                },
-                Err(_) => {
-                    if !without_ddl.contains(&def.kind()) {
-                        without_ddl.push(def.kind());
-                    }
-                    None
                 }
+            } else {
+                if !without_ddl.contains(&def.kind()) {
+                    without_ddl.push(def.kind());
+                }
+                None
             };
             let (def_info, ddl_info) = self
                 .archive

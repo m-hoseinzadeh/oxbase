@@ -74,7 +74,7 @@ impl<W: Write> Write for HashingWriter<W> {
 
 enum WriterState<W: Write + Seek> {
     /// Between entries.
-    Idle(ZipWriter<W>),
+    Idle(Box<ZipWriter<W>>),
     /// A table's data entry is open.
     Table {
         writer: Box<StreamWriter<HashingWriter<ZipWriter<W>>>>,
@@ -95,7 +95,7 @@ pub struct ArchiveWriter<W: Write + Seek> {
 impl<W: Write + Seek> ArchiveWriter<W> {
     pub fn new(sink: W, compression: Compression) -> Self {
         Self {
-            state: WriterState::Idle(ZipWriter::new(sink)),
+            state: WriterState::Idle(Box::new(ZipWriter::new(sink))),
             compression,
         }
     }
@@ -108,7 +108,7 @@ impl<W: Write + Seek> ArchiveWriter<W> {
 
     fn idle(&mut self) -> Result<&mut ZipWriter<W>> {
         match &mut self.state {
-            WriterState::Idle(zip) => Ok(zip),
+            WriterState::Idle(zip) => Ok(zip.as_mut()),
             WriterState::Table { .. } => Err(Error::internal(
                 "a table's data entry is still open in the backup archive",
             )),
@@ -174,7 +174,7 @@ impl<W: Write + Seek> ArchiveWriter<W> {
             .map_err(|e| Error::internal(format!("arrow: {e}")))?;
         let writer = StreamWriter::try_new_with_options(
             HashingWriter {
-                inner: zip,
+                inner: *zip,
                 hasher: EntryHasher::new(),
             },
             schema,
@@ -214,7 +214,7 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         let hashing = (*writer)
             .into_inner()
             .map_err(|e| Error::internal(format!("cannot finish table data: {e}")))?;
-        self.state = WriterState::Idle(hashing.inner);
+        self.state = WriterState::Idle(Box::new(hashing.inner));
         Ok((hashing.hasher.finish(), rows))
     }
 
@@ -226,7 +226,7 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         let WriterState::Idle(zip) = self.state else {
             return Err(poisoned());
         };
-        zip.finish().map_err(|e| zip_error(&e))
+        (*zip).finish().map_err(|e| zip_error(&e))
     }
 }
 

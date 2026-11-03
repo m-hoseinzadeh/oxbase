@@ -450,7 +450,7 @@ async fn scratch_round_trip(live: &Live) {
     // Back up, list, verify.
     let path = live.dir.path().join("scratch.oxbackup");
     let made = live.backup(live.spec(), &path).await;
-    let names: Vec<&str> = report
+    let names: Vec<&str> = made
         .manifest
         .objects
         .iter()

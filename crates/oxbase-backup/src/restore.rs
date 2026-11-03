@@ -198,7 +198,7 @@ pub struct RestoreJob<'a> {
 /// committed.
 pub async fn restore(
     job: RestoreJob<'_>,
-    source: &std::path::Path,
+    source: &Path,
     run_script: &ScriptRunner,
     on_progress: &(dyn Fn(&RestoreProgress) + Send + Sync),
     cancel: CancellationToken,
@@ -223,7 +223,7 @@ pub struct RestoreOutcome {
 /// `cancelled` events).
 pub async fn restore_run(
     job: RestoreJob<'_>,
-    source: &std::path::Path,
+    source: &Path,
     run_script: &ScriptRunner,
     on_progress: &(dyn Fn(&RestoreProgress) + Send + Sync),
     cancel: CancellationToken,
