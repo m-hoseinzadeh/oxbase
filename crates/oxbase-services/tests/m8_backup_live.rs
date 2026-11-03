@@ -1,22 +1,30 @@
 //! Live backup → restore round trips per SQL engine (PostgreSQL, MySQL, MariaDB, SQL Server,
 //! SQLite) against the Docker fixtures (`docs/m8-contracts.md` §7, §12 *backup*).
 //!
-//! Per engine, on scratch tables `m8_t_bk_<token>_parent` / `_child` (a foreign key between
-//! them, a unique key, an index, the common types, NULLs, empty and non-ASCII text) in the
-//! fixture database's default schema:
+//! Per engine, on scratch tables in the fixture database's default schema:
+//! `m8_t_bk_<token>_parent` / `_child` (a foreign key between them, a unique key, an index, the
+//! common types, NULLs, empty and non-ASCII text) and `_node` (an identity / auto-increment key,
+//! a foreign key to itself with a row that points at a row loaded after it, and on SQL Server a
+//! `rowversion` column):
 //!
-//! - back up both tables (zstd), list and verify the archive;
-//! - drop them and restore: the definitions compare equal (the engine's `Comparator`) and every
-//!   row reads back equal;
-//! - data-only restore with truncate (confirmed): the same rows, no duplicates;
+//! - back up the three tables (zstd), list and verify the archive;
+//! - drop them and restore: the definitions compare equal (the engine's `Comparator`), every row
+//!   reads back equal, and a new row gets a fresh generated key (PostgreSQL once its
+//!   `BulkLoader::identity_resync` cell exists);
+//! - a default restore over the tables, which hold rows, is refused before it writes;
+//! - data-only restore with truncate (confirmed): the same rows, no duplicates; the
+//!   self-referencing table too where the engine checks foreign keys per statement or can
+//!   switch them off;
 //! - a restore that would drop objects without confirmation is refused before it starts; a
 //!   structure restore over the equal existing tables keeps them;
 //! - restore of one selected object (the child table: structure only, then data only);
-//! - a cancelled backup ends `cancelled` and leaves no file.
+//! - a cancelled backup ends `cancelled` and leaves no file, also when cancelled while a larger
+//!   table's rows stream.
 //!
-//! The `[m8]` fixture round trip (`m8_src` → `m8_restore`, every table, definitions and rows)
-//! runs once the conformance stream's seeds exist; until then it reports "pending", unless
-//! `OXBASE_SERVICES_REQUIRE_M8=1`.
+//! The `[m8]` fixture round trip (`m8_src` → `m8_restore`: every object compared through the
+//! engine's comparator after moving the source definition like the restore does, every table's
+//! rows compared value by value, sequences past the restored values) runs once the conformance
+//! stream's seeds exist; until then it reports "pending", unless `OXBASE_SERVICES_REQUIRE_M8=1`.
 //!
 //! ```sh
 //! scripts/fixtures-up.sh
@@ -27,6 +35,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use oxbase_backup::move_definition;
 use oxbase_driver::{cell_value, collect};
 use oxbase_net::ssh::RusshTunnelProvider;
 use oxbase_services::backup::{
@@ -40,7 +49,7 @@ use oxbase_services::{
     SecretRef, SecretStore, SessionId, default_dialects, default_drivers,
 };
 use oxbase_store::{MemorySecretStore, ProfileAddress, Secret, SecretSlot, TlsMode, TlsSettings};
-use oxbase_types::{Engine, Location, ObjectDef, ObjectKind, ObjectRef, Value, relocate_def};
+use oxbase_types::{Engine, Location, ObjectDef, ObjectKind, ObjectRef, Value};
 
 fn root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -101,6 +110,10 @@ struct Live {
     container: ObjectRef,
     parent: String,
     child: String,
+    /// Identity key, foreign key to itself (and `rowversion` on SQL Server).
+    node: String,
+    /// The larger table of the mid-table cancel.
+    big: String,
     dir: tempfile::TempDir,
 }
 
@@ -180,6 +193,8 @@ impl Live {
             container,
             parent: format!("{prefix}_parent"),
             child: format!("{prefix}_child"),
+            node: format!("{prefix}_node"),
+            big: format!("{prefix}_big"),
             dir,
         }
     }
@@ -230,7 +245,7 @@ impl Live {
     }
 
     async fn drop_tables(&self) {
-        for t in [&self.child, &self.parent] {
+        for t in [&self.child, &self.parent, &self.node, &self.big] {
             let _ = self.try_exec(&format!("DROP TABLE {}", self.q(t))).await;
         }
     }
@@ -322,6 +337,58 @@ impl Live {
         .await;
     }
 
+    /// The self-referencing table with an identity key; rows `(2, NULL)`, `(1 → 2)`, `(3 → 1)`:
+    /// in key order, row 1 points at a row loaded after it.
+    async fn create_node(&self) {
+        let n = self.q(&self.node);
+        let ddl = match self.engine {
+            Engine::Postgres => format!(
+                "CREATE TABLE {n} (id serial PRIMARY KEY, parent_id integer REFERENCES {n} (id), \
+                 name varchar(20) NOT NULL)"
+            ),
+            Engine::MySql | Engine::MariaDb => format!(
+                "CREATE TABLE {n} (id INT AUTO_INCREMENT PRIMARY KEY, parent_id INT, \
+                 name VARCHAR(20) NOT NULL, FOREIGN KEY (parent_id) REFERENCES {n} (id)) \
+                 ENGINE=InnoDB"
+            ),
+            Engine::MsSql => format!(
+                "CREATE TABLE {n} (id INT IDENTITY(1,1) PRIMARY KEY, parent_id INT REFERENCES \
+                 {n} (id), name NVARCHAR(20) NOT NULL, rv rowversion)"
+            ),
+            _ => format!(
+                "CREATE TABLE {n} (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES {n} (id), \
+                 name TEXT NOT NULL)"
+            ),
+        };
+        self.exec(&ddl).await;
+        let inserts = [(2, "NULL", "b"), (1, "2", "a"), (3, "1", "c")]
+            .iter()
+            .map(|(id, parent, name)| {
+                format!("INSERT INTO {n} (id, parent_id, name) VALUES ({id}, {parent}, '{name}')")
+            })
+            .collect::<Vec<_>>();
+        if self.engine == Engine::MsSql {
+            self.exec(&format!(
+                "SET IDENTITY_INSERT {n} ON; {}; SET IDENTITY_INSERT {n} OFF",
+                inserts.join("; ")
+            ))
+            .await;
+        } else {
+            for sql in inserts {
+                self.exec(&sql).await;
+            }
+        }
+    }
+
+    /// The node table's stored values (not the server-maintained `rowversion`).
+    async fn node_rows(&self) -> Vec<Vec<Value>> {
+        self.exec(&format!(
+            "SELECT id, parent_id, name FROM {} ORDER BY id",
+            self.q(&self.node)
+        ))
+        .await
+    }
+
     async fn rows(&self, table: &str) -> Vec<Vec<Value>> {
         self.exec(&format!("SELECT * FROM {} ORDER BY id", self.q(table)))
             .await
@@ -404,12 +471,43 @@ impl Live {
         panic!("{}: the restore sent no terminal event", self.key)
     }
 
+    /// Starts a restore that must fail; returns its error message.
+    async fn restore_fails(&self, options: RestoreOptions, path: &Path) -> String {
+        let mut handle = self
+            .backups
+            .start_restore(
+                RestoreRequest {
+                    session: self.session,
+                    options,
+                },
+                path,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{}: restore: {e}", self.key));
+        while let Some(event) = handle.events.recv().await {
+            match event {
+                RestoreEvent::Started { .. } | RestoreEvent::Progress { .. } => {}
+                RestoreEvent::Failed { error, report } => {
+                    assert!(
+                        report.left_behind.starts_with("nothing was written"),
+                        "{}: {report:?}",
+                        self.key
+                    );
+                    return error.message;
+                }
+                other => panic!("{}: the restore should fail, it ended {other:?}", self.key),
+            }
+        }
+        panic!("{}: the restore sent no terminal event", self.key)
+    }
+
     fn spec(&self) -> BackupSpec {
         BackupSpec {
             container: self.container.clone(),
             objects: vec![
                 ObjectRef::new(ObjectKind::Table, self.parent.clone()),
                 ObjectRef::new(ObjectKind::Table, self.child.clone()),
+                ObjectRef::new(ObjectKind::Table, self.node.clone()),
             ],
             content: BackupContent::StructureAndData,
             compression: Compression::Zstd,
@@ -417,19 +515,54 @@ impl Live {
     }
 }
 
+/// An integer cell (integers, decimals or text by engine).
+fn integer(value: &Value) -> Option<i128> {
+    match value {
+        Value::Int(i) => Some(i128::from(*i)),
+        Value::UInt(u) => Some(i128::from(*u)),
+        Value::Decimal(t) | Value::Text(t) => t.trim().split('.').next()?.parse().ok(),
+        _ => None,
+    }
+}
+
 fn statuses(report: &RestoreReport) -> Vec<(String, RestoredStatus)> {
-    report
+    let mut out: Vec<(String, RestoredStatus)> = report
         .objects
         .iter()
         .map(|o| (o.object.name.clone(), o.status))
-        .collect()
+        .collect();
+    out.sort();
+    out
+}
+
+/// `(name, status)` for each of `names`, sorted like [`statuses`].
+fn all(names: &[&String], status: RestoredStatus) -> Vec<(String, RestoredStatus)> {
+    let mut out: Vec<(String, RestoredStatus)> =
+        names.iter().map(|n| ((*n).clone(), status)).collect();
+    out.sort();
+    out
+}
+
+/// The manifest index of table `name`.
+fn index_of(report: &BackupReport, name: &str) -> u32 {
+    report
+        .manifest
+        .objects
+        .iter()
+        .find(|o| o.object.name == name)
+        .unwrap_or_else(|| panic!("{name} is not in the backup"))
+        .index
 }
 
 async fn round_trip(key: &'static str, engine: Engine) {
     let live = Live::connect(key, engine).await;
     live.drop_tables().await;
     live.create_tables().await;
-    let result = std::panic::AssertUnwindSafe(scratch_round_trip(&live));
+    live.create_node().await;
+    let result = std::panic::AssertUnwindSafe(async {
+        scratch_round_trip(&live).await;
+        cancel_mid_table(&live).await;
+    });
     let outcome = futures::FutureExt::catch_unwind(result).await;
     live.drop_tables().await;
     if let Err(panic) = outcome {
@@ -440,12 +573,15 @@ async fn round_trip(key: &'static str, engine: Engine) {
 
 async fn scratch_round_trip(live: &Live) {
     let key = live.key;
-    let (parent, child) = (live.parent.clone(), live.child.clone());
+    let (parent, child, node) = (live.parent.clone(), live.child.clone(), live.node.clone());
     let parent_def = live.def(&parent).await;
     let child_def = live.def(&child).await;
+    let node_def = live.def(&node).await;
     let parent_rows = live.rows(&parent).await;
     let child_rows = live.rows(&child).await;
+    let node_rows = live.node_rows().await;
     assert_eq!(parent_rows.len(), 3, "{key}");
+    assert_eq!(node_rows.len(), 3, "{key}");
 
     // Back up, list, verify.
     let path = live.dir.path().join("scratch.oxbackup");
@@ -456,14 +592,24 @@ async fn scratch_round_trip(live: &Live) {
         .iter()
         .map(|o| o.object.name.as_str())
         .collect();
-    assert_eq!(
-        names,
-        [parent.as_str(), child.as_str()],
-        "{key}: parents first"
+    let at = |n: &str| names.iter().position(|x| *x == n);
+    assert!(
+        at(&parent).is_some() && at(&parent) < at(&child) && at(&node).is_some(),
+        "{key}: parents first: {names:?}"
     );
-    assert_eq!(made.manifest.total_rows(), 6, "{key}");
+    assert_eq!(made.manifest.total_rows(), 9, "{key}");
     assert_eq!(made.manifest.engine, live.engine);
     assert_eq!(made.bytes, std::fs::metadata(&path).unwrap().len());
+    if live.engine == Engine::MsSql {
+        assert!(
+            made.manifest
+                .warnings
+                .iter()
+                .any(|w| w.contains("column rv")),
+            "{key}: the rowversion column is left out with a warning: {:?}",
+            made.manifest.warnings
+        );
+    }
     let listed = live
         .backups
         .list(&path, CancellationToken::new())
@@ -477,7 +623,7 @@ async fn scratch_round_trip(live: &Live) {
         .unwrap();
     assert!(verified.ok, "{key}: {verified:?}");
     report(&format!(
-        "{key}: backup of 2 tables, {} bytes, verified",
+        "{key}: backup of 3 tables, {} bytes, verified",
         made.bytes
     ));
 
@@ -491,37 +637,112 @@ async fn scratch_round_trip(live: &Live) {
         .await;
     assert_eq!(
         statuses(&restored),
-        [
-            (parent.clone(), RestoredStatus::Created),
-            (child.clone(), RestoredStatus::Created)
-        ],
+        all(&[&parent, &child, &node], RestoredStatus::Created),
         "{key}"
     );
-    assert_eq!(restored.rows, 6, "{key}");
+    assert_eq!(restored.rows, 9, "{key}");
     live.assert_same_def(&parent_def, &live.def(&parent).await);
     live.assert_same_def(&child_def, &live.def(&child).await);
+    live.assert_same_def(&node_def, &live.def(&node).await);
     assert_eq!(live.rows(&parent).await, parent_rows, "{key}: parent rows");
     assert_eq!(live.rows(&child).await, child_rows, "{key}: child rows");
-    report(&format!("{key}: restore into an empty container: in sync"));
+    assert_eq!(live.node_rows().await, node_rows, "{key}: node rows");
+    report(&format!(
+        "{key}: restore into an empty container (forward self-reference): in sync"
+    ));
+
+    // A new row gets a fresh key: the identity counter follows the restored values.
+    let ObjectDef::Table(node_table) = &node_def else {
+        panic!("{key}: {node} is not a table")
+    };
+    let id_column = node_table.column("id").cloned().unwrap();
+    let resyncs = !live
+        .dialects
+        .bulk_loader(live.engine)
+        .unwrap()
+        .identity_resync(&live.table_ref(&node), &[id_column])
+        .is_empty();
+    let n = live.q(&node);
+    if live.engine != Engine::Postgres || resyncs {
+        live.exec(&format!(
+            "INSERT INTO {n} (parent_id, name) VALUES (NULL, 'new')"
+        ))
+        .await;
+        let rows = live.node_rows().await;
+        assert_eq!(rows.len(), 4, "{key}");
+        assert!(
+            matches!(rows[3][0], Value::Int(i) if i > 3),
+            "{key}: the new row's key {:?} follows the restored ones",
+            rows[3][0]
+        );
+        live.exec(&format!("DELETE FROM {n} WHERE name = 'new'"))
+            .await;
+        report(&format!(
+            "{key}: a new row after the restore gets a fresh key"
+        ));
+    } else {
+        report(&format!(
+            "{key}: new row after the restore PENDING (no identity_resync cell yet)"
+        ));
+    }
+
+    // The tables hold rows: a default restore is refused before it writes.
+    let refused = live
+        .restore_fails(
+            RestoreOptions::into_container(live.container.clone()),
+            &path,
+        )
+        .await;
+    assert!(refused.contains("already hold rows"), "{key}: {refused}");
+    assert_eq!(live.rows(&parent).await, parent_rows, "{key}: untouched");
 
     // Data only, emptying the tables first (confirmed): no duplicates.
     let data_only = RestoreOptions {
         content: RestoreContent::DataOnly,
+        objects: vec![index_of(&made, &parent), index_of(&made, &child)],
         truncate_before_load: true,
         confirm_destructive: true,
         ..RestoreOptions::into_container(live.container.clone())
     };
-    let restored = live.restore(data_only, &path).await;
+    let restored = live.restore(data_only.clone(), &path).await;
     assert_eq!(
         statuses(&restored),
-        [
-            (parent.clone(), RestoredStatus::Loaded),
-            (child.clone(), RestoredStatus::Loaded)
-        ],
+        all(&[&parent, &child], RestoredStatus::Loaded),
         "{key}"
     );
     assert_eq!(live.rows(&parent).await, parent_rows, "{key}: parent rows");
     assert_eq!(live.rows(&child).await, child_rows, "{key}: child rows");
+
+    // The self-referencing table, data only: engines that check foreign keys per statement, or
+    // whose loader can switch the checks off for the load.
+    let per_row_checks = matches!(live.engine, Engine::MySql | Engine::MariaDb);
+    let can_relax = live
+        .dialects
+        .bulk_loader(live.engine)
+        .unwrap()
+        .foreign_key_checks(&live.table_ref(&node), false)
+        .is_some();
+    if !per_row_checks || can_relax {
+        let restored = live
+            .restore(
+                RestoreOptions {
+                    objects: vec![index_of(&made, &node)],
+                    ..data_only
+                },
+                &path,
+            )
+            .await;
+        assert_eq!(restored.rows, 3, "{key}");
+        assert_eq!(live.node_rows().await, node_rows, "{key}: node rows");
+        report(&format!(
+            "{key}: data-only restore of the self-reference: in sync"
+        ));
+    } else {
+        report(&format!(
+            "{key}: data-only restore of the self-reference PENDING (no foreign_key_checks cell \
+             yet)"
+        ));
+    }
 
     // Destructive without confirmation: refused before it starts.
     let unconfirmed = RestoreOptions {
@@ -549,16 +770,13 @@ async fn scratch_round_trip(live: &Live) {
     let restored = live.restore(structure.clone(), &path).await;
     assert_eq!(
         statuses(&restored),
-        [
-            (parent.clone(), RestoredStatus::Kept),
-            (child.clone(), RestoredStatus::Kept)
-        ],
+        all(&[&parent, &child, &node], RestoredStatus::Kept),
         "{key}"
     );
 
     // One selected object: the child table, structure then data.
     live.exec(&format!("DROP TABLE {}", live.q(&child))).await;
-    let child_index = made.manifest.objects[1].index;
+    let child_index = index_of(&made, &child);
     let restored = live
         .restore(
             RestoreOptions {
@@ -624,13 +842,101 @@ async fn scratch_round_trip(live: &Live) {
     );
     assert!(asked.elapsed() < Duration::from_secs(2), "{key}");
     assert!(!cancelled.exists(), "{key}");
-    let leftovers: Vec<String> = std::fs::read_dir(live.dir.path())
+    assert_eq!(leftovers(live), Vec::<String>::new(), "{key}");
+    assert!(!live.backups.cancel(handle.id), "{key}: the run is over");
+}
+
+/// Temporary files of the backups in the test directory.
+fn leftovers(live: &Live) -> Vec<String> {
+    std::fs::read_dir(live.dir.path())
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
         .filter(|n| n.starts_with(".oxbase-"))
-        .collect();
-    assert_eq!(leftovers, Vec::<String>::new(), "{key}");
-    assert!(!live.backups.cancel(handle.id), "{key}: the run is over");
+        .collect()
+}
+
+/// A backup cancelled while a larger table's rows stream ends `cancelled` within 2 s and
+/// leaves no file. A server fast enough to finish first is reported, not failed.
+async fn cancel_mid_table(live: &Live) {
+    let key = live.key;
+    let b = live.q(&live.big);
+    let text = if live.engine == Engine::MsSql {
+        "NVARCHAR(200)"
+    } else if live.engine == Engine::Sqlite {
+        "TEXT"
+    } else {
+        "VARCHAR(200)"
+    };
+    live.exec(&format!(
+        "CREATE TABLE {b} (id INTEGER PRIMARY KEY, pad {text} NOT NULL)"
+    ))
+    .await;
+    live.exec(&format!(
+        "INSERT INTO {b} (id, pad) VALUES (1, '{}')",
+        "x".repeat(150)
+    ))
+    .await;
+    // Doubling: 2^17 rows.
+    let mut rows = 1_u64;
+    for _ in 0..17 {
+        live.exec(&format!(
+            "INSERT INTO {b} (id, pad) SELECT id + {rows}, pad FROM {b}"
+        ))
+        .await;
+        rows *= 2;
+    }
+    let path = live.dir.path().join("big.oxbackup");
+    let mut handle = live
+        .backups
+        .start_backup(
+            BackupRequest {
+                session: live.session,
+                spec: BackupSpec {
+                    container: live.container.clone(),
+                    objects: vec![ObjectRef::new(ObjectKind::Table, live.big.clone())],
+                    content: BackupContent::StructureAndData,
+                    compression: Compression::Zstd,
+                },
+            },
+            &path,
+            false,
+        )
+        .await
+        .unwrap();
+    let mut asked: Option<Instant> = None;
+    let mut last = None;
+    while let Some(event) = handle.events.recv().await {
+        if let BackupEvent::Progress { progress } = &event
+            && progress.rows > 0
+            && asked.is_none()
+        {
+            asked = Some(Instant::now());
+            assert!(live.backups.cancel(handle.id), "{key}");
+        }
+        if event.is_terminal() {
+            last = Some(event);
+        }
+    }
+    match (last, asked) {
+        (Some(BackupEvent::Cancelled { .. }), Some(asked)) => {
+            // The cancel came while rows streamed.
+            assert!(asked.elapsed() < Duration::from_secs(2), "{key}");
+            assert!(!path.exists(), "{key}");
+            assert_eq!(leftovers(live), Vec::<String>::new(), "{key}");
+            report(&format!(
+                "{key}: backup cancelled while {rows} rows streamed: no file"
+            ));
+        }
+        (Some(BackupEvent::Finished { .. }), _) => {
+            std::fs::remove_file(&path).unwrap();
+            report(&format!(
+                "{key}: the {rows}-row backup finished before the cancel took effect; cancel \
+                 mid-table not exercised"
+            ));
+        }
+        (other, asked) => panic!("{key}: ended {other:?} (cancel asked: {})", asked.is_some()),
+    }
+    let _ = live.try_exec(&format!("DROP TABLE {b}")).await;
 }
 
 /// The `[m8]` fixture: back up `m8_src`, restore it into the emptied `m8_restore`, compare
@@ -713,31 +1019,98 @@ async fn fixture_round_trip(live: &Live) {
         Location::of_container(&source),
         Location::of_container(&target),
     );
+    let quote = live.dialects.quoting(live.engine).unwrap();
+    // (table in the target, its definition) of every restored table: sequence users.
+    let mut tables: Vec<(ObjectRef, ObjectDef)> = Vec::new();
     for object in &backup.manifest.objects {
-        if object.kind != ObjectKind::Table {
-            continue;
-        }
         let mut expected = live
             .tree
             .load(live.session, &object.object, CancellationToken::new())
             .await
-            .unwrap();
-        relocate_def(&mut expected, &from, &to);
-        let moved = target.child(ObjectKind::Table, object.object.name.clone());
+            .unwrap_or_else(|e| panic!("{key}: load {}: {e}", object.object.name));
+        move_definition(live.engine, &mut expected, &from, &to);
+        let moved = expected.object_ref();
         let actual = live
             .tree
             .load(live.session, &moved, CancellationToken::new())
             .await
-            .unwrap();
-        live.assert_same_def(&expected, &actual);
-        let quote = live.dialects.quoting(live.engine).unwrap();
-        let count = |r: &ObjectRef| format!("SELECT COUNT(*) FROM {}", quote.qualify(r));
-        assert_eq!(
-            live.exec(&count(&object.object)).await,
-            live.exec(&count(&moved)).await,
-            "{key}: rows of {}",
-            object.object.name
-        );
+            .unwrap_or_else(|e| panic!("{key}: restored {}: {e}", moved.name));
+        match live.dialects.comparator(live.engine, object.kind) {
+            Ok(comparator) => assert_eq!(
+                comparator.diff(&expected, &actual),
+                [],
+                "{key}: {} {} differs after the restore",
+                object.kind,
+                object.object.name
+            ),
+            Err(_) => report(&format!(
+                "{key}: no {} comparator; {} was restored but not compared",
+                object.kind, object.object.name
+            )),
+        }
+        // Every stored value, as a sorted list of rows.
+        if let Some(data) = &object.data {
+            let columns: Vec<String> = data.columns.iter().map(|c| quote.quote_ident(c)).collect();
+            let select =
+                |r: &ObjectRef| format!("SELECT {} FROM {}", columns.join(", "), quote.qualify(r));
+            let sorted = |rows: Vec<Vec<Value>>| {
+                let mut out: Vec<String> = rows.iter().map(|r| format!("{r:?}")).collect();
+                out.sort();
+                out
+            };
+            assert_eq!(
+                sorted(live.exec(&select(&moved)).await),
+                sorted(live.exec(&select(&object.object)).await),
+                "{key}: rows of {}",
+                object.object.name
+            );
+            tables.push((moved, actual));
+        }
+    }
+    // Sequences: the next value is past the restored values of the columns that use them.
+    for object in &backup.manifest.objects {
+        if object.kind != ObjectKind::Sequence {
+            continue;
+        }
+        let mut seq = object.object.clone();
+        oxbase_types::relocate_ref(&mut seq, &from, &to);
+        let name = quote.qualify(&seq);
+        let next_sql = match live.engine {
+            Engine::Postgres => format!("SELECT nextval('{}')", name.replace('\'', "''")),
+            Engine::MsSql => format!("SELECT NEXT VALUE FOR {name}"),
+            Engine::MariaDb => format!("SELECT NEXTVAL({name})"),
+            _ => continue,
+        };
+        for (table, def) in &tables {
+            let ObjectDef::Table(t) = def else { continue };
+            for c in &t.columns {
+                let uses = c
+                    .default
+                    .as_deref()
+                    .is_some_and(|d| d.to_lowercase().contains(&seq.name.to_lowercase()));
+                if !uses {
+                    continue;
+                }
+                let max = live
+                    .exec(&format!(
+                        "SELECT MAX({}) FROM {}",
+                        quote.quote_ident(&c.name),
+                        quote.qualify(table)
+                    ))
+                    .await;
+                let next = live.exec(&next_sql).await;
+                let (Some(max), Some(next)) = (integer(&max[0][0]), integer(&next[0][0])) else {
+                    continue;
+                };
+                assert!(
+                    next > max,
+                    "{key}: {} gives {next}, {}.{} holds {max}",
+                    seq.name,
+                    t.obj.name,
+                    c.name
+                );
+            }
+        }
     }
     report(&format!(
         "{key}: [m8] {} → {}: {} objects, {} rows, in sync",

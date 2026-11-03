@@ -13,11 +13,19 @@
 //!
 //! # Order ([`creation_order`])
 //!
-//! Sequences, then tables by foreign keys (parents first, `oxbase_dialect::table_dependencies`;
-//! tables on a cycle in insertion order), then functions and procedures, then views and
-//! materialized views (a view whose query names another view after it), then triggers: the
+//! Sequences, then the functions and procedures a table's defaults, generated columns or checks
+//! call, then tables by foreign keys (parents first, `oxbase_dialect::table_dependencies`;
+//! tables on a cycle in insertion order), then the other functions and procedures, then views
+//! and materialized views (a view whose query names another view after it), then triggers: the
 //! order of the structure sync script (`docs/m8-contracts.md` §5.4). Within a group, the
 //! fetchers' order (by name).
+//!
+//! # After the rows ([`after_data`], [`late_order`])
+//!
+//! A restore creates materialized views (they read the tables) and triggers (they must not fire
+//! on restored rows) after the rows load, and with them every view, function or procedure whose
+//! SQL text names one of those (a view over a materialized view), in an order where what a text
+//! names comes first.
 
 use oxbase_dialect::{DependencyGraph, DialectRegistry, table_dependencies};
 use oxbase_driver::{CancellationToken, Connection};
@@ -245,7 +253,7 @@ fn rank(kind: ObjectKind) -> u8 {
 }
 
 /// `true` when `name` occurs in `text` as a whole identifier (ASCII case-insensitive).
-fn mentions(text: &str, name: &str) -> bool {
+pub(crate) fn mentions(text: &str, name: &str) -> bool {
     if name.is_empty() {
         return false;
     }
@@ -277,6 +285,14 @@ pub(crate) fn creation_order(objects: Vec<ObjectDef>) -> Vec<ObjectDef> {
     }
     let [sequences, tables, routines, views, triggers, others] = groups;
 
+    // Routines a table's expressions call are created before the tables.
+    let (early, routines): (Vec<ObjectDef>, Vec<ObjectDef>) = routines.into_iter().partition(|r| {
+        tables.iter().any(|t| match t {
+            ObjectDef::Table(t) => table_mentions(t, r.name()),
+            _ => false,
+        })
+    });
+
     // Tables: foreign keys.
     let defs: Vec<TableDef> = tables
         .iter()
@@ -304,11 +320,112 @@ pub(crate) fn creation_order(objects: Vec<ObjectDef>) -> Vec<ObjectDef> {
     let views = reorder(views, &graph.order().order);
 
     let mut out = sequences;
+    out.extend(early);
     out.extend(tables);
     out.extend(routines);
     out.extend(views);
     out.extend(triggers);
     out.extend(others);
+    out
+}
+
+/// `true` when a default, generated column, check or index predicate of `t` names `name`.
+fn table_mentions(t: &TableDef, name: &str) -> bool {
+    t.columns.iter().any(|c| {
+        c.default.as_deref().is_some_and(|d| mentions(d, name))
+            || c.generated
+                .as_ref()
+                .is_some_and(|g| mentions(&g.expression, name))
+    }) || t.checks.iter().any(|c| mentions(&c.expression, name))
+        || t.indexes
+            .iter()
+            .any(|i| i.predicate.as_deref().is_some_and(|p| mentions(p, name)))
+}
+
+/// `true` when the SQL text of a view, materialized view or routine names `name`.
+fn text_mentions(def: &ObjectDef, name: &str) -> bool {
+    match def {
+        ObjectDef::View(v) => mentions(&v.definition, name),
+        ObjectDef::Routine(r) => [r.body.as_deref(), r.definition.as_deref()]
+            .into_iter()
+            .flatten()
+            .any(|t| mentions(t, name)),
+        _ => false,
+    }
+}
+
+/// For `defs` (what a restore creates, in creation order): `true` for each object created after
+/// the rows (module docs): materialized views, triggers, and views and routines whose text
+/// names another such object (transitively).
+pub(crate) fn after_data(defs: &[&ObjectDef]) -> Vec<bool> {
+    let mut late: Vec<bool> = defs
+        .iter()
+        .map(|d| matches!(d.kind(), ObjectKind::MatView | ObjectKind::Trigger))
+        .collect();
+    loop {
+        let mut changed = false;
+        for i in 0..defs.len() {
+            if late[i]
+                || !matches!(
+                    defs[i].kind(),
+                    ObjectKind::View | ObjectKind::Function | ObjectKind::Procedure
+                )
+            {
+                continue;
+            }
+            let names_late = (0..defs.len()).any(|j| {
+                j != i
+                    && late[j]
+                    && defs[j].kind() != ObjectKind::Trigger
+                    && text_mentions(defs[i], defs[j].name())
+            });
+            if names_late {
+                late[i] = true;
+                changed = true;
+            }
+        }
+        if !changed {
+            return late;
+        }
+    }
+}
+
+/// The creation order of `defs` (the objects created after the rows, in creation order) as
+/// indexes into `defs`: what a view's or routine's text names first, a trigger after the view
+/// it belongs to; otherwise the given order.
+pub(crate) fn late_order(defs: &[&ObjectDef]) -> Vec<usize> {
+    let mut graph = DependencyGraph::new();
+    for d in defs {
+        graph.add(d.object_ref());
+    }
+    for a in defs {
+        for b in defs {
+            let (ra, rb) = (a.object_ref(), b.object_ref());
+            if ra == rb {
+                continue;
+            }
+            let needs = match a {
+                ObjectDef::Trigger(t) => t
+                    .obj
+                    .owner()
+                    .is_some_and(|o| o.kind == rb.kind && o.name == rb.name),
+                _ => b.kind() != ObjectKind::Trigger && text_mentions(a, b.name()),
+            };
+            if needs {
+                graph.depends_on(&ra, &rb);
+            }
+        }
+    }
+    let order = graph.order().order;
+    let mut out: Vec<usize> = order
+        .iter()
+        .filter_map(|r| defs.iter().position(|d| d.object_ref() == *r))
+        .collect();
+    for i in 0..defs.len() {
+        if !out.contains(&i) {
+            out.push(i);
+        }
+    }
     out
 }
 
@@ -327,6 +444,16 @@ fn reorder(defs: Vec<ObjectDef>, order: &[ObjectRef]) -> Vec<ObjectDef> {
     }
     out.extend(slots.into_iter().flatten());
     out
+}
+
+/// Moves `def` from the backed-up container `from` to `to` the way a restore does: its refs
+/// (`oxbase_types::relocate_def`) and the names inside its SQL text (`oxbase_diff::retarget_sql`).
+/// Tests compare a restored object with its source moved this way.
+pub fn move_definition(engine: Engine, def: &mut ObjectDef, from: &Location, to: &Location) {
+    oxbase_types::relocate_def(def, from, to);
+    if from != to {
+        retarget_text(engine, def, from, to);
+    }
 }
 
 /// Moves names inside the engine-native SQL text of `def` from `from` to `to`
@@ -378,7 +505,8 @@ pub(crate) fn retarget_text(engine: Engine, def: &mut ObjectDef, from: &Location
 mod tests {
     use super::*;
     use oxbase_types::{
-        ColumnDef, DataType, Extras, FkAction, ForeignKeyDef, SequenceDef, ViewDef,
+        ColumnDef, DataType, Extras, FkAction, ForeignKeyDef, RoutineDef, SequenceDef, TriggerDef,
+        TriggerEvent, TriggerLevel, TriggerTiming, ViewDef,
     };
     use pretty_assertions::assert_eq;
 
@@ -486,6 +614,88 @@ mod tests {
         let mut other_parent = ObjectRef::new(ObjectKind::Trigger, "audit");
         other_parent.parent = Some("customers".into());
         assert!(!is_selected(&[other_parent], &trigger));
+    }
+
+    fn routine(name: &str, body: &str) -> ObjectDef {
+        let mut r = RoutineDef::new(ObjectRef::schema(None, "s").child(ObjectKind::Function, name));
+        r.body = Some(body.into());
+        ObjectDef::Routine(r)
+    }
+
+    fn matview(name: &str, query: &str) -> ObjectDef {
+        let mut v = view(name, query);
+        if let ObjectDef::View(def) = &mut v {
+            def.obj.kind = ObjectKind::MatView;
+        }
+        v
+    }
+
+    fn trigger(name: &str, owner: &ObjectRef) -> ObjectDef {
+        ObjectDef::Trigger(TriggerDef {
+            obj: owner.child(ObjectKind::Trigger, name),
+            timing: TriggerTiming::InsteadOf,
+            events: vec![TriggerEvent::Insert],
+            update_columns: Vec::new(),
+            level: TriggerLevel::Row,
+            condition: None,
+            function: None,
+            body: Some("BEGIN END".into()),
+            definition: None,
+            enabled: true,
+            comment: None,
+            extras: Extras::default(),
+        })
+    }
+
+    #[test]
+    fn routines_that_tables_call_come_before_the_tables() {
+        let mut t = table("orders", &[]);
+        if let ObjectDef::Table(def) = &mut t {
+            def.columns[0].default = Some("s.next_order_no()".into());
+        }
+        let defs = vec![
+            routine("next_order_no", "SELECT 1"),
+            routine("order_total", "SELECT sum(qty) FROM orders"),
+            t,
+            sequence("invoice_seq", None),
+        ];
+        assert_eq!(
+            names(&creation_order(defs)),
+            ["invoice_seq", "next_order_no", "orders", "order_total"]
+        );
+    }
+
+    #[test]
+    fn views_over_materialized_views_wait_for_them() {
+        let mv = matview("mv_totals", "SELECT 1 FROM orders");
+        let defs = [
+            table("orders", &[]),
+            routine("read_totals", "SELECT * FROM v_totals"),
+            view("v_plain", "SELECT * FROM orders"),
+            mv,
+            view("v_totals", "SELECT * FROM mv_totals"),
+            trigger(
+                "v_totals_ins",
+                &ObjectRef::schema(None, "s").child(ObjectKind::View, "v_totals"),
+            ),
+        ];
+        let refs: Vec<&ObjectDef> = defs.iter().collect();
+        let late = after_data(&refs);
+        assert_eq!(late, [false, true, false, true, true, true]);
+        let deferred: Vec<&ObjectDef> = refs
+            .iter()
+            .zip(&late)
+            .filter(|(_, l)| **l)
+            .map(|(d, _)| *d)
+            .collect();
+        let order: Vec<&str> = late_order(&deferred)
+            .into_iter()
+            .map(|i| deferred[i].name())
+            .collect();
+        assert_eq!(
+            order,
+            ["mv_totals", "v_totals", "read_totals", "v_totals_ins"]
+        );
     }
 
     #[test]

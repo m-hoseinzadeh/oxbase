@@ -25,9 +25,9 @@ use oxbase_dialect::{
 use oxbase_driver::mock::{MockConfig, MockDriver};
 use oxbase_driver::{CancellationToken, ConnectParams, Connection, Driver};
 use oxbase_types::{
-    ColumnDef, DataType, Engine, Error, ErrorCategory, ObjectDef, ObjectKind, ObjectRef,
-    ObjectSummary, PrimaryKeyDef, PropertyDiff, Result, Script, ScriptStep, Secret, ServerVersion,
-    TableDef,
+    ColumnDef, DataType, Engine, Error, ErrorCategory, Extras, FkAction, ForeignKeyDef, ObjectDef,
+    ObjectKind, ObjectRef, ObjectSummary, PrimaryKeyDef, PropertyDiff, Result, Script, ScriptStep,
+    Secret, ServerVersion, TableDef,
 };
 use pretty_assertions::assert_eq;
 
@@ -50,8 +50,13 @@ fn items_def(schema: &ObjectRef) -> TableDef {
     t
 }
 
-/// Every schema holds one table, `items` (the mock's row shape).
-struct Tables;
+/// Every schema holds one table, `items` (the mock's row shape). `self_ref` gives it a foreign
+/// key to itself; `elsewhere` puts its definition in another schema (a forged archive).
+#[derive(Default)]
+struct Tables {
+    self_ref: bool,
+    elsewhere: bool,
+}
 
 #[async_trait]
 impl Fetcher for Tables {
@@ -72,8 +77,24 @@ impl Fetcher for Tables {
         obj: &ObjectRef,
         _cancel: CancellationToken,
     ) -> Result<ObjectDef> {
-        let schema = ObjectRef::schema(obj.catalog.as_deref(), obj.schema.clone().unwrap());
-        Ok(ObjectDef::Table(items_def(&schema)))
+        let schema = if self.elsewhere {
+            ObjectRef::schema(obj.catalog.as_deref(), "prod")
+        } else {
+            ObjectRef::schema(obj.catalog.as_deref(), obj.schema.clone().unwrap())
+        };
+        let mut t = items_def(&schema);
+        if self.self_ref {
+            t.foreign_keys.push(ForeignKeyDef {
+                name: Some("items_parent".into()),
+                columns: vec!["id".into()],
+                ref_table: t.obj.clone(),
+                ref_columns: vec!["id".into()],
+                on_delete: FkAction::NoAction,
+                on_update: FkAction::NoAction,
+                extras: Extras::default(),
+            });
+        }
+        Ok(ObjectDef::Table(t))
     }
 }
 
@@ -83,10 +104,20 @@ struct Ddl;
 impl DdlGenerator for Ddl {
     fn create(&self, d: &ObjectDef, _ctx: &DdlContext<'_>) -> Result<Script> {
         let mut s = Script::new();
-        s.push_step(
-            ScriptStep::new(format!("CREATE TABLE {}", d.object_ref().display_name()))
-                .described("create"),
-        );
+        let sql = match d {
+            ObjectDef::ForeignKey { table, foreign_key } => format!(
+                "ADD FOREIGN KEY {} ON {}",
+                foreign_key.name.as_deref().unwrap_or("?"),
+                table.display_name()
+            ),
+            ObjectDef::Table(t) => format!(
+                "CREATE TABLE {} ({} foreign keys)",
+                t.obj.display_name(),
+                t.foreign_keys.len()
+            ),
+            _ => format!("CREATE {}", d.object_ref().display_name()),
+        };
+        s.push_step(ScriptStep::new(sql).described("create"));
         Ok(s)
     }
 
@@ -150,9 +181,14 @@ impl BulkLoader for Recorder {
 }
 
 fn registry(loader: Arc<Recorder>) -> DialectRegistry {
+    registry_with(loader, Tables::default())
+}
+
+fn registry_with(loader: Arc<Recorder>, tables: Tables) -> DialectRegistry {
     let mut r = DialectRegistry::new();
-    r.register_fetcher(ENGINE, ObjectKind::Table, Arc::new(Tables))
+    r.register_fetcher(ENGINE, ObjectKind::Table, Arc::new(tables))
         .register_ddl(ENGINE, ObjectKind::Table, Arc::new(Ddl))
+        .register_ddl(ENGINE, ObjectKind::ForeignKey, Arc::new(Ddl))
         .register_comparator(ENGINE, ObjectKind::Table, Arc::new(Equal))
         .register_quoting(ENGINE, Arc::new(PgQuoting))
         .register_bulk_loader(ENGINE, loader);
@@ -187,10 +223,18 @@ fn runner(connection: Arc<dyn Connection>) -> Box<ScriptRunner> {
 }
 
 async fn make_backup(dir: &Path, config: MockConfig) -> (std::path::PathBuf, MockDriver) {
+    make_backup_with(dir, config, Tables::default()).await
+}
+
+async fn make_backup_with(
+    dir: &Path,
+    config: MockConfig,
+    tables: Tables,
+) -> (std::path::PathBuf, MockDriver) {
     let driver = MockDriver::new(ENGINE).with_config(config);
     let connection = connect(&driver).await;
     let loader = Arc::new(Recorder::default());
-    let dialects = registry(loader);
+    let dialects = registry_with(loader, tables);
     let spec = BackupSpec {
         container: container(),
         objects: Vec::new(),
@@ -250,8 +294,22 @@ async fn backup_then_restore_over_the_mock() {
     let verify = reader.verify(&mut |_| {}, &|| false).unwrap();
     assert!(verify.ok, "{verify:?}");
 
-    // Restore over the existing (equal) table: kept, rows appended in calls of 5.
-    let target_driver = MockDriver::new(ENGINE);
+    // Restore over the existing (equal) table that holds rows: refused before any write.
+    let (outcome, log) = try_restore(&path, &options(), ENGINE).await;
+    let err = outcome.error.unwrap();
+    assert!(err.to_string().contains("already hold rows"), "{err}");
+    assert!(log.iter().all(|s| s.starts_with("SELECT")), "{log:?}");
+    assert_eq!(
+        log,
+        ["SELECT 1 FROM \"sales\".\"items\" LIMIT 1"],
+        "only the emptiness check ran"
+    );
+
+    // Restore over the existing (equal) empty table: kept, rows added in calls of 5.
+    let target_driver = MockDriver::new(ENGINE).with_config(MockConfig {
+        batches: 0,
+        ..MockConfig::default()
+    });
     let target: Arc<dyn Connection> = Arc::from(connect(&target_driver).await);
     let loader = Arc::new(Recorder::default());
     let dialects = registry(Arc::clone(&loader));
@@ -556,4 +614,86 @@ async fn structure_only_backups_restore_without_rows() {
     assert_eq!(outcome.report.rows, 0);
     assert!(outcome.report.warnings[0].contains("no table rows"));
     assert!(!log.iter().any(|s| s == "INSERT rows"), "{log:?}");
+}
+
+#[tokio::test]
+async fn foreign_keys_to_the_table_itself_wait_for_the_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, _) = make_backup_with(
+        dir.path(),
+        MockConfig::default(),
+        Tables {
+            self_ref: true,
+            elsewhere: false,
+        },
+    )
+    .await;
+    let driver = MockDriver::new(ENGINE);
+    let mut params = ConnectParams::new(ENGINE);
+    params.database = Some("shop".into());
+    let target: Arc<dyn Connection> = Arc::from(driver.connect(&params).await.unwrap());
+    let dialects = registry_with(
+        Arc::new(Recorder::default()),
+        Tables {
+            self_ref: true,
+            elsewhere: false,
+        },
+    );
+    let opts = RestoreOptions {
+        drop_existing: true,
+        confirm_destructive: true,
+        ..options()
+    };
+    let run = runner(Arc::clone(&target));
+    let outcome = restore_run(
+        RestoreJob {
+            dialects: &dialects,
+            target: target.as_ref(),
+            options: &opts,
+        },
+        &path,
+        run.as_ref(),
+        &|_| {},
+        CancellationToken::new(),
+    )
+    .await;
+    assert!(outcome.error.is_none(), "{:?}", outcome.error);
+    let log = driver.log();
+    let create = log
+        .iter()
+        .position(|s| s == "CREATE TABLE items (0 foreign keys)")
+        .unwrap_or_else(|| panic!("{log:?}"));
+    let insert = log.iter().position(|s| s == "INSERT rows").unwrap();
+    let fk = log
+        .iter()
+        .position(|s| s.starts_with("ADD FOREIGN KEY items_parent"))
+        .unwrap_or_else(|| panic!("{log:?}"));
+    assert!(create < insert && insert < fk, "{log:?}");
+}
+
+#[tokio::test]
+async fn definitions_outside_the_backed_up_container_are_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, _) = make_backup_with(
+        dir.path(),
+        MockConfig::default(),
+        Tables {
+            self_ref: false,
+            elsewhere: true,
+        },
+    )
+    .await;
+    for content in [RestoreContent::DataOnly, RestoreContent::StructureAndData] {
+        let opts = RestoreOptions {
+            content,
+            truncate_before_load: true,
+            confirm_destructive: true,
+            ..options()
+        };
+        let (outcome, log) = try_restore(&path, &opts, ENGINE).await;
+        let err = outcome.error.unwrap();
+        assert_eq!(err.category(), ErrorCategory::InvalidInput);
+        assert!(err.to_string().contains("does not lie in"), "{err}");
+        assert_eq!(log, Vec::<String>::new(), "the target was touched");
+    }
 }

@@ -2,8 +2,10 @@
 //! stores, and the conversion of the source driver's Arrow pages into load batches.
 //!
 //! A backup and its restore are the same engine, so the load columns come straight from the
-//! table definition: every stored column (generated columns left out), its logical type from the
-//! fetcher, its native type kept for loaders that name types. The driver's pages are converted
+//! table definition: every stored column, its logical type from the fetcher, its native type
+//! kept for loaders that name types. Left out: generated columns, and columns the server
+//! maintains and refuses to take values for (SQL Server `rowversion`, period columns), which
+//! the engine's `DmlWriter` names by refusing an insert into them ([`server_maintained`]). The driver's pages are converted
 //! column by column: an array already in the load type passes through untouched; anything else
 //! goes value by value through `oxbase_driver::cell_value` into a builder of the load type (text
 //! forms parsed where the driver reports a typed column as text). A value that cannot be
@@ -20,23 +22,74 @@ use arrow_array::builder::{
 use arrow_array::{Array, ArrayRef, RecordBatch};
 use arrow_schema::{DataType as ArrowType, SchemaRef, TimeUnit};
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Timelike};
-use oxbase_dialect::LoadColumn;
+use oxbase_dialect::{DmlTarget, DmlWriter, LoadColumn};
 use oxbase_driver::cell_value;
-use oxbase_types::{Error, ObjectRef, Result, TableDef, Value};
+use oxbase_types::{
+    ColumnDef, ColumnValue, Error, ErrorCategory, KeyKind, ObjectRef, Result, RowEdit, RowKey,
+    ServerVersion, TableDef, Value,
+};
 
-/// The columns a backup stores for `table`, in table order: every column that is not generated.
-pub(crate) fn load_columns(table: &TableDef) -> Vec<LoadColumn> {
-    table
-        .columns
-        .iter()
-        .filter(|c| c.generated.is_none())
-        .map(|c| LoadColumn {
+/// The columns a backup stores for `table`, in table order: every column that is not generated
+/// and not server-maintained (`writer`: the engine's grid writer, when it has one). The second
+/// list names the columns left out for being server-maintained, with the writer's reason.
+pub(crate) fn load_columns(
+    table: &TableDef,
+    writer: Option<&dyn DmlWriter>,
+    version: &ServerVersion,
+) -> (Vec<LoadColumn>, Vec<(String, String)>) {
+    let mut out = Vec::with_capacity(table.columns.len());
+    let mut left_out = Vec::new();
+    for c in table.columns.iter().filter(|c| c.generated.is_none()) {
+        if let Some(why) = writer.and_then(|w| server_maintained(w, table, c, version)) {
+            left_out.push((c.name.clone(), why));
+            continue;
+        }
+        out.push(LoadColumn {
             name: c.name.clone(),
             data_type: c.data_type.clone(),
             native_type: c.native_type.clone(),
             nullable: c.nullable,
-        })
-        .collect()
+        });
+    }
+    (out, left_out)
+}
+
+/// `Some(reason)` when the server maintains `column` and refuses values for it: the engine's
+/// `DmlWriter` refuses a one-column insert into it with `InvalidInput` "... cannot be written"
+/// (the M3 write-back contract). Identity and auto-increment columns are never asked: restore
+/// loads their values on purpose (`BulkLoader::prepare`).
+pub(crate) fn server_maintained(
+    writer: &dyn DmlWriter,
+    table: &TableDef,
+    column: &ColumnDef,
+    version: &ServerVersion,
+) -> Option<String> {
+    if column.auto_increment || column.identity.is_some() {
+        return None;
+    }
+    let key = RowKey::new(
+        table.obj.clone(),
+        KeyKind::Unique,
+        vec![column.name.clone()],
+    );
+    let edit = RowEdit::Insert {
+        values: vec![ColumnValue::new(column.name.clone(), Value::Null)],
+    };
+    let target = DmlTarget {
+        table,
+        key: &key,
+        version,
+        read_back: &[],
+    };
+    match writer.plan(&edit, &target) {
+        Err(e)
+            if e.category() == ErrorCategory::InvalidInput
+                && e.to_string().contains("cannot be written") =>
+        {
+            Some(e.to_string())
+        }
+        _ => None,
+    }
 }
 
 /// Where a value comes from, for messages.
@@ -450,8 +503,8 @@ mod tests {
     };
     use arrow_array::{Decimal128Array, Int32Array, StringArray};
     use arrow_schema::{Field, Schema};
-    use oxbase_dialect::LoadTarget;
-    use oxbase_types::{ColumnDef, DataType, GeneratedColumn, ServerVersion};
+    use oxbase_dialect::{DmlPlan, LoadTarget};
+    use oxbase_types::{BoundStatement, DataType, GeneratedColumn};
     use pretty_assertions::assert_eq;
 
     fn table() -> TableDef {
@@ -482,9 +535,10 @@ mod tests {
     #[test]
     fn stored_columns_convert_into_the_load_schema() {
         let t = table();
-        let columns = load_columns(&t);
-        assert_eq!(columns.len(), 6, "the generated column is left out");
         let version = ServerVersion::new(1, 0, 0);
+        let (columns, left_out) = load_columns(&t, None, &version);
+        assert_eq!(columns.len(), 6, "the generated column is left out");
+        assert_eq!(left_out, Vec::<(String, String)>::new());
         let schema = LoadTarget {
             table: &t.obj,
             columns: &columns,
@@ -561,12 +615,58 @@ mod tests {
         );
     }
 
+    /// Refuses writes to `rv` like an engine whose server maintains it.
+    struct Refusing;
+
+    impl DmlWriter for Refusing {
+        fn plan(&self, edit: &RowEdit, target: &DmlTarget<'_>) -> Result<DmlPlan> {
+            target.key.validate(edit)?;
+            if let RowEdit::Insert { values } = edit
+                && values.iter().any(|v| v.column == "rv")
+            {
+                return Err(Error::invalid_input(
+                    "column 'rv' is a rowversion column and cannot be written",
+                ));
+            }
+            if let RowEdit::Insert { values } = edit
+                && values.iter().any(|v| v.column == "odd")
+            {
+                return Err(Error::invalid_input(
+                    "column 'odd': 'x y' is not a collation",
+                ));
+            }
+            Ok(DmlPlan::write_only(BoundStatement::new(
+                "INSERT",
+                Vec::new(),
+            )))
+        }
+    }
+
+    #[test]
+    fn server_maintained_columns_are_left_out() {
+        let mut t = TableDef::new(ObjectRef::table(None, Some("dbo"), "t"));
+        let mut id = ColumnDef::new("id", DataType::INT64).not_null();
+        id.auto_increment = true;
+        t.columns = vec![
+            id,
+            ColumnDef::new("rv", DataType::Binary { length: Some(8) }).not_null(),
+            ColumnDef::new("odd", DataType::Text),
+            ColumnDef::new("name", DataType::Text),
+        ];
+        let version = ServerVersion::new(16, 0, 0);
+        let (columns, left_out) = load_columns(&t, Some(&Refusing), &version);
+        let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["id", "odd", "name"], "only refusals to write count");
+        assert_eq!(left_out.len(), 1);
+        assert_eq!(left_out[0].0, "rv");
+    }
+
     #[test]
     fn values_that_do_not_fit_fail_with_their_place() {
         let mut t = TableDef::new(ObjectRef::table(None, None, "t"));
         t.columns = vec![ColumnDef::new("n", DataType::INT64)];
-        let columns = load_columns(&t);
         let version = ServerVersion::new(1, 0, 0);
+        let (columns, _) = load_columns(&t, None, &version);
         let schema = LoadTarget {
             table: &t.obj,
             columns: &columns,

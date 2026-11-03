@@ -1,28 +1,31 @@
-//! Logical backup of a database or schema (`docs/m8-contracts.md` §7.2). Owner of the body
-//! marked `unimplemented!("m8: backup")`: the **backup** stream.
+//! Logical backup of a database or schema (`docs/m8-contracts.md` §7.2), by the **backup**
+//! stream.
 //!
 //! # Steps ([`backup`])
 //!
-//! 1. Snapshot the container with `oxbase_diff::load_snapshot` (tables, views, materialized
-//!    views, sequences, routines, triggers; [`BackupSpec::objects`] narrows it, a selected
-//!    table brings its triggers).
-//! 2. Order: tables by foreign keys, then sequences before the tables whose defaults use them,
-//!    then routines, views (dependency order) and triggers: the same ordering the structure sync
-//!    script uses, recorded as `Manifest::order`.
+//! 1. Read the container through the engine's fetchers (`objects::load_container`: tables,
+//!    views, materialized views, sequences, routines, triggers; [`BackupSpec::objects`] narrows
+//!    it, a selected table brings its triggers). Deviation from the contract text
+//!    (`oxbase_diff::load_snapshot`): a backup needs the definitions one by one in creation
+//!    order, not a comparable snapshot, so it reads them itself with the same fetchers.
+//! 2. Order (`objects::creation_order`): sequences, routines the tables' expressions call,
+//!    tables by foreign keys, other routines, views (dependency order), triggers; recorded as
+//!    `Manifest::order`.
 //! 3. Per object: its definition JSON and its `CREATE` text (the source engine's
 //!    `DdlGenerator::create`, skipped with a warning when the engine has no generator for the
 //!    kind).
-//! 4. Per table (content `structure_and_data`): `SELECT` of every stored column (generated
-//!    columns left out) in primary-key order when there is one, streamed from a dedicated
-//!    session, converted to the load schema (`oxbase_transfer::convert::BatchConverter`, same
-//!    engine) and written as Arrow IPC batches. Memory: one batch at a time. Rows of one table
-//!    are read in one read-only transaction where the engine has one (PostgreSQL `REPEATABLE
-//!    READ`, MySQL / MariaDB `START TRANSACTION WITH CONSISTENT SNAPSHOT`, SQL Server snapshot
-//!    isolation when the database allows it, else read committed with a warning), so each table
-//!    is consistent; tables are not consistent with each other unless the engine allows one
-//!    transaction for all (PostgreSQL, MySQL / MariaDB: the stream uses one when it can and the
-//!    report says which).
-//! 5. The manifest last; the file is a temporary file next to the destination, renamed on
+//! 4. Per table (content `structure_and_data`): `SELECT` of every stored column in primary-key
+//!    order when there is one, streamed from a dedicated session, converted to the load schema
+//!    (`load::to_load_batch`) and written as Arrow IPC batches. Memory: one batch at a time.
+//!    Left out (with a manifest warning): generated columns, and server-maintained columns the
+//!    engine refuses values for (`load::server_maintained`). Each table's rows are read in one
+//!    transaction of its own at the session's default isolation (`Connection::begin`); tables
+//!    are not consistent with each other, and the manifest says so. (A snapshot read across
+//!    tables needs an engine-neutral isolation role, which M8 does not have.)
+//! 5. Warnings in the manifest for what a restore cannot bring back exactly: time values finer
+//!    than microseconds, sequences' positions (a restore restarts each sequence after its
+//!    restored values), and, for a backup of selected objects, foreign keys to tables left out.
+//! 6. The manifest last; the file is a temporary file next to the destination, renamed on
 //!    success (`oxbase_io::SinkFile`). A failed or cancelled backup leaves no file and never
 //!    damages an existing one.
 //!
@@ -38,11 +41,12 @@ use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use chrono::Utc;
 use futures::StreamExt;
+use oxbase_dialect::deps::same_table;
 use oxbase_dialect::sql::SqlWriter;
 use oxbase_dialect::{DdlContext, DialectRegistry, LoadTarget};
 use oxbase_driver::{CancellationToken, Connection, ResultItem};
 use oxbase_io::SinkFile;
-use oxbase_types::{Error, ObjectDef, ObjectKind, ObjectRef, Result, TableDef};
+use oxbase_types::{DataType, Error, Location, ObjectDef, ObjectKind, ObjectRef, Result, TableDef};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 
@@ -249,6 +253,7 @@ impl Run<'_> {
         .await?;
         let mut warnings = loaded.warnings;
         let objects = creation_order(loaded.objects);
+        warnings.extend(fidelity_warnings(&objects, spec));
         self.progress.objects_total = u32::try_from(objects.len()).unwrap_or(u32::MAX);
         self.report(true);
 
@@ -300,7 +305,7 @@ impl Run<'_> {
             }
             let data = match def {
                 ObjectDef::Table(table) if with_data => {
-                    let (info, data) = self.table_rows(index, table).await?;
+                    let (info, data) = self.table_rows(index, table, &mut warnings).await?;
                     entries.insert(data.entry.clone(), info);
                     Some(data)
                 }
@@ -346,11 +351,24 @@ impl Run<'_> {
     }
 
     /// Streams `table`'s stored columns into its data entry.
-    async fn table_rows(&mut self, index: u32, table: &TableDef) -> Result<(EntryInfo, TableData)> {
+    async fn table_rows(
+        &mut self,
+        index: u32,
+        table: &TableDef,
+        warnings: &mut Vec<String>,
+    ) -> Result<(EntryInfo, TableData)> {
         let job = self.job;
         let engine = job.rows.engine();
         let version = job.rows.server_version().clone();
-        let columns = load_columns(table);
+        let writer = job.dialects.dml_writer(engine).ok();
+        let (columns, left_out) = load_columns(table, writer.as_deref(), &version);
+        for (column, why) in left_out {
+            warnings.push(format!(
+                "{}: the values of column {column} were not backed up (the server maintains \
+                 them and generates new ones on restore: {why})",
+                table.obj.display_name()
+            ));
+        }
         let target = LoadTarget {
             table: &table.obj,
             columns: &columns,
@@ -437,6 +455,63 @@ impl Run<'_> {
             },
         ))
     }
+}
+
+/// What a restore of `objects` cannot bring back exactly (module docs, step 5).
+fn fidelity_warnings(objects: &[ObjectDef], spec: &BackupSpec) -> Vec<String> {
+    let mut out = Vec::new();
+    let tables: Vec<&TableDef> = objects
+        .iter()
+        .filter_map(|d| match d {
+            ObjectDef::Table(t) => Some(t),
+            _ => None,
+        })
+        .collect();
+    if spec.content == BackupContent::StructureAndData {
+        for t in &tables {
+            for c in &t.columns {
+                let precision = match &c.data_type {
+                    DataType::Time { precision }
+                    | DataType::Timestamp { precision }
+                    | DataType::TimestampTz { precision } => *precision,
+                    _ => None,
+                };
+                if precision.is_some_and(|p| p > 6) && c.generated.is_none() {
+                    out.push(format!(
+                        "{}: column {} holds time values finer than microseconds; the backup \
+                         keeps microseconds",
+                        t.obj.display_name(),
+                        c.name
+                    ));
+                }
+            }
+        }
+    }
+    if objects.iter().any(|d| matches!(d, ObjectDef::Sequence(_))) {
+        out.push(
+            "the backup does not hold the sequences' current positions; a restore restarts each \
+             sequence after the highest restored value of the columns whose default uses it"
+                .to_owned(),
+        );
+    }
+    if !spec.objects.is_empty() {
+        let here = Location::of_container(&spec.container);
+        for t in &tables {
+            for fk in &t.foreign_keys {
+                let missing = here.contains(&fk.ref_table)
+                    && !tables.iter().any(|o| same_table(&fk.ref_table, &o.obj));
+                if missing {
+                    out.push(format!(
+                        "{} has a foreign key to {}, which is not in the backup; restoring it \
+                         needs that table in the target",
+                        t.obj.display_name(),
+                        fk.ref_table.display_name()
+                    ));
+                }
+            }
+        }
+    }
+    out
 }
 
 /// The container ref as the manifest keeps it: kind, catalog, schema and name only.

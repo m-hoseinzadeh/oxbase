@@ -298,6 +298,14 @@ impl<'c, R: Read> HashingReader<'c, R> {
         }
     }
 
+    /// A reader that stops with an error once `cancelled` returns `true`.
+    fn cancellable(inner: R, cancelled: &'c dyn Fn() -> bool) -> Self {
+        Self {
+            cancelled: Some(cancelled),
+            ..Self::new(inner)
+        }
+    }
+
     fn watched(
         inner: R,
         base: u64,
@@ -606,7 +614,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
             // Table data is decoded only once its bytes matched the checksum: corrupted IPC
             // can name absurd buffer sizes.
             let problem = match (problem, rows_of.get(&name)) {
-                (None, Some(&expected)) => self.count_rows(&name, expected),
+                (None, Some(&expected)) => self.count_rows(&name, expected, cancelled)?,
                 (problem, _) => problem,
             };
             on_bytes(report.bytes_checked);
@@ -623,15 +631,21 @@ impl<R: Read + Seek> ArchiveReader<R> {
     }
 
     /// Decodes data entry `name` and compares its row count with `expected`; the problem, if
-    /// any.
-    fn count_rows(&mut self, name: &str, expected: u64) -> Option<String> {
+    /// any. `cancelled` is polled on every read (`Error::Cancelled`).
+    fn count_rows(
+        &mut self,
+        name: &str,
+        expected: u64,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Option<String>> {
         let entry = match self.zip.by_name(name) {
             Ok(entry) => entry,
-            Err(e) => return Some(format!("the entry cannot be read: {e}")),
+            Err(e) => return Ok(Some(format!("the entry cannot be read: {e}"))),
         };
+        let reader = HashingReader::cancellable(entry, cancelled);
         let decoded = catch_unwind(AssertUnwindSafe(
             move || -> std::result::Result<u64, String> {
-                let stream = StreamReader::try_new(entry, None).map_err(|e| e.to_string())?;
+                let stream = StreamReader::try_new(reader, None).map_err(|e| e.to_string())?;
                 let mut n = 0_u64;
                 for batch in stream {
                     let batch = batch.map_err(|e| e.to_string())?;
@@ -640,14 +654,17 @@ impl<R: Read + Seek> ArchiveReader<R> {
                 Ok(n)
             },
         ));
-        match decoded {
+        if cancelled() {
+            return Err(Error::Cancelled);
+        }
+        Ok(match decoded {
             Ok(Ok(n)) if n == expected => None,
             Ok(Ok(n)) => Some(format!(
                 "the table data has {n} rows, the manifest says {expected}"
             )),
             Ok(Err(e)) => Some(format!("the table data cannot be read: {e}")),
             Err(_) => Some("the table data cannot be decoded".to_owned()),
-        }
+        })
     }
 }
 

@@ -33,6 +33,7 @@ pub use format::{
     BackupContent, BackupSource, Compression, EntryInfo, FILE_EXTENSION, FORMAT_VERSION, Manifest,
     ManifestObject, TableData,
 };
+pub use objects::move_definition;
 pub use restore::{
     RestoreContent, RestoreOptions, RestoreOutcome, RestoreProgress, RestoreReport, RestoredObject,
     RestoredStatus,
