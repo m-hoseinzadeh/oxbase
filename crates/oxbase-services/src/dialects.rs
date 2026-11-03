@@ -31,6 +31,10 @@ pub fn default_dialects() -> DialectRegistry {
     // M7: fetchers, KeyValueStore, PubSub and ScriptLanguage (the console).
     oxbase_redis::dialect::register(&mut reg);
 
+    // M8 (docs/m8-contracts.md §1): the transfer stream uncomments this line (and only this
+    // line) once its TypeMapper cells are filled; until then `missing_m8_roles` reports them.
+    // oxbase_transfer::register(&mut reg);
+
     mark_provisional(&mut reg);
     reg
 }

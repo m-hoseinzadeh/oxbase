@@ -160,6 +160,45 @@ pub const KEY_HEX: PropId = PropId::from_static("key_hex");
 /// Collection / view summary: number of documents from the collection statistics (int).
 pub const DOCUMENT_COUNT: PropId = PropId::from_static("document_count");
 
+// --- M8: structure sync of views, routines, triggers and sequences (`docs/m8-contracts.md` §5.2) ---
+
+/// Routine arguments (JSON list of `RoutineArg`).
+pub const ARGS: PropId = PropId::from_static("args");
+/// Routine return type (text).
+pub const RETURNS: PropId = PropId::from_static("returns");
+/// Routine implementation language (text).
+pub const LANGUAGE: PropId = PropId::from_static("language");
+/// Routine or trigger body (engine-native text).
+pub const BODY: PropId = PropId::from_static("body");
+/// Trigger timing (`before`, `after`, `instead_of`).
+pub const TIMING: PropId = PropId::from_static("timing");
+/// Trigger events (JSON list).
+pub const EVENTS: PropId = PropId::from_static("events");
+/// Trigger `UPDATE OF` columns (JSON list).
+pub const UPDATE_COLUMNS: PropId = PropId::from_static("update_columns");
+/// Trigger level (`row`, `statement`).
+pub const LEVEL: PropId = PropId::from_static("level");
+/// Trigger `WHEN` condition (engine-native text).
+pub const CONDITION: PropId = PropId::from_static("condition");
+/// The function a trigger executes (text, `schema.name`).
+pub const FUNCTION: PropId = PropId::from_static("function");
+/// Trigger enabled (bool).
+pub const ENABLED: PropId = PropId::from_static("enabled");
+/// Sequence start (decimal text).
+pub const START: PropId = PropId::from_static("start");
+/// Sequence increment (decimal text).
+pub const INCREMENT: PropId = PropId::from_static("increment");
+/// Sequence minimum (decimal text).
+pub const MIN_VALUE: PropId = PropId::from_static("min_value");
+/// Sequence maximum (decimal text).
+pub const MAX_VALUE: PropId = PropId::from_static("max_value");
+/// Sequence cache size (decimal text).
+pub const CACHE: PropId = PropId::from_static("cache");
+/// Sequence cycles (bool).
+pub const CYCLE: PropId = PropId::from_static("cycle");
+/// The column that owns a sequence (text, `table.column`).
+pub const OWNED_BY: PropId = PropId::from_static("owned_by");
+
 /// Typed map of database-specific properties, ordered by id so output is deterministic.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(transparent)]

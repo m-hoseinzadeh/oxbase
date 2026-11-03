@@ -36,6 +36,13 @@
 //!   `pubsub_unsubscribe` and `pubsub_publish`. The mongo shell and the Redis console run
 //!   through `query_run` and `statement_at`. Contract: `docs/m7-contracts.md` §8.
 //!
+//! * Transfer, structure sync, data sync, backup and restore (M8, `src/sync.rs`):
+//!   `transfer_plan`, `transfer_pair_report`, `transfer_run` (events through a `Channel`),
+//!   `transfer_cancel`, `structure_compare`, `structure_script`, `structure_apply`,
+//!   `compare_forget`, `data_compare` (`Channel`), `data_script`, `data_apply` (`Channel`),
+//!   `data_cancel`, `backup_run` (`Channel`), `backup_restore` (`Channel`), `backup_verify`,
+//!   `backup_list` and `backup_cancel`. Contract: `docs/m8-contracts.md` §8.
+//!
 //! Every fallible command rejects with [`error::CommandError`], serialized as
 //! `{ "category": "<snake_case ErrorCategory>", "message": "..." }`.
 //!
@@ -52,6 +59,7 @@ mod files;
 mod insight;
 mod nosql;
 mod profiles;
+mod sync;
 mod transfer;
 mod workbench;
 
@@ -115,6 +123,7 @@ pub fn run() {
             app.manage(states.files);
             app.manage(states.insight);
             app.manage(states.nosql);
+            app.manage(states.sync);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -180,6 +189,23 @@ pub fn run() {
             nosql::pubsub_subscribe,
             nosql::pubsub_unsubscribe,
             nosql::pubsub_publish,
+            sync::transfer_plan,
+            sync::transfer_pair_report,
+            sync::transfer_run,
+            sync::transfer_cancel,
+            sync::structure_compare,
+            sync::structure_script,
+            sync::structure_apply,
+            sync::compare_forget,
+            sync::data_compare,
+            sync::data_script,
+            sync::data_apply,
+            sync::data_cancel,
+            sync::backup_run,
+            sync::backup_restore,
+            sync::backup_verify,
+            sync::backup_list,
+            sync::backup_cancel,
         ])
         .build(tauri::generate_context!())
         .expect("error while building the oxbase desktop shell");

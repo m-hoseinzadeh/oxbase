@@ -9,6 +9,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use oxbase_net::ssh::RusshTunnelProvider;
+use oxbase_services::backup::BackupService;
 use oxbase_services::designer::DesignerService;
 use oxbase_services::documents::DocumentService;
 use oxbase_services::edit::EditService;
@@ -21,6 +22,8 @@ use oxbase_services::pubsub::PubSubService;
 use oxbase_services::query::{QueryConfig, QueryService};
 use oxbase_services::schema_cache::{SchemaCacheConfig, SchemaCacheService, SchemaEvents};
 use oxbase_services::snippets::SnippetService;
+use oxbase_services::sync::{DataSyncService, StructureSyncService};
+use oxbase_services::transfer::TransferService;
 use oxbase_services::tree::TreeService;
 use oxbase_services::{ConnectionManager, DriverRegistry};
 use oxbase_store::{
@@ -36,6 +39,7 @@ use crate::designer::DesignerState;
 use crate::files::FilesState;
 use crate::insight::InsightState;
 use crate::nosql::NoSqlState;
+use crate::sync::SyncState;
 use crate::transfer::TransferState;
 use crate::workbench::WorkbenchState;
 
@@ -56,6 +60,8 @@ pub struct AppStates {
     pub insight: InsightState,
     /// M7: documents, keys and pub/sub (MongoDB, Redis).
     pub nosql: NoSqlState,
+    /// M8: transfer, structure sync, data sync, backup and restore.
+    pub sync: SyncState,
 }
 
 /// The repositories kept in the app database.
@@ -197,6 +203,39 @@ pub fn app_state_with_repositories(
         Arc::clone(&dialects),
         ExportConfig::default(),
     ));
+    // M8: transfer, structure / data sync and backup share the manager, the tree and the
+    // registry; the ones that change schemas publish on `events`.
+    let sync = SyncState::new(
+        Arc::new(
+            TransferService::new(
+                Arc::clone(&manager),
+                Arc::clone(&tree),
+                Arc::clone(&dialects),
+            )
+            .with_schema_events(events.clone()),
+        ),
+        Arc::new(
+            StructureSyncService::new(
+                Arc::clone(&manager),
+                Arc::clone(&tree),
+                Arc::clone(&dialects),
+            )
+            .with_schema_events(events.clone()),
+        ),
+        Arc::new(DataSyncService::new(
+            Arc::clone(&manager),
+            Arc::clone(&tree),
+            Arc::clone(&dialects),
+        )),
+        Arc::new(
+            BackupService::new(
+                Arc::clone(&manager),
+                Arc::clone(&tree),
+                Arc::clone(&dialects),
+            )
+            .with_schema_events(events.clone()),
+        ),
+    );
     let caches = Arc::new(SchemaCacheService::new(
         Arc::clone(&manager),
         Arc::clone(&dialects),
@@ -228,6 +267,7 @@ pub fn app_state_with_repositories(
         files: FilesState::new(),
         insight: InsightState::new(insight),
         nosql,
+        sync,
     }
 }
 
@@ -278,6 +318,25 @@ mod tests {
         ));
         // M7: no subscription is open.
         assert_eq!(states.nosql.pubsub().open_count(), 0);
+        // M8: the sync services share the manager and the registry, and nothing runs.
+        assert!(Arc::ptr_eq(
+            states.sync.transfer().manager(),
+            states.connections.manager()
+        ));
+        assert!(Arc::ptr_eq(
+            states.sync.structure().dialects(),
+            states.designer.service().dialects()
+        ));
+        assert!(Arc::ptr_eq(
+            states.sync.data().tree(),
+            states.sync.backup().tree()
+        ));
+        assert_eq!(
+            states
+                .sync
+                .cancel_session(oxbase_services::SessionId::new()),
+            0
+        );
     }
 
     #[test]

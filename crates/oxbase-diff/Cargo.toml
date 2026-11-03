@@ -11,6 +11,26 @@ authors.workspace = true
 [lints]
 workspace = true
 
+# M8 (docs/m8-contracts.md §5-§6): structure compare and sync scripts over the dialect cells
+# (Fetcher, Comparator, DdlGenerator), and chunked key-ordered data compare with DML scripts
+# (DmlWriter) and a spill store for the differing rows. Connection-level only: sessions, apply
+# and events live in oxbase-services::sync.
 [dependencies]
+oxbase-types.workspace = true
+oxbase-driver.workspace = true
+oxbase-dialect.workspace = true
+# Names inside view / routine / trigger SQL are moved between containers on the token level.
+oxbase-sql.workspace = true
+arrow-array.workspace = true
+arrow-schema.workspace = true
+# Differing rows spill to Arrow IPC files (bounded memory for 100k+ row differences).
+arrow-ipc.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
 
 [dev-dependencies]
+oxbase-driver = { workspace = true, features = ["mock"] }
+pretty_assertions.workspace = true
+tokio.workspace = true

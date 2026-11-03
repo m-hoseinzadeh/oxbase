@@ -45,6 +45,14 @@
 //! typed value reads, atomic key edits) and [`PubSub`] (module [`pubsub`]). Tree layouts may
 //! rename kinds ([`TreeLayout::with_label`]: MongoDB tables are "Collections").
 //!
+//! M8 adds what structure sync, data sync, transfer and backup share (`docs/m8-contracts.md`):
+//! the per-engine [`TypeMapper`] role (module [`typemap`]: column types across engines with a
+//! [`Fidelity`] per mapping), dependency ordering of objects (module [`deps`]: foreign keys,
+//! views, cycles), keyset ranges, the optional [`ChunkHasher`] role and
+//! [`keyset::inline_params`] for script previews (module [`keyset`]), the shared comparison of
+//! views, routines, triggers and sequences (module [`compare_objects`]) and the
+//! [`SYNC_KINDS`] those cells cover.
+//!
 //! How engine crates register their cells: see [`DialectRegistry`] (*Registration*). The
 //! contracts are in `docs/m2-contracts.md`, `docs/m3-contracts.md`, `docs/m4-contracts.md` and
 //! `docs/m5-contracts.md` and `docs/m6-contracts.md`.
@@ -53,10 +61,13 @@ pub mod bulk;
 mod capability;
 pub mod catalog;
 pub mod compare;
+pub mod compare_objects;
 mod ddl;
+pub mod deps;
 mod dml;
 pub mod document;
 pub mod dump;
+pub mod keyset;
 pub mod keyvalue;
 pub mod language;
 pub mod pubsub;
@@ -65,6 +76,7 @@ mod registry;
 pub mod script;
 pub mod sql;
 mod tree;
+pub mod typemap;
 
 use async_trait::async_trait;
 use oxbase_driver::{CancellationToken, Connection};
@@ -78,19 +90,24 @@ pub use bulk::{
 };
 pub use capability::{DesignerCapabilities, Support};
 pub use catalog::{CatalogReader, CatalogScope, RelationName};
+pub use compare_objects::DefinitionComparator;
 pub use ddl::DdlContext;
+pub use deps::{DependencyGraph, DependencyOrder, table_dependencies};
 pub use dml::{DmlPlan, DmlTarget, write_column_list, write_key_predicate};
 pub use document::DocumentStore;
 pub use dump::{DumpLiteral, DumpSession, IdentityInsert};
+pub use keyset::{ChunkHasher, KeyRange, inline_params};
 pub use keyvalue::KeyValueStore;
 pub use language::{FunctionInfo, FunctionKind, SqlLanguage, TypeInfo, TypeParams};
 pub use pubsub::{PubSub, PubSubEvent, SubscribeRequest, Subscription};
 pub use quoting::{AnsiQuoting, BacktickQuoting, BracketQuoting, LexRules, PgQuoting, Quoting};
 pub use registry::{
-    CellRole, CellStatus, CoverageMatrix, DESIGNER_KINDS, DialectRegistry, EngineRole, MissingCell,
+    CellRole, CellStatus, CoverageMatrix, DESIGNER_KINDS, DialectRegistry, EngineRole, M8_ENGINES,
+    MissingCell, SYNC_KINDS,
 };
 pub use script::{CONFIRMATION_REQUIRED, ScriptLanguage, StatementGuard};
 pub use tree::{ChildGroup, DatabaseScope, TreeLayout};
+pub use typemap::{Fidelity, TypeMapper, TypeMapping};
 
 /// Reads objects of one kind from a live connection. One implementation per (engine, kind).
 ///

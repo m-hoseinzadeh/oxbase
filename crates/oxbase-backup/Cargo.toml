@@ -11,6 +11,34 @@ authors.workspace = true
 [lints]
 workspace = true
 
+# M8 (docs/m8-contracts.md §7): the Oxbase backup archive (zip: manifest JSON, object
+# definitions and DDL, table data as zstd-compressed Arrow IPC streams, SHA-256 per entry),
+# logical backup of a database / schema, restore into the same engine (structure through
+# oxbase-diff's sync script, data through the engine's BulkLoader), verify and list.
 [dependencies]
+oxbase-types.workspace = true
+oxbase-driver.workspace = true
+oxbase-dialect.workspace = true
+# Restore builds its structure script with the structure-sync machinery (snapshot, compare,
+# dependency-ordered DDL) and converts rows into load batches like a transfer.
+oxbase-diff.workspace = true
+oxbase-transfer.workspace = true
+# SinkFile: the archive is written to a temporary file in the destination directory and renamed
+# on success (M5 rule: a failed backup never leaves a partial file or damages an existing one).
+oxbase-io.workspace = true
+arrow-array.workspace = true
+arrow-schema.workspace = true
+# `zstd`: IPC buffer compression of table data (zstd 0.14 is already in the graph via parquet).
+arrow-ipc = { workspace = true, features = ["zstd"] }
+zip.workspace = true
+sha2.workspace = true
+chrono.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
 
 [dev-dependencies]
+oxbase-driver = { workspace = true, features = ["mock"] }
+pretty_assertions.workspace = true
+tempfile.workspace = true

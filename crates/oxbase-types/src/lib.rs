@@ -29,6 +29,9 @@
 //!   edits ([`DocumentEdit`]) for document databases (MongoDB), in Extended JSON.
 //! - [`keyvalue`] (M7): key types, binary-safe [`BinaryText`], key-browser scans and typed,
 //!   atomic key edits ([`KeyApplyRequest`]) for key-value stores (Redis).
+//! - [`relocate`] (M8): [`Location`] (a database and schema) and [`relocate_def`], which moves a
+//!   definition read in a source container to a target container (structure sync, transfer,
+//!   restore; `docs/m8-contracts.md` §3.2).
 
 pub mod catalog;
 pub mod data_type;
@@ -45,6 +48,7 @@ pub mod net;
 pub mod object;
 pub mod progress;
 pub mod props;
+pub mod relocate;
 pub mod script;
 pub mod secret;
 pub mod snippet;
@@ -81,6 +85,7 @@ pub use net::{
 pub use object::{ObjectKind, ObjectRef, ObjectSummary};
 pub use progress::{Progress, ProgressUnit};
 pub use props::{Extras, PropId};
+pub use relocate::{Location, relocate_def, relocate_ref};
 pub use script::{BoundStatement, Script, ScriptStep, StepCheck, StepCondition, StepPhase};
 pub use secret::Secret;
 pub use snippet::{Snippet, SnippetInput, validate_snippet_body};

@@ -533,6 +533,35 @@ the text above or from `docs/m7-contracts.md`:
   shared suffix of the replaced document) and closes a dialog a failed M7 step left open.
 - `async-executor` 1.14.0 (via zbus / keyring) was yanked during M7; `Cargo.lock` pins 1.14.1.
 
+**M8 contracts (Design step, 2026-11-03).** `docs/m8-contracts.md` fixes the data transfer,
+structure sync, data sync and backup / restore contracts. The logical type model stays
+`oxbase_types::DataType`; a new per-engine `TypeMapper` role (`oxbase_dialect::typemap`) maps it
+to each engine's column types with a `Fidelity` per mapping (exact, widened, narrowed,
+unsupported, with a reason), its cells live in `oxbase-transfer` (one per SQL engine; MongoDB
+and Redis are not transfer endpoints in M8). Transfers plan first (the dry run: target DDL from
+the target's `DdlGenerator`, the per-column mapping report, foreign-key load order from a new
+shared `DependencyGraph`) and then stream Arrow pages from the source query path through a
+batch converter into the target's M5 `BulkLoader` (new hooks for foreign-key checks and identity
+resync), per table or per batch transactions, continue-or-stop, cancel. Structure sync compares
+two schemas of the same engine through the fetchers and comparators (definitions moved between
+containers with `oxbase_types::relocate` and a token-level SQL retarget), keeps the result by
+id, and scripts the selected items in dependency order with the `DdlGenerator` cells, M3's
+SQLite rebuild included; views, sequences, routines and triggers get new per-engine DDL cells
+and a shared `DefinitionComparator`; apply runs `execute_script` (one transaction where DDL is
+transactional; MySQL / MariaDB say they cannot) and re-compares. Data sync reads both tables in
+key order in keyset chunks with an optional per-engine digest skip, refuses tables without a key
+unless key columns are chosen, spills differing rows to Arrow IPC files, scripts DML through the
+M3 `DmlWriter` (deletes off by default; previews with dump literals) and applies in batched
+transactions with a re-compare. Backups are one ZIP archive (`.oxbackup`: manifest, object
+definitions and DDL, table data as zstd-compressed Arrow IPC in the load schema, SHA-256 per
+entry; never connection details) with backup, restore into the same engine (structure through
+the sync script, data through the `BulkLoader`), verify and list; the M5 SQL dump stays a
+separate export. Every long M8 run registers with its sessions so closing a connection cancels
+it. 17 Tauri commands; fixtures add source / target schemas or databases with designed
+structure and data differences on every SQL engine and a PostgreSQL type set for PG → MySQL
+(`[m8]`). Six streams (transfer, structure-sync, data-sync, backup, app, conformance) fill the
+skeletons.
+
 Order of work: M0–M3 prove the architecture. M4 and M7 are where the per-database matrix gets tested for real. M8 and M10 reuse the Comparator and DdlGenerator cells and get much cheaper if M3 is done right.
 
 ## 7. Main risks

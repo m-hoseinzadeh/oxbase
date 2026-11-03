@@ -171,6 +171,12 @@ rust_xlsxwriter = { version = "0.102.0", features = ["constant_memory", "chrono"
 # version and features as calamine's own dependency, so the lockfile gains no crate.
 zip = { version = "9.2.1", default-features = false, features = ["deflate"] }
 
+# --- M8 backup (oxbase-backup; docs/m8-contracts.md §7) ---
+# SHA-256 of every archive entry. Already in the graph (rustls / russh / mongodb), MIT OR
+# Apache-2.0, so the lockfile gains no crate. arrow-ipc's `zstd` feature (enabled by
+# oxbase-backup) uses zstd 0.14, also already in the graph through parquet.
+sha2 = "0.10.9"
+
 # --- observability ---
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }

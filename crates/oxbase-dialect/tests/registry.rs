@@ -741,3 +741,69 @@ fn missing_m7_roles_lists_what_mongodb_and_redis_need() {
         "Namespaces"
     );
 }
+
+/// Maps every logical type to itself.
+struct ToyMapper;
+
+impl oxbase_dialect::TypeMapper for ToyMapper {
+    fn map(&self, data_type: &DataType, _version: &ServerVersion) -> oxbase_dialect::TypeMapping {
+        oxbase_dialect::TypeMapping::exact(data_type.clone())
+    }
+}
+
+#[test]
+fn missing_m8_roles_lists_what_sync_and_transfer_need() {
+    let mut reg = full_postgres_table();
+    assert_eq!(
+        reg.missing_m8_roles(Engine::Postgres),
+        ["postgres: no TypeMapper"]
+    );
+    // Engines outside M8 need nothing.
+    assert_eq!(reg.missing_m8_roles(Engine::Redis), Vec::<String>::new());
+    assert_eq!(reg.missing_m8_roles(Engine::MongoDb), Vec::<String>::new());
+    assert_eq!(
+        reg.type_mapper(Engine::Postgres)
+            .err()
+            .as_ref()
+            .map(Error::category),
+        Some(ErrorCategory::Unsupported)
+    );
+
+    // A sync kind with a fetcher needs a generator and a comparator.
+    reg.register_fetcher(
+        Engine::Postgres,
+        ObjectKind::View,
+        Arc::new(ToyTableFetcher),
+    );
+    reg.register_type_mapper(Engine::Postgres, Arc::new(ToyMapper));
+    assert!(reg.has_type_mapper(Engine::Postgres));
+    assert_eq!(
+        reg.missing_m8_roles(Engine::Postgres),
+        [
+            "postgres/view: no DdlGenerator",
+            "postgres/view: no Comparator"
+        ]
+    );
+    reg.register_ddl(Engine::Postgres, ObjectKind::View, Arc::new(ToyDdl))
+        .register_comparator(Engine::Postgres, ObjectKind::View, Arc::new(ToyComparator));
+    assert_eq!(reg.missing_m8_roles(Engine::Postgres), Vec::<String>::new());
+
+    let mapping = reg
+        .type_mapper(Engine::Postgres)
+        .unwrap()
+        .map(&DataType::Uuid, &ServerVersion::new(18, 0, 0));
+    assert_eq!(mapping.fidelity, oxbase_dialect::Fidelity::Exact);
+    // The chunk hasher is optional.
+    assert!(reg.chunk_hasher(Engine::Postgres).is_none());
+    // The M8 loader hooks default to "not available" / nothing to run.
+    let loader = reg.bulk_loader(Engine::Postgres).unwrap();
+    let table = ObjectRef::table(None, Some("s"), "t");
+    assert!(loader.foreign_key_checks(&table, false).is_none());
+    assert!(
+        loader
+            .identity_resync(&table, &[ColumnDef::new("id", DataType::INT64)])
+            .is_empty()
+    );
+    assert!(oxbase_dialect::SYNC_KINDS.contains(&ObjectKind::Trigger));
+    assert_eq!(oxbase_dialect::M8_ENGINES.len(), 5);
+}

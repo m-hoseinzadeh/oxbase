@@ -959,3 +959,174 @@ master_name = "oxmaster"
 user = "default"
 password = "Oxbase_Fixture_Pw_2026"
 seed_key = "m7:sentinel"
+
+# --- M8: structure sync, data sync, transfer, backup / restore -------------------------------
+# Names only, like [m2] / [m3] / [m7] (docs/m8-contracts.md §9). The conformance stream writes
+# the seed scripts (`init_sql`) and the conformance cells; the transfer, structure-sync,
+# data-sync and backup streams assert these shapes in their live tests (#[ignore]d, run by the
+# conformance job). No new container and no port change: every engine reuses its fixture; M8
+# adds databases (MySQL, MariaDB), schemas (PostgreSQL, SQL Server) and files (SQLite) only.
+#
+# SOURCE = the desired state, TARGET = what a sync must change. Each pair holds the same object
+# set with these designed differences (portable names; per-engine types in the seed comments;
+# `id` columns are the engine's identity / auto-increment):
+#
+#   customers      both. Source adds `phone varchar(30) NULL`; target has an extra `fax
+#                  varchar(30) NULL` (a column drop: destructive); `email varchar(200) NOT NULL`
+#                  with unique `customers_email_uq` on both.
+#   products       both. `price` decimal(10,2) in target, decimal(12,2) in source (type change);
+#                  `sku varchar(40)` NULL in target, NOT NULL in source (nullability);
+#                  `stock int` DEFAULT 0 in source, no default in target (default); check
+#                  `products_price_ck (price >= 0)` in source only.
+#   orders         both. Index `orders_created_ix` on (created_at) in target, on (customer_id,
+#                  created_at) in source (index change); FK `orders_customer_fk` (customer_id →
+#                  customers.id) in source only (new FK, added last); trigger `orders_audit`
+#                  (AFTER INSERT, writes into order_audit) in source only (SQLite, MySQL,
+#                  MariaDB, PostgreSQL with function `orders_audit_fn`, SQL Server).
+#   order_audit    both, equal (the trigger's table; proves "same" items stay out of scripts).
+#   order_items    source only; `order_lines` target only, same columns: a rename-looking pair
+#                  that structure sync reports as one create plus one drop (no rename guessing).
+#   legacy_notes   target only (dropped only with include_drops).
+#   MixedCase      source only, quoted mixed-case table with column `Value` (case-sensitive
+#                  names; on PostgreSQL the target also has an unrelated `mixedcase`).
+#   select         both: reserved-word table with columns `from` (int PK), `it's` (text) and
+#                  `say "hi"` (text); target lacks `say "hi"` (quotes in names through DDL).
+#   active_customers  view in both; source `WHERE phone IS NOT NULL`, target `WHERE 1 = 1`
+#                  (view change; re-created after the tables it reads).
+#   invoice_seq    sequence START 1000 INCREMENT 1 in source only (PostgreSQL, SQL Server,
+#                  MariaDB); orders.id is an identity / auto-increment column on both sides.
+#   order_total(p_order int)  function returning decimal, source only (PostgreSQL, MySQL,
+#                  MariaDB, SQL Server).
+#
+# Data pairs (identical structure on both sides; data sync compares and syncs these):
+#   m8_data        id bigint PK, name varchar(100) (unicode: 'grüße', '日本', an astral '😀'),
+#                  amount decimal(38,10) (big: 1234567890123456789012345678.0123456789 and
+#                  negatives), payload binary (bytes 00 ff 10 and NULL), happened_at timestamp
+#                  with zone (PostgreSQL timestamptz, MySQL / MariaDB datetime(6) in UTC, SQL
+#                  Server datetimeoffset(7) with +05:30, SQLite ISO text with offset), note text
+#                  NULL. Source ids 1..20; target ids 1..18 and 21, 22; ids 3, 5, 7 differ in
+#                  name / amount / happened_at; id 9 note NULL in source and 'x' in target; id 10
+#                  note 'y' in source and NULL in target. Expected: inserts 2 (19, 20), updates
+#                  5 (3, 5, 7, 9, 10), deletes 2 (21, 22).
+#   m8_big         id bigint PK, val int, label varchar(20); source rows 1..100000 with val = id %
+#                  1000, label 'row-<id>'. Target: the same except id 500 (val 9999), id 50000
+#                  missing, id 100001 extra. Expected: inserts 1, updates 1, deletes 1; with a
+#                  chunk size of 10 000 at least 9 chunks compare equal.
+#   m8_composite   key (tenant int, code varchar(20)) PRIMARY KEY, qty int; 6 rows, (2, 'b')
+#                  qty differs. Expected: updates 1.
+#   m8_nokey       a int, b text; no key: refused unless key columns are chosen.
+[m8]
+stale_after_secs = 3600
+# Scratch objects the live tests create (dropped when older than stale_after_secs).
+scratch_prefix = "m8_t_"
+structure_tables = ["customers", "products", "orders", "order_audit", "order_items", "order_lines", "legacy_notes", "MixedCase", "select"]
+data_tables = ["m8_data", "m8_big", "m8_composite", "m8_nokey"]
+view = "active_customers"
+sequence = "invoice_seq"
+function = "order_total"
+trigger = "orders_audit"
+big_table = "m8_big"
+big_rows = 100000
+# Expected data differences per table: [inserts, updates, deletes].
+data_expected = { m8_data = [2, 5, 2], m8_big = [1, 1, 1], m8_composite = [0, 1, 0] }
+# Ids of the structure diff items every engine must report (docs/m8-contracts.md §5.1 ids);
+# engines without sequences / routines skip those (see per-engine `skip_items`). PostgreSQL
+# routine ids carry the identity arguments: `function:order_total(integer)`
+# ([m8.postgres] function_signature).
+structure_items = [
+  "table:customers", "table:products", "table:orders", "table:order_items",
+  "table:order_lines", "table:legacy_notes", "table:MixedCase", "table:select",
+  "view:active_customers", "sequence:invoice_seq", "function:order_total",
+  "trigger:orders.orders_audit",
+]
+
+[m8.postgres]
+init_sql = "tests/docker/init/postgres/06-m8.sql"
+database = "oxbase_test"
+source_schema = "m8_src"
+target_schema = "m8_tgt"
+# Restores go here (created empty by the seed; tests empty it first).
+restore_schema = "m8_restore"
+# The PG → MySQL / any-engine transfer source set (below).
+transfer_schema = "m8_xfer"
+# PostgreSQL routines carry their identity arguments.
+function_signature = "integer"
+
+[m8.mysql]
+# Databases created by the seed (as root) with ALL privileges for the fixture user `oxbase`.
+init_sql = "tests/docker/init/mysql/06-m8.sql"
+source_database = "m8_src"
+target_database = "m8_tgt"
+restore_database = "m8_restore"
+# Where the PostgreSQL transfer set lands (created empty; tests replace its tables).
+transfer_target_database = "m8_xfer_target"
+skip_items = ["sequence:invoice_seq"]
+
+[m8.mariadb]
+init_sql = "tests/docker/init/mariadb/06-m8.sql"
+source_database = "m8_src"
+target_database = "m8_tgt"
+restore_database = "m8_restore"
+transfer_target_database = "m8_xfer_target"
+
+[m8.mssql]
+init_sql = "tests/docker/init/mssql/07-m8.sql"
+database = "oxbase_test"
+source_schema = "m8_src"
+target_schema = "m8_tgt"
+restore_schema = "m8_restore"
+transfer_target_schema = "m8_xfer_target"
+
+[m8.sqlite]
+# Two fresh temp database files per test, built from these scripts (like [m2.sqlite]); the
+# restore target is a third, empty file. SQLite has no sequences or routines.
+source_sql = "tests/docker/init/sqlite/03-m8-src.sql"
+target_sql = "tests/docker/init/sqlite/04-m8-tgt.sql"
+database = "main"
+skip_items = ["sequence:invoice_seq", "function:order_total"]
+
+# The PostgreSQL transfer source set, schema [m8.postgres] transfer_schema. Rows: 1 typical
+# (unicode text, numeric 12345678901234567890.0123456789, interval '1 day 02:03:04.5', uuid
+# 6f1c2a3e-0000-4000-8000-00000000abcd, jsonb {"b": [1, 2], "a": null}, array {1,2,3} /
+# {"x","y,z"}, enum 'happy', timestamptz 2026-03-01 10:00:00+05:30, bytea 00 ff 0a), 1 edge
+# (min / max integers, negative interval, empty strings and arrays, '😀', 1970-01-01, 23:59:59.999999),
+# 1 with every column NULL except id. Tables are listed child first in the tests' transfer spec,
+# so the plan must reorder them (m8_parent before m8_child; m8_tree references itself).
+[m8.transfer]
+source_engine = "postgres"
+tables = ["m8_types", "m8_parent", "m8_child", "m8_tree"]
+types_table = "m8_types"
+types_rows = 3
+enum_type = "m8_mood"
+enum_labels = ["sad", "ok", "happy"]
+
+# Expected MySQL 8.4 column of each m8_types column after a PG → MySQL transfer:
+# [native type (as information_schema.COLUMNS.COLUMN_TYPE spells it), fidelity]. The plan's
+# mapping report must say exactly this fidelity; the loaded values must read back equal
+# (timestamptz as the same instant in UTC, interval / uuid / arrays as their PostgreSQL text
+# or JSON form, jsonb as an equal JSON value).
+[m8.transfer.expected_mysql]
+id = ["int", "exact"]
+c_bool = ["tinyint(1)", "exact"]
+c_int2 = ["smallint", "exact"]
+c_int4 = ["int", "exact"]
+c_int8 = ["bigint", "exact"]
+c_numeric = ["decimal(38,10)", "exact"]
+c_numeric_free = ["decimal(65,30)", "narrowed"]
+c_real = ["float", "exact"]
+c_double = ["double", "exact"]
+c_char = ["char(10)", "exact"]
+c_varchar = ["varchar(255)", "exact"]
+c_text = ["longtext", "exact"]
+c_bytea = ["longblob", "exact"]
+c_date = ["date", "exact"]
+c_time = ["time(6)", "exact"]
+c_timestamp = ["datetime(6)", "exact"]
+c_timestamptz = ["datetime(6)", "narrowed"]
+c_interval = ["varchar(64)", "widened"]
+c_uuid = ["char(36)", "widened"]
+c_json = ["json", "exact"]
+c_jsonb = ["json", "exact"]
+c_int_array = ["json", "widened"]
+c_text_array = ["json", "widened"]
+c_enum = ["enum('sad','ok','happy')", "exact"]

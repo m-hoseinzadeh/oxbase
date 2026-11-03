@@ -72,6 +72,24 @@ const COMMANDS: &[&str] = &[
     "pubsub_subscribe",
     "pubsub_unsubscribe",
     "pubsub_publish",
+    // M8 transfer, structure / data sync, backup and restore (src/sync.rs).
+    "transfer_plan",
+    "transfer_pair_report",
+    "transfer_run",
+    "transfer_cancel",
+    "structure_compare",
+    "structure_script",
+    "structure_apply",
+    "compare_forget",
+    "data_compare",
+    "data_script",
+    "data_apply",
+    "data_cancel",
+    "backup_run",
+    "backup_restore",
+    "backup_verify",
+    "backup_list",
+    "backup_cancel",
 ];
 
 fn main() {

@@ -304,6 +304,7 @@ dependencies = [
  "arrow-schema",
  "arrow-select",
  "flatbuffers",
+ "zstd",
 ]
 
 [[package]]
@@ -4376,6 +4377,26 @@ version = "0.7.0"
 [[package]]
 name = "oxbase-backup"
 version = "0.7.0"
+dependencies = [
+ "arrow-array",
+ "arrow-ipc",
+ "arrow-schema",
+ "chrono",
+ "futures",
+ "oxbase-dialect",
+ "oxbase-diff",
+ "oxbase-driver",
+ "oxbase-io",
+ "oxbase-transfer",
+ "oxbase-types",
+ "pretty_assertions",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
+ "zip",
+]
 
 [[package]]
 name = "oxbase-bi"
@@ -4442,6 +4463,21 @@ dependencies = [
 [[package]]
 name = "oxbase-diff"
 version = "0.7.0"
+dependencies = [
+ "arrow-array",
+ "arrow-ipc",
+ "arrow-schema",
+ "futures",
+ "oxbase-dialect",
+ "oxbase-driver",
+ "oxbase-sql",
+ "oxbase-types",
+ "pretty_assertions",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
 
 [[package]]
 name = "oxbase-driver"
@@ -4689,8 +4725,10 @@ dependencies = [
  "async-trait",
  "chrono",
  "futures",
+ "oxbase-backup",
  "oxbase-designer",
  "oxbase-dialect",
+ "oxbase-diff",
  "oxbase-driver",
  "oxbase-insight",
  "oxbase-io",
@@ -4704,6 +4742,7 @@ dependencies = [
  "oxbase-sql",
  "oxbase-sqlite",
  "oxbase-store",
+ "oxbase-transfer",
  "oxbase-types",
  "pretty_assertions",
  "serde",
@@ -4762,6 +4801,18 @@ dependencies = [
 [[package]]
 name = "oxbase-transfer"
 version = "0.7.0"
+dependencies = [
+ "arrow-array",
+ "arrow-schema",
+ "futures",
+ "oxbase-dialect",
+ "oxbase-driver",
+ "oxbase-types",
+ "pretty_assertions",
+ "serde",
+ "serde_json",
+ "tokio",
+]
 
 [[package]]
 name = "oxbase-types"

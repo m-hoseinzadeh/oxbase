@@ -161,6 +161,14 @@ pub trait Quoting: Send + Sync {
         DumpLiteral::exact(self.literal(v))
     }
 
+    /// What ends each statement of a script written out as text (M8: structure and data sync
+    /// previews and saved scripts, `Script::to_sql`): `";"` by default; [`BracketQuoting`]
+    /// `"\nGO"`, because SQL Server needs `CREATE VIEW` / `PROCEDURE` / `TRIGGER` / `FUNCTION`
+    /// alone in their batch.
+    fn script_terminator(&self) -> &'static str {
+        ";"
+    }
+
     /// What a dump's `INSERT`s into `table` (already qualified with this quoting) need when
     /// they write the values of `columns` (the written columns), some of which may be identity
     /// or auto-increment columns. Default: nothing.
@@ -464,6 +472,10 @@ impl Quoting for BracketQuoting {
         "%_["
     }
 
+    fn script_terminator(&self) -> &'static str {
+        "\nGO"
+    }
+
     /// `OFFSET 0 ROWS FETCH NEXT n ROWS ONLY`, which T-SQL accepts only after an `ORDER BY`;
     /// statements without one use [`Quoting::top_clause`].
     fn limit_clause(&self, n: u64) -> String {
@@ -665,6 +677,10 @@ mod tests {
         assert!(PgQuoting.nulls_ordering() && AnsiQuoting.nulls_ordering());
         assert!(!BacktickQuoting.nulls_ordering() && !BracketQuoting.nulls_ordering());
         assert_eq!(BracketQuoting.like_specials(), "%_[");
+        // M8: script terminators.
+        assert_eq!(PgQuoting.script_terminator(), ";");
+        assert_eq!(BacktickQuoting.script_terminator(), ";");
+        assert_eq!(BracketQuoting.script_terminator(), "\nGO");
         assert_eq!(AnsiQuoting.limit_clause(10), "LIMIT 10");
         assert_eq!(AnsiQuoting.top_clause(10), None);
         assert_eq!(PgQuoting.top_clause(10), None);

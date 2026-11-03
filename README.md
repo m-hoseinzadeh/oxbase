@@ -172,13 +172,13 @@ crates/
   oxbase-conformance                              cross-engine conformance harness
   app-tauri                                       Tauri 2 shell (no logic)
 ui/                                               React + TS + Vite front end
-tests/fixtures.toml                               test DB connection params, M2-M4 and M7 seed
+tests/fixtures.toml                               test DB connection params, M2-M4, M7 and M8 seed
                                                   names, the M5 import / export expectations and
                                                   the M6 insight perf scenarios (single source of
                                                   truth)
 tests/data/m5/                                    small hand-written import samples (M5)
 docs/                                             frozen contracts per milestone (m1-contracts.md
-                                                  to m7-contracts.md)
+                                                  to m8-contracts.md; M8 in progress)
 ```
 
 ## Prerequisites
@@ -282,6 +282,16 @@ MongoDB and Redis seeds (a document collection covering every mapped BSON type, 
 (`allowTLS`) and Redis with a TLS-only port on `127.0.0.1:15480`, and `[m7.redis_cluster]` /
 `[m7.redis_sentinel]` describe a 3-master cluster on 15501-15503 and a sentinel setup on 15511,
 15512 and 15526 (host networking). `scripts/fixtures-up.sh` starts them with the others.
+
+M8 (contracts in `docs/m8-contracts.md` §9): `[m8]` names a source and a target schema
+(PostgreSQL and SQL Server: `m8_src` / `m8_tgt` of `oxbase_test`) or database (MySQL and
+MariaDB: `m8_src` / `m8_tgt`; SQLite: two files) with designed structure differences (added,
+dropped and changed columns, a type, nullability and default change, an index change, a new
+foreign key, a changed view, a sequence, a rename-looking pair, case-sensitive and reserved
+names) and data differences (inserted, updated and deleted rows with NULLs, unicode, big
+decimals, binary and zoned timestamps, a 100 000-row table), restore targets, and the
+PostgreSQL type set of the PG → MySQL transfer with the expected MySQL column types. No new
+container or port.
 
 M5 adds no seed objects: import and export tests create and drop scratch tables
 `m5_t_<case>_<token>` (`[m5]`). `[m5.files."<name>"]` lists what each sample in `tests/data/m5`

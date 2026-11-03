@@ -52,6 +52,10 @@ oxbase-io.workspace = true
 # schema identifier cache.
 oxbase-insight.workspace = true
 oxbase-schema-cache.workspace = true
+# M8: data transfer, structure / data sync and backup / restore (docs/m8-contracts.md §8).
+oxbase-transfer.workspace = true
+oxbase-diff.workspace = true
+oxbase-backup.workspace = true
 
 [dev-dependencies]
 oxbase-driver = { workspace = true, features = ["mock"] }
