@@ -74,7 +74,7 @@ pub enum BackupEvent {
         progress: BackupProgress,
     },
     Finished {
-        report: BackupReport,
+        report: Box<BackupReport>,
     },
     Failed {
         error: ErrorInfo,
@@ -95,7 +95,7 @@ pub enum BackupEvent {
 pub enum RestoreEvent {
     Started {
         restore_id: OperationId,
-        manifest: Manifest,
+        manifest: Box<Manifest>,
     },
     Progress {
         progress: RestoreProgress,

@@ -264,7 +264,7 @@ pub enum DataCompareEvent {
         progress: CompareProgress,
     },
     TableFinished {
-        table: TableDataDiff,
+        table: Box<TableDataDiff>,
     },
     Finished {
         result: DataCompareResult,

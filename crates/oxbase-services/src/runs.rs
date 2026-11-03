@@ -74,7 +74,9 @@ impl Drop for RunTicket {
 
 impl fmt::Debug for RunTicket {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("RunTicket").field("id", &self.id).finish()
+        f.debug_struct("RunTicket")
+            .field("id", &self.id)
+            .finish_non_exhaustive()
     }
 }
 
@@ -152,7 +154,7 @@ impl fmt::Debug for RunRegistry {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RunRegistry")
             .field("running", &self.len())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
