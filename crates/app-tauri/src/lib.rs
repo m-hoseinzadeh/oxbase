@@ -76,7 +76,7 @@ const EXIT_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppInfo {
-    /// Core (workspace) version, e.g. `0.8.0`.
+    /// Core (workspace) version, e.g. `0.8.1`.
     pub version: String,
     /// Operating system: `linux`, `macos` or `windows`.
     pub platform: String,
