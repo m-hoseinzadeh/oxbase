@@ -278,6 +278,7 @@ function planStages({ assigned, special }) {
 
 // --- 3. fixtures, snapshots and cleanup checks ---------------------------------------------
 const PW = "Oxbase_Fixture_Pw_2026";
+const SQLITE_FIXTURE = path.join("target", "fixtures", "oxbase_test.sqlite");
 const PROJECT = "oxbase-fixtures";
 const FIXTURE_PORTS = /:(15[4-5]\d\d)\b/;
 
@@ -302,7 +303,7 @@ function snapshot(engine) {
         UNION ALL SELECT 'role ' || rolname FROM pg_roles WHERE rolname NOT LIKE 'pg\\_%'
         UNION ALL SELECT 'schema ' || nspname FROM pg_namespace
           WHERE nspname NOT LIKE 'pg\\_%' AND nspname <> 'information_schema'
-        UNION ALL SELECT 'rel ' || n.nspname || '.' || c.relname || ' (' || c.relkind || ')'
+        UNION ALL SELECT 'rel ' || n.nspname || '.' || c.relname || ' (' || c.relkind::text || ')'
           FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
           WHERE n.nspname NOT LIKE 'pg\\_%' AND n.nspname <> 'information_schema'
             AND c.relkind IN ('r', 'p', 'v', 'm', 'S', 'f')
@@ -331,15 +332,30 @@ function snapshot(engine) {
         ORDER BY 1`], { MYSQL_PWD: PW });
       break;
     case "mssql":
-      r = dockerExec("oxbase-fixtures-mssql", ["/opt/mssql-tools18/bin/sqlcmd", "-C", "-S", "127.0.0.1", "-U", "sa", "-P", PW, "-d", "oxbase_test", "-h", "-1", "-W", "-Q", `
+      // Every user database, not only oxbase_test (m8_restore, scratch databases, ...).
+      r = dockerExec("oxbase-fixtures-mssql", ["/opt/mssql-tools18/bin/sqlcmd", "-C", "-S", "127.0.0.1", "-U", "sa", "-P", PW, "-h", "-1", "-W", "-Q", `
         SET NOCOUNT ON;
-        SELECT 'db ' + name FROM sys.databases
-        UNION ALL SELECT 'login ' + name FROM sys.server_principals WHERE type IN ('S', 'U')
-        UNION ALL SELECT 'schema ' + name FROM sys.schemas WHERE schema_id BETWEEN 5 AND 16383
-        UNION ALL SELECT 'obj ' + SCHEMA_NAME(schema_id) + '.' + name + ' (' + RTRIM(type) + ')'
-          FROM sys.objects WHERE is_ms_shipped = 0 AND parent_object_id = 0
-        UNION ALL SELECT 'type ' + SCHEMA_NAME(schema_id) + '.' + name FROM sys.types WHERE is_user_defined = 1
-        ORDER BY 1`]);
+        CREATE TABLE #o (n nvarchar(1000) COLLATE DATABASE_DEFAULT);
+        INSERT #o SELECT N'db ' + name FROM sys.databases;
+        INSERT #o SELECT N'login ' + name FROM sys.server_principals WHERE type IN ('S', 'U');
+        DECLARE @d sysname, @e nvarchar(300), @q nvarchar(max);
+        DECLARE c CURSOR LOCAL FAST_FORWARD FOR
+          SELECT name FROM sys.databases WHERE database_id > 4 AND state = 0;
+        OPEN c;
+        FETCH NEXT FROM c INTO @d;
+        WHILE @@FETCH_STATUS = 0
+        BEGIN
+          SET @e = REPLACE(@d, , '');
+          SET @q =
+            N'INSERT #o SELECT N''obj ' + @e + N'.'' + s.name COLLATE DATABASE_DEFAULT + N''.'' + o.name COLLATE DATABASE_DEFAULT + N'' ('' + RTRIM(o.type) + N'')'' FROM '
+              + QUOTENAME(@d) + N'.sys.objects o JOIN ' + QUOTENAME(@d) + N'.sys.schemas s ON s.schema_id = o.schema_id WHERE o.is_ms_shipped = 0 AND o.parent_object_id = 0; '
+            + N'INSERT #o SELECT N''schema ' + @e + N'.'' + name COLLATE DATABASE_DEFAULT FROM ' + QUOTENAME(@d) + N'.sys.schemas WHERE schema_id BETWEEN 5 AND 16383; '
+            + N'INSERT #o SELECT N''type ' + @e + N'.'' + name COLLATE DATABASE_DEFAULT FROM ' + QUOTENAME(@d) + N'.sys.types WHERE is_user_defined = 1; '
+            + N'INSERT #o SELECT N''user ' + @e + N'.'' + name COLLATE DATABASE_DEFAULT FROM ' + QUOTENAME(@d) + N'.sys.database_principals WHERE type IN (''S'', ''U'', ''R'') AND principal_id BETWEEN 5 AND 16383;';
+          EXEC (@q);
+          FETCH NEXT FROM c INTO @d;
+        END
+        SELECT n FROM #o ORDER BY n;`]);
       break;
     case "mongodb":
       r = dockerExec("oxbase-fixtures-mongodb", ["mongosh", "--quiet", "--host", "127.0.0.1", "-u", "oxbase", "-p", PW, "--authenticationDatabase", "admin", "--eval", `
@@ -367,7 +383,8 @@ function snapshot(engine) {
       return { ok: true, lines: [...new Set(lines)].sort() };
     }
     case "sqlite":
-      return { ok: true, lines: sqliteFiles().map((f) => `file ${f}`) };
+      // The harness's own fixture file is expected; any other SQLite file under target/ is not.
+      return { ok: true, lines: sqliteFiles().filter((f) => f !== SQLITE_FIXTURE).map((f) => `file ${f}`) };
     default:
       return { ok: false, lines: [], err: `no snapshot for ${engine}` };
   }
