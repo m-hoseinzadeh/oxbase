@@ -531,7 +531,7 @@ fn statuses(report: &RestoreReport) -> Vec<(String, RestoredStatus)> {
         .iter()
         .map(|o| (o.object.name.clone(), o.status))
         .collect();
-    out.sort();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
     out
 }
 
@@ -539,7 +539,7 @@ fn statuses(report: &RestoreReport) -> Vec<(String, RestoredStatus)> {
 fn all(names: &[&String], status: RestoredStatus) -> Vec<(String, RestoredStatus)> {
     let mut out: Vec<(String, RestoredStatus)> =
         names.iter().map(|n| ((*n).clone(), status)).collect();
-    out.sort();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
     out
 }
 
