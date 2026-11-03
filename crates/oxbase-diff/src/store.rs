@@ -230,7 +230,7 @@ impl DiffStore {
             paths: paths.into_iter(),
             reader: None,
             pending: None,
-            slice_rows: batch_rows.max(1),
+            slice_len: batch_rows.max(1),
         }))
     }
 }
@@ -241,7 +241,7 @@ struct Rows {
     reader: Option<StreamReader<BufReader<File>>>,
     /// A batch being handed out in slices, and the next offset.
     pending: Option<(RecordBatch, usize)>,
-    slice_rows: usize,
+    slice_len: usize,
 }
 
 impl Rows {
@@ -279,7 +279,7 @@ impl Iterator for Rows {
             if let Some((batch, offset)) = self.pending.take() {
                 let left = batch.num_rows() - offset;
                 if left > 0 {
-                    let take = left.min(self.slice_rows);
+                    let take = left.min(self.slice_len);
                     let slice = batch.slice(offset, take);
                     if offset + take < batch.num_rows() {
                         self.pending = Some((batch, offset + take));
