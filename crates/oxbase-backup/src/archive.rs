@@ -110,7 +110,7 @@ impl ArchiveReader<std::fs::File> {
 impl<R: Read + Seek> ArchiveReader<R> {
     /// Opens an archive from any reader (tests: in-memory archives).
     pub fn from_reader(reader: R) -> Result<Self> {
-        let _ = reader;
+        drop(reader);
         unimplemented!("m8: backup")
     }
 
