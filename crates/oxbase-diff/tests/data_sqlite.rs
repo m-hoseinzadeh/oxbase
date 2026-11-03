@@ -8,7 +8,9 @@ use std::sync::{Arc, Mutex};
 
 use futures::StreamExt as _;
 use oxbase_dialect::{DialectRegistry, inline_params};
-use oxbase_diff::data::{CompareJob, compare_table, data_statements, insert_session, row_key};
+use oxbase_diff::data::{
+    CompareJob, InsertSession, compare_table, data_statements, insert_session, row_key,
+};
 use oxbase_diff::{
     DataCompareOptions, DiffStore, KeyChoice, RowCounts, RowOp, TableCompareStatus, TableDataDiff,
 };
@@ -778,7 +780,7 @@ async fn awkward_names_and_values_survive_the_preview_text() {
     let quoting = f.reg.quoting(Engine::Sqlite).unwrap();
     let key = row_key(&table, &diff.key, None);
     let session = insert_session(&f.reg, Engine::Sqlite, &table, &diff.columns).unwrap();
-    assert!(session.is_empty(), "{session:?}");
+    assert_eq!(session, InsertSession::default());
     let mut preview = Vec::new();
     for op in [RowOp::Delete, RowOp::Update, RowOp::Insert] {
         for batch in store.read(0, op, 1_000).unwrap() {

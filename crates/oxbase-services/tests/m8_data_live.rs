@@ -1157,7 +1157,7 @@ async fn sqlite_cancelled_apply_keeps_only_committed_batches() {
         cancelled_at.elapsed()
     );
     assert!(!report.in_sync, "{report:?}");
-    assert!(!report.left_behind.is_empty());
+    assert_ne!(report.left_behind, "", "{report:?}");
     assert_eq!(
         report.statements,
         report.committed_batches * 100,

@@ -9,7 +9,7 @@ use arrow_array::{ArrayRef, BinaryArray, Decimal128Array, Int64Array, RecordBatc
 use arrow_schema::{DataType as Arrow, Field, Schema};
 use oxbase_dialect::{DialectRegistry, inline_params};
 use oxbase_diff::RowOp;
-use oxbase_diff::data::{data_statements, insert_session, row_key};
+use oxbase_diff::data::{InsertSession, data_statements, insert_session, row_key};
 use oxbase_types::{
     ColumnDef, DataType, Engine, IdentityDef, ObjectRef, PrimaryKeyDef, ServerVersion, TableDef,
     Value,
@@ -310,7 +310,11 @@ fn identity_keys_are_written_with_the_engines_identity_insert() {
                     "INSERT INTO \"s\".\"t\" (\"id\", \"v\") OVERRIDING SYSTEM VALUE VALUES ($1, \
                      $2)"
                 );
-                assert!(session.before.is_empty(), "{session:?}");
+                assert_eq!(
+                    session.before,
+                    Vec::<oxbase_types::BoundStatement>::new(),
+                    "{session:?}"
+                );
                 // The resync (if the bulk loader has one) moves the sequence past the ids.
                 assert!(
                     session.after.iter().all(|s| s.sql.contains("setval")),
@@ -333,13 +337,17 @@ fn identity_keys_are_written_with_the_engines_identity_insert() {
             _ => {
                 assert!(insert.sql.contains("INSERT INTO "), "{}", insert.sql);
                 assert!(!insert.sql.contains("OVERRIDING"), "{}", insert.sql);
-                assert!(session.before.is_empty(), "{engine:?}: {session:?}");
+                assert_eq!(
+                    session.before,
+                    Vec::<oxbase_types::BoundStatement>::new(),
+                    "{engine:?}: {session:?}"
+                );
             }
         }
         // Without an identity column nothing wraps the inserts.
         let plain = table(engine);
         let none = insert_session(&reg, engine, &plain, &["id".into(), "name".into()]).unwrap();
-        assert!(none.is_empty(), "{engine:?}: {none:?}");
+        assert_eq!(none, InsertSession::default(), "{engine:?}");
     }
 }
 
