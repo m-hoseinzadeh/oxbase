@@ -123,13 +123,22 @@ fn property_step(
 
 /// Rules of the definition comparator: a module header names its object the way it was
 /// created (`CREATE PROCEDURE p`, `CREATE PROCEDURE [s].[p]`); the compared object is already
-/// known, so only the rest of the text counts.
+/// known, so only the rest of the text counts. Trailing semicolons after the module body
+/// (`END;`) do not count either: [`module_text`] writes the module without them, so a module
+/// created from a fetched `... END;` reads back as `... END`.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct MsSqlSyncRules;
 
 impl CompareRules for MsSqlSyncRules {
     fn same_expression(&self, old: &str, new: &str) -> bool {
-        normalize_ws(&header_names_bare(old)) == normalize_ws(&header_names_bare(new))
+        let bare = |text: &str| {
+            let text = header_names_bare(text);
+            normalize_ws(
+                text.trim_end()
+                    .trim_end_matches(|c: char| c == ';' || c.is_whitespace()),
+            )
+        };
+        bare(old) == bare(new)
     }
 }
 
@@ -772,6 +781,15 @@ mod tests {
         assert!(!rules.same_expression(
             "CREATE TRIGGER t ON orders AFTER INSERT AS SELECT 1",
             "CREATE TRIGGER [s].[t] ON [s].[items] AFTER INSERT AS SELECT 1"
+        ));
+        // A module created from `... END;` reads back without the semicolon (module_text).
+        assert!(rules.same_expression(
+            "CREATE FUNCTION s.f (@p int) RETURNS int AS BEGIN RETURN 1 END;\r\n",
+            "CREATE FUNCTION [t].[f] (@p int) RETURNS int AS BEGIN RETURN 1 END"
+        ));
+        assert!(!rules.same_expression(
+            "CREATE FUNCTION f () RETURNS int AS BEGIN RETURN 1 END; SELECT 1",
+            "CREATE FUNCTION f () RETURNS int AS BEGIN RETURN 1 END"
         ));
         assert_eq!(part_value("[a]]b]"), "a]b");
         assert_eq!(part_value("\"x\"\"y\""), "x\"y");

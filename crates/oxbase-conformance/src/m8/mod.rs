@@ -599,7 +599,7 @@ mod tests {
         );
         assert!(transfer.tables.iter().any(|t| t == "m8_parent"));
         let (_, pg) = fx.m8_seed("postgres", Engine::Postgres).unwrap();
-        assert_eq!(pg.function_signature.as_deref(), Some("integer"));
+        assert_eq!(pg.function_signature.as_deref(), Some("p_order integer"));
         let (_, my) = fx.m8_seed("mysql", Engine::MySql).unwrap();
         assert_eq!(my.skip_items, vec!["sequence:invoice_seq".to_owned()]);
     }

@@ -297,8 +297,8 @@ pub fn list_containers(engine: Engine, prefix: &str) -> Option<String> {
 }
 
 /// The `[m8] structure_items` an engine must report: without its `skip_items`, and with the
-/// routine's identity arguments where the engine has them (`function:order_total(integer)` on
-/// PostgreSQL).
+/// routine's identity arguments where the engine has them
+/// (`function:order_total(p_order integer)` on PostgreSQL).
 pub fn expected_items(
     items: &[String],
     skip: &[String],

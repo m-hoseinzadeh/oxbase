@@ -1031,8 +1031,9 @@ big_rows = 100000
 data_expected = { m8_data = [2, 5, 2], m8_big = [1, 1, 1], m8_composite = [0, 1, 0] }
 # Ids of the structure diff items every engine must report (docs/m8-contracts.md §5.1 ids);
 # engines without sequences / routines skip those (see per-engine `skip_items`). PostgreSQL
-# routine ids carry the identity arguments: `function:order_total(integer)`
-# ([m8.postgres] function_signature).
+# routine ids carry the identity arguments as `pg_get_function_identity_arguments` spells them
+# (argument names included): `function:order_total(p_order integer)` ([m8.postgres]
+# function_signature).
 structure_items = [
   "table:customers", "table:products", "table:orders", "table:order_items",
   "table:order_lines", "table:legacy_notes", "table:MixedCase", "table:select",
@@ -1050,7 +1051,7 @@ restore_schema = "m8_restore"
 # The PG → MySQL / any-engine transfer source set (below).
 transfer_schema = "m8_xfer"
 # PostgreSQL routines carry their identity arguments.
-function_signature = "integer"
+function_signature = "p_order integer"
 
 [m8.mysql]
 # Databases created by the seed (as root) with ALL privileges for the fixture user `oxbase`.

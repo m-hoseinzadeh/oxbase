@@ -242,7 +242,7 @@ fetchers. `compare(dialects, source, target, options) -> StructureDiff { engine,
 target, items: [DiffItem], warnings }`; `DiffItem { id, kind, name, parent?, status:
 only_in_source | only_in_target | different | same, source?, target?, properties:
 [PropertyDiff] (going from target to source), sourceDdl?, targetDdl? }`. Ids: `item_id`
-(`table:orders`, `trigger:orders.orders_audit`, `function:order_total(integer)` on
+(`table:orders`, `trigger:orders.orders_audit`, `function:order_total(p_order integer)` on
 PostgreSQL). Sorted by kind rank, then name. `StructureDiff::is_in_sync(include_drops)` is the
 re-compare check.
 
