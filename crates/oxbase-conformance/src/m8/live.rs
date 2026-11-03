@@ -2,6 +2,7 @@
 //! the real drivers, scratch copies of the seed per engine, cells run one after another.
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -16,9 +17,9 @@ use oxbase_services::backup::{
 };
 use oxbase_services::sync::{
     DataApplyEvent, DataApplyOptions, DataApplyRequest, DataCompareEvent, DataCompareOptions,
-    DataCompareRequest, DataCompareResult, DataScriptOptions, DataSyncService, DiffStatus,
-    StructureApplyRequest, StructureCompareRequest, StructureCompareResult, StructureOptions,
-    StructureSyncService, TableCompareStatus, TablePair,
+    DataCompareRequest, DataCompareResult, DataScriptOptions, DataScriptRequest, DataSyncService,
+    DiffStatus, StructureApplyRequest, StructureCompareRequest, StructureCompareResult,
+    StructureOptions, StructureScriptRequest, StructureSyncService, TableCompareStatus, TablePair,
 };
 use oxbase_services::transfer::{
     SourceObject, TableStatus, TransferEvent, TransferOptions, TransferPlan, TransferRequest,
@@ -68,6 +69,15 @@ const SEED_COUNTS: [(&str, Option<u64>, Option<u64>); 13] = [
     ("m8_big", Some(0), Some(0)),
     ("m8_composite", Some(6), Some(6)),
     ("m8_nokey", Some(2), Some(2)),
+];
+
+/// The designed data differences, checked through sums of a column: `(table, column, source
+/// sum, target sum)` (`m8_data` ids 1..20 vs 1..18 + 21, 22; `m8_big` without 50000 and with
+/// 100001 for `big_rows` = 100 000; `m8_composite` qty of (2, 'b') 4 vs 40).
+const SEED_SUMS: [(&str, &str, u64, u64); 3] = [
+    ("m8_data", "id", 210, 214),
+    ("m8_big", "id", 5_000_050_000, 5_000_100_001),
+    ("m8_composite", "qty", 21, 57),
 ];
 
 /// What a cell found.
@@ -236,28 +246,25 @@ async fn run_async(
             if si == ti {
                 continue;
             }
-            let cell = match (&envs[si], &envs[ti]) {
-                (Some(src), Some(tgt)) => {
-                    let fut =
-                        transfer_cell(services.clone(), dialects.clone(), src.clone(), tgt.clone());
-                    let (status, detail, ms) = guarded(TRANSFER_LIMIT, fut).await;
-                    let mut c = M8Cell::transfer(s, t, status, detail);
-                    c.elapsed_ms = Some(ms);
-                    c
-                }
-                _ => {
-                    let skipped = cells.iter().any(|c| {
-                        c.check == M8Check::Seed
-                            && (c.engine == s.name || c.engine == t.name)
-                            && c.status == CellStatus::Skipped
-                    });
-                    let status = if skipped {
-                        CellStatus::Skipped
-                    } else {
-                        CellStatus::Fail
-                    };
-                    M8Cell::transfer(s, t, status, "not run: a seed cell failed or was skipped")
-                }
+            let cell = if let (Some(src), Some(tgt)) = (&envs[si], &envs[ti]) {
+                let fut =
+                    transfer_cell(services.clone(), dialects.clone(), src.clone(), tgt.clone());
+                let (status, detail, ms) = guarded(TRANSFER_LIMIT, fut).await;
+                let mut c = M8Cell::transfer(s, t, status, detail);
+                c.elapsed_ms = Some(ms);
+                c
+            } else {
+                let skipped = cells.iter().any(|c| {
+                    c.check == M8Check::Seed
+                        && (c.engine == s.name || c.engine == t.name)
+                        && c.status == CellStatus::Skipped
+                });
+                let status = if skipped {
+                    CellStatus::Skipped
+                } else {
+                    CellStatus::Fail
+                };
+                M8Cell::transfer(s, t, status, "not run: a seed cell failed or was skipped")
             };
             cells.push(cell);
         }
@@ -560,7 +567,7 @@ async fn open(
 }
 
 async fn run_sql(conn: &dyn Connection, sql: &str) -> Result<oxbase_driver::Collected, String> {
-    exec::exec(conn, sql, &[], &CancellationToken::new())
+    exec(conn, sql, &[], &CancellationToken::new())
         .await
         .map_err(|err| format!("{err} (statement: {})", first_line(sql)))
 }
@@ -628,8 +635,12 @@ async fn rows(conn: &dyn Connection, sql: &str) -> Result<Vec<Vec<Option<String>
 }
 
 async fn count(conn: &dyn Connection, table: &str) -> Result<u64, String> {
-    let sql = format!("SELECT COUNT(*) FROM {table}");
-    let values = column(conn, &sql).await?;
+    scalar(conn, &format!("SELECT COUNT(*) FROM {table}")).await
+}
+
+/// The first value of `sql` as a whole number.
+async fn scalar(conn: &dyn Connection, sql: &str) -> Result<u64, String> {
+    let values = column(conn, sql).await?;
     values
         .first()
         .and_then(|v| v.trim().parse::<u64>().ok())
@@ -693,7 +704,7 @@ async fn check_canonical(
                 t.types_rows
             ));
         }
-        out.push_str(&format!(", {schema}.{types} {n} rows"));
+        let _ = write!(out, ", {schema}.{types} {n} rows");
     }
     Ok(out)
 }
@@ -719,8 +730,32 @@ async fn check_counts(env: &Env) -> Result<String, String> {
             }
         }
     }
+    for (table, col, src, tgt) in SEED_SUMS {
+        if table == "m8_big" && big != 100_000 {
+            continue;
+        }
+        for (want, session, container) in [
+            (src, &env.src, &env.names.source),
+            (tgt, &env.tgt, &env.names.target),
+        ] {
+            let sql = format!(
+                "SELECT SUM({}) FROM {}",
+                seed::quote(env.engine, col),
+                env.q(container, table)
+            );
+            match scalar(session.connection().as_ref(), &sql).await {
+                Ok(n) if n == want => checked += 1,
+                Ok(n) => problems.push(format!(
+                    "{container}.{table}: SUM({col}) {n}, expected {want}"
+                )),
+                Err(err) => problems.push(err),
+            }
+        }
+    }
     if problems.is_empty() {
-        Ok(format!("{checked} scratch tables hold the designed rows"))
+        Ok(format!(
+            "{checked} row counts and sums of the scratch copies as designed"
+        ))
     } else {
         Err(format!("scratch seed: {}", problems.join("; ")))
     }
@@ -834,6 +869,22 @@ async fn structure_run(services: &Services, env: &Env) -> CellResult {
         )));
     }
     let to_apply = differing(&first, true);
+    // The preview of what the apply runs: every differing item, drops flagged destructive.
+    let preview = services
+        .structure
+        .script(&StructureScriptRequest {
+            compare_id: first.compare_id,
+            selection: Vec::new(),
+        })
+        .map_err(|err| fail(format!("structure script failed: {err}")))?;
+    if preview.is_empty() || preview.sql.trim().is_empty() || !preview.destructive {
+        return Err(fail(format!(
+            "the script preview is empty or not flagged destructive (it drops objects): \
+             destructive {}, {} steps",
+            preview.destructive,
+            preview.script.steps.len()
+        )));
+    }
     let report = services
         .structure
         .apply(
@@ -1026,6 +1077,35 @@ async fn data_run(services: &Services, env: &Env) -> CellResult {
         return Err(fail(format!("data compare: {}", problems.join("; "))));
     }
 
+    // The preview of every statement the apply runs (one per differing row).
+    let want_statements: u64 = env.m8.data_expected.values().flatten().sum();
+    let preview = services
+        .data
+        .script(
+            &DataScriptRequest {
+                compare_id: result.compare_id,
+                options: DataScriptOptions {
+                    deletes: true,
+                    ..DataScriptOptions::default()
+                },
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .map_err(|err| fail(format!("data script failed: {err}")))?;
+    if preview.total_statements != want_statements
+        || preview.statements.is_empty()
+        || !preview.destructive
+    {
+        return Err(fail(format!(
+            "the data script preview has {} statements ({} rendered, destructive {}), \
+             expected {want_statements} with deletes flagged",
+            preview.total_statements,
+            preview.statements.len(),
+            preview.destructive
+        )));
+    }
+
     let mark = skeleton::mark();
     let mut handle = services
         .data
@@ -1083,7 +1163,8 @@ async fn data_run(services: &Services, env: &Env) -> CellResult {
         ))
     })?;
     Ok(format!(
-        "{}; applied {} statements in {} batches; re-compare and a fresh compare in sync",
+        "{}; script preview {want_statements} statements; applied {} statements in {} batches; \
+         re-compare and a fresh compare in sync",
         seen.join(", "),
         report.statements,
         report.committed_batches
