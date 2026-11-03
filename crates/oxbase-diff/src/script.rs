@@ -62,9 +62,9 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 
 use oxbase_dialect::compare::{DefaultRules, diff_objects};
+use oxbase_dialect::deps::same_table;
 use oxbase_dialect::{
-    DdlContext, DdlGenerator, DependencyGraph, DialectRegistry, Support, same_table,
-    table_dependencies,
+    DdlContext, DdlGenerator, DependencyGraph, DialectRegistry, Support, table_dependencies,
 };
 use oxbase_sql::{SqlDialect, SqlTokenKind, ident_value, tokenize};
 use oxbase_types::{
