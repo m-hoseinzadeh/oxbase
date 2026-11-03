@@ -486,13 +486,16 @@ impl DataSyncService {
         request: DataApplyRequest,
     ) -> Result<DataRunHandle<DataApplyEvent>> {
         let entry = self.kept.get(request.compare_id)?;
-        let total = data::check_apply(&entry, &request.options)?;
+        let ctx = self.ctx();
+        let total = data::check_apply(&ctx, &entry, &request.options)?;
         if self.manager.get(entry.target_session).is_none() {
             return Err(oxbase_types::Error::not_found(format!(
                 "no open session {}; the target connection was closed",
                 entry.target_session
             )));
         }
+        // A compare is applied once: its rows describe the target before this apply.
+        data::mark_applied(&entry)?;
         let ticket = self
             .runs
             .register(&[entry.source_session, entry.target_session]);
@@ -501,7 +504,7 @@ impl DataSyncService {
         // Keeps the signature async (clippy::unused_async) like the other starts.
         std::future::ready(()).await;
         tokio::spawn(data::apply_task(
-            self.ctx(),
+            ctx,
             ticket,
             entry,
             request.options,

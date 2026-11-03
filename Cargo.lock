@@ -4468,6 +4468,7 @@ dependencies = [
  "arrow-ipc",
  "arrow-schema",
  "arrow-select",
+ "async-trait",
  "chrono",
  "futures",
  "oxbase-dialect",

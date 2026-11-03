@@ -10,15 +10,22 @@
 //! - **Apply**: the bound statements of `oxbase_diff::data::data_statements` run on a work
 //!   session of the target in transactions of `batch_statements`; each must affect exactly one
 //!   row (a result set's rows when the plan returns them, else the affected-row count), else
-//!   the batch rolls back and the apply stops. Then the applied pairs are compared again.
+//!   the batch rolls back and the apply stops. A table's inserts are wrapped in the statements
+//!   of `oxbase_diff::data::insert_session` (identity inserts, sequence resync), which run on
+//!   the same session and change no rows; after a failure the closing ones run anyway (best
+//!   effort). Then the applied pairs are compared again. A compare is applied at most once;
+//!   another apply needs a fresh compare.
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Write as _;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use oxbase_dialect::{DialectRegistry, inline_params, table_dependencies};
-use oxbase_diff::data::{CompareJob, compare_table, data_statements, row_key};
+use oxbase_diff::data::{
+    CompareJob, InsertSession, compare_table, data_statements, insert_session, row_key,
+};
 use oxbase_diff::{DiffStore, RowOp};
 use oxbase_driver::{Tx, collect};
 use oxbase_types::{
@@ -58,18 +65,28 @@ pub(super) struct DataCompare {
     pub pairs: Vec<KeptPair>,
     pub result: DataCompareResult,
     pub store: DiffStore,
+    /// An apply of this compare started (a second one is refused).
+    pub applied: AtomicBool,
 }
 
 /// A request pair and what its compare found out.
 pub(super) struct KeptPair {
     pub pair: TablePair,
-    /// The target table and its key, when the pair was compared.
-    pub target: Option<(TableDef, RowKey)>,
+    /// The target table, its key and the compared columns, when the pair was compared.
+    pub target: Option<Compared>,
+}
+
+/// What scripts and applies of a compared pair need.
+pub(super) struct Compared {
+    pub table: TableDef,
+    pub key: RowKey,
+    /// The compared columns (key first): the stored rows' columns.
+    pub columns: Vec<String>,
 }
 
 impl KeptPair {
     fn compared(&self) -> Option<(&TableDef, &RowKey)> {
-        self.target.as_ref().map(|(t, k)| (t, k))
+        self.target.as_ref().map(|c| (&c.table, &c.key))
     }
 }
 
@@ -409,6 +426,7 @@ where
             pairs,
             result,
             store,
+            applied: AtomicBool::new(false),
         },
         error,
     )
@@ -431,7 +449,7 @@ async fn compare_pair(
     version: &ServerVersion,
     token: &CancellationToken,
     on_progress: &(dyn Fn(&oxbase_diff::CompareProgress) + Send + Sync),
-) -> Result<(TableDataDiff, Option<(TableDef, RowKey)>)> {
+) -> Result<(TableDataDiff, Option<Compared>)> {
     let started = Instant::now();
     let refused = |reason: String| TableDataDiff {
         pair: index,
@@ -490,9 +508,10 @@ async fn compare_pair(
     };
     let diff = compare_table(job, store, on_progress, token.clone()).await?;
     drop(held);
-    let kept = (diff.status == TableCompareStatus::Compared).then(|| {
-        let key = row_key(&target_def, &diff.key, pair.key.as_ref());
-        (target_def, key)
+    let kept = (diff.status == TableCompareStatus::Compared).then(|| Compared {
+        key: row_key(&target_def, &diff.key, pair.key.as_ref()),
+        columns: diff.columns.clone(),
+        table: target_def,
     });
     Ok((diff, kept))
 }
@@ -560,6 +579,43 @@ fn total_rows(entry: &DataCompare, groups: &[(usize, RowOp)]) -> u64 {
     groups.iter().map(|&(p, op)| entry.store.rows(p, op)).sum()
 }
 
+/// The session statements around the inserts of each insert group with rows (by pair).
+fn insert_sessions(
+    ctx: &Ctx,
+    entry: &DataCompare,
+    groups: &[(usize, RowOp)],
+) -> Result<HashMap<usize, InsertSession>> {
+    let mut out = HashMap::new();
+    for &(p, op) in groups {
+        if op != RowOp::Insert || entry.store.rows(p, op) == 0 {
+            continue;
+        }
+        let Some(compared) = entry.pairs[p].target.as_ref() else {
+            continue;
+        };
+        let session = insert_session(
+            &ctx.dialects,
+            entry.engine,
+            &compared.table,
+            &compared.columns,
+        )?;
+        if !session.is_empty() {
+            out.insert(p, session);
+        }
+    }
+    Ok(out)
+}
+
+/// Every statement a script or apply of `groups` runs: the rows plus the insert sessions.
+fn total_statements(
+    entry: &DataCompare,
+    groups: &[(usize, RowOp)],
+    sessions: &HashMap<usize, InsertSession>,
+) -> u64 {
+    let extra: usize = sessions.values().map(InsertSession::len).sum();
+    total_rows(entry, groups) + u64::try_from(extra).unwrap_or(u64::MAX)
+}
+
 /// Warnings every script and apply of `entry` carries.
 fn script_warnings(
     ctx: &Ctx,
@@ -606,15 +662,28 @@ pub(super) fn script(
     let groups = groups(entry, options)?;
     let quoting = ctx.dialects.quoting(entry.engine)?;
     let terminator = quoting.script_terminator();
-    let total = total_rows(entry, &groups);
+    let sessions = insert_sessions(ctx, entry, &groups)?;
+    let total = total_statements(entry, &groups, &sessions);
+    let limit = options.preview_limit;
     let mut statements = Vec::new();
+    let render = |statement: &BoundStatement| -> Result<String> {
+        let text = inline_params(quoting.as_ref(), statement)?;
+        Ok(format!("{text}{terminator}"))
+    };
     'groups: for &(p, op) in &groups {
-        if statements.len() >= options.preview_limit {
+        if statements.len() >= limit {
             break;
         }
         let Some((table, key)) = entry.pairs[p].compared() else {
             continue;
         };
+        let session = sessions.get(&p).filter(|_| op == RowOp::Insert);
+        for statement in session.map_or(&[][..], |s| s.before.as_slice()) {
+            if statements.len() >= limit {
+                break 'groups;
+            }
+            statements.push(render(statement)?);
+        }
         for batch in entry.store.read(p, op, STORE_BATCH_ROWS)? {
             if cancel.is_cancelled() {
                 return Err(Error::Cancelled);
@@ -629,12 +698,17 @@ pub(super) fn script(
                 op,
                 &batch,
             )? {
-                if statements.len() >= options.preview_limit {
+                if statements.len() >= limit {
                     break 'groups;
                 }
-                let text = inline_params(quoting.as_ref(), &statement)?;
-                statements.push(format!("{text}{terminator}"));
+                statements.push(render(&statement)?);
             }
+        }
+        for statement in session.map_or(&[][..], |s| s.after.as_slice()) {
+            if statements.len() >= limit {
+                break 'groups;
+            }
+            statements.push(render(statement)?);
         }
     }
     let destructive = options.deletes
@@ -652,7 +726,11 @@ pub(super) fn script(
 }
 
 /// Checks an apply before it starts; returns the number of statements it runs.
-pub(super) fn check_apply(entry: &DataCompare, options: &DataApplyOptions) -> Result<u64> {
+pub(super) fn check_apply(
+    ctx: &Ctx,
+    entry: &DataCompare,
+    options: &DataApplyOptions,
+) -> Result<u64> {
     let groups = groups(entry, &options.script)?;
     let deletes: u64 = groups
         .iter()
@@ -667,7 +745,25 @@ pub(super) fn check_apply(entry: &DataCompare, options: &DataApplyOptions) -> Re
     if options.batch_statements == 0 {
         return Err(Error::invalid_input("batchStatements must be at least 1"));
     }
-    Ok(total_rows(entry, &groups))
+    if entry.applied.load(Ordering::SeqCst) {
+        return Err(Error::invalid_input(format!(
+            "data compare {} was already applied; compare again before another apply",
+            entry.id
+        )));
+    }
+    let sessions = insert_sessions(ctx, entry, &groups)?;
+    Ok(total_statements(entry, &groups, &sessions))
+}
+
+/// Marks `entry` applied; `InvalidInput` when another apply got there first.
+pub(super) fn mark_applied(entry: &DataCompare) -> Result<()> {
+    if entry.applied.swap(true, Ordering::SeqCst) {
+        return Err(Error::invalid_input(format!(
+            "data compare {} was already applied; compare again before another apply",
+            entry.id
+        )));
+    }
+    Ok(())
 }
 
 // --- apply -----------------------------------------------------------------------------------
@@ -876,6 +972,121 @@ async fn recompare(
     }
 }
 
+/// One statement of an apply: a row statement (`op`, must affect one row) or a session
+/// statement around inserts (`op` `None`).
+#[derive(Clone, Copy)]
+struct Step<'a> {
+    pair: usize,
+    op: Option<RowOp>,
+    table: &'a TableDef,
+}
+
+/// The running state of an apply: the open transaction, counts and progress.
+struct Applier<'a> {
+    report: &'a mut DataApplyReport,
+    events: &'a mpsc::Sender<DataApplyEvent>,
+    token: &'a CancellationToken,
+    open: Option<Batch>,
+    batch_size: u64,
+    done: u64,
+    total: u64,
+    last_progress: Instant,
+    started: Instant,
+    /// What the failing statement was, for the table's error.
+    current: Option<String>,
+}
+
+impl Applier<'_> {
+    /// Runs `statement` on `session` inside the open transaction (begun on first use, committed
+    /// every `batch_size` statements or when the session changes).
+    async fn run(
+        &mut self,
+        session: &Work,
+        statement: &BoundStatement,
+        step: Step<'_>,
+    ) -> Result<()> {
+        if self.token.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        let other_session = self
+            .open
+            .as_ref()
+            .is_some_and(|b| b.session != session.handle.id());
+        if other_session && let Some(batch) = self.open.take() {
+            commit(batch, self.report).await?;
+        }
+        if self.open.is_none() {
+            self.open = Some(Batch {
+                session: session.handle.id(),
+                tx: session.handle.connection().begin().await?,
+                statements: 0,
+                pending: HashMap::new(),
+            });
+        }
+        let Some(batch) = self.open.as_mut() else {
+            return Err(Error::internal("no open transaction"));
+        };
+        let number = self.done + 1;
+        self.current = Some(match step.op {
+            Some(op) => format!(
+                "statement {number} ({} {})",
+                op_words(op),
+                step.table.obj.display_name()
+            ),
+            None => format!(
+                "statement {number} (a session statement for the inserts into {})",
+                step.table.obj.display_name()
+            ),
+        });
+        match step.op {
+            Some(op) => {
+                execute_one(batch.tx.as_ref(), statement, self.token, step.table, number).await?;
+                let counts = batch.pending.entry(step.pair).or_default();
+                match op {
+                    RowOp::Insert => counts.0 += 1,
+                    RowOp::Update => counts.1 += 1,
+                    RowOp::Delete => counts.2 += 1,
+                }
+            }
+            None => {
+                collect(
+                    batch
+                        .tx
+                        .execute(&statement.sql, &statement.params, self.token.clone())
+                        .await?,
+                )
+                .await?;
+            }
+        }
+        self.current = None;
+        batch.statements += 1;
+        self.done += 1;
+        if batch.statements >= self.batch_size
+            && let Some(batch) = self.open.take()
+        {
+            commit(batch, self.report).await?;
+        }
+        if self.last_progress.elapsed() >= PROGRESS_EVERY {
+            self.last_progress = Instant::now();
+            let _ = self.events.try_send(DataApplyEvent::Progress {
+                statements_done: self.done,
+                total_statements: self.total,
+                pair: step.pair,
+                elapsed_ms: elapsed_ms(self.started),
+            });
+        }
+        Ok(())
+    }
+}
+
+fn op_words(op: RowOp) -> &'static str {
+    match op {
+        RowOp::Insert => "an insert into",
+        RowOp::Update => "an update of",
+        RowOp::Delete => "a delete from",
+    }
+}
+
 /// Runs every statement of `groups` (module docs, *Apply*).
 #[allow(
     clippy::too_many_arguments,
@@ -893,13 +1104,24 @@ async fn run_apply(
     events: &mpsc::Sender<DataApplyEvent>,
     started: Instant,
 ) -> std::result::Result<(), ApplyStop> {
-    let batch_size = u64::try_from(options.batch_statements.max(1)).unwrap_or(u64::MAX);
-    let mut open: Option<Batch> = None;
     let mut held = Vec::new();
-    let mut last_progress = Instant::now();
-    let mut done: u64 = 0;
     let mut current: Option<usize> = None;
+    // The closing statements of an insert group whose opening ones ran (run after a failure).
+    let mut closing: Option<(Work, Vec<BoundStatement>)> = None;
+    let mut applier = Applier {
+        report: &mut *report,
+        events,
+        token,
+        open: None,
+        batch_size: u64::try_from(options.batch_statements.max(1)).unwrap_or(u64::MAX),
+        done: 0,
+        total,
+        last_progress: Instant::now(),
+        started,
+        current: None,
+    };
     let result: Result<()> = async {
+        let wrapping = insert_sessions(ctx, entry, groups)?;
         for &(p, op) in groups {
             let Some((table, key)) = entry.pairs[p].compared() else {
                 continue;
@@ -913,6 +1135,23 @@ async fn run_apply(
                 )
                 .await?;
             guard(&session, &mut held, token).await?;
+            let around = wrapping.get(&p).filter(|_| op == RowOp::Insert);
+            let plain = Step {
+                pair: p,
+                op: None,
+                table,
+            };
+            if let Some(around) = around {
+                closing = Some((session.clone(), around.after.clone()));
+                for statement in &around.before {
+                    applier.run(&session, statement, plain).await?;
+                }
+            }
+            let row = Step {
+                pair: p,
+                op: Some(op),
+                table,
+            };
             for batch in entry.store.read(p, op, STORE_BATCH_ROWS)? {
                 let statements = data_statements(
                     &ctx.dialects,
@@ -923,75 +1162,81 @@ async fn run_apply(
                     op,
                     &batch?,
                 )?;
-                for statement in statements {
-                    if token.is_cancelled() {
-                        return Err(Error::Cancelled);
-                    }
-                    let other_session = open
-                        .as_ref()
-                        .is_some_and(|b| b.session != session.handle.id());
-                    if other_session && let Some(batch) = open.take() {
-                        commit(batch, report).await?;
-                    }
-                    if open.is_none() {
-                        open = Some(Batch {
-                            session: session.handle.id(),
-                            tx: session.handle.connection().begin().await?,
-                            statements: 0,
-                            pending: HashMap::new(),
-                        });
-                    }
-                    let Some(batch) = open.as_mut() else {
-                        return Err(Error::internal("no open transaction"));
-                    };
-                    execute_one(batch.tx.as_ref(), &statement, token, table, done + 1).await?;
-                    batch.statements += 1;
-                    let counts = batch.pending.entry(p).or_default();
-                    match op {
-                        RowOp::Insert => counts.0 += 1,
-                        RowOp::Update => counts.1 += 1,
-                        RowOp::Delete => counts.2 += 1,
-                    }
-                    done += 1;
-                    if batch.statements >= batch_size
-                        && let Some(batch) = open.take()
-                    {
-                        commit(batch, report).await?;
-                    }
-                    if last_progress.elapsed() >= PROGRESS_EVERY {
-                        last_progress = Instant::now();
-                        let _ = events.try_send(DataApplyEvent::Progress {
-                            statements_done: done,
-                            total_statements: total,
-                            pair: p,
-                            elapsed_ms: elapsed_ms(started),
-                        });
-                    }
+                for statement in &statements {
+                    applier.run(&session, statement, row).await?;
                 }
             }
+            if let Some(around) = around {
+                for statement in &around.after {
+                    applier.run(&session, statement, plain).await?;
+                }
+                closing = None;
+            }
         }
-        if let Some(batch) = open.take() {
-            commit(batch, report).await?;
+        if let Some(batch) = applier.open.take() {
+            commit(batch, applier.report).await?;
         }
         Ok(())
     }
     .await;
-    if let Some(batch) = open.take()
+    if let Some(batch) = applier.open.take()
         && let Err(e) = batch.tx.rollback().await
     {
         tracing::debug!(category = %e.category(), "rolling back a data sync batch failed");
     }
+    if result.is_err()
+        && let Some((session, statements)) = closing.take()
+    {
+        // Best effort, outside any transaction: undo session settings (identity inserts).
+        for statement in &statements {
+            let ran = async {
+                collect(
+                    session
+                        .handle
+                        .connection()
+                        .execute(&statement.sql, &statement.params, CancellationToken::new())
+                        .await?,
+                )
+                .await
+            };
+            if let Err(e) = tokio::time::timeout(CLOSE_WAIT, ran)
+                .await
+                .unwrap_or(Err(Error::Cancelled))
+            {
+                tracing::debug!(category = %e.category(), "a closing data sync statement failed");
+            }
+        }
+    }
     drop(held);
+    let failing = applier.current.take();
     match result {
         Ok(()) => Ok(()),
         Err(e) if e.is_cancelled() || token.is_cancelled() => Err(ApplyStop::Cancelled),
         Err(e) => {
             if let Some(t) = current.and_then(|p| report.tables.iter_mut().find(|t| t.pair == p)) {
-                t.error = Some(ErrorInfo::from(&e).message);
+                t.error = Some(table_error(failing.as_deref(), &e));
             }
             Err(ApplyStop::Failed(e))
         }
     }
+}
+
+/// The table error of a failed apply: which statement, the server's message, and for a
+/// foreign-key failure why the order may matter.
+fn table_error(failing: Option<&str>, e: &Error) -> String {
+    let message = ErrorInfo::from(e).message;
+    let mut text = match failing {
+        Some(what) => format!("{what}: {message}"),
+        None => message,
+    };
+    if text.to_ascii_lowercase().contains("foreign key") {
+        text.push_str(
+            " (statements run as deletes, then updates, then inserts: a row that refers to a \
+             row this sync inserts later, or a row still referred to by a row it updates later, \
+             fails its foreign key; apply the tables in separate steps)",
+        );
+    }
+    text
 }
 
 /// Commits `batch` and moves its counts into `report`.

@@ -34,6 +34,8 @@ tempfile.workspace = true
 
 [dev-dependencies]
 oxbase-driver = { workspace = true, features = ["mock"] }
+# A counting connection wrapper in the data tests (bounded reads).
+async-trait.workspace = true
 pretty_assertions.workspace = true
 tokio.workspace = true
 chrono.workspace = true

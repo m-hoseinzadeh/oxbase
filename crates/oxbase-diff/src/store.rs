@@ -98,6 +98,18 @@ fn same_types(a: &Schema, b: &Schema) -> bool {
             .all(|(x, y)| x.name() == y.name() && x.data_type() == y.data_type())
 }
 
+/// Finishes and flushes the open file of `slot`, if any.
+fn close(slot: &mut Slot) -> Result<()> {
+    if let Some(mut writer) = slot.writer.take() {
+        writer.finish().map_err(from_arrow)?;
+        let inner = writer.into_inner().map_err(from_arrow)?;
+        inner
+            .into_inner()
+            .map_err(|e| io_error("cannot write a file", e.error()))?;
+    }
+    Ok(())
+}
+
 fn io_error(what: &str, e: &std::io::Error) -> Error {
     Error::internal(format!("data compare store: {what}: {e}"))
 }
@@ -192,15 +204,20 @@ impl DiffStore {
     /// Finishes every open file (call once the compare is done; reads before that fail).
     pub fn finish(&mut self) -> Result<()> {
         for slot in self.slots.values_mut() {
-            if let Some(mut writer) = slot.writer.take() {
-                writer.finish().map_err(from_arrow)?;
-                let inner = writer.into_inner().map_err(from_arrow)?;
-                inner
-                    .into_inner()
-                    .map_err(|e| io_error("cannot write a file", e.error()))?;
-            }
+            close(slot)?;
         }
         self.finished = true;
+        Ok(())
+    }
+
+    /// Closes the open files of `pair` (its table is done), so a compare of many tables keeps
+    /// at most one table's files open. A later append to the pair starts a new file.
+    pub(crate) fn finish_pair(&mut self, pair: usize) -> Result<()> {
+        for ((p, _), slot) in &mut self.slots {
+            if *p == pair {
+                close(slot)?;
+            }
+        }
         Ok(())
     }
 
@@ -451,6 +468,41 @@ mod tests {
                 (arrow_schema::DataType::Int64, 2),
             ]
         );
+        assert_eq!(std::fs::read_dir(store.path()).unwrap().count(), 3);
+    }
+
+    #[test]
+    fn a_finished_pair_closes_its_files_and_later_rows_start_a_new_one() {
+        use arrow_array::cast::AsArray;
+        let mut store = DiffStore::new(None).unwrap();
+        let first = batch(1, 3);
+        store
+            .append(0, RowOp::Insert, &first.schema(), &first)
+            .unwrap();
+        store
+            .append(1, RowOp::Insert, &first.schema(), &first)
+            .unwrap();
+        store.finish_pair(0).unwrap();
+        assert!(store.slots[&(0, RowOp::Insert)].writer.is_none());
+        assert!(store.slots[&(1, RowOp::Insert)].writer.is_some());
+        let second = batch(4, 2);
+        store
+            .append(0, RowOp::Insert, &second.schema(), &second)
+            .unwrap();
+        store.finish().unwrap();
+        assert_eq!(store.rows(0, RowOp::Insert), 5);
+        let ids: Vec<i64> = store
+            .read(0, RowOp::Insert, 100)
+            .unwrap()
+            .flat_map(|b| {
+                let b = b.unwrap();
+                b.column(0)
+                    .as_primitive::<arrow_array::types::Int64Type>()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        assert_eq!(ids, [1, 2, 3, 4, 5]);
         assert_eq!(std::fs::read_dir(store.path()).unwrap().count(), 3);
     }
 }

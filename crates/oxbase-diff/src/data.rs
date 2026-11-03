@@ -9,19 +9,26 @@
 //! NULL, else columns the user names ([`KeyChoice`]; [`resolve_key`]). A table without any is
 //! **refused** (status [`TableCompareStatus::Refused`]): comparing by full row cannot tell an
 //! update from a delete plus an insert and breaks on duplicate rows. A user-named key that turns
-//! out not to be unique on either side fails that table ("duplicate key ...").
+//! out not to be unique on either side fails that table ("duplicate key ..."), and so does a
+//! NULL in a user-named key column (NULL keys fall outside every key range).
 //!
 //! # Compare ([`compare_table`])
 //!
 //! 1. Columns: the key plus the compared columns (default: every column present on both sides
-//!    by name, generated columns excluded); a column only on one side is a warning, not
-//!    compared. Both sides' key columns must have the same logical type (else refused).
+//!    by name); a column only on one side is a warning, not compared. Also left out, with a
+//!    warning: generated columns, identity / auto-increment columns outside the key (the
+//!    target generates its own values), and columns the target's `DmlWriter` refuses to write
+//!    (server-maintained: SQL Server `rowversion`, period columns, ...). Both sides' key
+//!    columns must have the same logical type and, where both report one, the same collation
+//!    (else refused), and the target's writer must be able to write them.
 //! 2. Chunks: the **source** is read in key order with keyset paging
 //!    (`oxbase_dialect::keyset`: `WHERE key > last ORDER BY key` with the engine's row limit,
-//!    [`DataCompareOptions::chunk_rows`] rows); each chunk `(after, upto]` is then read from the
-//!    **target** with the same range; the final chunk is `(last, +inf)` on the target. Both
-//!    reads bind every value; the ranges partition the key space, so every target row is read
-//!    exactly once.
+//!    [`DataCompareOptions::chunk_rows`] rows), which fixes the range `(after, upto]`; the
+//!    **target** is read for the same range with the same limit. When the target's page is
+//!    full before `upto`, the range shrinks to the target's last key and the source is read
+//!    again for it, so **both** sides hold at most `chunk_rows` rows (one more for a re-read
+//!    source range) whatever their sizes. The last range is `(last, +inf)`. Every value is
+//!    bound; the ranges partition the key space, so every row is read exactly once.
 //! 3. Optional skip: when the engine has a `ChunkHasher` and
 //!    [`DataCompareOptions::use_chunk_hash`], both sides' digests of the range are compared
 //!    first and equal ranges are counted as `same` without reading rows.
@@ -29,18 +36,30 @@
 //!    `Value` conversion): only in source = insert, only in target = delete, both with any
 //!    compared column different = update (which columns go in the sample). Values compare
 //!    exactly (decimals as canonical text, floats bit-for-bit except `-0.0 == 0.0` and `NaN ==
-//!    NaN`, timestamps with zone as instants, JSON as parsed values).
+//!    NaN`, timestamps with zone as instants, JSON as parsed values with exact numbers).
 //! 5. Every insert / update source row and every delete key goes to the store; the first
 //!    [`DataCompareOptions::sample_rows`] of each kind go to the samples as display text.
 //!
-//! Memory: one source chunk and one target chunk at a time; the 100 000-row fixture table runs
-//! in bounded memory.
+//! Safety checks (each fails the table rather than report wrong counts): the keys both sides
+//! have in a range must come back in the same order (else the key sorts differently on the two
+//! sides); no read after a key may return that key again (a key type that does not survive
+//! being bound, such as one that rounds fractions of a second); and at the end each side's
+//! `COUNT(*)` must equal the rows its ranges read (rows changed during the compare, or ranges
+//! overlapped or left gaps). A key only in the source that equals a key only in the target
+//! but for letter case or trailing spaces is a warning (a case- or pad-insensitive collation
+//! would make the insert a duplicate).
+//!
+//! Memory: at most one source chunk and one target chunk at a time; the 100 000-row fixture
+//! table runs in bounded memory, also against an empty or much larger other side.
 //!
 //! # Scripts and apply
 //!
 //! [`data_statements`] turns stored rows into bound statements through the engine's
-//! `DmlWriter` (`RowEdit::Insert` with every compared column, `RowEdit::Update` with the
-//! changed columns matched by key, `RowEdit::Delete` by key; `read_back` empty), in the order
+//! `DmlWriter` (`RowEdit::Insert` with every compared column, identity key columns included
+//! with the source's values; `RowEdit::Update` with the compared non-key columns matched by
+//! key; `RowEdit::Delete` by key; `read_back` empty); [`insert_session`] adds the statements a
+//! table's inserts need around them on the same session (SQL Server `SET IDENTITY_INSERT`,
+//! PostgreSQL sequence resync), in the order
 //! deletes (children first), updates, inserts (parents first) across tables of one sync
 //! (`oxbase_dialect::table_dependencies`). Deletes are off unless asked
 //! ([`DataScriptOptions::deletes`]) and destructive (confirmed to apply). The preview renders
@@ -50,6 +69,7 @@
 //! the applied tables.
 
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::time::Instant;
 
 use arrow_array::{BooleanArray, RecordBatch};
@@ -57,12 +77,12 @@ use arrow_select::concat::concat_batches;
 use arrow_select::filter::filter_record_batch;
 use oxbase_dialect::sql::SqlWriter;
 use oxbase_dialect::{
-    ChunkHasher, DialectRegistry, DmlTarget, KeyRange, Quoting, write_column_list,
+    ChunkHasher, DialectRegistry, DmlTarget, DmlWriter, KeyRange, Quoting, write_column_list,
 };
 use oxbase_driver::{CancellationToken, Connection, collect, from_arrow};
 use oxbase_types::{
-    BoundStatement, ColumnDef, ColumnValue, Engine, Error, KeyKind, ObjectRef, Result, RowEdit,
-    RowKey, ServerVersion, TableDef, Value,
+    BoundStatement, ColumnDef, ColumnValue, DataType, Engine, Error, KeyKind, ObjectRef, Result,
+    RowEdit, RowKey, ServerVersion, TableDef, Value,
 };
 use serde::{Deserialize, Serialize};
 
@@ -382,16 +402,19 @@ pub async fn compare_table(
         plan: &plan,
         quoting: quoting.as_ref(),
         hasher,
-        store,
+        store: &mut *store,
         diff: &mut diff,
         cancel,
         chunks: 0,
         samples: [0; 3],
+        fold_warned: false,
         started,
         on_progress,
     };
     let outcome = run.chunks().await;
     let cancelled = run.cancel.is_cancelled();
+    // The table is done: its files are closed now (a compare of many tables keeps few open).
+    store.finish_pair(job.pair)?;
     match outcome {
         Ok(()) => {}
         Err(Stop::Store(e)) => return Err(e),
@@ -431,12 +454,17 @@ struct ColumnPlan {
     source: Vec<ColumnDef>,
     target: Vec<ColumnDef>,
     warnings: Vec<String>,
+    /// A key column is nullable on one side: NULL keys are looked for before the compare.
+    nullable_key: bool,
 }
 
 fn plan_columns(job: &CompareJob<'_>) -> Result<ColumnPlan> {
     let (src, tgt) = (job.source_table, job.target_table);
     let key = resolve_key(src, job.choice)?;
+    let writer = job.dialects.dml_writer(job.engine)?;
+    let refused = |c: &ColumnDef| writer_refusal(writer.as_ref(), tgt, c, job.version);
     let mut warnings = Vec::new();
+    let mut nullable_key = false;
     for k in &key {
         let s = src.column(k).ok_or_else(|| {
             Error::invalid_input(format!("{} has no column '{k}'", src.obj.display_name()))
@@ -455,19 +483,59 @@ fn plan_columns(job: &CompareJob<'_>) -> Result<ColumnPlan> {
                 type_name(t)
             )));
         }
+        if let (Some(a), Some(b)) = (&s.collation, &t.collation)
+            && !a.eq_ignore_ascii_case(b)
+        {
+            return Err(Error::invalid_input(format!(
+                "key column '{k}' has collation {a} in the source and {b} in the target; the \
+                 two sides sort keys differently, so key ranges would not line up"
+            )));
+        }
+        if let Some(why) = refused(t) {
+            return Err(Error::invalid_input(format!(
+                "key column '{k}' cannot be written in the target ({why}); choose other key \
+                 columns"
+            )));
+        }
+        nullable_key |= s.nullable || t.nullable;
     }
+    // Why a common column is not compared (`None`: it is).
+    let skip = |s: &ColumnDef, t: &ColumnDef| -> Option<String> {
+        if s.generated.is_some() || t.generated.is_some() {
+            Some(format!(
+                "column '{}' is generated; it is not compared",
+                s.name
+            ))
+        } else if counter(s) || counter(t) {
+            Some(format!(
+                "column '{}' is an identity or auto-increment column outside the key; it is not \
+                 compared (the target generates its own values)",
+                s.name
+            ))
+        } else {
+            refused(t).map(|why| {
+                format!(
+                    "column '{}' cannot be written in the target ({why}); it is not compared",
+                    s.name
+                )
+            })
+        }
+    };
     let mut columns = key.clone();
     if let Some(chosen) = job.columns {
         for name in chosen {
             if columns.contains(name) {
                 continue;
             }
-            if src.column(name).is_none() || tgt.column(name).is_none() {
+            let (Some(s), Some(t)) = (src.column(name), tgt.column(name)) else {
                 return Err(Error::invalid_input(format!(
                     "column '{name}' is not in both tables"
                 )));
+            };
+            match skip(s, t) {
+                Some(why) => warnings.push(why),
+                None => columns.push(name.clone()),
             }
-            columns.push(name.clone());
         }
     } else {
         for c in &src.columns {
@@ -479,13 +547,10 @@ fn plan_columns(job: &CompareJob<'_>) -> Result<ColumnPlan> {
                     "column '{}' is only in the source; it is not compared",
                     c.name
                 )),
-                Some(t) if c.generated.is_some() || t.generated.is_some() => {
-                    warnings.push(format!(
-                        "column '{}' is generated; it is not compared",
-                        c.name
-                    ));
-                }
-                Some(_) => columns.push(c.name.clone()),
+                Some(t) => match skip(c, t) {
+                    Some(why) => warnings.push(why),
+                    None => columns.push(c.name.clone()),
+                },
             }
         }
         for c in &tgt.columns {
@@ -510,7 +575,52 @@ fn plan_columns(job: &CompareJob<'_>) -> Result<ColumnPlan> {
         source,
         target,
         warnings,
+        nullable_key,
     })
+}
+
+/// `true` for a column whose values the engine generates (identity, auto-increment, serial).
+fn counter(c: &ColumnDef) -> bool {
+    c.identity.is_some() || c.auto_increment
+}
+
+/// Why the target's `DmlWriter` refuses to write `column` of `table` (`None`: it writes it): a
+/// column the server maintains (generated, a row version, a period column, ...). Identity and
+/// auto-increment columns are probed as plain columns: data sync writes them on purpose
+/// ([`insert_session`]). Only a refusal (`InvalidInput`) counts.
+fn writer_refusal(
+    writer: &dyn DmlWriter,
+    table: &TableDef,
+    column: &ColumnDef,
+    version: &ServerVersion,
+) -> Option<String> {
+    let mut probed = column.clone();
+    probed.identity = None;
+    probed.auto_increment = false;
+    let mut key_name = "oxbase_probe_key".to_owned();
+    while key_name == probed.name {
+        key_name.push('_');
+    }
+    let key_column = ColumnDef::new(key_name.clone(), DataType::INT64).not_null();
+    let mut probe = TableDef::new(table.obj.clone());
+    probe.columns = vec![key_column, probed];
+    let key = RowKey::new(table.obj.clone(), KeyKind::Primary, vec![key_name]);
+    let edit = RowEdit::Insert {
+        values: vec![ColumnValue {
+            column: column.name.clone(),
+            value: Value::Null,
+        }],
+    };
+    let target = DmlTarget {
+        table: &probe,
+        key: &key,
+        version,
+        read_back: &[],
+    };
+    match writer.plan(&edit, &target) {
+        Err(e @ Error::InvalidInput { .. }) => Some(error_text(&e)),
+        _ => None,
+    }
 }
 
 fn type_name(c: &ColumnDef) -> String {
@@ -610,9 +720,46 @@ fn duplicate(side: &str, row: &Row, key_len: usize) -> Error {
     ))
 }
 
-/// The match form of a key: its columns' forms joined.
+/// The match form of a key: its columns' forms, each prefixed with its length (so no two
+/// different composite keys share a form, whatever their text holds).
 pub(crate) fn key_form(canon: &[String]) -> String {
-    canon.join("\u{1}")
+    let mut out = String::with_capacity(canon.iter().map(|c| c.len() + 4).sum());
+    for form in canon {
+        let _ = write!(out, "{}:{form}", form.len());
+    }
+    out
+}
+
+/// `true` when the keys both sides have in common come in the same order on both (each side's
+/// rows are in its own `ORDER BY` order).
+pub(crate) fn orders_agree(source: &[Row], target: &[Row]) -> bool {
+    let at: HashMap<&str, usize> = target
+        .iter()
+        .enumerate()
+        .map(|(i, r)| (r.key.as_str(), i))
+        .collect();
+    let mut last: Option<usize> = None;
+    for row in source {
+        if let Some(&i) = at.get(row.key.as_str()) {
+            if last.is_some_and(|l| i <= l) {
+                return false;
+            }
+            last = Some(i);
+        }
+    }
+    true
+}
+
+/// A key's form with text lower-cased and trailing spaces dropped (the folded-key warning).
+fn fold_key(values: &[Value]) -> String {
+    let forms: Vec<String> = values
+        .iter()
+        .map(|v| match v {
+            Value::Text(t) => format!("t:{}", t.trim_end_matches(' ').to_lowercase()),
+            other => canon(other, None),
+        })
+        .collect();
+    key_form(&forms)
 }
 
 /// `SELECT [top] <columns> FROM <table> WHERE <range> ORDER BY <key> [limit]`.
@@ -655,106 +802,210 @@ struct Run<'r, 'j> {
     chunks: u64,
     /// Samples taken per kind (insert, update, delete).
     samples: [usize; 3],
+    /// The folded-key warning was given.
+    fold_warned: bool,
     started: Instant,
     on_progress: &'r (dyn Fn(&CompareProgress) + Send + Sync),
 }
 
 impl Run<'_, '_> {
+    /// The chunk loop (module docs, *Compare*). Per range `(after, upto]`: the source page
+    /// fixes `upto` (its `chunk_rows`-th key, open at the end); equal digests skip the range;
+    /// the target is read with the same limit, and when its page is full before `upto` the
+    /// range shrinks to the target's last key (the source is then read again for the smaller
+    /// range), so neither side ever holds more than `chunk_rows` (+1) rows.
     async fn chunks(&mut self) -> std::result::Result<(), Stop> {
         let plan = self.plan;
         let limit = self.job.options.chunk_rows.max(1);
         let key_len = plan.key.len();
-        let mut after: Option<Vec<Value>> = None;
+        // A declared unique key cannot repeat; user-named key columns are read again by range
+        // (one row over the limit), so a duplicate at a chunk boundary is found.
+        let user_key = matches!(self.job.choice, Some(KeyChoice::Columns { .. }));
+        if plan.nullable_key {
+            self.no_null_keys().await?;
+        }
+        let mut after: Option<Bound> = None;
         loop {
             if self.cancel.is_cancelled() {
                 return Err(Stop::Table(Error::Cancelled));
             }
             self.chunks += 1;
-            let upto = if let Some(hasher) = self.hasher.clone() {
-                // Find the range on the source by its keys, then compare digests first.
-                let keys = self
-                    .read(
-                        true,
-                        &plan.key,
-                        KeyRange {
-                            after: after.as_deref(),
-                            upto: None,
-                        },
-                        Some(limit),
-                    )
-                    .await?;
-                if keys.rows.is_empty() {
-                    self.rest_of_target(after.as_deref()).await?;
-                    self.progress();
-                    return Ok(());
-                }
-                let upto = (keys.rows.len() == limit)
-                    .then(|| keys.rows.last().map(|r| r.values[..key_len].to_vec()))
-                    .flatten();
-                drop(keys);
-                let range = KeyRange {
-                    after: after.as_deref(),
-                    upto: upto.as_deref(),
-                };
-                if !self.digests_equal(hasher.as_ref(), range).await? {
-                    let source = self.read(true, &plan.columns, range, None).await?;
-                    let target = self.read(false, &plan.columns, range, None).await?;
-                    self.record(&source, &target)?;
-                }
-                upto
+            let hasher = self.hasher.clone();
+            let page_columns = if hasher.is_some() {
+                &plan.key
             } else {
-                let source = self
+                &plan.columns
+            };
+            let after_values = after.as_ref().map(|b| b.values.as_slice());
+            let page = self
+                .read(
+                    true,
+                    page_columns,
+                    KeyRange {
+                        after: after_values,
+                        upto: None,
+                    },
+                    Some(limit),
+                )
+                .await?;
+            check_after("source", &page, after.as_ref())?;
+            let mut upto: Option<Bound> = if page.rows.len() == limit {
+                page.rows.last().map(|r| Bound::of(r, key_len))
+            } else {
+                None
+            };
+            if let Some(hasher) = hasher.as_ref()
+                && !page.rows.is_empty()
+            {
+                let range = KeyRange {
+                    after: after_values,
+                    upto: upto.as_ref().map(|b| b.values.as_slice()),
+                };
+                if self.digests_equal(hasher.as_ref(), range).await? {
+                    self.progress();
+                    match upto {
+                        Some(next) => {
+                            after = Some(next);
+                            continue;
+                        }
+                        None => return self.counts_agree().await,
+                    }
+                }
+            }
+            let target = self
+                .read(
+                    false,
+                    &plan.columns,
+                    KeyRange {
+                        after: after_values,
+                        upto: upto.as_ref().map(|b| b.values.as_slice()),
+                    },
+                    Some(limit),
+                )
+                .await?;
+            check_after("target", &target, after.as_ref())?;
+            let mut shrunk = false;
+            if target.rows.len() == limit
+                && let Some(last) = target.rows.last()
+                && upto.as_ref().is_none_or(|u| u.form != last.key)
+            {
+                upto = Some(Bound::of(last, key_len));
+                shrunk = true;
+            }
+            let source = if hasher.is_some() || shrunk || user_key {
+                drop(page);
+                let rows = self
                     .read(
                         true,
                         &plan.columns,
                         KeyRange {
-                            after: after.as_deref(),
-                            upto: None,
+                            after: after_values,
+                            upto: upto.as_ref().map(|b| b.values.as_slice()),
                         },
-                        Some(limit),
+                        Some(limit.saturating_add(1)),
                     )
                     .await?;
-                if source.rows.is_empty() {
-                    self.rest_of_target(after.as_deref()).await?;
-                    self.progress();
-                    return Ok(());
-                }
-                let upto = (source.rows.len() == limit)
-                    .then(|| source.rows.last().map(|r| r.values[..key_len].to_vec()))
-                    .flatten();
-                let target = self
-                    .read(
-                        false,
-                        &plan.columns,
-                        KeyRange {
-                            after: after.as_deref(),
-                            upto: upto.as_deref(),
-                        },
-                        None,
-                    )
-                    .await?;
-                self.record(&source, &target)?;
-                upto
+                check_after("source", &rows, after.as_ref())?;
+                rows
+            } else {
+                page
             };
+            self.record(&source, &target)?;
+            if source.rows.len() > limit {
+                // More rows than distinct keys in the range, and no duplicate found among them.
+                return Err(Stop::Table(Error::invalid_input(
+                    "the source returned more rows for a key range than it has keys; the key \
+                     columns do not identify one row",
+                )));
+            }
             self.progress();
             match upto {
-                Some(upto) => after = Some(upto),
-                None => return Ok(()),
+                Some(next) => after = Some(next),
+                None => return self.counts_agree().await,
             }
         }
     }
 
-    /// The target's rows after the source's last key: all deletes.
-    async fn rest_of_target(&mut self, after: Option<&[Value]>) -> std::result::Result<(), Stop> {
+    /// Fails the table when a key column holds NULL on either side (only nullable key columns
+    /// get here: user-named ones). NULL keys match no range and would be skipped silently.
+    async fn no_null_keys(&self) -> std::result::Result<(), Stop> {
         let plan = self.plan;
-        let target = self
-            .read(false, &plan.columns, KeyRange { after, upto: None }, None)
+        for (side, source) in [("source", true), ("target", false)] {
+            let (conn, table, _) = self.side(source);
+            let mut w = SqlWriter::new(self.quoting);
+            let top = self.quoting.top_clause(1);
+            w.push("SELECT ");
+            if let Some(top) = &top {
+                w.push(top).push(" ");
+            }
+            write_column_list(&mut w, &plan.key);
+            w.push(" FROM ").qualified(&table.obj).push(" WHERE ");
+            for (pos, k) in plan.key.iter().enumerate() {
+                if pos > 0 {
+                    w.push(" OR ");
+                }
+                w.ident(k).push(" IS NULL");
+            }
+            if top.is_none() {
+                let clause = self.quoting.limit_clause(1);
+                w.push(" ").push(&clause);
+            }
+            let statement = w.finish();
+            let collected = collect(
+                conn.execute(&statement.sql, &statement.params, self.cancel.clone())
+                    .await?,
+            )
             .await?;
-        let empty = ChunkRows {
-            batch: None,
-            rows: Vec::new(),
-        };
-        self.record(&empty, &target)
+            let found = collected
+                .result_sets
+                .iter()
+                .flat_map(|set| set.batches.iter())
+                .any(|b| b.num_rows() > 0);
+            if found {
+                return Err(Stop::Table(Error::invalid_input(format!(
+                    "the key columns ({}) hold NULL in the {side}; NULL keys cannot match rows, \
+                     so choose key columns without NULLs",
+                    plan.key.join(", ")
+                ))));
+            }
+        }
+        Ok(())
+    }
+
+    /// After the last range: both sides' row counts must equal the rows the ranges read. A
+    /// difference means rows changed during the compare, or the two sides sort the key
+    /// differently (another collation), so ranges overlapped or left gaps.
+    async fn counts_agree(&self) -> std::result::Result<(), Stop> {
+        let counts = self.diff.counts;
+        for (side, source, read) in [
+            ("source", true, counts.source_rows),
+            ("target", false, counts.target_rows),
+        ] {
+            let (conn, table, _) = self.side(source);
+            let mut w = SqlWriter::new(self.quoting);
+            w.push("SELECT COUNT(*) FROM ").qualified(&table.obj);
+            let statement = w.finish();
+            let collected = collect(
+                conn.execute(&statement.sql, &statement.params, self.cancel.clone())
+                    .await?,
+            )
+            .await?;
+            let batch = collected
+                .result_sets
+                .iter()
+                .flat_map(|set| set.batches.iter())
+                .find(|b| b.num_rows() > 0)
+                .ok_or_else(|| Error::internal("the row count returned no row"))?;
+            let total = count_cell(&cell(batch.column(0).as_ref(), 0, None)?);
+            if total != read {
+                return Err(Stop::Table(Error::invalid_input(format!(
+                    "the {side} has {total} rows but the key ranges read {read}: rows changed \
+                     during the compare, or the key sorts differently on the two sides (another \
+                     collation); compare again"
+                ))));
+            }
+        }
+        Ok(())
     }
 
     /// `true` when both sides' digests of `range` are equal (counted as same). A digest
@@ -817,13 +1068,7 @@ impl Run<'_, '_> {
         if batch.num_columns() < 2 {
             return Err(Error::internal("the chunk digest returned too few columns"));
         }
-        let count = match cell(batch.column(0).as_ref(), 0, None)? {
-            Value::Int(n) => u64::try_from(n).unwrap_or_default(),
-            Value::UInt(n) => n,
-            other => display(&other)
-                .and_then(|t| t.parse::<u64>().ok())
-                .unwrap_or_default(),
-        };
+        let count = count_cell(&cell(batch.column(0).as_ref(), 0, None)?);
         let digest = canon(&cell(batch.column(1).as_ref(), 0, None)?, None);
         Ok((count, digest))
     }
@@ -902,6 +1147,16 @@ impl Run<'_, '_> {
     fn record(&mut self, source: &ChunkRows, target: &ChunkRows) -> std::result::Result<(), Stop> {
         let key_len = self.plan.key.len();
         let matched = match_rows(&source.rows, &target.rows, key_len)?;
+        if !orders_agree(&source.rows, &target.rows) {
+            return Err(Stop::Table(Error::invalid_input(
+                "the source and the target return the key in different orders (the key sorts \
+                 differently on the two sides, for example another collation); rows cannot be \
+                 compared by key ranges",
+            )));
+        }
+        if !self.fold_warned {
+            self.warn_on_folded_keys(source, target, &matched);
+        }
         let counts = &mut self.diff.counts;
         counts.source_rows += len_u64(source.rows.len());
         counts.target_rows += len_u64(target.rows.len());
@@ -1006,6 +1261,39 @@ impl Run<'_, '_> {
         Ok(())
     }
 
+    /// Warns (once per table) when a key only in the source and a key only in the target differ
+    /// only by letter case or trailing spaces: a case- or pad-insensitive key collation treats
+    /// them as one key, so the insert would fail on a duplicate key unless the delete runs too.
+    fn warn_on_folded_keys(&mut self, source: &ChunkRows, target: &ChunkRows, m: &ChunkMatch) {
+        if m.inserts.is_empty() || m.deletes.is_empty() {
+            return;
+        }
+        let key_len = self.plan.key.len();
+        let folded: HashSet<String> = m
+            .deletes
+            .iter()
+            .map(|&t| fold_key(&target.rows[t].values[..key_len]))
+            .collect();
+        if let Some(&i) = m
+            .inserts
+            .iter()
+            .find(|&&i| folded.contains(&fold_key(&source.rows[i].values[..key_len])))
+        {
+            self.fold_warned = true;
+            let key: Vec<String> = texts(&source.rows[i].values[..key_len])
+                .into_iter()
+                .map(|v| v.unwrap_or_else(|| "NULL".to_owned()))
+                .collect();
+            self.diff.warnings.push(format!(
+                "key ({}) is only in the source, and a key that differs from it only by letter \
+                 case or trailing spaces is only in the target; if the key's collation treats \
+                 them as one key, the insert fails on a duplicate key unless the deletes are \
+                 applied too",
+                key.join(", ")
+            ));
+        }
+    }
+
     fn progress(&self) {
         (self.on_progress)(&CompareProgress {
             pair: self.job.pair,
@@ -1014,6 +1302,60 @@ impl Run<'_, '_> {
             chunks_skipped: self.diff.chunks_skipped,
             elapsed_ms: elapsed_ms(self.started),
         });
+    }
+}
+
+/// A row count read back as a value (`0` when it is not a count).
+fn count_cell(value: &Value) -> u64 {
+    match value {
+        Value::Int(n) => u64::try_from(*n).unwrap_or_default(),
+        Value::UInt(n) => *n,
+        other => display(other)
+            .and_then(|t| t.trim().parse::<u64>().ok())
+            .unwrap_or_default(),
+    }
+}
+
+/// One end of a key range: the key values (bound) and their match form.
+struct Bound {
+    values: Vec<Value>,
+    form: String,
+}
+
+impl Bound {
+    fn of(row: &Row, key_len: usize) -> Self {
+        Self {
+            values: row.values[..key_len.min(row.values.len())].to_vec(),
+            form: row.key.clone(),
+        }
+    }
+}
+
+/// Fails the table when a read of the range after `after` returned the row of `after` itself:
+/// the key value did not compare equal to itself once bound as a parameter (a type that rounds
+/// its fractions, for example), so ranges would overlap and rows count twice.
+fn check_after(
+    side: &str,
+    rows: &ChunkRows,
+    after: Option<&Bound>,
+) -> std::result::Result<(), Stop> {
+    let Some(after) = after else {
+        return Ok(());
+    };
+    match rows.rows.iter().find(|r| r.key == after.form) {
+        None => Ok(()),
+        Some(row) => {
+            let key: Vec<String> = row.values[..after.values.len().min(row.values.len())]
+                .iter()
+                .map(|v| display(v).unwrap_or_else(|| "NULL".to_owned()))
+                .collect();
+            Err(Stop::Table(Error::invalid_input(format!(
+                "the {side} returned the row of key ({}) again after that key: its value does \
+                 not compare equal to itself when sent back to the server (a type that rounds \
+                 fractions of a second, for example); choose other key columns",
+                key.join(", ")
+            ))))
+        }
     }
 }
 
@@ -1097,6 +1439,13 @@ pub struct DataScript {
 /// Columns are matched to `target_table` by name. An update writes every stored non-key
 /// column (the compared columns; the ones that already match keep their value), so the row
 /// ends up equal whatever changed.
+///
+/// Inserts write identity and auto-increment key columns with the source's values: the writer
+/// is given the table with those columns as plain ones, and the engine's
+/// `Quoting::dump_identity_insert` words after the column list are added where the engine needs
+/// them (PostgreSQL `OVERRIDING SYSTEM VALUE`). The statements that must run around a table's
+/// inserts on the same session (SQL Server `SET IDENTITY_INSERT`, PostgreSQL sequence resync)
+/// come from [`insert_session`].
 pub fn data_statements(
     dialects: &DialectRegistry,
     engine: Engine,
@@ -1107,8 +1456,13 @@ pub fn data_statements(
     rows: &RecordBatch,
 ) -> Result<Vec<BoundStatement>> {
     let writer = dialects.dml_writer(engine)?;
+    let mut writable = target_table.clone();
+    for c in &mut writable.columns {
+        c.identity = None;
+        c.auto_increment = false;
+    }
     let target = DmlTarget {
-        table: target_table,
+        table: &writable,
         key,
         version,
         read_back: &[],
@@ -1132,41 +1486,157 @@ pub fn data_statements(
                 })
         })
         .collect::<Result<_>>()?;
+    let written = |skip_key: bool| -> Vec<(usize, String)> {
+        names
+            .iter()
+            .enumerate()
+            .filter(|(c, _)| !(skip_key && key_at.contains(c)))
+            .filter(|(c, _)| !defs[*c].is_some_and(|d| d.generated.is_some()))
+            .map(|(c, name)| {
+                (
+                    c,
+                    defs[c].map_or_else(|| (*name).to_owned(), |d| d.name.clone()),
+                )
+            })
+            .collect()
+    };
+    let insert_columns = written(false);
+    let update_columns = written(true);
+    let overriding = if op == RowOp::Insert {
+        overriding_words(dialects, engine, target_table, &insert_columns)?
+    } else {
+        None
+    };
     let mut out = Vec::with_capacity(rows.num_rows());
     for r in 0..rows.num_rows() {
         let value = |c: usize| cell(rows.column(c).as_ref(), r, defs[c]);
         let key_values = || key_at.iter().map(|&c| value(c)).collect::<Result<Vec<_>>>();
-        let column_values = |skip_key: bool| -> Result<Vec<ColumnValue>> {
-            let mut values = Vec::with_capacity(names.len());
-            for (c, name) in names.iter().enumerate() {
-                if skip_key && key_at.contains(&c) {
-                    continue;
-                }
-                if defs[c].is_some_and(|d| d.generated.is_some()) {
-                    continue;
-                }
-                let column = defs[c].map_or_else(|| (*name).to_owned(), |d| d.name.clone());
-                values.push(ColumnValue {
-                    column,
-                    value: value(c)?,
-                });
-            }
-            Ok(values)
+        let column_values = |columns: &[(usize, String)]| -> Result<Vec<ColumnValue>> {
+            columns
+                .iter()
+                .map(|(c, column)| {
+                    Ok(ColumnValue {
+                        column: column.clone(),
+                        value: value(*c)?,
+                    })
+                })
+                .collect()
         };
         let edit = match op {
             RowOp::Insert => RowEdit::Insert {
-                values: column_values(false)?,
+                values: column_values(&insert_columns)?,
             },
             RowOp::Update => RowEdit::Update {
                 key: key_values()?,
-                changes: column_values(true)?,
+                changes: column_values(&update_columns)?,
             },
             RowOp::Delete => RowEdit::Delete { key: key_values()? },
         };
         key.validate(&edit)?;
-        out.push(writer.plan(&edit, &target)?.write);
+        let mut statement = writer.plan(&edit, &target)?.write;
+        if let Some((prefix, words)) = &overriding {
+            statement.sql = match statement.sql.strip_prefix(prefix.as_str()) {
+                Some(rest) => format!("{prefix} {words}{rest}"),
+                None => {
+                    return Err(Error::internal(format!(
+                        "cannot add {words} to the insert into {}",
+                        target_table.obj.display_name()
+                    )));
+                }
+            };
+        }
+        out.push(statement);
     }
     Ok(out)
+}
+
+/// The engine's words after an insert's column list for `columns` (`None`: none), with the
+/// statement text they follow (`INSERT INTO <table> (<columns>)`).
+fn overriding_words(
+    dialects: &DialectRegistry,
+    engine: Engine,
+    target_table: &TableDef,
+    columns: &[(usize, String)],
+) -> Result<Option<(String, String)>> {
+    let quoting = dialects.quoting(engine)?;
+    let defs: Vec<&ColumnDef> = columns
+        .iter()
+        .filter_map(|(_, name)| column_named(target_table, name))
+        .collect();
+    let identity = quoting.dump_identity_insert(&quoting.qualify(&target_table.obj), &defs);
+    let Some(words) = identity.overriding.filter(|w| !w.trim().is_empty()) else {
+        return Ok(None);
+    };
+    let names: Vec<String> = columns.iter().map(|(_, name)| name.clone()).collect();
+    let mut w = SqlWriter::new(quoting.as_ref());
+    w.push("INSERT INTO ")
+        .qualified(&target_table.obj)
+        .push(" (");
+    write_column_list(&mut w, &names);
+    w.push(")");
+    Ok(Some((w.finish().sql, words)))
+}
+
+/// Statements that run on the target session around the inserts of one table (in the apply
+/// and the script): `before` the first insert (SQL Server `SET IDENTITY_INSERT <t> ON` when an
+/// identity column is written) and `after` the last one (`... OFF`, then the bulk loader's
+/// `identity_resync`, PostgreSQL `setval`, so the next generated value follows the inserted
+/// ones). Both come from engine roles (`Quoting::dump_identity_insert`,
+/// `BulkLoader::identity_resync`); they change no rows, so the apply does not count rows for
+/// them.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct InsertSession {
+    pub before: Vec<BoundStatement>,
+    pub after: Vec<BoundStatement>,
+}
+
+impl InsertSession {
+    /// Number of statements.
+    pub fn len(&self) -> usize {
+        self.before.len() + self.after.len()
+    }
+
+    /// `true` when there are none.
+    pub fn is_empty(&self) -> bool {
+        self.before.is_empty() && self.after.is_empty()
+    }
+}
+
+/// The [`InsertSession`] of inserts into `target_table` that write `columns` (the compared
+/// columns of the table's compare, [`TableDataDiff::columns`]).
+pub fn insert_session(
+    dialects: &DialectRegistry,
+    engine: Engine,
+    target_table: &TableDef,
+    columns: &[String],
+) -> Result<InsertSession> {
+    let quoting = dialects.quoting(engine)?;
+    let written: Vec<&ColumnDef> = columns
+        .iter()
+        .filter_map(|name| column_named(target_table, name))
+        .filter(|c| c.generated.is_none())
+        .collect();
+    let identity = quoting.dump_identity_insert(&quoting.qualify(&target_table.obj), &written);
+    let plain = |sql: String| BoundStatement::new(sql, Vec::new());
+    let before = identity.enable.into_iter().map(plain).collect();
+    let mut after: Vec<BoundStatement> = identity.disable.into_iter().map(plain).collect();
+    let counters: Vec<ColumnDef> = written
+        .iter()
+        .copied()
+        .filter(|c| counter(c))
+        .cloned()
+        .collect();
+    if !counters.is_empty()
+        && let Ok(loader) = dialects.bulk_loader(engine)
+    {
+        after.extend(
+            loader
+                .identity_resync(&target_table.obj, &counters)
+                .into_iter()
+                .map(plain),
+        );
+    }
+    Ok(InsertSession { before, after })
 }
 
 fn column_named<'t>(table: &'t TableDef, name: &str) -> Option<&'t ColumnDef> {
@@ -1313,6 +1783,94 @@ mod tests {
         // Empty sides.
         let m = match_rows(&[], &[], 1).unwrap();
         assert_eq!(m, ChunkMatch::default());
+    }
+
+    #[test]
+    fn key_forms_never_collide() {
+        // Separators inside text cannot make two composite keys one.
+        let pairs: [([&str; 2], [&str; 2]); 2] = [
+            (["t:a", "t:b\u{1}t:c"], ["t:a\u{1}t:b", "t:c"]),
+            (["t:x\u{1}t:y", "t:z"], ["t:x", "t:y\u{1}t:z"]),
+        ];
+        for (a, b) in pairs {
+            assert_ne!(
+                key_form(&a.map(String::from)),
+                key_form(&b.map(String::from))
+            );
+        }
+        assert_ne!(
+            key_form(&["2:ab".to_owned()]),
+            key_form(&["2".to_owned(), "ab".to_owned()])
+        );
+        // Through match_rows: two composite keys that joined forms would confuse stay apart.
+        let s = [row(&["a".into(), "b\u{1}t:c".into()], &[])];
+        let t = [row(&["a\u{1}t:b".into(), "c".into()], &[])];
+        let m = match_rows(&s, &t, 2).unwrap();
+        assert_eq!((m.inserts.len(), m.deletes.len(), m.same), (1, 1, 0));
+    }
+
+    #[test]
+    fn key_orders_are_checked_and_case_folds_found() {
+        let keys = |names: &[&str]| -> Vec<Row> {
+            names.iter().map(|n| row(&[(*n).into()], &[])).collect()
+        };
+        let source = keys(&["a", "b", "c"]);
+        assert!(orders_agree(&source, &keys(&["a", "c"])));
+        assert!(orders_agree(&source, &keys(&["a", "x", "c"])));
+        assert!(orders_agree(&source, &[]));
+        assert!(!orders_agree(&source, &keys(&["c", "a"])));
+        // 'B' sorts before 'a' in a binary collation, after it in a case-insensitive one.
+        assert!(!orders_agree(&keys(&["a", "B"]), &keys(&["B", "a"])));
+
+        assert_eq!(fold_key(&["Ab  ".into()]), fold_key(&["ab".into()]));
+        assert_ne!(fold_key(&["ab".into()]), fold_key(&["abc".into()]));
+        assert_eq!(
+            fold_key(&[Value::Int(1), "X".into()]),
+            fold_key(&[Value::Int(1), "x".into()])
+        );
+    }
+
+    #[test]
+    fn server_maintained_columns_are_found_by_the_writer() {
+        let mut reg = DialectRegistry::new();
+        oxbase_mssql::dialect::register(&mut reg);
+        oxbase_pg::dialect::register(&mut reg);
+        let version = ServerVersion::new(17, 0, 0);
+        let table = TableDef::new(ObjectRef::table(Some("db"), Some("dbo"), "t"));
+        let mssql = reg.dml_writer(Engine::MsSql).unwrap();
+        let mut rv = ColumnDef::new("rv", DataType::Binary { length: Some(8) }).not_null();
+        rv.native_type = "rowversion".into();
+        let why = writer_refusal(mssql.as_ref(), &table, &rv, &version).expect("refused");
+        assert!(why.contains("rowversion"), "{why}");
+        let mut computed = ColumnDef::new("c", DataType::INT32);
+        computed.generated = Some(oxbase_types::GeneratedColumn {
+            expression: "[a] + 1".into(),
+            stored: false,
+        });
+        assert!(writer_refusal(mssql.as_ref(), &table, &computed, &version).is_some());
+        // Identity columns are written on purpose (IDENTITY_INSERT), so they are not refused.
+        let mut id = ColumnDef::new("id", DataType::INT32).not_null();
+        id.identity = Some(oxbase_types::IdentityDef {
+            always: false,
+            start: Some(1),
+            increment: Some(1),
+        });
+        id.auto_increment = true;
+        assert_eq!(writer_refusal(mssql.as_ref(), &table, &id, &version), None);
+        let plain = ColumnDef::new("v", DataType::Text);
+        assert_eq!(
+            writer_refusal(mssql.as_ref(), &table, &plain, &version),
+            None
+        );
+        // PostgreSQL: GENERATED ALWAYS identity is written with OVERRIDING SYSTEM VALUE.
+        let pg = reg.dml_writer(Engine::Postgres).unwrap();
+        id.identity = Some(oxbase_types::IdentityDef {
+            always: true,
+            start: None,
+            increment: None,
+        });
+        assert_eq!(writer_refusal(pg.as_ref(), &table, &id, &version), None);
+        assert!(writer_refusal(pg.as_ref(), &table, &computed, &version).is_some());
     }
 
     #[test]

@@ -3,16 +3,20 @@
 //! differing rows read back from the spill store as bound statements, applied to the target in
 //! one transaction, and compared again (in sync). `docs/m8-contracts.md` §6, §12.
 
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
+use futures::StreamExt as _;
 use oxbase_dialect::{DialectRegistry, inline_params};
-use oxbase_diff::data::{CompareJob, compare_table, data_statements, row_key};
+use oxbase_diff::data::{CompareJob, compare_table, data_statements, insert_session, row_key};
 use oxbase_diff::{
     DataCompareOptions, DiffStore, KeyChoice, RowCounts, RowOp, TableCompareStatus, TableDataDiff,
 };
-use oxbase_driver::{CancellationToken, ConnectParams, Connection, Driver, collect};
+use oxbase_driver::{
+    CancellationToken, ConnectParams, Connection, Driver, ResultItem, ResultStream, Tx, collect,
+};
 use oxbase_sqlite::SqliteDriver;
-use oxbase_types::{Engine, ObjectDef, ObjectKind, ObjectRef, ServerVersion, TableDef};
+use oxbase_types::{Engine, ObjectDef, ObjectKind, ObjectRef, ServerVersion, TableDef, Value};
 
 const SCHEMA: &str = "
 CREATE TABLE m8_data (id BIGINT NOT NULL PRIMARY KEY, name VARCHAR(100) NOT NULL,
@@ -98,7 +102,7 @@ async fn load(reg: &DialectRegistry, c: &dyn Connection, name: &str) -> TableDef
 }
 
 struct Fixture {
-    _dir: tempfile::TempDir,
+    dir: tempfile::TempDir,
     reg: DialectRegistry,
     source: Box<dyn Connection>,
     target: Box<dyn Connection>,
@@ -114,7 +118,7 @@ async fn fixture() -> Fixture {
     }
     run(target.as_ref(), TARGET_CHANGES).await;
     Fixture {
-        _dir: dir,
+        dir,
         reg: registry(),
         source,
         target,
@@ -477,4 +481,337 @@ async fn user_keys_and_refusals() {
         "{:?}",
         diff.status
     );
+}
+
+/// A connection that records the most rows one statement returned (one result set).
+struct Counting {
+    inner: Box<dyn Connection>,
+    peak: Arc<AtomicUsize>,
+}
+
+impl Counting {
+    fn new(inner: Box<dyn Connection>) -> Self {
+        Self {
+            inner,
+            peak: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn peak(&self) -> usize {
+        self.peak.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait::async_trait]
+impl Connection for Counting {
+    fn engine(&self) -> Engine {
+        self.inner.engine()
+    }
+
+    fn server_version(&self) -> &ServerVersion {
+        self.inner.server_version()
+    }
+
+    async fn execute(
+        &self,
+        sql: &str,
+        params: &[Value],
+        cancel: CancellationToken,
+    ) -> oxbase_types::Result<ResultStream> {
+        let stream = self.inner.execute(sql, params, cancel).await?;
+        let peak = Arc::clone(&self.peak);
+        let rows = Arc::new(AtomicUsize::new(0));
+        Ok(stream
+            .inspect(move |item| match item {
+                Ok(ResultItem::Schema(_)) => rows.store(0, Ordering::SeqCst),
+                Ok(ResultItem::Batch(batch)) => {
+                    let n = rows.fetch_add(batch.num_rows(), Ordering::SeqCst) + batch.num_rows();
+                    peak.fetch_max(n, Ordering::SeqCst);
+                }
+                _ => {}
+            })
+            .boxed())
+    }
+
+    async fn cancel_running(&self) -> oxbase_types::Result<()> {
+        self.inner.cancel_running().await
+    }
+
+    async fn begin(&self) -> oxbase_types::Result<Box<dyn Tx>> {
+        self.inner.begin().await
+    }
+
+    async fn close(&self) -> oxbase_types::Result<()> {
+        self.inner.close().await
+    }
+}
+
+#[tokio::test]
+async fn both_sides_stay_within_the_chunk_size() {
+    // An empty source against the 100 000-row target, and the other way round: neither side
+    // ever returns more than one chunk (the source one row more for a re-read range).
+    let f = fixture().await;
+    let version = f.target.server_version().clone();
+    for (emptied, deletes) in [("src.sqlite", true), ("tgt.sqlite", false)] {
+        let fresh = |name: &str| f.dir.path().join(name);
+        let other = if deletes { "tgt.sqlite" } else { "src.sqlite" };
+        let emptied_conn = open(&fresh(emptied)).await;
+        run(emptied_conn.as_ref(), "DELETE FROM m8_big").await;
+        let (source, target) = if deletes {
+            (
+                Counting::new(emptied_conn),
+                Counting::new(open(&fresh(other)).await),
+            )
+        } else {
+            (
+                Counting::new(open(&fresh(other)).await),
+                Counting::new(emptied_conn),
+            )
+        };
+        let source_table = load(&f.reg, &source, "m8_big").await;
+        let target_table = load(&f.reg, &target, "m8_big").await;
+        let options = DataCompareOptions {
+            chunk_rows: 1_000,
+            sample_rows: 3,
+            use_chunk_hash: true,
+        };
+        let mut store = DiffStore::new(None).unwrap();
+        let diff = compare_table(
+            CompareJob {
+                dialects: &f.reg,
+                engine: Engine::Sqlite,
+                version: &version,
+                pair: 0,
+                source: &source,
+                target: &target,
+                source_table: &source_table,
+                target_table: &target_table,
+                choice: None,
+                columns: None,
+                options: &options,
+            },
+            &mut store,
+            &no_progress,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(diff.status, TableCompareStatus::Compared, "{emptied}");
+        if deletes {
+            // The target kept its designed rows: 100 000 with id 50000 gone and 100001 added.
+            assert_eq!(counts(&diff), [0, 0, 100_000]);
+            assert_eq!(diff.counts.target_rows, 100_000);
+            assert!(
+                target.peak() > 0 && target.peak() <= 1_000,
+                "{}",
+                target.peak()
+            );
+            assert!(source.peak() <= 1, "{}", source.peak());
+        } else {
+            assert_eq!(counts(&diff), [100_000, 0, 0]);
+            assert_eq!(diff.counts.source_rows, 100_000);
+            assert!(
+                source.peak() > 0 && source.peak() <= 1_001,
+                "{}",
+                source.peak()
+            );
+            assert!(target.peak() <= 1, "{}", target.peak());
+        }
+        assert_eq!(diff.samples.len(), 3);
+        store.finish().unwrap();
+        let op = if deletes {
+            RowOp::Delete
+        } else {
+            RowOp::Insert
+        };
+        assert_eq!(store.rows(0, op), 100_000);
+        if deletes {
+            // Put the source rows back for the second round.
+            run(
+                source.inner.as_ref(),
+                "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < \
+                 100000) INSERT INTO m8_big SELECT i, i % 1000, 'row-' || i FROM n",
+            )
+            .await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn user_keys_with_nulls_or_duplicates_across_chunks_fail() {
+    let f = fixture().await;
+    for c in [&f.source, &f.target] {
+        run(c.as_ref(), "CREATE TABLE uk (a INT, b TEXT)").await;
+    }
+    run(
+        f.source.as_ref(),
+        "INSERT INTO uk VALUES (1, 'x'), (2, 'y'), (2, 'z'), (3, 'w')",
+    )
+    .await;
+    run(
+        f.target.as_ref(),
+        "INSERT INTO uk VALUES (1, 'x'), (2, 'y'), (3, 'w')",
+    )
+    .await;
+    let version = f.target.server_version().clone();
+    let chosen = KeyChoice::Columns {
+        columns: vec!["a".into()],
+    };
+    let options = DataCompareOptions {
+        chunk_rows: 2,
+        sample_rows: 5,
+        use_chunk_hash: true,
+    };
+    let compare = |source_table: TableDef, target_table: TableDef| {
+        let (f, version, chosen, options) = (&f, &version, &chosen, &options);
+        async move {
+            let mut store = DiffStore::new(None).unwrap();
+            compare_table(
+                job(
+                    f,
+                    version,
+                    (&source_table, &target_table),
+                    Some(chosen),
+                    options,
+                ),
+                &mut store,
+                &no_progress,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap()
+        }
+    };
+    // The duplicate 2 straddles the first chunk's end: the range is read again and it shows.
+    let source_table = load(&f.reg, f.source.as_ref(), "uk").await;
+    let target_table = load(&f.reg, f.target.as_ref(), "uk").await;
+    let diff = compare(source_table.clone(), target_table.clone()).await;
+    match &diff.status {
+        TableCompareStatus::Failed { message } => {
+            assert!(
+                message.contains("duplicate key (2) in the source"),
+                "{message}"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    // Without the duplicate the tables are equal.
+    run(f.source.as_ref(), "DELETE FROM uk WHERE b = 'z'").await;
+    let diff = compare(source_table.clone(), target_table.clone()).await;
+    assert_eq!(diff.status, TableCompareStatus::Compared);
+    assert!(diff.counts.in_sync(), "{:?}", diff.counts);
+    assert_eq!(diff.counts.same, 3);
+    // A NULL key would fall outside every range: the table fails instead.
+    run(f.target.as_ref(), "INSERT INTO uk VALUES (NULL, 'n')").await;
+    let diff = compare(source_table, target_table).await;
+    match &diff.status {
+        TableCompareStatus::Failed { message } => {
+            assert!(message.contains("NULL in the target"), "{message}");
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// Names with quote characters and spaces, values that look like placeholders or escapes, JSON
+/// numbers beyond `f64`: compared, rendered as preview text, the preview text run as SQL on the
+/// target, compared again (in sync).
+#[tokio::test]
+async fn awkward_names_and_values_survive_the_preview_text() {
+    let f = fixture().await;
+    let ddl = "CREATE TABLE \"we\"\"ird t\" (\"k\"\"ey\" INTEGER NOT NULL PRIMARY KEY, \
+               \"va l\" TEXT, \"x]`y\" TEXT, doc JSON)";
+    for c in [&f.source, &f.target] {
+        run(c.as_ref(), ddl).await;
+    }
+    run(
+        f.source.as_ref(),
+        "INSERT INTO \"we\"\"ird t\" VALUES \
+         (1, 'it''s', 'back\\slash', '{\"n\": 123456789012345678901234}'), \
+         (2, '?', '$1', '[1, 2]'), \
+         (3, '@P1', ':name -- not a comment /* nor this */', NULL), \
+         (4, 'x', 'y', '{\"a\": 0.30000000000000000001}')",
+    )
+    .await;
+    run(
+        f.target.as_ref(),
+        "INSERT INTO \"we\"\"ird t\" VALUES \
+         (1, 'it''s', 'back\\slash', '{\"n\": 1.2345678901234568e23}'), \
+         (3, 'old', NULL, NULL), \
+         (4, 'x', 'y', '{\"a\": 0.3}'), \
+         (5, 'gone', NULL, NULL)",
+    )
+    .await;
+    let name = "we\"ird t";
+    let version = f.target.server_version().clone();
+    let options = DataCompareOptions::default();
+    let compare = || {
+        let (f, version, options) = (&f, &version, &options);
+        async move {
+            let mut store = DiffStore::new(None).unwrap();
+            let source_table = load(&f.reg, f.source.as_ref(), name).await;
+            let target_table = load(&f.reg, f.target.as_ref(), name).await;
+            let diff = compare_table(
+                job(f, version, (&source_table, &target_table), None, options),
+                &mut store,
+                &no_progress,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            store.finish().unwrap();
+            (diff, target_table, store)
+        }
+    };
+    let (diff, table, store) = compare().await;
+    assert_eq!(diff.status, TableCompareStatus::Compared);
+    assert_eq!(diff.key, ["k\"ey"]);
+    // 1 and 4 differ only in JSON digits an f64 cannot hold; 3 in two columns.
+    assert_eq!(counts(&diff), [1, 3, 1], "{:?}", diff.samples);
+
+    let quoting = f.reg.quoting(Engine::Sqlite).unwrap();
+    let key = row_key(&table, &diff.key, None);
+    let session = insert_session(&f.reg, Engine::Sqlite, &table, &diff.columns).unwrap();
+    assert!(session.is_empty(), "{session:?}");
+    let mut preview = Vec::new();
+    for op in [RowOp::Delete, RowOp::Update, RowOp::Insert] {
+        for batch in store.read(0, op, 1_000).unwrap() {
+            for st in data_statements(
+                &f.reg,
+                Engine::Sqlite,
+                &version,
+                &table,
+                &key,
+                op,
+                &batch.unwrap(),
+            )
+            .unwrap()
+            {
+                preview.push(inline_params(quoting.as_ref(), &st).unwrap());
+            }
+        }
+    }
+    let text = preview.join(";\n");
+    eprintln!("[m8 data sqlite] awkward preview:\n{text}");
+    assert_eq!(preview.len(), 5);
+    assert!(text.contains("\"we\"\"ird t\""), "{text}");
+    assert!(text.contains("\"k\"\"ey\""), "{text}");
+    assert!(text.contains("\"x]`y\""), "{text}");
+    assert!(text.contains("'it''s'") && text.contains("'$1'"), "{text}");
+    assert!(text.contains("123456789012345678901234"), "{text}");
+    // The preview text itself is valid SQL that makes the target equal.
+    for statement in &preview {
+        let done = collect(
+            f.target
+                .execute(statement, &[], CancellationToken::new())
+                .await
+                .unwrap_or_else(|e| panic!("{e}: {statement}")),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{e}: {statement}"));
+        assert_eq!(done.rows_affected.iter().sum::<u64>(), 1, "{statement}");
+    }
+    let (again, _, _) = compare().await;
+    assert_eq!(again.status, TableCompareStatus::Compared);
+    assert!(again.counts.in_sync(), "{:?}", again.samples);
+    assert_eq!(again.counts.same, 4);
 }
