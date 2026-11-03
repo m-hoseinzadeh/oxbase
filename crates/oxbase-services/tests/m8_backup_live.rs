@@ -538,8 +538,7 @@ async fn scratch_round_trip(live: &Live) {
             &path,
         )
         .await
-        .err()
-        .expect("an unconfirmed destructive restore is refused");
+        .expect_err("an unconfirmed destructive restore is refused");
     assert!(refused.to_string().contains("confirm"), "{key}: {refused}");
 
     // Structure over the equal existing tables: kept.
@@ -628,7 +627,7 @@ async fn scratch_round_trip(live: &Live) {
     let leftovers: Vec<String> = std::fs::read_dir(live.dir.path())
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-        .filter(|n| n.ends_with(".part"))
+        .filter(|n| n.starts_with(".oxbase-"))
         .collect();
     assert_eq!(leftovers, Vec::<String>::new(), "{key}");
     assert!(!live.backups.cancel(handle.id), "{key}: the run is over");
