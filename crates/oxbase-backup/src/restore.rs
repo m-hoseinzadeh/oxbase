@@ -180,7 +180,7 @@ pub struct RestoreReport {
 /// semantics; `Ok(true)` when it committed. The services pass `execute_script` on a dedicated
 /// child session.
 pub type ScriptRunner =
-    dyn Fn(oxbase_types::Script) -> futures::future::BoxFuture<'static, Result<bool>> + Send + Sync;
+    dyn Fn(Script) -> futures::future::BoxFuture<'static, Result<bool>> + Send + Sync;
 
 /// The session and registry a restore writes through. The structure script runs through
 /// `run_script` (the services pass `execute_script` on a dedicated child session), so this
@@ -590,9 +590,10 @@ impl Restore<'_> {
         for p in planned.iter().filter(|p| p.create) {
             if dialects.ddl(engine, p.def.kind()).is_err() {
                 return Err(Error::unsupported(format!(
-                    "Oxbase cannot create {} objects on {engine} yet ({}); leave it out of the \
+                    "Oxbase cannot create {} objects on {} yet ({}); leave it out of the \
                      restore",
                     p.def.kind(),
+                    engine.display_name(),
                     p.def.object_ref().display_name()
                 )));
             }
@@ -1039,8 +1040,9 @@ fn open_archive(
     let manifest = reader.manifest().clone();
     if manifest.engine != engine {
         return Err(Error::invalid_input(format!(
-            "the backup is from {}, the target is {engine}",
-            manifest.engine
+            "the backup is from {}, the target is {}",
+            manifest.engine.display_name(),
+            engine.display_name()
         )));
     }
     let all: BTreeSet<u32> = manifest.objects.iter().map(|o| o.index).collect();

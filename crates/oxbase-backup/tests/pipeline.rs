@@ -140,7 +140,7 @@ impl BulkLoader for Recorder {
     ) -> Result<u64> {
         target.check_batch(batch)?;
         // The mock logs the statement, so the test sees where it ran.
-        session.execute("INSERT rows", &[], cancel).await?;
+        drop(session.execute("INSERT rows", &[], cancel).await?);
         self.batches
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -174,9 +174,11 @@ fn runner(connection: Arc<dyn Connection>) -> Box<ScriptRunner> {
         let connection = Arc::clone(&connection);
         async move {
             for step in script.ordered() {
-                connection
-                    .execute(&step.sql, &[], CancellationToken::new())
-                    .await?;
+                drop(
+                    connection
+                        .execute(&step.sql, &[], CancellationToken::new())
+                        .await?,
+                );
             }
             Ok::<_, Error>(true)
         }

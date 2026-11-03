@@ -221,7 +221,8 @@ impl BackupService {
         let engine = base.summary().engine;
         if self.dialects.fetcher(engine, ObjectKind::Table).is_err() {
             return Err(Error::unsupported(format!(
-                "Oxbase cannot back up {engine} databases"
+                "Oxbase cannot back up {} databases",
+                engine.display_name()
             )));
         }
         if !overwrite && tokio::fs::try_exists(destination).await.unwrap_or(false) {

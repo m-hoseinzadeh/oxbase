@@ -128,7 +128,8 @@ pub async fn backup(
     let engine = job.metadata.engine();
     if job.dialects.fetcher(engine, ObjectKind::Table).is_err() {
         return Err(Error::unsupported(format!(
-            "Oxbase cannot back up {engine} databases"
+            "Oxbase cannot back up {} databases",
+            engine.display_name()
         )));
     }
     check(&cancel)?;
@@ -318,8 +319,9 @@ impl Run<'_> {
         }
         for kind in without_ddl {
             warnings.push(format!(
-                "Oxbase has no CREATE text for {kind} objects on {engine}; the backup holds \
-                 their definitions"
+                "Oxbase has no CREATE text for {kind} objects on {}; the backup holds \
+                 their definitions",
+                engine.display_name()
             ));
         }
         let order = manifest_objects.iter().map(|o| o.index).collect();

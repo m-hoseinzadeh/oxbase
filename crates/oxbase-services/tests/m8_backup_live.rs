@@ -55,7 +55,7 @@ fn fixtures() -> toml::Value {
         .map_or_else(|| root().join("tests/fixtures.toml"), |p| root().join(p));
     let text = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
-    text.parse().expect("fixtures.toml parses")
+    toml::Value::Table(text.parse::<toml::Table>().expect("fixtures.toml parses"))
 }
 
 fn s(t: &toml::Value, key: &str) -> String {
