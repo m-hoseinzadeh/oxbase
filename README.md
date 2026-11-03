@@ -703,6 +703,8 @@ missing fixture, seed or cell fails instead of being pending. Numbers from fast-
 Tests at the M8 integration: 1 589 Rust tests passed in the Linux test job of run 41605886760
 and on macOS in full-lane run 41608238873 (335 live / perf tests ignored there and run in the
 Conformance and perf jobs), 1 468 in the Conformance job, 433 UI tests.
+`calamine` is at 0.38.0: an advisory against 0.37.0 (crafted XLS files could panic or exhaust
+memory) appeared during the M8 integration; the API oxbase-io uses did not change.
 
 ## App data
 
