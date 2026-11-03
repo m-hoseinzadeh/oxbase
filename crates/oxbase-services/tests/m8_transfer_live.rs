@@ -197,16 +197,16 @@ async fn drain(handle: &mut TransferHandle, limit: Duration) -> Vec<TransferEven
     let deadline = Instant::now() + limit;
     loop {
         let left = deadline.saturating_duration_since(Instant::now());
-        match tokio::time::timeout(left, handle.events.recv()).await {
-            Ok(Some(event)) => {
-                let terminal = event.is_terminal();
-                events.push(event);
-                if terminal {
-                    return events;
-                }
-            }
-            Ok(None) => panic!("the event stream ended without a terminal event: {events:?}"),
-            Err(_) => panic!("no terminal event within {limit:?}"),
+        let next = tokio::time::timeout(left, handle.events.recv())
+            .await
+            .unwrap_or_else(|_| panic!("no terminal event within {limit:?}"));
+        let Some(event) = next else {
+            panic!("the event stream ended without a terminal event: {events:?}");
+        };
+        let terminal = event.is_terminal();
+        events.push(event);
+        if terminal {
+            return events;
         }
     }
 }
