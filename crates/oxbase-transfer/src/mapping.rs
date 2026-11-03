@@ -227,7 +227,7 @@ pub fn fidelity_between(from: &DataType, to: &DataType) -> (Fidelity, Option<Str
                 ))
             }
         }
-        (T::Float { .. } | T::Decimal { .. }, T::Float { .. }) => narrowed(format!(
+        (T::Decimal { .. }, T::Float { .. }) => narrowed(format!(
             "values are rounded to {to}; values outside its range are refused"
         )),
         (T::Float { .. } | T::Decimal { .. }, T::Int { .. } | T::Decimal { .. }) => narrowed(
@@ -787,7 +787,7 @@ pub fn target_table(
             checks.clone_from(&source.checks);
             if rename {
                 for check in &mut checks {
-                    check.name = check.name.as_deref().map(&new_name);
+                    check.name = check.name.as_deref().map(new_name);
                 }
             }
         } else if !source.checks.is_empty() {

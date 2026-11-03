@@ -400,6 +400,27 @@ async fn query_sources_take_their_columns_from_the_result() {
     );
 }
 
+async fn plan_on(
+    reg: &DialectRegistry,
+    source: &dyn Connection,
+    target: &dyn Connection,
+    spec: &TransferSpec,
+    same_server: bool,
+) -> TransferPlan {
+    plan(
+        PlanInputs {
+            dialects: reg,
+            source,
+            target,
+            spec,
+            same_server,
+        },
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap()
+}
+
 #[tokio::test]
 async fn a_table_is_not_copied_onto_itself() {
     let reg = registry(Vec::new());
@@ -412,19 +433,8 @@ async fn a_table_is_not_copied_onto_itself() {
     if let SourceObject::Table { target_name, .. } = &mut renamed.objects[0] {
         *target_name = Some("parent_copy".into());
     }
-    let run = |spec: &TransferSpec, same_server: bool| {
-        plan(
-            PlanInputs {
-                dialects: &reg,
-                source: source.as_ref(),
-                target: target.as_ref(),
-                spec,
-                same_server,
-            },
-            CancellationToken::new(),
-        )
-    };
-    let blocked = run(&spec, true).await.unwrap();
+    let (source, target) = (source.as_ref(), target.as_ref());
+    let blocked = plan_on(&reg, source, target, &spec, true).await;
     assert!(!blocked.runnable);
     assert!(
         blocked
@@ -435,9 +445,9 @@ async fn a_table_is_not_copied_onto_itself() {
         blocked.blocked
     );
     // Another server, or another name next to the source: fine.
-    let other_server = run(&spec, false).await.unwrap();
+    let other_server = plan_on(&reg, source, target, &spec, false).await;
     assert!(other_server.runnable, "{:?}", other_server.blocked);
-    let beside = run(&renamed, true).await.unwrap();
+    let beside = plan_on(&reg, source, target, &renamed, true).await;
     assert!(beside.runnable, "{:?}", beside.blocked);
 }
 
