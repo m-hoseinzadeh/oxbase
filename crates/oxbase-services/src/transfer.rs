@@ -29,10 +29,13 @@
 //! `Cancelled`. Schema changes on the target (created / replaced tables) are announced on
 //! [`SchemaEvents`] like the import's.
 
+mod run;
+
 use std::sync::Arc;
 
 use oxbase_dialect::DialectRegistry;
-use oxbase_types::Result;
+use oxbase_transfer::MappingContext;
+use oxbase_types::{Error, Result};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
@@ -175,10 +178,16 @@ impl TransferService {
         request: &TransferRequest,
         cancel: CancellationToken,
     ) -> Result<TransferPlan> {
-        let _ = (&self.schema_events, request, cancel);
-        // Keeps the skeleton an `async fn` (clippy::unused_async) until the body lands.
-        std::future::ready(()).await;
-        unimplemented!("m8: transfer")
+        let _ticket = self.runs.register_with(
+            &[request.source_session, request.target_session],
+            cancel.clone(),
+        );
+        let sessions = run::Sessions::open(&self.manager, &self.dialects, request, &cancel).await?;
+        let prepared = sessions
+            .prepare(&self.dialects, &request.spec, &cancel)
+            .await;
+        sessions.close(&self.manager).await;
+        prepared.map(|p| p.plan)
     }
 
     /// The type mapping report of an engine pair (the wizard's mapping help), for the engines
@@ -188,16 +197,78 @@ impl TransferService {
         source_session: SessionId,
         target_session: SessionId,
     ) -> Result<PairReport> {
-        let _ = (&self.manager, source_session, target_session);
-        unimplemented!("m8: transfer")
+        let handle = |id: SessionId| {
+            self.manager
+                .get(id)
+                .ok_or_else(|| Error::not_found(format!("no open session {id}")))
+        };
+        let (source, target) = (handle(source_session)?, handle(target_session)?);
+        let (se, te) = (source.summary().engine, target.summary().engine);
+        let source_mapper = self.dialects.type_mapper(se)?;
+        let target_mapper = self.dialects.type_mapper(te)?;
+        let ctx = MappingContext {
+            source_engine: se,
+            source_version: &source.info().server_version,
+            source_mapper: source_mapper.as_ref(),
+            target_engine: te,
+            target_version: &target.info().server_version,
+            target_mapper: target_mapper.as_ref(),
+        };
+        Ok(oxbase_transfer::mapping::pair_report(&ctx))
     }
 
     /// Starts `request` (module docs, *Run*); events follow on the handle.
     pub async fn start(&self, request: TransferRequest) -> Result<TransferHandle> {
-        let _ = (&self.runs, request);
-        // Keeps the skeleton an `async fn` (clippy::unused_async) until the body lands.
-        std::future::ready(()).await;
-        unimplemented!("m8: transfer")
+        let ticket = self
+            .runs
+            .register(&[request.source_session, request.target_session]);
+        let cancel = ticket.token().clone();
+        let sessions =
+            run::Sessions::open(&self.manager, &self.dialects, &request, &cancel).await?;
+        let prepared = match sessions
+            .prepare(&self.dialects, &request.spec, &cancel)
+            .await
+        {
+            Ok(prepared) => prepared,
+            Err(e) => {
+                sessions.close(&self.manager).await;
+                return Err(e);
+            }
+        };
+        let refused = if prepared.plan.runnable {
+            (prepared.plan.destructive && !request.confirm_destructive).then(|| {
+                Error::invalid_input(
+                    "the transfer drops or empties existing tables: confirm it first",
+                )
+            })
+        } else {
+            Some(Error::invalid_input(format!(
+                "the transfer cannot run: {}",
+                prepared.plan.blocked.join("; ")
+            )))
+        };
+        if let Some(e) = refused {
+            sessions.close(&self.manager).await;
+            return Err(e);
+        }
+        let (events, receiver) = mpsc::channel(256);
+        let id = ticket.id();
+        let job = run::Job {
+            id,
+            request,
+            prepared,
+            sessions,
+            manager: Arc::clone(&self.manager),
+            dialects: Arc::clone(&self.dialects),
+            schema_events: self.schema_events.clone(),
+            events,
+            ticket,
+        };
+        tokio::spawn(job.run());
+        Ok(TransferHandle {
+            id,
+            events: receiver,
+        })
     }
 
     /// Cancels transfer `id`; `false` when it is unknown or already ended.

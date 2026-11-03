@@ -101,7 +101,9 @@ use oxbase_dialect::bulk::{
 use oxbase_dialect::sql::SqlWriter;
 use oxbase_dialect::{BracketQuoting, InsertLoader, Quoting};
 use oxbase_driver::{CancellationToken, ResultItem, ResultStream, cell_value, collect};
-use oxbase_types::{BoundStatement, DataType, Engine, Error, Result, ServerVersion, Value};
+use oxbase_types::{
+    BoundStatement, DataType, Engine, Error, ObjectRef, Result, ServerVersion, Value,
+};
 use tiberius::ColumnData;
 use tiberius::numeric::Numeric;
 use tiberius::time::{Date, DateTime2, DateTimeOffset, Time};
@@ -594,6 +596,18 @@ impl BulkLoader for MsSqlBulkLoader {
 
     fn limits(&self, _version: &ServerVersion) -> BulkLimits {
         self.limits
+    }
+
+    /// M8: per table, `ALTER TABLE t NOCHECK CONSTRAINT ALL` and, after the load,
+    /// `ALTER TABLE t WITH CHECK CHECK CONSTRAINT ALL` (which checks the loaded rows, so the
+    /// constraints stay trusted).
+    fn foreign_key_checks(&self, table: &ObjectRef, enabled: bool) -> Option<Vec<String>> {
+        let name = BracketQuoting.qualify(table);
+        Some(vec![if enabled {
+            format!("ALTER TABLE {name} WITH CHECK CHECK CONSTRAINT ALL")
+        } else {
+            format!("ALTER TABLE {name} NOCHECK CONSTRAINT ALL")
+        }])
     }
 
     /// The expected rate: parameterized multi-row `INSERT`s, not TDS bulk load (contracts §13).

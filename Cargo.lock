@@ -4804,14 +4804,19 @@ version = "0.7.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
+ "arrow-select",
+ "async-trait",
+ "chrono",
  "futures",
  "oxbase-dialect",
  "oxbase-driver",
+ "oxbase-io",
  "oxbase-types",
  "pretty_assertions",
  "serde",
  "serde_json",
  "tokio",
+ "uuid",
 ]
 
 [[package]]

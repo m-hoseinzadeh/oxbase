@@ -25,7 +25,7 @@ use async_trait::async_trait;
 use oxbase_dialect::bulk::{BulkLimits, BulkLoader, BulkMethod, LoadSession, LoadTarget};
 use oxbase_dialect::{BacktickQuoting, InsertLoader};
 use oxbase_driver::CancellationToken;
-use oxbase_types::{BoundStatement, Engine, Result, ServerVersion};
+use oxbase_types::{BoundStatement, Engine, ObjectRef, Result, ServerVersion};
 
 /// The session setting [`BulkLoader::prepare`] runs.
 pub const UTC_SESSION_SQL: &str = "SET time_zone = '+00:00'";
@@ -55,6 +55,14 @@ impl BulkLoader for MySqlBulkLoader {
 
     fn limits(&self, _version: &ServerVersion) -> BulkLimits {
         self.limits
+    }
+
+    /// M8: `SET FOREIGN_KEY_CHECKS = 0 / 1` (a session setting).
+    fn foreign_key_checks(&self, _table: &ObjectRef, enabled: bool) -> Option<Vec<String>> {
+        Some(vec![format!(
+            "SET FOREIGN_KEY_CHECKS = {}",
+            u8::from(enabled)
+        )])
     }
 
     async fn prepare(
@@ -94,5 +102,15 @@ mod tests {
         // 14 columns: 4681 rows (65 534 placeholders) per statement.
         assert_eq!(limits.rows_per_statement(14), 4_681);
         assert_eq!(limits.max_statement_bytes, Some(16 * 1024 * 1024));
+        let table = ObjectRef::table(Some("db"), None, "t");
+        assert_eq!(
+            loader.foreign_key_checks(&table, false),
+            Some(vec!["SET FOREIGN_KEY_CHECKS = 0".to_owned()])
+        );
+        assert_eq!(
+            loader.foreign_key_checks(&table, true),
+            Some(vec!["SET FOREIGN_KEY_CHECKS = 1".to_owned()])
+        );
+        assert_eq!(loader.identity_resync(&table, &[]), Vec::<String>::new());
     }
 }
