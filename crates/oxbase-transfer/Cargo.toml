@@ -11,6 +11,29 @@ authors.workspace = true
 [lints]
 workspace = true
 
+# M8 (docs/m8-contracts.md §4): cross-engine type mapping cells (TypeMapper per SQL engine),
+# transfer planning (mapping report, target DDL, dependency order) and the per-table copy loop
+# (source Arrow pages → load batches → the target engine's BulkLoader). Connection-level only:
+# sessions, events and cancellation registries live in oxbase-services::transfer.
 [dependencies]
+oxbase-types.workspace = true
+oxbase-driver.workspace = true
+oxbase-dialect.workspace = true
+# The logical type of a query result's Arrow fields (`oxbase_io::logical_type`).
+oxbase-io.workspace = true
+arrow-array.workspace = true
+arrow-schema.workspace = true
+# Dropping rows with issues and re-chunking load batches.
+arrow-select.workspace = true
+chrono.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# Timeouts and cancellation of the copy loop.
+tokio.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
+oxbase-driver = { workspace = true, features = ["mock"] }
+async-trait.workspace = true
+pretty_assertions.workspace = true

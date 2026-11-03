@@ -53,7 +53,7 @@ use chrono::{Datelike, NaiveDate};
 use oxbase_dialect::bulk::{BulkLimits, BulkLoader, BulkMethod, LoadSession, LoadTarget};
 use oxbase_dialect::{InsertLoader, PgQuoting, Quoting};
 use oxbase_driver::CancellationToken;
-use oxbase_types::{Engine, Error, Result, ServerVersion};
+use oxbase_types::{ColumnDef, Engine, Error, ObjectRef, Result, ServerVersion};
 
 use crate::conn::{COPY_CHUNK, CopySession};
 
@@ -104,6 +104,26 @@ impl BulkLoader for PgBulkLoader {
 
     fn limits(&self, _version: &ServerVersion) -> BulkLimits {
         BulkLimits::for_engine(Engine::Postgres)
+    }
+
+    /// M8: moves the sequence behind each `serial` / identity column past the loaded values:
+    /// `SELECT setval(pg_get_serial_sequence('<table>', '<column>'), max(<column>)) FROM
+    /// <table>` (no change on an empty table or a column without a sequence: `setval` and
+    /// `pg_get_serial_sequence` return NULL for NULL input).
+    fn identity_resync(&self, table: &ObjectRef, columns: &[ColumnDef]) -> Vec<String> {
+        let q = PgQuoting;
+        let qualified = q.qualify(table);
+        columns
+            .iter()
+            .map(|c| {
+                format!(
+                    "SELECT setval(pg_get_serial_sequence({}, {}), max({})) FROM {qualified}",
+                    q.quote_str(&qualified),
+                    q.quote_str(&c.name),
+                    q.quote_ident(&c.name)
+                )
+            })
+            .collect()
     }
 
     async fn load(
@@ -459,5 +479,20 @@ mod tests {
         PgBulkLoader::encode_rows(&batch, 0..2, &mut out).unwrap();
         assert_eq!(out, "1\tt\ta\\tb\t\\\\x01\n\\N\tf\t\\N\t\\N\n");
         assert_eq!(PgBulkLoader.method(&version), BulkMethod::CopyText);
+    }
+
+    #[test]
+    fn identity_resync_moves_each_sequence_past_the_loaded_values() {
+        let table = ObjectRef::table(Some("db"), Some("s"), "T");
+        let id = ColumnDef::new("Id", DataType::INT32);
+        assert_eq!(
+            PgBulkLoader.identity_resync(&table, &[id]),
+            vec![
+                "SELECT setval(pg_get_serial_sequence('\"s\".\"T\"', 'Id'), max(\"Id\")) FROM \
+                 \"s\".\"T\""
+                    .to_owned()
+            ]
+        );
+        assert_eq!(PgBulkLoader.foreign_key_checks(&table, false), None);
     }
 }

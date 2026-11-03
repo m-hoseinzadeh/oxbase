@@ -198,8 +198,8 @@ jobs:
 
       # Compile before the containers start so their startup overlaps nothing slow
       # and a compile error does not leave a stack running.
-      - name: Build conformance harness and M1-M5 live tests
-        run: cargo test -p oxbase-conformance -p oxbase-net -p oxbase-pg -p oxbase-mysql -p oxbase-sqlite -p oxbase-mssql -p oxbase-mongo -p oxbase-redis -p oxbase-services -p oxbase-io --locked --no-run
+      - name: Build conformance harness and M1-M8 live tests
+        run: cargo test -p oxbase-conformance -p oxbase-net -p oxbase-pg -p oxbase-mysql -p oxbase-sqlite -p oxbase-mssql -p oxbase-mongo -p oxbase-redis -p oxbase-services -p oxbase-io -p oxbase-transfer -p oxbase-diff -p oxbase-backup --locked --no-run
 
       # Test CA, server/client certificates and SSH keys for the TLS/SSH fixtures (openssl and
       # ssh-keygen ship with the runner image). Compose bind-mounts these files and refuses to
@@ -233,12 +233,19 @@ jobs:
       # fetch_list cells list the [m7] seed through the registered dialect cells.
       # OXBASE_CONFORMANCE_REQUIRE_M7=1 is the 7-engine guard: every applicable cell of all
       # seven engines must pass, nothing pending or skipped.
+      # M8 (docs/m8-contracts.md §12, tests/m8_live.rs): on scratch copies of the [m8] seed
+      # (tests/docker/init/*/06-m8.sql, mssql/07-m8.sql, sqlite/03-04) the seed, sync_structure,
+      # sync_data and backup cells of the five SQL engines and the 20-cell transfer matrix (PG ->
+      # MySQL with the [m8.transfer] set must pass), printed as tables. Cells of streams that
+      # OXBASE_CONFORMANCE_REQUIRE_M8=1 (all M8 streams are merged): every cell must pass,
+      # nothing pending, and missing_m8_roles must be empty.
       - name: Run conformance harness
         env:
           OXBASE_CONFORMANCE_REQUIRE_M2_FETCH: "1"
           OXBASE_CONFORMANCE_REQUIRE_M3_ROUNDTRIP: "1"
           OXBASE_CONFORMANCE_REQUIRE_M4: "1"
           OXBASE_CONFORMANCE_REQUIRE_M7: "1"
+          OXBASE_CONFORMANCE_REQUIRE_M8: "1"
         run: cargo test -p oxbase-conformance --locked -- --include-ignored --nocapture --test-threads 1
 
       # Driver, tunnel and connection-manager live tests (SSH bastion, TLS-only users, cancel),
@@ -256,6 +263,10 @@ jobs:
       # M7: the MongoDB / Redis driver, fetch, document, key, pub/sub, cluster, sentinel, shell
       # and console live tests and the services' m7_*_live tests (browse, edit and query on both
       # engines). The REQUIRE switches turn a missing M7 fixture, seed or cell into a failure.
+      # --no-fail-fast: one failing test binary does not hide the results of the others.
+      # M8: the oxbase-transfer, oxbase-diff and oxbase-backup live tests (with the services'
+      # m8_*_live tests above) against the [m8] seed. OXBASE_SERVICES_REQUIRE_M8=1: a missing
+      # M8 fixture, seed or cell fails instead of being pending.
       - name: Run M1-M5 live tests
         env:
           OXBASE_SERVICES_REQUIRE_M3_CELLS: "1"
@@ -263,7 +274,8 @@ jobs:
           OXBASE_SERVICES_REQUIRE_M7: "1"
           OXBASE_REDIS_REQUIRE_M7: "1"
           OXBASE_SHELL_REQUIRE_M7_SEED: "1"
-        run: cargo test -p oxbase-net -p oxbase-pg -p oxbase-mysql -p oxbase-sqlite -p oxbase-mssql -p oxbase-mongo -p oxbase-redis -p oxbase-services -p oxbase-io --locked -- --include-ignored --test-threads 1 --nocapture
+          OXBASE_SERVICES_REQUIRE_M8: "1"
+        run: cargo test -p oxbase-net -p oxbase-pg -p oxbase-mysql -p oxbase-sqlite -p oxbase-mssql -p oxbase-mongo -p oxbase-redis -p oxbase-services -p oxbase-io -p oxbase-transfer -p oxbase-diff -p oxbase-backup --locked --no-fail-fast -- --include-ignored --test-threads 1 --nocapture
 
       - name: Dump fixture logs
         if: failure()
@@ -481,7 +493,8 @@ jobs:
       # M3: the table-data edit step is mandatory (a skip fails the job). M5: so is the
       # import / export step (the debug app's --e2e-file-dir hook, ui/e2e/README.md). M6: so is
       # the code-insight step (completion, diagnostics, format, IPC latency). M7: so is the
-      # MongoDB / Redis step (collection, shell, key browser, console; screenshots).
+      # MongoDB / Redis step (collection, shell, key browser, console; screenshots). M8: so are
+      # the structure sync, data sync, transfer and backup steps (docs/m8-contracts.md §8.4).
       - name: Webview smoke test
         env:
           OXBASE_E2E_OUT: ${{ runner.temp }}/e2e
@@ -489,6 +502,7 @@ jobs:
           OXBASE_E2E_REQUIRE_M5: "1"
           OXBASE_E2E_REQUIRE_M6: "1"
           OXBASE_E2E_REQUIRE_M7: "1"
+          OXBASE_E2E_REQUIRE_M8: "1"
         run: bash scripts/e2e-smoke.sh
 
       - name: Upload e2e results

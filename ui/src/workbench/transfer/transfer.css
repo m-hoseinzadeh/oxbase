@@ -471,6 +471,15 @@ input.transfer-form__char {
   display: block;
 }
 
+/* On a table cell itself the classes only style the text: the cell stays a table cell, or
+   the row's later cells shift one column left under the wrong headers. */
+th.transfer-table__name,
+td.transfer-table__name,
+th.transfer-table__type,
+td.transfer-table__type {
+  display: table-cell;
+}
+
 .transfer-table__type {
   color: var(--color-fg-faint);
   font-family: var(--font-mono);

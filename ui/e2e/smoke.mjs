@@ -28,12 +28,15 @@
 //                             that step (core insight or schema cache not built yet) is a skip
 //   OXBASE_E2E_REQUIRE_M7     1: the M7 MongoDB and Redis steps must pass; without it a missing
 //                             fixture or any failure of those steps is a skip (warning)
+//   OXBASE_E2E_REQUIRE_M8     1: the M8 steps (data and structure compare of the m8_src /
+//                             m8_tgt seeds, structure apply, transfer, backup + verify) must pass;
+//                             without it missing seeds or any failure of those steps is a skip
 //   OXBASE_E2E_INSIGHT_P95_LIMIT_MS  p95 bound of 50 `insight_complete` calls through IPC
 //                             (default 150, docs/m6-contracts.md §5)
 //   GITHUB_STEP_SUMMARY       if set, a Markdown summary is appended to it
 
 import { createReadStream } from "node:fs";
-import { appendFile, copyFile, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { appendFile, copyFile, mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import net from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -55,6 +58,7 @@ const config = {
   requireM5: /^(1|true|yes)$/i.test(env.OXBASE_E2E_REQUIRE_M5 || ""),
   requireM6: /^(1|true|yes)$/i.test(env.OXBASE_E2E_REQUIRE_M6 || ""),
   requireM7: /^(1|true|yes)$/i.test(env.OXBASE_E2E_REQUIRE_M7 || ""),
+  requireM8: /^(1|true|yes)$/i.test(env.OXBASE_E2E_REQUIRE_M8 || ""),
   insightP95LimitMs: Number(env.OXBASE_E2E_INSIGHT_P95_LIMIT_MS || 150),
   insightSamples: 50,
   rows: 1_000_000,
@@ -217,6 +221,7 @@ const report = {
   requireM5: config.requireM5,
   requireM6: config.requireM6,
   requireM7: config.requireM7,
+  requireM8: config.requireM8,
   query: null,
   pageLatency: null,
   scroll: [],
@@ -225,6 +230,7 @@ const report = {
   m5: null,
   m6: null,
   m7: null,
+  m8: null,
   steps: results,
   pageErrors: [],
 };
@@ -252,6 +258,7 @@ const EDIT_GATE = { required: config.requireEdit, env: "OXBASE_E2E_REQUIRE_EDIT"
 const M5_GATE = { required: config.requireM5, env: "OXBASE_E2E_REQUIRE_M5" };
 const M6_GATE = { required: config.requireM6, env: "OXBASE_E2E_REQUIRE_M6" };
 const M7_GATE = { required: config.requireM7, env: "OXBASE_E2E_REQUIRE_M7" };
+const M8_GATE = { required: config.requireM8, env: "OXBASE_E2E_REQUIRE_M8" };
 
 async function step(name, fn, gate = EDIT_GATE) {
   const started = Date.now();
@@ -2347,6 +2354,483 @@ async function redisSteps() {
   return `m7:ns: ${out.nsKeys} keys; m7:hash ${out.hashValue}; edited ${out.edited}; HGETALL shown`;
 }
 
+// ---------------------------------------------------------------------------------------------
+// M8: structure sync, data sync, transfer, backup (docs/m8-contracts.md §8.4, ui/e2e/README.md
+// step 12). Tolerant (skips) until OXBASE_E2E_REQUIRE_M8=1.
+
+/** M8 expectations from tests/fixtures.toml `[m8]` (structure items, data counts, transfer). */
+async function fixtureM8() {
+  const text = await readFile(path.resolve(here, "../../tests/fixtures.toml"), "utf8");
+  const start = text.indexOf("\n[m8]");
+  if (start < 0) return null;
+  const m8 = text.slice(start);
+  const list = /structure_items\s*=\s*\[([\s\S]*?)\]/.exec(m8);
+  const items = list ? [...list[1].matchAll(/"([^"]+)"/g)].map((m) => m[1]) : [];
+  const counts = /m8_data\s*=\s*\[(\d+),\s*(\d+),\s*(\d+)\]/.exec(m8);
+  const rows = /types_rows\s*=\s*(\d+)/.exec(m8);
+  return {
+    items,
+    data: counts ? counts.slice(1).map(Number) : null,
+    typesRows: rows ? Number(rows[1]) : null,
+  };
+}
+
+/** Until the M8 streams are integrated a failure is a skip; OXBASE_E2E_REQUIRE_M8=1 fails. */
+async function m8Tolerant(fn) {
+  try {
+    return await fn();
+  } catch (error) {
+    await closeOpenDialogs().catch(() => {});
+    if (config.requireM8 || error instanceof SkipStep) throw error;
+    throw new SkipStep(`not working in this build yet: ${error.message}`);
+  }
+}
+
+/**
+ * Picks `want` (an option's value, its exact text, or text containing it) in the select whose
+ * `<label>` reads `label`, inside `root`; waits until the option is there (lists load lazily).
+ */
+async function selectByLabel(root, label, want, timeoutMs = 20_000) {
+  await waitFor(
+    `"${want}" in the "${label}" list`,
+    async () => {
+      const out = await wd.execute(
+        `const [root, label, want] = arguments;
+         const l = Array.from((root || document).querySelectorAll('label'))
+           .find((x) => x.textContent.trim() === label);
+         if (!l) return 'no field "' + label + '"';
+         const sel = document.getElementById(l.htmlFor);
+         if (!sel || sel.tagName !== 'SELECT') return 'no select for "' + label + '"';
+         const opts = Array.from(sel.options);
+         const opt = opts.find((o) => o.value === want || o.textContent.trim() === want)
+           || opts.find((o) => o.value && o.textContent.includes(want));
+         if (!opt) return 'options: ' + opts.map((o) => o.textContent).join(' | ');
+         if (sel.disabled) return 'disabled';
+         if (sel.value !== opt.value) {
+           const setter = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value').set;
+           setter.call(sel, opt.value);
+           sel.dispatchEvent(new Event('change', { bubbles: true }));
+         }
+         return 'ok';`,
+        root,
+        label,
+        want,
+      );
+      if (out === "ok") return true;
+      throw new Error(out);
+    },
+    { timeoutMs },
+  );
+}
+
+/** Picks a connection, database and (when it has schemas) schema in a container picker. */
+async function pickContainer(root, prefix, { connection, database, schema }) {
+  await selectByLabel(root, `${prefix} connection`, connection);
+  await selectByLabel(root, `${prefix} database`, database);
+  if (schema) await selectByLabel(root, `${prefix} schema`, schema);
+}
+
+/** The last visible element matching `css` (the newest tab or dialog of its kind). */
+function lastVisible(css) {
+  return wd.executeElement(
+    "const all = Array.from(document.querySelectorAll(arguments[0])).filter((e) => e.offsetParent !== null);" +
+      "return all.length ? all[all.length - 1] : null;",
+    css,
+  );
+}
+
+/** The open dialog titled `title`. */
+function dialogNamed(title) {
+  return wd.executeElement(
+    "for (const d of document.querySelectorAll('[role=dialog]')) {" +
+      "  const h = d.querySelector('.modal__title'); if (h && h.textContent.trim() === arguments[0]) return d; }" +
+      "return null;",
+    title,
+  );
+}
+
+/** Clicks the element matching `css` inside `root` once it is enabled. */
+async function clickWhenEnabled(root, css, what, timeoutMs = 30_000) {
+  const el = await waitFor(
+    what,
+    async () => {
+      const found = await within(root, css);
+      if (!found) return null;
+      return (await wd.execute("return !arguments[0].disabled;", found)) ? found : null;
+    },
+    { timeoutMs },
+  );
+  await wd.execute("arguments[0].scrollIntoView({ block: 'nearest' }); arguments[0].click();", el);
+}
+
+/** Opens an item of an app bar menu (`app-compare`, `app-backup`). */
+async function appMenu(testid, label) {
+  const button = await waitFor(`the app bar's ${testid} button`, () =>
+    within(null, `[data-testid=${testid}]`),
+  );
+  await wd.execute("arguments[0].click();", button);
+  const item = await waitFor(`the "${label}" menu item`, () =>
+    wd.executeElement(
+      "for (const i of document.querySelectorAll('[role=menu] [role=menuitem]'))" +
+        "  if (i.textContent.trim() === arguments[0]) return i;" +
+        "return null;",
+      label,
+    ),
+  );
+  await wd.execute("arguments[0].click();", item);
+}
+
+/** M8 state: the PostgreSQL session's profile and database, the fixture expectations. */
+const m8 = { ready: false, expect: null, database: "" };
+
+async function m8Setup() {
+  report.m8 = {};
+  const pg = await fixtureEngine("postgres");
+  m8.database = pg?.database ?? "oxbase_test";
+  m8.expect = await fixtureM8();
+  if (!m8.expect) throw new SkipStep("tests/fixtures.toml has no [m8] section");
+  const session = await sessionOf(config.profileName);
+  const rows = await scriptViaIpc(
+    session.id,
+    "SELECT count(*) FROM information_schema.schemata WHERE schema_name IN ('m8_src', 'm8_tgt', 'm8_xfer')",
+  );
+  const found = Number(rows[0]?.[0] ?? 0);
+  report.m8.seeds = found;
+  if (found < 3) {
+    throw new SkipStep(
+      `the M8 PostgreSQL seed (tests/docker/init/postgres/06-m8.sql) is not loaded: ${found} of the schemas m8_src, m8_tgt, m8_xfer exist`,
+    );
+  }
+  m8.ready = true;
+  return `seeds present; ${m8.expect.items.length} structure items expected`;
+}
+
+/** The PostgreSQL side of a picker: the smoke profile, its database, `schema`. */
+function pgSide(schema) {
+  return { connection: config.profileName, database: m8.database, schema };
+}
+
+async function m8DataStep() {
+  await appMenu("app-compare", "Data sync");
+  const view = await waitFor("the data sync tab", () => lastVisible("[data-testid=data-sync]"));
+  await pickContainer(view, "Source", pgSide("m8_src"));
+  await pickContainer(view, "Target", pgSide("m8_tgt"));
+  await waitFor("the table pairs", () => within(view, "[data-testid=data-pairs]"));
+  // Only m8_data.
+  await wd.execute(
+    "for (const r of arguments[0].querySelectorAll('[data-testid=data-pair]')) {" +
+      "  const c = r.querySelector('input[type=checkbox]');" +
+      "  const want = r.getAttribute('data-table') === 'm8_data';" +
+      "  if (c && !c.disabled && c.checked !== want) c.click(); }",
+    view,
+  );
+  await clickWhenEnabled(view, "[data-testid=data-compare]", "the Compare button");
+  const counts = await waitFor(
+    "the m8_data counts",
+    async () => {
+      const error = await textIn(view, "[data-testid=data-error]");
+      if (error) throw new Fatal(error);
+      if (!(await within(view, "[data-testid=data-totals]"))) return null;
+      return wd.execute(
+        "for (const r of arguments[0].querySelectorAll('[data-testid=data-table-row]')) {" +
+          "  if (r.getAttribute('data-table') !== 'm8_data') continue;" +
+          "  const n = (id) => { const e = r.querySelector('[data-testid=' + id + ']'); return e ? Number(e.textContent.replace(/,/g, '')) : null; };" +
+          "  return [n('count-inserts'), n('count-updates'), n('count-deletes'), r.textContent]; }" +
+          "return null;",
+        view,
+      );
+    },
+    { timeoutMs: 60_000 },
+  );
+  await gallery("08-data-sync");
+  report.m8.data = counts.slice(0, 3);
+  const want = m8.expect.data;
+  if (want && counts.slice(0, 3).join("/") !== want.join("/")) {
+    throw new Error(
+      `m8_data shows ${counts.slice(0, 3).join(" / ")}, expected ${want.join(" / ")}: ${counts[3]}`,
+    );
+  }
+  return `m8_data ${counts.slice(0, 3).join(" / ")} (inserts / updates / deletes)`;
+}
+
+async function m8StructureStep() {
+  await appMenu("app-compare", "Structure sync");
+  const view = await waitFor("the structure sync tab", () =>
+    lastVisible("[data-testid=structure-sync]"),
+  );
+  await pickContainer(view, "Source", pgSide("m8_src"));
+  await pickContainer(view, "Target", pgSide("m8_tgt"));
+  await clickWhenEnabled(view, "[data-testid=structure-compare]", "the Compare button");
+  const ids = await waitFor(
+    "the differences",
+    async () => {
+      const error = await textIn(view, "[data-testid=structure-error]");
+      if (error) throw new Fatal(error);
+      if (!(await within(view, "[data-testid=structure-items], [data-testid=structure-no-diffs]")))
+        return null;
+      return wd.execute(
+        "return Array.from(arguments[0].querySelectorAll('[data-testid=structure-item]')).map((e) => e.getAttribute('data-item-id'));",
+        view,
+      );
+    },
+    { timeoutMs: 90_000 },
+  );
+  const missing = m8.expect.items.filter(
+    (want) => !ids.some((id) => id === want || id.startsWith(`${want}(`)),
+  );
+  report.m8.structureItems = ids;
+  if (missing.length > 0) {
+    throw new Error(`the compare does not list ${missing.join(", ")} (shown: ${ids.join(", ")})`);
+  }
+  // The script tab, for the screenshot.
+  const tab = await within(view, "[data-testid=structure-script-tab]");
+  if (tab) await wd.execute("arguments[0].click();", tab);
+  await waitFor("the sync script", async () =>
+    ((await textIn(view, "[data-testid=structure-script-status]")) ?? "").includes("statement"),
+  );
+  await gallery("08-structure-sync");
+
+  // Apply everything selected (no drops: the default), confirming destructive column drops.
+  await clickWhenEnabled(view, "[data-testid=structure-apply]", "the Apply button");
+  const dialog = await waitFor("the confirmation", () => dialogNamed("Apply the sync script?"));
+  const ack = await within(dialog, "[data-testid=structure-acknowledge]");
+  if (ack) await wd.execute("if (!arguments[0].checked) arguments[0].click();", ack);
+  await clickWhenEnabled(dialog, "[data-testid=structure-confirm]", "the confirm button");
+  const result = await waitFor(
+    "the apply result",
+    () => textIn(view, "[data-testid=structure-result]"),
+    { timeoutMs: 120_000 },
+  );
+  report.m8.structureResult = result;
+  if (!result.startsWith("In sync")) throw new Error(`after the apply: ${result}`);
+  const left = await wd.execute(
+    "return Array.from(arguments[0].querySelectorAll('[data-testid=structure-item]')).map((e) => e.getAttribute('data-item-id') + ':' + e.getAttribute('data-status'));",
+    view,
+  );
+  const unexpected = left.filter((x) => !x.endsWith(":only_in_target"));
+  if (unexpected.length > 0) throw new Error(`the re-compare still lists ${unexpected.join(", ")}`);
+  return `${ids.length} differences; applied; re-compare in sync (left: ${left.join(", ") || "none"})`;
+}
+
+/** A MySQL session for the transfer target when the fixture runs (else `null`). */
+async function m8MySql() {
+  const mysql = await fixtureEngine("mysql");
+  if (!mysql?.host || !mysql.port || !(await reachable(mysql.host, mysql.port))) return null;
+  const name = "E2E MySQL";
+  const sessions = await ipc("list_open_connections", {});
+  if (!sessions.some((s) => s.profile_name === name)) {
+    await ipc("save_profile", { profile: fixtureProfile(name, "mysql", mysql), secrets: {} });
+    await wd.execute("location.reload();");
+    await sleep(500);
+    await waitFor(
+      "the reloaded document",
+      () => wd.execute("return document.readyState === 'complete' && !window.__e2e;"),
+      { timeoutMs: 60_000 },
+    ).catch(() => {});
+    await wd.execute(INSTALL_PROBES, HOOKS);
+    await waitFor("the status bar after the reload", async () =>
+      (await hookText("statusBar"))?.includes("oxbase core"),
+    );
+    await connectProfile(name, mysql.password);
+  }
+  return { name, session: await sessionOf(name) };
+}
+
+async function m8TransferStep() {
+  const pgSession = await sessionOf(config.profileName);
+  const mysql = await m8MySql();
+  const scratch = `e2e_m8_xfer_${runToken()}`;
+  let target;
+  if (mysql) {
+    target = { connection: mysql.name, database: "m8_xfer_target", schema: null, engine: "MySQL" };
+  } else {
+    await scriptViaIpc(pgSession.id, `CREATE SCHEMA ${scratch}`);
+    target = { ...pgSide(scratch), engine: "PostgreSQL" };
+  }
+  report.m8.transferTarget = `${target.engine} ${target.schema ?? target.database}`;
+  try {
+    const opened = await wd.execute(
+      "const b = document.querySelector('[data-testid=app-transfer]'); if (b) b.click(); return !!b;",
+    );
+    if (!opened) throw new Error("no Transfer button in the app bar");
+    const dialog = await waitFor("the transfer wizard", () => dialogNamed("Data transfer"));
+    await pickContainer(dialog, "Source", pgSide("m8_xfer"));
+    const box = await waitFor("m8_xfer.m8_types in the object list", () =>
+      wd.executeElement(
+        "for (const l of arguments[0].querySelectorAll('[data-testid=transfer-objects] label'))" +
+          "  if (l.textContent.trim().startsWith('m8_xfer.m8_types')) return l.querySelector('input');" +
+          "return null;",
+        dialog,
+      ),
+    );
+    await wd.execute("if (!arguments[0].checked) arguments[0].click();", box);
+    await clickWhenEnabled(dialog, "[data-testid=transfer-next]", "Next (source)");
+    await pickContainer(dialog, "Target", target);
+    await clickWhenEnabled(dialog, "[data-testid=transfer-next]", "Next (target)");
+    if (mysql) await selectByLabel(dialog, "When a target table exists", "replace");
+    await clickWhenEnabled(dialog, "[data-testid=transfer-next]", "Next (objects)");
+    const columns = await waitFor(
+      "the column mapping",
+      async () => {
+        const error = await textIn(dialog, "[data-testid=transfer-plan-error]");
+        if (error) throw new Fatal(error);
+        return wd.execute(
+          "return arguments[0].querySelectorAll('[data-testid=mapping-row]').length;",
+          dialog,
+        );
+      },
+      { timeoutMs: 60_000 },
+    );
+    await gallery("08-transfer-mapping");
+    await clickWhenEnabled(dialog, "[data-testid=transfer-next]", "Next (mapping)");
+    await clickWhenEnabled(dialog, "[data-testid=transfer-next]", "Next (options)");
+    await waitFor("the dry-run DDL", () => within(dialog, "[data-testid=transfer-ddl]"), {
+      timeoutMs: 60_000,
+    });
+    const ack = await within(dialog, "[data-testid=transfer-acknowledge]");
+    if (ack) await wd.execute("if (!arguments[0].checked) arguments[0].click();", ack);
+    await gallery("08-transfer-review");
+    await clickWhenEnabled(dialog, "[data-testid=transfer-start]", "Start transfer", 60_000);
+    const status = await waitFor(
+      "the transfer to finish",
+      async () => {
+        const error = await textIn(dialog, "[data-testid=transfer-error]");
+        if (error) throw new Fatal(error);
+        const text = (await textIn(dialog, "[data-testid=transfer-status]")) ?? "";
+        if (text.startsWith("Cancelled")) throw new Fatal("the transfer was cancelled");
+        return text.startsWith("Finished") ? text : null;
+      },
+      { timeoutMs: 180_000 },
+    );
+    await gallery("08-transfer-run");
+    const sql = mysql
+      ? "SELECT COUNT(*) FROM m8_xfer_target.m8_types"
+      : `SELECT count(*) FROM ${scratch}.m8_types`;
+    const rows = await scriptViaIpc(mysql ? mysql.session.id : pgSession.id, sql);
+    const count = Number(rows[0]?.[0]);
+    const want = m8.expect.typesRows;
+    if (want !== null && count !== want) {
+      throw new Error(`the target m8_types has ${count} rows, expected ${want}`);
+    }
+    const close = await within(dialog, ".modal__footer .button--primary");
+    if (close) await wd.execute("arguments[0].click();", close);
+    return `PostgreSQL → ${report.m8.transferTarget}: ${columns} columns mapped; ${status}; ${count} rows read back`;
+  } finally {
+    if (!mysql) {
+      await scriptViaIpc(pgSession.id, `DROP SCHEMA ${scratch} CASCADE`).catch((error) =>
+        log(`could not drop ${scratch}: ${error.message}`),
+      );
+    }
+  }
+}
+
+async function m8BackupStep() {
+  if (!m5.hook) throw new SkipStep("this build has no e2e file hook (debug builds only)");
+  await appMenu("app-backup", "Back up…");
+  const dialog = await waitFor("the backup dialog", () => dialogNamed("Back up"));
+  await pickContainer(dialog, "Back up", pgSide("m8_src"));
+  await gallery("08-backup");
+  await clickWhenEnabled(dialog, "[data-testid=backup-start]", "Back up…");
+  const result = await waitFor(
+    "the backup to finish",
+    async () => {
+      const text = await textIn(dialog, "[data-testid=backup-result]");
+      if (text && !text.startsWith("Backup written")) throw new Fatal(text);
+      return text;
+    },
+    { timeoutMs: 120_000 },
+  );
+  const close = await within(dialog, ".modal__footer .button--primary");
+  if (close) await wd.execute("arguments[0].click();", close);
+  // The hook's open/ folder must hold exactly the archive.
+  const saved = (await readdir(path.join(m5.dir, "save"))).filter((f) => f.endsWith(".oxbackup"));
+  if (saved.length === 0) throw new Error("no .oxbackup file in the hook's save folder");
+  const archive = saved.sort().at(-1);
+  await rm(path.join(m5.dir, "open"), { recursive: true, force: true });
+  await mkdir(path.join(m5.dir, "open"), { recursive: true });
+  await copyFile(path.join(m5.dir, "save", archive), path.join(m5.dir, "open", archive));
+  await m8RestoreScreens();
+
+  await appMenu("app-backup", "Verify a backup…");
+  const verify = await waitFor("the verify dialog", () => dialogNamed("Verify a backup"));
+  await clickWhenEnabled(verify, "[data-testid=restore-choose]", "Choose backup…");
+  await waitFor(
+    "the manifest",
+    async () => {
+      const error = await textIn(verify, "[data-testid=restore-manifest-error]");
+      if (error) throw new Fatal(error);
+      return within(verify, "[data-testid=restore-manifest]");
+    },
+    { timeoutMs: 30_000 },
+  );
+  await clickWhenEnabled(verify, "[data-testid=restore-verify]", "Verify checksums");
+  const verdict = await waitFor(
+    "the verify result",
+    () => textIn(verify, "[data-testid=verify-result]"),
+    { timeoutMs: 60_000 },
+  );
+  const done = await within(verify, ".modal__footer .button--primary");
+  if (done) await wd.execute("arguments[0].click();", done);
+  report.m8.backup = { archive, verdict };
+  if (!verdict.startsWith("Archive OK")) throw new Error(`verify: ${verdict}`);
+  return `${result}; verify: ${verdict}`;
+}
+
+/**
+ * Screenshots of the restore dialog with the archive's manifest shown (never fails). Nothing is
+ * restored: the dialog is cancelled before a target is picked.
+ */
+async function m8RestoreScreens() {
+  let dialog = null;
+  try {
+    await appMenu("app-backup", "Restore…");
+    dialog = await waitFor("the restore dialog", () => dialogNamed("Restore a backup"));
+    await clickWhenEnabled(dialog, "[data-testid=restore-choose]", "Choose backup…");
+    await waitFor("the manifest", () => within(dialog, "[data-testid=restore-manifest]"), {
+      timeoutMs: 30_000,
+    });
+    await gallery("08-restore");
+  } catch (error) {
+    log(`no restore screenshot: ${error.message}`);
+  } finally {
+    if (dialog) {
+      const cancel = await within(dialog, ".modal__footer .modal__footer-start").catch(() => null);
+      if (cancel) await wd.execute("arguments[0].click();", cancel).catch(() => {});
+    }
+  }
+}
+
+/**
+ * Screenshots of the M8 views as they open, before anything runs (never fails): the transfer
+ * wizard listing a schema's tables and a structure sync tab with both sides picked.
+ */
+async function m8Screens() {
+  try {
+    const opened = await wd.execute(
+      "const b = document.querySelector('[data-testid=app-transfer]'); if (b) b.click(); return !!b;",
+    );
+    if (opened) {
+      const dialog = await waitFor("the transfer wizard", () => dialogNamed("Data transfer"));
+      await selectByLabel(dialog, "Source connection", config.profileName).catch(() => {});
+      await selectByLabel(dialog, "Source database", m8.database || "oxbase_test").catch(() => {});
+      await selectByLabel(dialog, "Source schema", m8.ready ? "m8_xfer" : "public").catch(() => {});
+      await sleep(1000);
+      await gallery("08-transfer-wizard");
+      await closeOpenDialogs();
+    }
+    await appMenu("app-compare", "Structure sync");
+    const view = await waitFor("the structure sync tab", () =>
+      lastVisible("[data-testid=structure-sync]"),
+    );
+    await pickContainer(view, "Source", pgSide(m8.ready ? "m8_src" : "public")).catch(() => {});
+    await pickContainer(view, "Target", pgSide(m8.ready ? "m8_tgt" : "public")).catch(() => {});
+    await sleep(500);
+    await gallery("08-structure-sync-setup");
+  } catch (error) {
+    log(`M8 screenshots: ${error.message}`);
+  }
+}
+
 function markdownSummary() {
   const lines = ["## Webview smoke (Linux)", ""];
   lines.push("| Step | Result | Time | Detail |", "|---|---|---|---|");
@@ -2431,6 +2915,9 @@ function markdownSummary() {
       `M7: MongoDB ${m.mongo ? JSON.stringify(m.mongo) : "not run"}; Redis ${m.redis ? JSON.stringify(m.redis) : "not run"}.`,
     );
   }
+  if (report.m8) {
+    lines.push(`M8: ${JSON.stringify(report.m8)}.`);
+  }
   if (report.cancel) {
     lines.push(
       `Cancel: "Cancelled" ${report.cancel.ms} ms after Stop (limit ${config.cancelLimitMs} ms), ` +
@@ -2471,6 +2958,32 @@ async function main() {
     }
     if (ready && m7.redis) {
       await step("Browse, edit and query Redis (M7)", () => m7Tolerant(redisSteps), M7_GATE);
+    }
+  }
+
+  if (ok) {
+    // M8 (docs/m8-contracts.md §8.4): data and structure compare of the PostgreSQL m8_src /
+    // m8_tgt seeds, the structure apply, a transfer, a backup + verify; screenshots of the
+    // transfer wizard and the sync views. Tolerant (skips) until OXBASE_E2E_REQUIRE_M8=1.
+    await step("M8 PostgreSQL seeds are loaded (M8)", () => m8Tolerant(m8Setup), M8_GATE);
+    await m8Screens();
+    if (m8.ready) {
+      await step(
+        "Data compare m8_src → m8_tgt shows the m8_data counts (M8)",
+        () => m8Tolerant(m8DataStep),
+        M8_GATE,
+      );
+      await step(
+        "Structure compare m8_src → m8_tgt, apply, re-compare in sync (M8)",
+        () => m8Tolerant(m8StructureStep),
+        M8_GATE,
+      );
+      await step("Transfer m8_xfer.m8_types (M8)", () => m8Tolerant(m8TransferStep), M8_GATE);
+      await step(
+        "Back up m8_src and verify the archive (M8)",
+        () => m8Tolerant(m8BackupStep),
+        M8_GATE,
+      );
     }
   }
 

@@ -1,0 +1,31 @@
+# MySQL -> SQLite
+boolean                  -> boolean                              widened     SQLite has no boolean type: stored as the integers 0 and 1
+int8                     -> int64                                widened     SQLite stores every integer as a 64-bit INTEGER
+int16                    -> int64                                widened     SQLite stores every integer as a 64-bit INTEGER
+int32                    -> int64                                widened     SQLite stores every integer as a 64-bit INTEGER
+int64                    -> int64                                exact
+int32 unsigned           -> int64                                widened     SQLite stores every integer as a 64-bit INTEGER
+int64 unsigned           -> text                                 widened     SQLite integers are signed 64-bit: stored as decimal text
+float32                  -> float64                              widened     SQLite floats are 64-bit: every value is kept
+float64                  -> float64                              exact
+decimal(18,4)            -> decimal(18,4)                        widened     more than 15 digits: declared DECIMAL_TEXT, so the exact text is kept (it compares and sorts as text)
+decimal(38,10)           -> decimal(38,10)                       widened     more than 15 digits: declared DECIMAL_TEXT, so the exact text is kept (it compares and sorts as text)
+decimal                  -> decimal(65,30)                       widened     more than 15 digits: declared DECIMAL_TEXT, so the exact text is kept (it compares and sorts as text)
+char(10)                 -> char(10)                             widened     SQLite does not enforce text lengths: every value is kept
+varchar(255)             -> varchar(255)                         widened     SQLite does not enforce text lengths: every value is kept
+varchar                  -> text                                 exact
+text                     -> text                                 exact
+binary(16)               -> varbinary                            widened     stored as a BLOB without a length limit
+varbinary                -> varbinary                            exact
+date                     -> date                                 widened     SQLite has no date and time types: stored as ISO-8601 text
+time(6)                  -> time(6)                              widened     SQLite has no date and time types: stored as ISO-8601 text
+timestamp(6)             -> timestamp(6)                         widened     SQLite has no date and time types: stored as ISO-8601 text
+timestamptz(6)           -> timestamp(6)                         widened     SQLite has no date and time types: stored as ISO-8601 text
+interval                 -> varchar(64)                          widened     SQLite does not enforce text lengths: every value is kept
+uuid                     -> char(36)                             widened     SQLite does not enforce text lengths: every value is kept
+json                     -> json                                 widened     SQLite has no JSON type: stored as JSON text
+jsonb                    -> jsonb                                widened     SQLite has no JSON type: stored as JSON text
+int32[]                  -> json                                 widened     SQLite has no JSON type: stored as JSON text
+text[]                   -> json                                 widened     SQLite has no JSON type: stored as JSON text
+enum(small, medium, large) -> text                                 widened     SQLite has no enum types: the labels are stored as text
+geometry                 -> text                                 widened     an engine-specific type: stored as the value's text form

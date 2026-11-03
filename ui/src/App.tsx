@@ -26,6 +26,7 @@ import {
   openQueryEditor,
   type PubSubPanelParams,
   type QueryEditorParams,
+  type SyncPanelParams,
   setDockviewApi,
   showHistory,
   type TableDataPanelParams,
@@ -34,6 +35,10 @@ import { CollectionPanel } from "./workbench/nosql/CollectionPanel";
 import { ConsolePanel } from "./workbench/nosql/console/ConsolePanel";
 import { KeyBrowserPanel } from "./workbench/nosql/keys/KeyBrowserPanel";
 import { PubSubPanel } from "./workbench/nosql/pubsub/PubSubPanel";
+import { DataSyncPanel } from "./workbench/sync/DataSyncPanel";
+import { StructureSyncPanel } from "./workbench/sync/StructureSyncPanel";
+import { SyncHost } from "./workbench/sync/SyncHost";
+import { SyncMenu } from "./workbench/sync/SyncMenu";
 import { openImport } from "./workbench/transfer/store";
 import { TransferHost } from "./workbench/transfer/TransferHost";
 import { ObjectTreePanel } from "./workbench/tree/ObjectTreePanel";
@@ -117,6 +122,14 @@ function PubSubTab({ params }: IDockviewPanelProps<PubSubPanelParams>) {
   return <PubSubPanel sessionId={params.sessionId} />;
 }
 
+function StructureSyncTab({ params }: IDockviewPanelProps<SyncPanelParams>) {
+  return <StructureSyncPanel params={params ?? {}} />;
+}
+
+function DataSyncTab({ params }: IDockviewPanelProps<SyncPanelParams>) {
+  return <DataSyncPanel params={params ?? {}} />;
+}
+
 const components: Record<string, FunctionComponent<IDockviewPanelProps>> = {
   connections: () => <ConnectionsPanel />,
   objects: () => <ObjectTreePanel />,
@@ -129,6 +142,8 @@ const components: Record<string, FunctionComponent<IDockviewPanelProps>> = {
   keys: KeysTab,
   console: ConsoleTab,
   pubsub: PubSubTab,
+  structureSync: StructureSyncTab,
+  dataSync: DataSyncTab,
 };
 
 // Structural variables come from dockview's light theme; colours are overridden in
@@ -197,6 +212,7 @@ export function App() {
             <FileInput {...ICON} />
             Import…
           </button>
+          <SyncMenu />
           <button type="button" className="button button--ghost" onClick={showHistory}>
             <History {...ICON} />
             History
@@ -208,6 +224,7 @@ export function App() {
       </main>
       <StatusBar />
       <TransferHost />
+      <SyncHost />
     </div>
   );
 }

@@ -55,7 +55,7 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use oxbase_driver::{CancellationToken, Connection, ResultItem, ResultStream, Tx, cell_value};
 use oxbase_types::{
-    BoundStatement, DataType, Engine, Error, ObjectRef, Result, ServerVersion, Value,
+    BoundStatement, ColumnDef, DataType, Engine, Error, ObjectRef, Result, ServerVersion, Value,
 };
 use serde::{Deserialize, Serialize};
 
@@ -393,6 +393,33 @@ pub trait BulkLoader: Send + Sync {
     ) -> Option<Result<()>> {
         let _ = (session, target, cancel);
         None
+    }
+
+    /// M8 (`docs/m8-contracts.md` §4.4): statements that switch foreign-key enforcement for
+    /// loads into `table` off (`enabled = false`, run once on the load session before the first
+    /// load, outside any transaction) or back on (`enabled = true`, after the last load, also
+    /// after a failure). `None` (default): the engine cannot do it for a session (PostgreSQL
+    /// needs superuser rights for `session_replication_role`), and transfer and restore rely on
+    /// dependency order and foreign keys added after the load instead. Engines (transfer
+    /// stream): MySQL / MariaDB `SET FOREIGN_KEY_CHECKS = 0 / 1` (session), SQLite `PRAGMA
+    /// foreign_keys = OFF / ON` (session, outside a transaction), SQL Server `ALTER TABLE t
+    /// NOCHECK CONSTRAINT fk` / `WITH CHECK CHECK CONSTRAINT fk` for each foreign key of the
+    /// table (not `ALL`, which would also switch check constraints; re-enabling validates the
+    /// loaded rows).
+    fn foreign_key_checks(&self, table: &ObjectRef, enabled: bool) -> Option<Vec<String>> {
+        let _ = (table, enabled);
+        None
+    }
+
+    /// M8: statements run after loads that wrote explicit values into the identity or
+    /// auto-increment `columns` of `table`, so the next generated value follows the loaded ones.
+    /// Default: none (MySQL, MariaDB, SQLite and SQL Server move their counters past explicit
+    /// values themselves). PostgreSQL (transfer stream): `SELECT setval(pg_get_serial_sequence(
+    /// '<table>', '<column>'), max(<column>)) FROM <table>` per column, names as literals and
+    /// identifiers through `Quoting`.
+    fn identity_resync(&self, table: &ObjectRef, columns: &[ColumnDef]) -> Vec<String> {
+        let _ = (table, columns);
+        Vec::new()
     }
 
     /// Inserts every row of `batch` (in the load schema of `target`) into `target.table` on

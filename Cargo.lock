@@ -304,6 +304,7 @@ dependencies = [
  "arrow-schema",
  "arrow-select",
  "flatbuffers",
+ "zstd",
 ]
 
 [[package]]
@@ -885,9 +886,9 @@ dependencies = [
 
 [[package]]
 name = "calamine"
-version = "0.37.0"
+version = "0.38.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c9ca341b94bc4b29e08970b1a03914fad2dfe177e2ecb67fcd6de9046004aafb"
+checksum = "f431b67cba6122a1f7d26b7adafc71bbdf07026095fe811f5efc025d8748e1d8"
 dependencies = [
  "atoi_simd",
  "byteorder",
@@ -4376,6 +4377,29 @@ version = "0.7.0"
 [[package]]
 name = "oxbase-backup"
 version = "0.7.0"
+dependencies = [
+ "arrow-array",
+ "arrow-ipc",
+ "arrow-schema",
+ "async-trait",
+ "chrono",
+ "futures",
+ "oxbase-dialect",
+ "oxbase-diff",
+ "oxbase-driver",
+ "oxbase-io",
+ "oxbase-transfer",
+ "oxbase-types",
+ "pretty_assertions",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
+ "zip",
+]
 
 [[package]]
 name = "oxbase-bi"
@@ -4393,12 +4417,15 @@ name = "oxbase-conformance"
 version = "0.7.0"
 dependencies = [
  "arrow-array",
+ "arrow-cast",
  "async-trait",
+ "chrono",
  "futures",
  "oxbase-dialect",
  "oxbase-driver",
  "oxbase-net",
  "oxbase-services",
+ "oxbase-sql",
  "oxbase-store",
  "oxbase-types",
  "pretty_assertions",
@@ -4408,6 +4435,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "toml 1.1.8+spec-1.1.0",
+ "zip",
 ]
 
 [[package]]
@@ -4442,6 +4470,28 @@ dependencies = [
 [[package]]
 name = "oxbase-diff"
 version = "0.7.0"
+dependencies = [
+ "arrow-array",
+ "arrow-ipc",
+ "arrow-schema",
+ "arrow-select",
+ "async-trait",
+ "chrono",
+ "futures",
+ "oxbase-dialect",
+ "oxbase-driver",
+ "oxbase-mssql",
+ "oxbase-mysql",
+ "oxbase-pg",
+ "oxbase-sql",
+ "oxbase-sqlite",
+ "oxbase-types",
+ "pretty_assertions",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
 
 [[package]]
 name = "oxbase-driver"
@@ -4689,8 +4739,10 @@ dependencies = [
  "async-trait",
  "chrono",
  "futures",
+ "oxbase-backup",
  "oxbase-designer",
  "oxbase-dialect",
+ "oxbase-diff",
  "oxbase-driver",
  "oxbase-insight",
  "oxbase-io",
@@ -4704,6 +4756,7 @@ dependencies = [
  "oxbase-sql",
  "oxbase-sqlite",
  "oxbase-store",
+ "oxbase-transfer",
  "oxbase-types",
  "pretty_assertions",
  "serde",
@@ -4762,6 +4815,23 @@ dependencies = [
 [[package]]
 name = "oxbase-transfer"
 version = "0.7.0"
+dependencies = [
+ "arrow-array",
+ "arrow-schema",
+ "arrow-select",
+ "async-trait",
+ "chrono",
+ "futures",
+ "oxbase-dialect",
+ "oxbase-driver",
+ "oxbase-io",
+ "oxbase-types",
+ "pretty_assertions",
+ "serde",
+ "serde_json",
+ "tokio",
+ "uuid",
+]
 
 [[package]]
 name = "oxbase-types"

@@ -1,0 +1,31 @@
+# MariaDB -> SQL Server
+boolean                  -> boolean                              exact
+int8                     -> int16                                widened     SQL Server tinyint is unsigned: stored as smallint
+int16                    -> int16                                exact
+int32                    -> int32                                exact
+int64                    -> int64                                exact
+int32 unsigned           -> int64                                widened     SQL Server has no unsigned int: stored as bigint
+int64 unsigned           -> decimal(20,0)                        widened     SQL Server has no unsigned bigint: stored as decimal(20,0)
+float32                  -> float32                              exact
+float64                  -> float64                              exact
+decimal(18,4)            -> decimal(18,4)                        exact
+decimal(38,10)           -> decimal(38,10)                       exact
+decimal                  -> decimal(38,30)                       narrowed    SQL Server decimals have at most 38 digits: longer values are refused
+char(10)                 -> char(10)                             narrowed    nchar lengths count UTF-16 code units, and characters outside the BMP take two: a value with them can exceed nchar(n) and is refused
+varchar(255)             -> varchar(510)                         widened     nvarchar lengths count UTF-16 code units, and characters outside the BMP take two: stored as nvarchar(510) to hold 255 characters
+varchar                  -> text                                 exact
+text                     -> text                                 exact
+binary(16)               -> binary(16)                           exact
+varbinary                -> varbinary                            exact
+date                     -> date                                 exact
+time(6)                  -> time(6)                              exact
+timestamp(6)             -> timestamp(6)                         exact
+timestamptz(6)           -> timestamp(6)                         exact
+interval                 -> varchar(128)                         widened     nvarchar lengths count UTF-16 code units, and characters outside the BMP take two: stored as nvarchar(128) to hold 64 characters
+uuid                     -> uuid                                 exact
+json                     -> json                                 exact
+jsonb                    -> jsonb                                exact
+int32[]                  -> json                                 exact
+text[]                   -> json                                 exact
+enum(small, medium, large) -> varchar(6)                           widened     SQL Server has no enum types: the labels are stored as text
+geometry                 -> geometry [geometry]                  narrowed    an engine-specific type: values are copied in their text form, which SQL Server must accept

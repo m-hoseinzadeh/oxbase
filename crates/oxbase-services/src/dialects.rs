@@ -31,6 +31,9 @@ pub fn default_dialects() -> DialectRegistry {
     // M7: fetchers, KeyValueStore, PubSub and ScriptLanguage (the console).
     oxbase_redis::dialect::register(&mut reg);
 
+    // M8 (docs/m8-contracts.md §1): the TypeMapper of every SQL engine (data transfer).
+    oxbase_transfer::register(&mut reg);
+
     mark_provisional(&mut reg);
     reg
 }
@@ -127,6 +130,39 @@ mod tests {
             ObjectKind::Sequence
         ));
         assert!(provisional_applicable(Engine::Sqlite, ObjectKind::Database));
+    }
+
+    /// M8 transfer: every SQL engine maps types (`docs/m8-contracts.md` §1); MongoDB and Redis
+    /// are not transfer endpoints.
+    #[test]
+    fn every_sql_engine_has_a_type_mapper() {
+        let reg = default_dialects();
+        for engine in oxbase_dialect::M8_ENGINES {
+            assert!(reg.has_type_mapper(engine), "{engine}");
+            assert!(
+                !reg.missing_m8_roles(engine)
+                    .iter()
+                    .any(|m| m.contains("TypeMapper")),
+                "{engine}: {:?}",
+                reg.missing_m8_roles(engine)
+            );
+        }
+        assert!(!reg.has_type_mapper(Engine::MongoDb));
+        assert!(!reg.has_type_mapper(Engine::Redis));
+    }
+
+    /// M8 integration (`docs/m8-contracts.md` §1, §3.6): every SQL engine has a type mapper
+    /// and, for each sync kind it can fetch, a DDL generator and a comparator.
+    #[test]
+    fn every_m8_engine_has_all_m8_roles() {
+        let reg = default_dialects();
+        for engine in oxbase_dialect::M8_ENGINES {
+            assert_eq!(
+                reg.missing_m8_roles(engine),
+                Vec::<String>::new(),
+                "{engine}"
+            );
+        }
     }
 
     #[test]

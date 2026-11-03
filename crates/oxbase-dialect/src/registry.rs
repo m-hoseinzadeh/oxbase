@@ -9,10 +9,12 @@ use oxbase_types::{Engine, Error, ObjectKind, Result, ServerVersion};
 use crate::bulk::{BulkLimits, BulkLoader, InsertLoader};
 use crate::catalog::CatalogReader;
 use crate::document::DocumentStore;
+use crate::keyset::ChunkHasher;
 use crate::keyvalue::KeyValueStore;
 use crate::language::SqlLanguage;
 use crate::pubsub::PubSub;
 use crate::script::ScriptLanguage;
+use crate::typemap::TypeMapper;
 use crate::{Capabilities, Comparator, DdlGenerator, DmlWriter, Fetcher, Quoting, TreeLayout};
 
 /// The kinds the M3 table designer and the round-trip conformance cells need a
@@ -23,6 +25,33 @@ pub const DESIGNER_KINDS: [ObjectKind; 5] = [
     ObjectKind::Index,
     ObjectKind::ForeignKey,
     ObjectKind::Check,
+];
+
+/// The kinds structure sync compares and scripts (M8, `docs/m8-contracts.md` §5.1): the
+/// [`DESIGNER_KINDS`] plus views, materialized views, sequences, routines and triggers. On each
+/// SQL engine, every one of these kinds that has a [`Fetcher`] needs a [`DdlGenerator`] and a
+/// [`Comparator`] ([`DialectRegistry::missing_m8_roles`]).
+pub const SYNC_KINDS: [ObjectKind; 11] = [
+    ObjectKind::Table,
+    ObjectKind::Column,
+    ObjectKind::Index,
+    ObjectKind::ForeignKey,
+    ObjectKind::Check,
+    ObjectKind::View,
+    ObjectKind::MatView,
+    ObjectKind::Sequence,
+    ObjectKind::Function,
+    ObjectKind::Procedure,
+    ObjectKind::Trigger,
+];
+
+/// The engines structure sync, data sync, transfer and backup cover in M8.
+pub const M8_ENGINES: [Engine; 5] = [
+    Engine::Postgres,
+    Engine::MySql,
+    Engine::MariaDb,
+    Engine::Sqlite,
+    Engine::MsSql,
 ];
 
 /// Roles filled per (engine, object kind).
@@ -242,6 +271,10 @@ struct EngineEntry {
     key_values: Option<Arc<dyn KeyValueStore>>,
     /// M7: publish / subscribe (Redis).
     pubsub: Option<Arc<dyn PubSub>>,
+    /// M8: cross-engine column type mapping for data transfer.
+    type_mapper: Option<Arc<dyn TypeMapper>>,
+    /// M8: optional per-range digests for data compare.
+    chunk_hasher: Option<Arc<dyn ChunkHasher>>,
 }
 
 /// Holds every dialect implementation, keyed by (engine, object kind) for per-kind roles and by
@@ -317,6 +350,20 @@ struct EngineEntry {
 ///
 /// Neither registers `Quoting`, `DmlWriter`, DDL generators or comparators: they have no SQL.
 /// [`DialectRegistry::missing_m7_roles`] must be empty for both at the end of M7.
+///
+/// # Registration (M8)
+///
+/// `docs/m8-contracts.md` §1, §4.1, §5.2:
+///
+/// - each SQL engine gets a [`TypeMapper`] ([`DialectRegistry::register_type_mapper`]),
+///   registered by `oxbase_transfer::register` (transfer stream) from `default_dialects`;
+/// - each SQL engine's `register` adds a [`DdlGenerator`] and a [`Comparator`]
+///   (`compare_objects::DefinitionComparator`) for every [`SYNC_KINDS`] kind it has a fetcher
+///   for beyond the designer kinds (structure-sync stream);
+/// - optionally a [`ChunkHasher`] ([`DialectRegistry::register_chunk_hasher`], data-sync
+///   stream).
+///
+/// [`DialectRegistry::missing_m8_roles`] must be empty for the five SQL engines at the end of M8.
 #[derive(Default, Clone)]
 pub struct DialectRegistry {
     cells: HashMap<(Engine, ObjectKind), Cell>,
@@ -447,6 +494,27 @@ impl DialectRegistry {
     /// Registers the publish / subscribe role of `engine` (M7), replacing an earlier one.
     pub fn register_pubsub(&mut self, engine: Engine, pubsub: Arc<dyn PubSub>) -> &mut Self {
         self.engine_mut(engine).pubsub = Some(pubsub);
+        self
+    }
+
+    /// Registers the transfer type mapper of `engine` (M8), replacing an earlier one.
+    pub fn register_type_mapper(
+        &mut self,
+        engine: Engine,
+        mapper: Arc<dyn TypeMapper>,
+    ) -> &mut Self {
+        self.engine_mut(engine).type_mapper = Some(mapper);
+        self
+    }
+
+    /// Registers the data-compare chunk hasher of `engine` (M8, optional), replacing an earlier
+    /// one.
+    pub fn register_chunk_hasher(
+        &mut self,
+        engine: Engine,
+        hasher: Arc<dyn ChunkHasher>,
+    ) -> &mut Self {
+        self.engine_mut(engine).chunk_hasher = Some(hasher);
         self
     }
 
@@ -692,6 +760,61 @@ impl DialectRegistry {
             }
             if entry.is_none_or(|e| e.pubsub.is_none()) {
                 out.push(format!("{engine}: no PubSub"));
+            }
+        }
+        out
+    }
+
+    /// The transfer type mapper of `engine` (M8); `Error::Unsupported` when none is
+    /// registered.
+    pub fn type_mapper(&self, engine: Engine) -> Result<Arc<dyn TypeMapper>> {
+        self.engines
+            .get(&engine)
+            .and_then(|e| e.type_mapper.clone())
+            .ok_or_else(|| {
+                Error::unsupported(format!(
+                    "{} has no type mapping for data transfer",
+                    engine.display_name()
+                ))
+            })
+    }
+
+    /// `true` when `engine` registered a [`TypeMapper`].
+    pub fn has_type_mapper(&self, engine: Engine) -> bool {
+        self.engines
+            .get(&engine)
+            .is_some_and(|e| e.type_mapper.is_some())
+    }
+
+    /// The data-compare chunk hasher of `engine` (M8), if it registered one (optional: data
+    /// compare reads every row of an engine without one).
+    pub fn chunk_hasher(&self, engine: Engine) -> Option<Arc<dyn ChunkHasher>> {
+        self.engines
+            .get(&engine)
+            .and_then(|e| e.chunk_hasher.clone())
+    }
+
+    /// What `engine` still lacks for M8 (`docs/m8-contracts.md` §1): on the five SQL engines
+    /// ([`M8_ENGINES`]) a [`TypeMapper`], and a [`DdlGenerator`] and a [`Comparator`] for every
+    /// [`SYNC_KINDS`] kind that has a [`Fetcher`]. Empty for every other engine. Streams
+    /// assert their part is empty; integration asserts all of it.
+    pub fn missing_m8_roles(&self, engine: Engine) -> Vec<String> {
+        let mut out = Vec::new();
+        if !M8_ENGINES.contains(&engine) {
+            return out;
+        }
+        if !self.has_type_mapper(engine) {
+            out.push(format!("{engine}: no TypeMapper"));
+        }
+        for kind in SYNC_KINDS {
+            if self.fetcher(engine, kind).is_err() {
+                continue;
+            }
+            if self.ddl(engine, kind).is_err() {
+                out.push(format!("{engine}/{kind}: no DdlGenerator"));
+            }
+            if self.comparator(engine, kind).is_err() {
+                out.push(format!("{engine}/{kind}: no Comparator"));
             }
         }
         out

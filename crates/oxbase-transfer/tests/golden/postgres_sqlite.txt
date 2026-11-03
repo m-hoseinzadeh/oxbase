@@ -1,0 +1,31 @@
+# PostgreSQL -> SQLite
+boolean                  -> boolean                              widened     SQLite has no boolean type: stored as the integers 0 and 1
+int8                     -> int64                                widened     SQLite stores every integer as a 64-bit INTEGER
+int16                    -> int64                                widened     SQLite stores every integer as a 64-bit INTEGER
+int32                    -> int64                                widened     SQLite stores every integer as a 64-bit INTEGER
+int64                    -> int64                                exact
+int32 unsigned           -> int64                                exact
+int64 unsigned           -> decimal(20,0)                        widened     more than 15 digits: declared DECIMAL_TEXT, so the exact text is kept (it compares and sorts as text)
+float32                  -> float64                              widened     SQLite floats are 64-bit: every value is kept
+float64                  -> float64                              exact
+decimal(18,4)            -> decimal(18,4)                        widened     more than 15 digits: declared DECIMAL_TEXT, so the exact text is kept (it compares and sorts as text)
+decimal(38,10)           -> decimal(38,10)                       widened     more than 15 digits: declared DECIMAL_TEXT, so the exact text is kept (it compares and sorts as text)
+decimal                  -> decimal                              widened     more than 15 digits: declared DECIMAL_TEXT, so the exact text is kept (it compares and sorts as text)
+char(10)                 -> char(10)                             widened     SQLite does not enforce text lengths: every value is kept
+varchar(255)             -> varchar(255)                         widened     SQLite does not enforce text lengths: every value is kept
+varchar                  -> varchar                              exact
+text                     -> text                                 exact
+binary(16)               -> varbinary                            exact
+varbinary                -> varbinary                            exact
+date                     -> date                                 widened     SQLite has no date and time types: stored as ISO-8601 text
+time(6)                  -> time(6)                              widened     SQLite has no date and time types: stored as ISO-8601 text
+timestamp(6)             -> timestamp(6)                         widened     SQLite has no date and time types: stored as ISO-8601 text
+timestamptz(6)           -> timestamptz(6)                       widened     SQLite has no date and time types: stored as ISO-8601 text
+interval                 -> text                                 widened     SQLite has no interval type: stored as the source's text form
+uuid                     -> uuid                                 widened     SQLite has no uuid type: stored as its 36-character text
+json                     -> json                                 widened     SQLite has no JSON type: stored as JSON text
+jsonb                    -> jsonb                                widened     SQLite has no JSON type: stored as JSON text
+int32[]                  -> text                                 widened     SQLite has no array types: stored as the source's text form
+text[]                   -> text                                 widened     SQLite has no array types: stored as the source's text form
+enum(small, medium, large) -> text                                 exact
+geometry                 -> geometry                             unsupported PostgreSQL has no column type for geometry

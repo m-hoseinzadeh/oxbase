@@ -5,7 +5,7 @@ React + TypeScript UI. v1 targets PostgreSQL, MySQL, MariaDB, SQLite, SQL Server
 Redis on Linux, macOS and Windows. The core is headless, so every feature also works from
 `oxbase-cli` and from tests. See [PLAN.md](PLAN.md) for the architecture and milestones.
 
-## What works (M7)
+## What works (M8)
 
 On PostgreSQL, MySQL, MariaDB, SQLite and SQL Server (M1 connections: plain, TLS, SSH,
 keychain secrets; SQL Server since M4):
@@ -152,6 +152,39 @@ Contracts: [docs/m3-contracts.md](docs/m3-contracts.md),
 Contracts and every deviation: [docs/m7-contracts.md](docs/m7-contracts.md). Numbers: see
 *MongoDB and Redis (M7)* below.
 
+Data transfer, structure sync, data sync and backup (M8; PostgreSQL, MySQL, MariaDB, SQLite and
+SQL Server; nothing writes to a target before an explicit apply, and every script can be
+previewed first):
+
+- **Data transfer** (toolbar **Transfer...**): tables, views or a query from one connection into
+  a database or schema of any of the five SQL engines. A per-engine type mapper maps each
+  column and says how faithful the mapping is (exact, widened, narrowed or unsupported, with the
+  reason as a tooltip); types, names and skips can be overridden per column. The review step
+  shows the target DDL, the load order (parents before children, cycles reported) and the
+  warnings. Rows stream as Arrow pages through the target's bulk loader (one batch in memory
+  per side), per-table or per-batch transactions, stop or continue on bad rows (reported),
+  foreign keys added after the load, progress and cancel. Same-engine copies keep native types.
+- **Structure sync** (toolbar **Compare**): compares two schemas or databases of the same engine
+  (tables with their columns, keys, indexes, checks and foreign keys, views, materialized
+  views, sequences, functions, procedures and triggers), shows only-in-source, only-in-target
+  and different items with a DDL diff, and scripts the selected items in dependency order.
+  Drops are flagged and need a confirmation; the script runs in one transaction on PostgreSQL,
+  SQL Server and SQLite (MySQL and MariaDB DDL commits per statement, and the preview says
+  so), and a re-compare follows the apply.
+- **Data sync**: compares tables by key in keyset chunks (an optional per-engine digest skips
+  equal chunks), refuses tables without a primary or unique key unless key columns are chosen,
+  spills differing rows to disk, shows counts and sample rows per insert / update / delete, and
+  scripts DML with bound values (deletes off by default and confirmed separately); the apply
+  runs in batched transactions and re-compares.
+- **Backup / restore** (toolbar **Backup**): one `.oxbackup` ZIP per schema or database
+  (manifest, object definitions and DDL, table rows as zstd-compressed Arrow IPC, a SHA-256 per
+  entry, no connection details), verify and list, and restore into an existing schema or
+  database of the same engine (structure, data or both; drop existing and truncate need a
+  confirmation).
+
+Contracts and every deviation: [docs/m8-contracts.md](docs/m8-contracts.md). Numbers: see
+*Transfer, sync and backup (M8)* below.
+
 ## Layout
 
 ```
@@ -172,13 +205,13 @@ crates/
   oxbase-conformance                              cross-engine conformance harness
   app-tauri                                       Tauri 2 shell (no logic)
 ui/                                               React + TS + Vite front end
-tests/fixtures.toml                               test DB connection params, M2-M4 and M7 seed
+tests/fixtures.toml                               test DB connection params, M2-M4, M7 and M8 seed
                                                   names, the M5 import / export expectations and
                                                   the M6 insight perf scenarios (single source of
                                                   truth)
 tests/data/m5/                                    small hand-written import samples (M5)
 docs/                                             frozen contracts per milestone (m1-contracts.md
-                                                  to m7-contracts.md)
+                                                  to m8-contracts.md)
 ```
 
 ## Prerequisites
@@ -282,6 +315,16 @@ MongoDB and Redis seeds (a document collection covering every mapped BSON type, 
 (`allowTLS`) and Redis with a TLS-only port on `127.0.0.1:15480`, and `[m7.redis_cluster]` /
 `[m7.redis_sentinel]` describe a 3-master cluster on 15501-15503 and a sentinel setup on 15511,
 15512 and 15526 (host networking). `scripts/fixtures-up.sh` starts them with the others.
+
+M8 (contracts in `docs/m8-contracts.md` §9): `[m8]` names a source and a target schema
+(PostgreSQL and SQL Server: `m8_src` / `m8_tgt` of `oxbase_test`) or database (MySQL and
+MariaDB: `m8_src` / `m8_tgt`; SQLite: two files) with designed structure differences (added,
+dropped and changed columns, a type, nullability and default change, an index change, a new
+foreign key, a changed view, a sequence, a rename-looking pair, case-sensitive and reserved
+names) and data differences (inserted, updated and deleted rows with NULLs, unicode, big
+decimals, binary and zoned timestamps, a 100 000-row table), restore targets, and the
+PostgreSQL type set of the PG → MySQL transfer with the expected MySQL column types. No new
+container or port.
 
 M5 adds no seed objects: import and export tests create and drop scratch tables
 `m5_t_<case>_<token>` (`[m5]`). `[m5.files."<name>"]` lists what each sample in `tests/data/m5`
@@ -615,6 +658,54 @@ Tests at the M7 integration (full-lane run 41549606517 on `milestone/m7` at f900
 Windows (302 live / perf tests ignored there and run in the Conformance and perf jobs; the
 QuickJS shell builds and runs on all three), 1 260 in the Conformance job, 377 UI tests.
 
+### Transfer, sync and backup (M8)
+
+The exit check (PLAN.md §6, "sync between PG↔PG, MySQL↔MySQL and MSSQL↔MSSQL produces correct
+scripts; transfer PG→MySQL works") runs live in the CI Conformance job on scratch copies of the
+`[m8]` seeds, with `OXBASE_CONFORMANCE_REQUIRE_M8` and `OXBASE_SERVICES_REQUIRE_M8` set, so a
+missing fixture, seed or cell fails instead of being pending. Numbers from fast-lane run
+41605886760 (df06e10):
+
+- **M8 conformance**: 40 cells, **40 pass**, 0 fail, 0 pending. Per engine (PostgreSQL, MySQL,
+  MariaDB, SQLite, SQL Server) the `seed`, `sync_structure`, `sync_data` and `backup` cells
+  pass, and the transfer matrix (every SQL engine into every other one, 20 cells, `m8_data`
+  read back and compared column by column) passes.
+- **Structure sync**: the designed items are reported with their designed status (PostgreSQL
+  12, MySQL 11, MariaDB 12, SQL Server 12, SQLite 10); an unconfirmed destructive apply is
+  refused; the applied scripts (PostgreSQL 21 statements in one transaction, MySQL 13 and
+  MariaDB 14 statements not atomic, SQL Server 19 in one transaction, SQLite 31 with table
+  rebuilds in one transaction) run without errors and a re-compare and a fresh compare are in
+  sync, with the existing rows kept. Golden scripts per engine are pinned in
+  `crates/oxbase-diff/tests/golden/`.
+- **Data sync**: `m8_data` 2 / 5 / 2 (inserts / updates / deletes), the 100 000-row `m8_big`
+  1 / 1 / 1 with 8 of 10 chunks skipped by the digest on PostgreSQL, MySQL, MariaDB and SQL
+  Server, `m8_composite` 0 / 1 / 0, `m8_nokey` refused; the 13-statement script applies in one
+  batch (deletes refused without confirmation) and the re-compare is in sync on every engine.
+- **Transfer PG → MySQL**: the `[m8.transfer]` set (4 tables, 24 columns) gets the expected
+  MySQL column types and fidelities, values read back equal, `m8_parent` loads before
+  `m8_child` and the foreign keys exist after the load (348 ms). Golden pair reports for all 25
+  engine pairs are pinned in `crates/oxbase-transfer/tests/golden/`.
+- **Backup / restore**: a backup of `m8_src` (PostgreSQL 16 objects, 643 KB) verifies (a
+  truncated or damaged copy is rejected, no password or host in the archive) and restores into
+  `m8_restore` with 100 036 rows; structure and data compares of source and restore are in sync
+  on all five engines (SQL Server `datetimeoffset` values keep their offset and 100 ns digits).
+- **Live tests** (services): `m8_structure_live` 15, `m8_data_live` 7, `m8_transfer_live` 8
+  (including cancel mid-table within 2 s, `continue` mode and closing the source session),
+  `m8_backup_live` 5; all passed.
+- **Webview smoke** (Linux, `OXBASE_E2E_REQUIRE_M8=1`): data compare of `m8_src` → `m8_tgt`
+  showed `m8_data` 2 / 5 / 2; structure compare showed 14 differences, the apply without drops
+  ran and the re-compare left only the three target-only tables; a transfer of
+  `m8_xfer.m8_types` into a new PostgreSQL schema mapped 24 columns and finished (3 rows); a
+  backup of `m8_src` (16 objects, 643 KB, 530 ms) verified OK. Screenshots
+  `ui-08-transfer-{wizard,mapping,review,run}-{dark,light}`,
+  `ui-08-structure-sync{,-setup}-{dark,light}` and `ui-08-data-sync-{dark,light}`.
+
+Tests at the M8 integration: 1 589 Rust tests passed in the Linux test job of run 41605886760
+and on macOS in full-lane run 41608238873 (335 live / perf tests ignored there and run in the
+Conformance and perf jobs), 1 468 in the Conformance job, 433 UI tests.
+`calamine` is at 0.38.0: an advisory against 0.37.0 (crafted XLS files could panic or exhaust
+memory) appeared during the M8 integration; the API oxbase-io uses did not change.
+
 ## App data
 
 Profiles live in `connections.json` in the config directory (`OXBASE_CONFIG_DIR` overrides it).
@@ -673,8 +764,9 @@ pnpm tauri build                          # release bundles for the current OS
 `ui/e2e/smoke.mjs` drives the built app through its real webview (WebKitGTK, Linux only) with
 `tauri-driver` and `WebKitWebDriver`: connect, a 1 000 000-row query, Arrow pages decoded in the
 webview, scrolling, page latency, cancel, a table-data cell edit applied and seen after a
-reload, import / export (M5), completion (M6), and MongoDB and Redis browse / edit / query (M7;
-`scripts/e2e-fixtures.sh` starts PostgreSQL, MongoDB and Redis). See [ui/e2e/README.md](ui/e2e/README.md). Locally (needs `webkit2gtk-driver`,
+reload, import / export (M5), completion (M6), MongoDB and Redis browse / edit / query (M7;
+`scripts/e2e-fixtures.sh` starts PostgreSQL, MongoDB and Redis), and data compare, structure
+compare and apply, transfer and backup with verify on the PostgreSQL `[m8]` seeds (M8). See [ui/e2e/README.md](ui/e2e/README.md). Locally (needs `webkit2gtk-driver`,
 `cargo install tauri-driver --locked --version 2.1.0`, Docker, and `xvfb-run` without a
 display):
 
@@ -700,7 +792,7 @@ value after a reload.
   **Full lane**, on pull requests, pushes to main, weekly and manual runs: fmt + clippy on Linux;
   `cargo test --workspace` on Linux, macOS and Windows; the OS keychain tests
   (`scripts/keychain-tests.sh`) on Linux, macOS and Windows; UI lint, typecheck, test and build;
-  the conformance harness and the M1-M7 live tests against the Docker fixtures (MongoDB and
+  the conformance harness and the M1-M8 live tests against the Docker fixtures (MongoDB and
   Redis included, with the Redis cluster and sentinel); the webview
   smoke test (Linux; also on the fast lane of `wip/*-e2e`, `wip/*-app` and `wip/*-integrate`);
   `cargo deny` (advisories, bans, licenses, sources); the `import-perf` job (M5, the 1 GB CSV
@@ -710,8 +802,9 @@ value after a reload.
   synthetic 5k-table catalog in the perf and release profiles, the diagnostics (1 MiB) and
   formatter (100 KiB) budgets, then the live 5k-table PostgreSQL schema; full lane, plus the
   fast lane of `wip/*-perf`, `wip/*-complete`, `wip/*-cache` and `wip/*-integrate`. The webview
-  smoke test requires the M6 completion step (`OXBASE_E2E_REQUIRE_M6=1`) and the M7 MongoDB and
-  Redis steps (`OXBASE_E2E_REQUIRE_M7=1`).
+  smoke test requires the M6 completion step (`OXBASE_E2E_REQUIRE_M6=1`), the M7 MongoDB and
+  Redis steps (`OXBASE_E2E_REQUIRE_M7=1`) and the M8 sync, transfer and backup steps
+  (`OXBASE_E2E_REQUIRE_M8=1`).
 - `.github/workflows/bundle.yml` (push to main, manual): Tauri dev bundles for Linux x86_64,
   Windows x86_64 and macOS aarch64/x86_64, uploaded as workflow artifacts.
   `scripts/ci-verify-signing.mjs` checks what was produced: `codesign --verify --deep --strict`,

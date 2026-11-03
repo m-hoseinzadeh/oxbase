@@ -126,6 +126,22 @@
 //! - [`pubsub::PubSubService`]: subscriptions on dedicated connections with a bounded, lossy
 //!   event buffer, and publish (the engine's `PubSub`).
 //!
+//! # M8: transfer, structure sync, data sync, backup / restore
+//!
+//! Contracts in `docs/m8-contracts.md`:
+//!
+//! - [`transfer::TransferService`]: plans (dry run: target DDL and the type-mapping report) and
+//!   runs `oxbase_transfer` transfers between two open connections, with events and cancel.
+//! - [`sync::StructureSyncService`]: compares two containers of the same engine
+//!   (`oxbase_diff`), keeps the result by id, scripts and applies the selected items
+//!   ([`designer::execute_script`]) and re-compares.
+//! - [`sync::DataSyncService`]: chunked key-ordered data compare with a spill store, DML script
+//!   preview, batched transactional apply and re-compare.
+//! - [`backup::BackupService`]: Oxbase backup archives (`oxbase_backup`): backup, restore,
+//!   verify, list.
+//! - [`runs::RunRegistry`]: every long M8 operation registers with its sessions, so closing a
+//!   connection cancels it (`cancel_session`).
+//!
 //! **Sessions.** A session opened with [`ConnectionManager::open`] is a *base* session: the
 //! object tree reads metadata through it. Query editors never run on a base session; each
 //! editor gets a *child* session ([`ConnectionManager::open_child`]) with the same resolved
@@ -155,6 +171,7 @@ pub use oxbase_store::{
 use oxbase_store::{PemRef, ProfileAddress, SshAuthSettings, SshSettings, TlsSettings};
 use oxbase_types::{Engine, Error, KnownHostsPolicy, Result, Secret, ServerVersion};
 
+pub mod backup;
 pub mod convert;
 pub mod designer;
 mod dialects;
@@ -170,9 +187,12 @@ pub mod profiles;
 pub mod pubsub;
 pub mod query;
 pub mod results;
+pub mod runs;
 pub mod schema_cache;
 pub mod script;
 pub mod snippets;
+pub mod sync;
+pub mod transfer;
 pub mod tree;
 
 pub use dialects::default_dialects;

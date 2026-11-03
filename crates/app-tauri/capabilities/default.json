@@ -68,6 +68,23 @@
     "allow-pubsub-subscribe",
     "allow-pubsub-unsubscribe",
     "allow-pubsub-publish",
+    "allow-transfer-plan",
+    "allow-transfer-pair-report",
+    "allow-transfer-run",
+    "allow-transfer-cancel",
+    "allow-structure-compare",
+    "allow-structure-script",
+    "allow-structure-apply",
+    "allow-compare-forget",
+    "allow-data-compare",
+    "allow-data-script",
+    "allow-data-apply",
+    "allow-data-cancel",
+    "allow-backup-run",
+    "allow-backup-restore",
+    "allow-backup-verify",
+    "allow-backup-list",
+    "allow-backup-cancel",
     "dialog:allow-open"
   ]
 }

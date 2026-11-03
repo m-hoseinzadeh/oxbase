@@ -64,6 +64,7 @@
 mod bulk;
 mod caps;
 mod catalog_bulk;
+mod chunk_hash;
 mod compare;
 mod ddl;
 mod dml;
@@ -72,13 +73,16 @@ mod fetch;
 mod language;
 mod rows;
 mod sql;
+// M8: structure sync DDL for views, materialized views, sequences, routines and triggers.
+mod sync_ddl;
 mod types;
 
 use std::sync::Arc;
 
+use oxbase_dialect::compare::DefaultRules;
 use oxbase_dialect::{
-    Capabilities, ChildGroup, DESIGNER_KINDS, DatabaseScope, DesignerCapabilities, DialectRegistry,
-    PgQuoting, TreeLayout,
+    Capabilities, ChildGroup, DESIGNER_KINDS, DatabaseScope, DefinitionComparator,
+    DesignerCapabilities, DialectRegistry, PgQuoting, TreeLayout,
 };
 use oxbase_types::{Engine, ObjectKind, PropId, ServerVersion};
 
@@ -137,7 +141,18 @@ pub fn register(reg: &mut DialectRegistry) {
     reg.register_catalog_reader(engine, Arc::new(PgCatalogReader));
     // M6: language data for code insight (language.rs).
     reg.register_language(engine, language::LANGUAGE);
+
+    // M8: data sync skips equal key ranges by digest (chunk_hash.rs).
+    reg.register_chunk_hasher(engine, Arc::new(chunk_hash::PgChunkHasher));
     reg.mark_not_applicable_except(engine, &APPLICABLE);
+
+    // M8: structure sync DDL and comparison of views, materialized views, sequences, routines
+    // and triggers (sync_ddl.rs).
+    let sync = Arc::new(sync_ddl::PgSyncDdl);
+    for kind in sync_ddl::KINDS {
+        reg.register_ddl(engine, kind, sync.clone());
+        reg.register_comparator(engine, kind, Arc::new(DefinitionComparator(DefaultRules)));
+    }
 }
 
 /// The PostgreSQL object tree (see the module docs).

@@ -92,6 +92,9 @@ pub struct Fixtures {
     /// M7: MongoDB and Redis seed names, the Redis cluster and sentinel (`[m7]`).
     #[serde(default)]
     pub m7: Option<M7Fixture>,
+    /// M8: the sync pairs, data pairs, transfer set and restore targets (`[m8]`).
+    #[serde(default)]
+    pub m8: Option<M8Fixture>,
     /// Where the file came from, for error messages. Not part of the TOML.
     #[serde(skip)]
     pub origin: String,
@@ -555,6 +558,102 @@ impl std::fmt::Debug for M7RedisSeed {
             .field("db1_key", &self.db1_key)
             .field("acl_user", &self.acl_user)
             .finish_non_exhaustive()
+    }
+}
+
+/// The `[m8]` table (`docs/m8-contracts.md` §9; shapes documented next to it in
+/// `tests/fixtures.toml`). Every field is optional; the `[m8.<engine>]` and `[m8.transfer]`
+/// tables stay in `other` and are read with [`M8Fixture::engine`] / [`M8Fixture::transfer`], so
+/// a malformed engine table cannot stop the rest of the fixtures from loading.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct M8Fixture {
+    /// Scratch containers whose token is older than this are dropped when a run starts.
+    pub stale_after_secs: Option<u64>,
+    /// Prefix of every scratch container (`m8_t_`).
+    pub scratch_prefix: Option<String>,
+    pub structure_tables: Vec<String>,
+    pub data_tables: Vec<String>,
+    pub view: Option<String>,
+    pub sequence: Option<String>,
+    pub function: Option<String>,
+    pub trigger: Option<String>,
+    pub big_table: Option<String>,
+    pub big_rows: Option<u64>,
+    /// `[inserts, updates, deletes]` per data table.
+    pub data_expected: BTreeMap<String, Vec<u64>>,
+    /// Ids of the structure diff items every engine reports (minus its `skip_items`).
+    pub structure_items: Vec<String>,
+    /// `[m8.<engine>]`, `[m8.transfer]` and any other key, as written.
+    #[serde(flatten)]
+    pub other: BTreeMap<String, toml::Value>,
+}
+
+/// One `[m8.<engine>]` table: where the engine's M8 containers live. PostgreSQL and SQL Server
+/// name schemas of `database`; MySQL and MariaDB name databases; SQLite names scripts.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct M8EngineSeed {
+    /// The seed script the Docker init runs (networked engines), relative to the workspace root.
+    pub init_sql: Option<String>,
+    pub database: Option<String>,
+    pub source_schema: Option<String>,
+    pub target_schema: Option<String>,
+    pub restore_schema: Option<String>,
+    pub transfer_schema: Option<String>,
+    pub transfer_target_schema: Option<String>,
+    pub source_database: Option<String>,
+    pub target_database: Option<String>,
+    pub restore_database: Option<String>,
+    pub transfer_target_database: Option<String>,
+    /// SQLite: the scripts that build the source and the target file.
+    pub source_sql: Option<String>,
+    pub target_sql: Option<String>,
+    /// PostgreSQL: the identity arguments of `[m8] function` in its diff item id.
+    pub function_signature: Option<String>,
+    /// `[m8] structure_items` this engine does not have.
+    pub skip_items: Vec<String>,
+}
+
+/// The `[m8.transfer]` table: the PostgreSQL transfer source set and the expected MySQL columns.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct M8Transfer {
+    pub source_engine: Option<String>,
+    pub tables: Vec<String>,
+    pub types_table: Option<String>,
+    pub types_rows: Option<u64>,
+    pub enum_type: Option<String>,
+    pub enum_labels: Vec<String>,
+    /// Column -> `[native type, fidelity]` after a PostgreSQL → MySQL transfer.
+    pub expected_mysql: BTreeMap<String, Vec<String>>,
+}
+
+impl M8Fixture {
+    /// The `[m8.<name>]` table, if there is one and it parses.
+    pub fn engine(&self, name: &str) -> Option<M8EngineSeed> {
+        match self.other.get(name)? {
+            toml::Value::Table(t) => t.clone().try_into().ok(),
+            _ => None,
+        }
+    }
+
+    /// The `[m8.transfer]` table, if there is one and it parses.
+    pub fn transfer(&self) -> Option<M8Transfer> {
+        match self.other.get("transfer")? {
+            toml::Value::Table(t) => t.clone().try_into().ok(),
+            _ => None,
+        }
+    }
+}
+
+impl Fixtures {
+    /// The M8 table of the fixture `name` (falling back to the engine kind's name), with the
+    /// shared `[m8]` table.
+    pub fn m8_seed(&self, name: &str, engine: Engine) -> Option<(&M8Fixture, M8EngineSeed)> {
+        let m8 = self.m8.as_ref()?;
+        let seed = m8.engine(name).or_else(|| m8.engine(engine.as_str()))?;
+        Some((m8, seed))
     }
 }
 

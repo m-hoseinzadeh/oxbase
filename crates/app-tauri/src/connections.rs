@@ -269,11 +269,14 @@ pub async fn close_connection(
     state: State<'_, ConnectionsState>,
     workbench: State<'_, WorkbenchState>,
     nosql: State<'_, crate::nosql::NoSqlState>,
+    sync: State<'_, crate::sync::SyncState>,
     session_id: SessionId,
 ) -> std::result::Result<(), CommandError> {
     let manager = Arc::clone(&state.manager);
     let tree = Arc::clone(workbench.tree());
     let pubsub = Arc::clone(nosql.pubsub());
+    // M8: transfers, compares, applies, backups and restores that use the session stop first.
+    sync.cancel_session(session_id);
     isolated(Vec::new(), async move {
         // M7: subscriptions run on their own connections; end them with the session.
         pubsub.close_session(session_id).await;

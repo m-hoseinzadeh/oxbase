@@ -161,6 +161,25 @@ pub trait Quoting: Send + Sync {
         DumpLiteral::exact(self.literal(v))
     }
 
+    /// What ends each statement of a script written out as text (M8: structure and data sync
+    /// previews and saved scripts, `Script::to_sql`): `";"` by default; [`BracketQuoting`]
+    /// `"\nGO"`, because SQL Server needs `CREATE VIEW` / `PROCEDURE` / `TRIGGER` / `FUNCTION`
+    /// alone in their batch.
+    fn script_terminator(&self) -> &'static str {
+        ";"
+    }
+
+    /// Statements that prepare a session dedicated to one structure sync step (M8) on a
+    /// schema container. `apply_into` `None`: the session reads definitions, and the engine's
+    /// catalog functions must print every name qualified (so names inside view, trigger and
+    /// default texts can be moved between schemas, `oxbase_diff::retarget_sql`). `Some(schema)`:
+    /// the session applies a script into that schema, and unqualified names in it resolve
+    /// there first. Default: none (engines whose definitions always carry their qualifiers).
+    fn sync_session(&self, apply_into: Option<&str>) -> Vec<String> {
+        let _ = apply_into;
+        Vec::new()
+    }
+
     /// What a dump's `INSERT`s into `table` (already qualified with this quoting) need when
     /// they write the values of `columns` (the written columns), some of which may be identity
     /// or auto-increment columns. Default: nothing.
@@ -319,6 +338,20 @@ impl Quoting for PgQuoting {
         }
     }
 
+    /// `pg_get_viewdef`, `pg_get_triggerdef` and `pg_get_expr` leave a name unqualified when
+    /// its schema is on the `search_path`: a reading session searches `pg_catalog` only, so
+    /// every other name comes back qualified. An applying session searches the target schema,
+    /// then `pg_catalog` (SQL function bodies are checked against it at create time).
+    fn sync_session(&self, apply_into: Option<&str>) -> Vec<String> {
+        vec![match apply_into {
+            None => "SET search_path TO pg_catalog".to_owned(),
+            Some(schema) => format!(
+                "SET search_path TO {}, pg_catalog",
+                self.quote_ident(schema)
+            ),
+        }]
+    }
+
     /// `OVERRIDING SYSTEM VALUE` when a written column is a `GENERATED ALWAYS` identity (the
     /// server refuses explicit values otherwise).
     fn dump_identity_insert(&self, table: &str, columns: &[&ColumnDef]) -> IdentityInsert {
@@ -462,6 +495,10 @@ impl Quoting for BracketQuoting {
 
     fn like_specials(&self) -> &'static str {
         "%_["
+    }
+
+    fn script_terminator(&self) -> &'static str {
+        "\nGO"
     }
 
     /// `OFFSET 0 ROWS FETCH NEXT n ROWS ONLY`, which T-SQL accepts only after an `ORDER BY`;
@@ -665,6 +702,10 @@ mod tests {
         assert!(PgQuoting.nulls_ordering() && AnsiQuoting.nulls_ordering());
         assert!(!BacktickQuoting.nulls_ordering() && !BracketQuoting.nulls_ordering());
         assert_eq!(BracketQuoting.like_specials(), "%_[");
+        // M8: script terminators.
+        assert_eq!(PgQuoting.script_terminator(), ";");
+        assert_eq!(BacktickQuoting.script_terminator(), ";");
+        assert_eq!(BracketQuoting.script_terminator(), "\nGO");
         assert_eq!(AnsiQuoting.limit_clause(10), "LIMIT 10");
         assert_eq!(AnsiQuoting.top_clause(10), None);
         assert_eq!(PgQuoting.top_clause(10), None);
@@ -716,5 +757,22 @@ mod tests {
 
     fn serde_json_value() -> serde_json::Value {
         serde_json::json!({"a": "b'c"})
+    }
+
+    #[test]
+    fn sync_sessions() {
+        assert_eq!(
+            PgQuoting.sync_session(None),
+            ["SET search_path TO pg_catalog"]
+        );
+        assert_eq!(
+            PgQuoting.sync_session(Some("My \"Schema\"")),
+            ["SET search_path TO \"My \"\"Schema\"\"\", pg_catalog"]
+        );
+        assert_eq!(BacktickQuoting.sync_session(None), Vec::<String>::new());
+        assert_eq!(
+            BracketQuoting.sync_session(Some("dbo")),
+            Vec::<String>::new()
+        );
     }
 }

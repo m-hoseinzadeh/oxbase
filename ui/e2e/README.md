@@ -131,6 +131,51 @@ import / export step (step 9) once the integrator turns it on.
       skip with a warning. The webview job sets it (M7 integration), so there a skip or a
       failure fails the run.
 
+12. **Transfer, sync and backup (M8)** (docs/m8-contracts.md §8.4):
+    - **Seeds.** Through IPC on the PostgreSQL session the test checks that the M8 seed
+      (`tests/docker/init/postgres/06-m8.sql`) made the schemas `m8_src`, `m8_tgt` and
+      `m8_xfer`; without them the M8 steps are a skip unless `OXBASE_E2E_REQUIRE_M8=1`.
+      Expectations come from `tests/fixtures.toml` `[m8]` (`structure_items`,
+      `data_expected.m8_data`, `[m8.transfer] types_rows`).
+    - **Screenshots first** (never fail): the transfer wizard (app bar **Transfer…**,
+      `app-transfer`) listing the source schema's tables, and a structure sync tab with both
+      sides picked: `ui-08-transfer-wizard-*`, `ui-08-structure-sync-setup-*`.
+    - **Data compare.** App bar **Compare → Data sync**; source `m8_src`, target `m8_tgt`
+      (`data-source` / `data-target` pickers, chosen by their labels "Source connection",
+      "Source database", "Source schema", ...); only `m8_data` checked (`data-pair`), Compare
+      (`data-compare`); the `data-table-row` of `m8_data` must show the `[m8]` counts
+      (`count-inserts`, `count-updates`, `count-deletes`, 2 / 5 / 2). Nothing is applied.
+      Screenshots `ui-08-data-sync-*`.
+    - **Structure compare and apply.** **Compare → Structure sync**, `m8_src` → `m8_tgt`,
+      Compare (`structure-compare`); every `[m8] structure_items` id must be among the
+      `structure-item` rows (`data-item-id`; PostgreSQL routine ids carry their arguments). The
+      script tab (`structure-script-tab`) shows the script (screenshots
+      `ui-08-structure-sync-*`), Apply (`structure-apply`) opens the confirmation, the test ticks
+      `structure-acknowledge` when the script is destructive (column drops) and confirms
+      (`structure-confirm`). `structure-result` must say "In sync" and only target-only objects
+      (drops were not selected) may remain. This changes `m8_tgt`: re-running locally needs
+      fresh fixtures.
+    - **Transfer.** When the MySQL fixture answers, PostgreSQL → MySQL into `m8_xfer_target`
+      (mode replace, confirmed; the test saves and connects an "E2E MySQL" profile like step
+      11); otherwise (the webview job starts PostgreSQL, MongoDB and Redis only) PostgreSQL →
+      a new schema `e2e_m8_xfer_<token>` it creates and drops. It ticks `m8_xfer.m8_types` in
+      the wizard, picks the target, waits for the mapping (`mapping-row`, screenshots
+      `ui-08-transfer-mapping-*`), the review's dry-run DDL (`transfer-ddl`,
+      `ui-08-transfer-review-*`), starts (`transfer-start`) and waits for `transfer-status` to
+      say Finished (screenshots `ui-08-transfer-run-*`); `SELECT count(*)` through IPC must find
+      the `[m8.transfer] types_rows` rows.
+    - **Backup and verify** (needs the M5 file hook). **Backup → Back up…** of `m8_src`
+      (screenshots `ui-08-backup-*`; `backup-start`; the hook saves
+      `<dir>/save/<name>.oxbackup`); `backup-result` must say "Backup written". The test moves
+      the archive alone into `<dir>/open/`, opens **Backup → Restore…**, chooses it and waits
+      for the manifest (screenshots `ui-08-restore-*`; never fails; the dialog is cancelled,
+      nothing is restored), then opens **Backup → Verify a backup…**, chooses it (`restore-choose`), waits for the manifest
+      (`restore-manifest`) and verifies (`restore-verify`); `verify-result` must say "Archive
+      OK".
+    - Without `OXBASE_E2E_REQUIRE_M8=1`, missing seeds or any failure of these steps is a skip
+      with a warning (until the M8 streams are integrated). The integrator sets it in the
+      webview job.
+
 ### The M5 file hook (app stream)
 
 What the test expects from the app, in **debug builds only** (`#[cfg(debug_assertions)]`, so a
