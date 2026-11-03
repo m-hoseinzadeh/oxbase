@@ -493,6 +493,45 @@ key edits; pub/sub on dedicated connections with a bounded, lossy buffer over a 
 a sentinel setup. Seven streams (mongo-driver, redis-driver, mongo, redis, shell, app,
 conformance) fill the skeletons.
 
+**M7 as built (notes, 2026-11-03).** The exit check ("browse, edit and query on both engines")
+passed in the CI Conformance job (Linux) against MongoDB 7.0.45 and Redis 8.10.3, plus a
+3-master Redis cluster and a sentinel setup on the host network (full-lane run 41549606517 on
+`milestone/m7` at f90055a, green on Linux, macOS and Windows; Bundle run 41549609930 green; the
+fast-lane run 41547092752 on the same commit gave the same cells). CI sets
+`OXBASE_CONFORMANCE_REQUIRE_M7`, `OXBASE_SERVICES_REQUIRE_M7`, `OXBASE_REDIS_REQUIRE_M7`,
+`OXBASE_SHELL_REQUIRE_M7_SEED` and, in the webview job, `OXBASE_E2E_REQUIRE_M7`, so nothing M7
+passes as pending. The 7-engine guard reported nothing open: connection checks 39 pass / 3 n/a
+(SQLite TLS / SSH), MongoDB and Redis included (MongoDB cancel: server operation gone 1 ms
+after the token, `cancel_running` 209 ms; 200 000 documents in 897 ms; Redis `BLPOP 0`
+cancelled in 0-1 ms, 200 000 list elements in 283 ms); `fetch_list` 65 pass (MongoDB 6, Redis
+4). Live tests: `oxbase-mongo` 24, `oxbase-redis` 35, services `m7_*` 8, all passed; the webview
+smoke test opened `m7_docs` (12 documents), edited a document, ran the shell's
+`countDocuments`, browsed `m7:ns:`, opened and edited Redis keys and ran `HGETALL` in the
+console. The README (*MongoDB and Redis (M7)*) has the numbers. Where the build differs from
+the text above or from `docs/m7-contracts.md`:
+
+- One BSON → Arrow implementation: `oxbase_mongo::arrow::DocumentLayout` is a thin face over
+  the driver's private `driver::convert` layout, and builder requests (`RequestSource`) run as
+  JSON request statements through `Connection::execute`, so a builder request, the same request
+  typed in the editor and its history entry pasted back stream, cancel and convert alike.
+  Explicit BSON `null` is the JSON text `null` in JSON text columns (still NULL in typed
+  columns); a column that is null-only in the sample is `mixed` with `oxbase.bson_types =
+  null`; a user field named `$document` stays in the document column.
+- The driver adds a **command request** statement, `{"type": "command", "database", "command"}`
+  (one `runCommand`, reply as one row; a cursor reply shows its first batch, then the driver
+  closes the cursor with `killCursors` outside a session and says so in a notice). Not in
+  contracts §4.2; the shell language guards (`drop`, `dropDatabase`, `dropIndexes`,
+  `renameCollection` with `dropTarget`) and redacts (`pwd`) this form too.
+- MongoDB `Prefer` TLS falls back to plain per connection (handshake failure or no answer
+  within min(connect timeout, 5 s)); there is no sticky choice per client.
+- The `[m7.mongodb]` seed carries two more fields than §9.2 lists (`score` a double in every
+  document, `big_long` an int64 above 2^53); `fixture_meta` `schema_version` 2 marks it, and
+  the compose healthcheck refuses older data volumes.
+- `scripts/e2e-fixtures.sh` starts MongoDB and Redis next to PostgreSQL for the webview job.
+  The smoke test empties a Monaco editor before inserting text (Monaco's input diff kept a
+  shared suffix of the replaced document) and closes a dialog a failed M7 step left open.
+- `async-executor` 1.14.0 (via zbus / keyring) was yanked during M7; `Cargo.lock` pins 1.14.1.
+
 Order of work: M0–M3 prove the architecture. M4 and M7 are where the per-database matrix gets tested for real. M8 and M10 reuse the Comparator and DdlGenerator cells and get much cheaper if M3 is done right.
 
 ## 7. Main risks

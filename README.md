@@ -5,7 +5,7 @@ React + TypeScript UI. v1 targets PostgreSQL, MySQL, MariaDB, SQLite, SQL Server
 Redis on Linux, macOS and Windows. The core is headless, so every feature also works from
 `oxbase-cli` and from tests. See [PLAN.md](PLAN.md) for the architecture and milestones.
 
-## What works (M6)
+## What works (M7)
 
 On PostgreSQL, MySQL, MariaDB, SQLite and SQL Server (M1 connections: plain, TLS, SSH,
 keychain secrets; SQL Server since M4):
@@ -110,14 +110,47 @@ Contracts: [docs/m3-contracts.md](docs/m3-contracts.md),
   and not used, see [docs/m6-contracts.md](docs/m6-contracts.md) §2.1). Numbers: see *Code
   insight (M6)* below.
 
-**In progress (M7): MongoDB and Redis.** The contracts are fixed in
-[docs/m7-contracts.md](docs/m7-contracts.md): MongoDB through the official `mongodb` crate
-behind an in-process SOCKS5 dialer (so SSH and every TLS mode work like the SQL engines), a
-document grid with tree / JSON views, a find / aggregate builder and a sandboxed mongo-shell
-subset (QuickJS); Redis through the `redis` crate (standalone, cluster, sentinel, RESP3), a
-`SCAN`-based key browser with typed editors, a console and pub/sub. The engine crates,
-services, commands and UI wrappers exist; the drivers, cells and screens land with the M7
-streams, and the engines are registered at M7 integration.
+- **MongoDB** (M7, MongoDB 5.0 and later; CI runs 7.0.45): the official `mongodb` crate
+  behind an in-process SOCKS5 dialer, so SSH tunnels and every TLS mode (`VerifyCa`, platform
+  roots, inline PEM, keychain client keys, the server name checked separately from the dial
+  address) work as on the SQL engines; SCRAM-SHA-256 / SHA-1, X.509 and PLAIN; host lists,
+  replica sets and `mongodb+srv` (not through SSH). The tree shows databases, then
+  **Collections** (with their indexes), Views, Users and Roles. Double-click a collection to
+  open the **document grid**: columns are inferred from a sample (one `Int64` column for int +
+  long, JSON text for nested and mixed values, Decimal128 as exact text), and the **tree** and
+  **JSON** views show the whole selected document. The **find / aggregate builder** writes the
+  filter, projection, sort (key order kept), skip and limit, or pipeline stages; history keeps
+  each request as shell code. Documents are edited, inserted and deleted as Extended JSON text
+  with an optimistic check: a document changed on the server since it was read is a conflict
+  and nothing is written. **New query** on a MongoDB connection opens the **mongo shell**, a
+  sandboxed subset on QuickJS (`db.<coll>.find / aggregate / insertOne / updateMany /
+  countDocuments / ...`, `use`, `show dbs / collections`, `ObjectId`, `ISODate`,
+  `NumberLong`, ...; no file, network or process access; memory, stack and CPU limits). Cursors
+  stream into the same result grid as SQL results; Stop kills the server operation
+  (`killOp`) within 2 s. `dropDatabase()`, `drop()`, `dropIndex` and `deleteMany` /
+  `updateMany` with an empty filter ask for confirmation; `pwd` / `password` values are masked
+  in history. Collections can be imported into (`insertMany`) and exported like any table.
+- **Redis** (M7; CI runs 8.10.3): the `redis` crate (RESP3 on 6.0 and later, else RESP2),
+  standalone (also through SSH), **cluster** and **sentinel**, TLS through rustls with the same
+  dial / server-name split. The tree lists databases 0..N-1, then namespaces (prefixes split at
+  `:` by default) and keys with their type and TTL, plus ACL users. The **key browser** scans
+  with a pattern and type filter (cursor `SCAN` only, never `KEYS`; a cluster's masters are
+  scanned in turn) and opens a key in its **typed editor**: string (text or hex), hash, list,
+  set, sorted set, stream and RedisJSON values stream in chunks of 1000, so a 200 000-member
+  key opens in bounded memory. Edits (set a string; add, change or remove hash fields, list
+  items, set and sorted-set members and stream entries; TTL, rename, delete) run atomically
+  under `WATCH` / `MULTI`; a key changed since it was read is a conflict, and delete and an
+  overwriting rename need a confirmation. The **console** runs one command per line with `redis-cli` quoting and shows
+  replies per RESP type (tables for hashes, sorted sets with scores, ...); `FLUSHALL`,
+  `FLUSHDB`, `CONFIG SET`, `KEYS` and the other dangerous commands ask for confirmation,
+  `SUBSCRIBE` / `MONITOR` are refused (use the pub/sub panel), and `AUTH` / `ACL SETUSER` /
+  `CONFIG SET requirepass` secrets are masked in history. The **pub/sub** panel subscribes to
+  channels and patterns on its own connection, shows messages as they arrive (a bounded buffer
+  that counts dropped messages) and publishes. Stop cancels a blocking command with
+  `CLIENT UNBLOCK`.
+
+Contracts and every deviation: [docs/m7-contracts.md](docs/m7-contracts.md). Numbers: see
+*MongoDB and Redis (M7)* below.
 
 ## Layout
 
@@ -145,7 +178,7 @@ tests/fixtures.toml                               test DB connection params, M2-
                                                   truth)
 tests/data/m5/                                    small hand-written import samples (M5)
 docs/                                             frozen contracts per milestone (m1-contracts.md
-                                                  to m6-contracts.md)
+                                                  to m7-contracts.md)
 ```
 
 ## Prerequisites
@@ -217,8 +250,8 @@ scripts/fixtures-certs.sh [--force]   # (re)generate the test PKI and SSH keys; 
 TLS and SSH (M1):
 
 - **Test PKI** (`[tls]`): `scripts/fixtures-certs.sh` (OpenSSL 1.1.1+/3.x and ssh-keygen) writes a
-  CA, a server certificate for `localhost`, `127.0.0.1`, `postgres`, `mysql`, `mariadb` and
-  `mssql`, and a client certificate (CN `oxbase_tls`) to `target/fixtures/tls`. PostgreSQL,
+  CA, a server certificate for `localhost`, `127.0.0.1`, `postgres`, `mysql`, `mariadb`,
+  `mssql`, `mongodb` and `redis`, and a client certificate (CN `oxbase_tls`) to `target/fixtures/tls`. PostgreSQL,
   MySQL, MariaDB and SQL Server run with TLS on. Each has a user `oxbase_tls` that the server
   accepts **only** over TLS (`[engines.<name>.tls_user]`; on SQL Server a logon trigger enforces
   it); the normal user (`oxbase`, `sa` on SQL Server) works with and without TLS.
@@ -248,7 +281,7 @@ MongoDB and Redis seeds (a document collection covering every mapped BSON type, 
 `mongodb:27017`, `redis:6379` and `redis:6380` (TLS), MongoDB runs with optional TLS
 (`allowTLS`) and Redis with a TLS-only port on `127.0.0.1:15480`, and `[m7.redis_cluster]` /
 `[m7.redis_sentinel]` describe a 3-master cluster on 15501-15503 and a sentinel setup on 15511,
-15512 and 15526 (host networking). The conformance stream implements them in the compose file.
+15512 and 15526 (host networking). `scripts/fixtures-up.sh` starts them with the others.
 
 M5 adds no seed objects: import and export tests create and drop scratch tables
 `m5_t_<case>_<token>` (`[m5]`). `[m5.files."<name>"]` lists what each sample in `tests/data/m5`
@@ -279,10 +312,13 @@ project.
    non-ASCII text) that must survive every alter, a reserved-word column `order` and a column
    renamed to `sel"ect_ü`, and finally drops. `capabilities` checks that what the engine's
    `DesignerCapabilities` claims (native, rebuild, unsupported; transactional DDL and check
-   enforcement, both probed) matches what the generator does. Other kinds stay pending;
-   mongodb and redis wait for M7. The harness also proves each fixture answers its handshake.
-   With `OXBASE_CONFORMANCE_REQUIRE_M4=1` (CI, the M4 exit check) every M1-M3 cell of
-   PostgreSQL, MySQL, MariaDB, SQLite and SQL Server must pass, nothing pending or skipped.
+   enforcement, both probed) matches what the generator does. Other kinds stay pending. From
+   M7, `fetch_list` also lists the `[m7]` seeds of MongoDB (database, collection, index, view,
+   user, role) and Redis (database, namespace, key, user). The harness also proves each
+   fixture answers its handshake. With `OXBASE_CONFORMANCE_REQUIRE_M4=1` (CI, the M4 exit
+   check) every M1-M3 cell of PostgreSQL, MySQL, MariaDB, SQLite and SQL Server must pass,
+   nothing pending or skipped; `OXBASE_CONFORMANCE_REQUIRE_M7=1` (CI since M7) extends that
+   guard to all seven engines.
 2. **Connection checks** (M1), through the real drivers, `ConnectionManager` and russh provider:
    `connect` (plain, server version equals `version_prefix`), `tls` (`VerifyFull` with the
    fixture CA as `oxbase_tls`, `tls_in_use`; plaintext and a wrong server name refused), `ssh`
@@ -291,7 +327,10 @@ project.
    `SLEEP(30)` / an endless recursive CTE / `WAITFOR DELAY` ends with `Cancelled` and the
    session answers `SELECT 1` within 2 s, via the token and via `cancel_running`) and
    `stream_200k` (200 000 generated rows arrive in more than one batch). SQLite has no TLS/SSH
-   columns; mongodb and redis show `pending (M7)`.
+   columns. MongoDB cancels a `$where` sleep (`killOp`, the server operation must be gone) and
+   streams `m7_big`; Redis cancels `BLPOP 0` (`CLIENT UNBLOCK`) and streams `m7:big:list`;
+   MongoDB's `tls` check runs as `oxbase` (no TLS-only user exists on MongoDB) and Redis's on
+   the TLS-only port.
 
 ```sh
 scripts/fixtures-up.sh
@@ -308,7 +347,7 @@ with a `[m2 query]` prefix:
 
 ```sh
 cargo test -p oxbase-net -p oxbase-pg -p oxbase-mysql -p oxbase-sqlite -p oxbase-mssql \
-    -p oxbase-services --locked -- --include-ignored --test-threads 1
+    -p oxbase-mongo -p oxbase-redis -p oxbase-services --locked -- --include-ignored --test-threads 1
 ```
 
 The OS keychain tests (`keychain_smoke` and `keychain_long_values` in `oxbase-store`,
@@ -329,25 +368,28 @@ command can follow the script name, e.g.
 runs the services live tests with the keychain test included. CI runs the script on Linux, macOS
 and Windows (`keychain` job).
 
-Last verified 2026-11-01 in the GitHub Actions conformance job (Linux x86_64, M4 integration,
-full-lane run 41298470889 on `milestone/m4` at d47cb5d; the fast-lane run 41298123652 on the same
-commit gave the same cells) with all 7 fixtures up: every fixture reachable (PostgreSQL 18.6,
-MySQL 8.4.13, MariaDB 11.8.9, SQL Server 2025 17.0.5035, MongoDB 7.0.45, Redis, SQLite 3.54.1
-file). CI sets `OXBASE_CONFORMANCE_REQUIRE_M4=1`: the 5-engine guard reported nothing open.
+Last verified 2026-11-03 in the GitHub Actions conformance job (Linux x86_64, M7 integration,
+fast-lane run 41547092752 on `wip/m7-integrate` at f90055a; the full-lane run 41549606517 on
+`milestone/m7` ran the same commit) with all 7 fixtures up plus the Redis cluster and sentinel:
+every fixture reachable (PostgreSQL 18.6, MySQL 8.4.13, MariaDB 11.8.9, SQL Server 2025
+17.0.5035, MongoDB 7.0.45, Redis 8.10.3, SQLite 3.54.1 file). CI sets
+`OXBASE_CONFORMANCE_REQUIRE_M7=1`: the 7-engine guard reported nothing open.
 
-- Object-kind matrix, 420 cells: **105 pass, 0 fail**, 135 pending, 180 n/a. The 55
+- Object-kind matrix, 420 cells: **115 pass, 0 fail**, 108 pending, 0 skipped, 197 n/a. The 65
   `fetch_list` passes are every M2 cell: PostgreSQL 13 (database, schema, table, column,
   index, foreign key, check, view, materialized view, function, procedure, trigger,
   sequence), MySQL 10 and MariaDB 11 (the same without schema and materialized view; sequence
   on MariaDB only), SQLite 8 (database, table, column, index, foreign key, check, view,
   trigger) and SQL Server 13 (database, schema, table, column, index, foreign key, check,
   view, function, procedure, trigger, sequence, type; indexes and triggers also under an
-  indexed view). The 50 M3 passes are `roundtrip` and `capabilities` for table, column,
-  index, foreign key and check on each of the five SQL engines (CI also sets
+  indexed view), plus M7: MongoDB 6 (database, collection, index, view, user, role) and Redis 4
+  (database, namespace, key, user). The 50 M3 passes are `roundtrip` and `capabilities` for
+  table, column, index, foreign key and check on each of the five SQL engines (CI also sets
   `OXBASE_CONFORMANCE_REQUIRE_M3_ROUNDTRIP=1`). The only skipped operations are the ones the
   contract allows: table and column comments on SQLite. The pending cells are user, role,
   grant, event, extension and the `roundtrip` / `capabilities` checks of the non-designer
-  kinds (not in M2-M4), and MongoDB / Redis (M7).
+  kinds on the SQL engines (not in M2-M7); MongoDB and Redis have no designer, so their
+  `roundtrip` / `capabilities` checks are n/a.
 
   | Engine | table | column | index | foreign key | check |
   |---|---|---|---|---|---|
@@ -359,8 +401,7 @@ file). CI sets `OXBASE_CONFORMANCE_REQUIRE_M4=1`: the 5-engine guard reported no
 
   (`roundtrip` / `capabilities`.) SQLite does NOT NULL, default, foreign key and check changes
   as the table rebuild; MySQL and MariaDB DDL is not transactional, SQL Server's is (probed).
-- Connection checks, 42: **27 pass** (postgres, mysql, mariadb, sqlite, mssql), 12 pending
-  (mongodb/redis M7), 3 n/a (SQLite TLS/SSH), 0 fail.
+- Connection checks, 42: **39 pass**, 3 n/a (SQLite TLS/SSH), 0 pending, 0 fail.
 
   | Engine | connect | tls | ssh | tls_over_ssh | cancel | stream_200k |
   |---|---|---|---|---|---|---|
@@ -369,13 +410,16 @@ file). CI sets `OXBASE_CONFORMANCE_REQUIRE_M4=1`: the 5-engine guard reported no
   | MariaDB | pass | pass | pass | pass | pass | pass |
   | SQLite | pass | n/a | n/a | n/a | pass | pass |
   | SQL Server | pass | pass | pass | pass | pass | pass |
+  | MongoDB | pass | pass | pass | pass | pass | pass |
+  | Redis | pass | pass | pass | pass | pass | pass |
 
-  SQL Server details (fast-lane run): TLS as the TLS-only login `oxbase_tls` (plaintext and a
-  wrong name refused), SSH to `mssql:1433`, `VerifyFull` through the tunnel, cancel of
-  `WAITFOR DELAY '00:00:30'` (token: ended in 9 ms, session answered in 12 ms;
-  `cancel_running`: 1 ms / 2 ms), 200 000 rows in 49 batches (1506 ms).
-- Query runs (`oxbase-services` live tests, 8 MiB memory budget so the result spills; full-lane
-  run 41298470889. In the fast-lane run 41298123652 the 1M-row stream took 1376 / 1335 / 1315 /
+  SQL Server details (M4 fast-lane run 41298123652): TLS as the TLS-only login `oxbase_tls`
+  (plaintext and a wrong name refused), SSH to `mssql:1433`, `VerifyFull` through the tunnel,
+  cancel of `WAITFOR DELAY '00:00:30'` (token: ended in 9 ms, session answered in 12 ms;
+  `cancel_running`: 1 ms / 2 ms), 200 000 rows in 49 batches (1506 ms). MongoDB and Redis
+  details: *MongoDB and Redis (M7)* below.
+- Query runs (`oxbase-services` live tests, 8 MiB memory budget so the result spills; M4
+  full-lane run 41298470889. In the fast-lane run 41298123652 the 1M-row stream took 1376 / 1335 / 1315 /
   692 / 3520 ms in the same engine order and every other figure stayed in the same range):
 
   | Engine | 1M rows streamed | first page | random 200-row page p95 | spill | peak batch memory | cancel after ~220-250k rows: run ended | next `SELECT 1` |
@@ -517,6 +561,60 @@ Tests: 1 205 Rust tests passed on Linux and macOS and 1 203 on Windows (235 live
 ignored there and run in the Conformance and perf jobs), 1 021 in the Conformance job, 284 UI
 tests.
 
+### MongoDB and Redis (M7)
+
+The exit check (PLAN.md §6, "browse, edit and query on both engines") runs live in the CI
+Conformance job against MongoDB 7.0.45 and Redis 8.10.3 (plus a 3-master Redis cluster and a
+sentinel setup), with `OXBASE_CONFORMANCE_REQUIRE_M7`, `OXBASE_SERVICES_REQUIRE_M7`,
+`OXBASE_REDIS_REQUIRE_M7` and `OXBASE_SHELL_REQUIRE_M7_SEED` set, so a missing fixture, seed or
+cell fails instead of being pending. Numbers from fast-lane run 41547092752 (f90055a):
+
+- **Connections** (conformance): MongoDB plain 17 ms, `VerifyFull` TLS on the shared port (a
+  wrong name refused), SSH to `mongodb:27017`, `VerifyFull` through the tunnel 477 ms; cancel of
+  a running operation: the token ended the run in 0 ms and the server operation was gone 1 ms
+  later, `cancel_running` 209 ms (the `$currentOp` search retries once after 200 ms); 200 000
+  documents in 200 batches in 897 ms. Redis plain 2 ms, TLS on the TLS-only port (plaintext to
+  it and a wrong name refused), SSH to `redis:6379`, `VerifyFull` to `redis:6380` through the
+  tunnel 352 ms; `BLPOP 0` cancelled in 0 ms (token) / 1 ms (`cancel_running`), the session
+  answered 1-2 ms later; 200 000 list elements in 49 batches in 283 ms.
+- **Browse**: the tree lists `oxbase_test` → Collections (`m7_docs`, `m7_big`, `m7_edit`) with
+  `m7_docs`'s five indexes, Views (`m7_view`), Users and Roles; Redis databases 0..15 (key
+  counts; `m7:db1:key` read on database 1's own session), the namespace tree under `m7:` with
+  key types and TTLs, ACL users without passwords.
+- **Query**: a `find` on `m7_docs` gives the contract's column table (one `Int64` column for
+  int + long, a `mixed` JSON column, `only_late` only in the `$document` column with a sample of
+  10); a `$group` aggregate; `m7_big` (200 000 documents) streams every row in about 0.66 s
+  (driver test) and pages at random offsets, and a cancel mid-stream ends within 2 s. The
+  shell: `db.m7_docs.countDocuments({})` = 12, `db.m7_big.find({g: 7}).sort({_id: 1}).limit(5)`
+  → 7, 107, 207, 307, 407, a `$group` total of 9 900 000, `use` switching the database; a
+  `while (true) {}` stops on cancel and at the CPU limit, an allocation loop at the memory
+  limit. Redis: a `SCAN` of `m7:*` returns every seed key once; each type opens in its typed
+  columns; `m7:big:list` and `m7:big:zset` (200 000 each) stream in 98 ms and 176 ms; a value
+  read is cancelled within 2 s; the console renders `HGETALL`, `ZRANGE ... WITHSCORES` and
+  binary `GET` replies, and `FLUSHDB` is refused without a confirmation; the cluster scan finds
+  the 100 seed keys across the three masters; sentinel mode reads through `oxmaster`.
+- **Edit**: document insert, update (including a field that was missing), replace and delete
+  on `m7_edit`; a stale `previous` (also a case-only or type-only change) is a conflict and
+  writes nothing. Every key edit on scratch keys applies atomically under `WATCH` / `MULTI`; a
+  type conflict and a `delete` without confirmation are refused. Pub/sub: subscriptions to
+  `m7:news` and `m7:*` both receive a published message, and a full buffer reports `dropped`.
+  A collection exports to CSV and imports into a new collection (`insertMany`).
+- **Live tests**: `oxbase-mongo` driver 7, fetch 6, documents 7, shell 4; `oxbase-redis`
+  driver 14, fetch 5, keys 7, pub/sub 3, cluster 3, console 3; `oxbase-services` m7_mongo 5,
+  m7_redis 1, m7_shell 2 (history redaction of a `createUser` `pwd` and an `AUTH` password
+  checked there; the other redaction rules are unit-tested); all passed.
+- **Webview smoke** (Linux, `OXBASE_E2E_REQUIRE_M7=1`): MongoDB `m7_docs` opened with 12
+  documents and no `$document` column, a test document edited in the document dialog and read
+  back, the shell's `countDocuments` showed 12 (8.7 s for the step); Redis `m7:ns:*` found 4
+  keys, `m7:hash` opened with 3 rows, a scratch string key edited and read back, the console's
+  `HGETALL m7:hash` rendered (5.9 s). Screenshots `ui-04-mongo-collection-{dark,light}` and
+  `ui-05-redis-key-browser-{dark,light}`.
+
+Tests at the M7 integration (full-lane run 41549606517 on `milestone/m7` at f90055a, Bundle run
+41549609930 green on all four targets): 1 394 Rust tests passed on Linux and macOS and 1 392 on
+Windows (302 live / perf tests ignored there and run in the Conformance and perf jobs; the
+QuickJS shell builds and runs on all three), 1 260 in the Conformance job, 377 UI tests.
+
 ## App data
 
 Profiles live in `connections.json` in the config directory (`OXBASE_CONFIG_DIR` overrides it).
@@ -574,8 +672,9 @@ pnpm tauri build                          # release bundles for the current OS
 
 `ui/e2e/smoke.mjs` drives the built app through its real webview (WebKitGTK, Linux only) with
 `tauri-driver` and `WebKitWebDriver`: connect, a 1 000 000-row query, Arrow pages decoded in the
-webview, scrolling, page latency, cancel, and a table-data cell edit applied and seen after a
-reload. See [ui/e2e/README.md](ui/e2e/README.md). Locally (needs `webkit2gtk-driver`,
+webview, scrolling, page latency, cancel, a table-data cell edit applied and seen after a
+reload, import / export (M5), completion (M6), and MongoDB and Redis browse / edit / query (M7;
+`scripts/e2e-fixtures.sh` starts PostgreSQL, MongoDB and Redis). See [ui/e2e/README.md](ui/e2e/README.md). Locally (needs `webkit2gtk-driver`,
 `cargo install tauri-driver --locked --version 2.1.0`, Docker, and `xvfb-run` without a
 display):
 
@@ -601,7 +700,8 @@ value after a reload.
   **Full lane**, on pull requests, pushes to main, weekly and manual runs: fmt + clippy on Linux;
   `cargo test --workspace` on Linux, macOS and Windows; the OS keychain tests
   (`scripts/keychain-tests.sh`) on Linux, macOS and Windows; UI lint, typecheck, test and build;
-  the conformance harness and the M1-M6 live tests against the Docker fixtures; the webview
+  the conformance harness and the M1-M7 live tests against the Docker fixtures (MongoDB and
+  Redis included, with the Redis cluster and sentinel); the webview
   smoke test (Linux; also on the fast lane of `wip/*-e2e`, `wip/*-app` and `wip/*-integrate`);
   `cargo deny` (advisories, bans, licenses, sources); the `import-perf` job (M5, the 1 GB CSV
   import exit check, `docs/m5-contracts.md` §9, with `OXBASE_REQUIRE_M5_PERF=1`): full lane,
@@ -610,7 +710,8 @@ value after a reload.
   synthetic 5k-table catalog in the perf and release profiles, the diagnostics (1 MiB) and
   formatter (100 KiB) budgets, then the live 5k-table PostgreSQL schema; full lane, plus the
   fast lane of `wip/*-perf`, `wip/*-complete`, `wip/*-cache` and `wip/*-integrate`. The webview
-  smoke test requires the M6 completion step (`OXBASE_E2E_REQUIRE_M6=1`).
+  smoke test requires the M6 completion step (`OXBASE_E2E_REQUIRE_M6=1`) and the M7 MongoDB and
+  Redis steps (`OXBASE_E2E_REQUIRE_M7=1`).
 - `.github/workflows/bundle.yml` (push to main, manual): Tauri dev bundles for Linux x86_64,
   Windows x86_64 and macOS aarch64/x86_64, uploaded as workflow artifacts.
   `scripts/ci-verify-signing.mjs` checks what was produced: `codesign --verify --deep --strict`,
