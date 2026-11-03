@@ -57,6 +57,7 @@ use crate::schema_cache::SchemaEvents;
 use crate::tree::TreeService;
 use crate::{CancellationToken, ConnectionManager, SessionId};
 
+mod data;
 mod structure;
 
 /// Compare results kept per service (module docs).
@@ -392,6 +393,8 @@ pub struct DataSyncService {
     tree: Arc<TreeService>,
     dialects: Arc<DialectRegistry>,
     runs: RunRegistry,
+    /// Kept compare results with their spill stores (`data::Kept`).
+    kept: Arc<data::Kept>,
 }
 
 impl DataSyncService {
@@ -405,6 +408,7 @@ impl DataSyncService {
             tree,
             dialects,
             runs: RunRegistry::new(),
+            kept: Arc::new(data::Kept::default()),
         }
     }
 
@@ -424,16 +428,38 @@ impl DataSyncService {
         &self.runs
     }
 
+    fn ctx(&self) -> data::Ctx {
+        data::Ctx {
+            manager: Arc::clone(&self.manager),
+            dialects: Arc::clone(&self.dialects),
+            kept: Arc::clone(&self.kept),
+        }
+    }
+
     /// Starts a data compare; fails before starting when a pair names no table or the
     /// engines differ.
     pub async fn start_compare(
         &self,
         request: DataCompareRequest,
     ) -> Result<DataRunHandle<DataCompareEvent>> {
-        let _ = (&self.runs, request);
-        // Keeps the skeleton an `async fn` (clippy::unused_async) until the body lands.
-        std::future::ready(()).await;
-        unimplemented!("m8: data-sync")
+        let ctx = self.ctx();
+        let target = data::check_request(&ctx, &request)?;
+        // The spill directory is made before the run starts, so a full disk fails here.
+        let store = tokio::task::spawn_blocking(|| oxbase_diff::DiffStore::new(None))
+            .await
+            .map_err(|e| oxbase_types::Error::internal(format!("data compare setup: {e}")))??;
+        let ticket = self
+            .runs
+            .register(&[request.source_session, request.target_session]);
+        let id = ticket.id();
+        let (events, receiver) = mpsc::channel(data::EVENT_BUFFER);
+        tokio::spawn(data::compare_task(
+            ctx, ticket, request, target, store, events,
+        ));
+        Ok(DataRunHandle {
+            id,
+            events: receiver,
+        })
     }
 
     /// The script preview of a kept compare. Changes nothing.
@@ -442,10 +468,12 @@ impl DataSyncService {
         request: &DataScriptRequest,
         cancel: CancellationToken,
     ) -> Result<DataScript> {
-        let _ = (&self.runs, request, cancel);
-        // Keeps the skeleton an `async fn` (clippy::unused_async) until the body lands.
-        std::future::ready(()).await;
-        unimplemented!("m8: data-sync")
+        let entry = self.kept.get(request.compare_id)?;
+        let ctx = self.ctx();
+        let options = request.options.clone();
+        tokio::task::spawn_blocking(move || data::script(&ctx, &entry, &options, &cancel))
+            .await
+            .map_err(|e| oxbase_types::Error::internal(format!("data script: {e}")))?
     }
 
     /// Starts applying a kept compare (module docs, *Data compare and apply*).
@@ -453,16 +481,41 @@ impl DataSyncService {
         &self,
         request: DataApplyRequest,
     ) -> Result<DataRunHandle<DataApplyEvent>> {
-        let _ = (&self.runs, request);
-        // Keeps the skeleton an `async fn` (clippy::unused_async) until the body lands.
+        let entry = self.kept.get(request.compare_id)?;
+        let ctx = self.ctx();
+        let total = data::check_apply(&ctx, &entry, &request.options)?;
+        if self.manager.get(entry.target_session).is_none() {
+            return Err(oxbase_types::Error::not_found(format!(
+                "no open session {}; the target connection was closed",
+                entry.target_session
+            )));
+        }
+        // A compare is applied once: its rows describe the target before this apply.
+        data::mark_applied(&entry)?;
+        let ticket = self
+            .runs
+            .register(&[entry.source_session, entry.target_session]);
+        let id = ticket.id();
+        let (events, receiver) = mpsc::channel(data::EVENT_BUFFER);
+        // Keeps the signature async (clippy::unused_async) like the other starts.
         std::future::ready(()).await;
-        unimplemented!("m8: data-sync")
+        tokio::spawn(data::apply_task(
+            ctx,
+            ticket,
+            entry,
+            request.options,
+            total,
+            events,
+        ));
+        Ok(DataRunHandle {
+            id,
+            events: receiver,
+        })
     }
 
     /// Drops a kept compare (and its spill files); `false` when it is unknown.
     pub fn forget(&self, compare_id: OperationId) -> bool {
-        let _ = (&self.runs, compare_id);
-        unimplemented!("m8: data-sync")
+        self.kept.forget(compare_id)
     }
 
     /// Cancels a running compare or apply; `false` when it is unknown or already ended.

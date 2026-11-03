@@ -64,6 +64,7 @@
 mod bulk;
 mod caps;
 mod catalog_bulk;
+mod chunk_hash;
 mod compare;
 mod ddl;
 mod dml;
@@ -140,6 +141,9 @@ pub fn register(reg: &mut DialectRegistry) {
     reg.register_catalog_reader(engine, Arc::new(PgCatalogReader));
     // M6: language data for code insight (language.rs).
     reg.register_language(engine, language::LANGUAGE);
+
+    // M8: data sync skips equal key ranges by digest (chunk_hash.rs).
+    reg.register_chunk_hasher(engine, Arc::new(chunk_hash::PgChunkHasher));
     reg.mark_not_applicable_except(engine, &APPLICABLE);
 
     // M8: structure sync DDL and comparison of views, materialized views, sequences, routines

@@ -25,6 +25,8 @@ arrow-array.workspace = true
 arrow-schema.workspace = true
 # Differing rows spill to Arrow IPC files (bounded memory for 100k+ row differences).
 arrow-ipc.workspace = true
+# Chunk pages concatenated and filtered into the spill store (data compare).
+arrow-select.workspace = true
 futures.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -32,9 +34,13 @@ tempfile.workspace = true
 
 [dev-dependencies]
 oxbase-driver = { workspace = true, features = ["mock"] }
+# A counting connection wrapper in the data tests (bounded reads).
+async-trait.workspace = true
 pretty_assertions.workspace = true
 tokio.workspace = true
-# Structure sync script tests (tests/structure_script.rs) run the engines' real DDL cells.
+chrono.workspace = true
+# Structure sync script tests (tests/structure_script.rs) and data compare / DML tests run
+# every SQL engine's real cells (and real SQLite files; no Docker).
 oxbase-pg.workspace = true
 oxbase-mysql.workspace = true
 oxbase-mssql.workspace = true

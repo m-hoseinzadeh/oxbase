@@ -56,6 +56,7 @@
 mod bulk;
 mod caps;
 mod catalog_bulk;
+mod chunk_hash;
 mod coltype;
 mod compare;
 mod database;
@@ -177,6 +178,9 @@ pub fn register(reg: &mut DialectRegistry) {
         reg.register_tree_layout(engine, tree_layout(engine));
         reg.register_capabilities(engine, Arc::new(MySqlCapabilities::new(engine)));
         reg.register_quoting(engine, Arc::new(BacktickQuoting));
+
+        // M8: data sync skips equal key ranges by digest (chunk_hash.rs).
+        reg.register_chunk_hasher(engine, Arc::new(chunk_hash::MySqlChunkHasher));
         reg.mark_not_applicable_except(engine, applicable_kinds(engine));
 
         // M8: structure sync DDL and comparison of views, routines, triggers and MariaDB
