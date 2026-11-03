@@ -111,7 +111,8 @@ fn gate_for(
     env: &str,
 ) -> Vec<String> {
     let mut problems = Vec::new();
-    for &want in required {
+    // OXBASE_CONFORMANCE_ENGINES: only the selected engines are required.
+    for &want in required.iter().filter(|&&e| crate::adapter::is_selected(e)) {
         if !engines.iter().any(|e| e.engine == want) {
             problems.push(format!(
                 "no {want} fixture in the fixtures file ({env} is set)"

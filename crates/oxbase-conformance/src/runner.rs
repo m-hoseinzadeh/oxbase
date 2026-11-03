@@ -160,7 +160,7 @@ pub fn run(
 
     let missing_engines = Engine::ALL
         .into_iter()
-        .filter(|k| !engines.iter().any(|e| e.engine == *k))
+        .filter(|k| adapter::is_selected(*k) && !engines.iter().any(|e| e.engine == *k))
         .collect();
 
     Report {

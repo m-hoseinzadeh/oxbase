@@ -875,6 +875,10 @@ impl Fixtures {
                     known.join(", ")
                 ))
             })?;
+            // OXBASE_CONFORMANCE_ENGINES: the other engines' fixtures are not part of the run.
+            if !crate::adapter::is_selected(engine) {
+                continue;
+            }
             let target = if engine.is_networked() {
                 let port = fx
                     .port
