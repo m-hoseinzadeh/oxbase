@@ -210,6 +210,7 @@ async fn plan_of(spec: &TransferSpec, existing: Vec<TableDef>) -> TransferPlan {
             source: source.as_ref(),
             target: target.as_ref(),
             spec,
+            same_server: false,
         },
         CancellationToken::new(),
     )
@@ -341,7 +342,11 @@ async fn query_sources_take_their_columns_from_the_result() {
         target_name: "copied".into(),
     });
     let reg = registry(Vec::new());
-    let source = connect(Engine::Postgres, MockConfig::default()).await;
+    let source_driver = MockDriver::new(Engine::Postgres);
+    let source = source_driver
+        .connect(&ConnectParams::new(Engine::Postgres))
+        .await
+        .unwrap();
     let target = connect(Engine::MySql, MockConfig::default()).await;
     let prepared = prepare(
         PlanInputs {
@@ -349,6 +354,7 @@ async fn query_sources_take_their_columns_from_the_result() {
             source: source.as_ref(),
             target: target.as_ref(),
             spec: &spec,
+            same_server: false,
         },
         CancellationToken::new(),
     )
@@ -366,7 +372,14 @@ async fn query_sources_take_their_columns_from_the_result() {
     let table = &prepared.tables[0];
     assert_eq!(table.select.sql, "SELECT id, name FROM anywhere");
     assert_eq!(table.columns.len(), 2);
-    assert!(table.ddl_in_transaction && table.creates);
+    // Without a capabilities role the target's DDL is taken to commit at once.
+    assert!(!planned.transactional_ddl);
+    assert!(!table.ddl_in_transaction && table.creates);
+    // The query was read inside a transaction that was rolled back.
+    let log = source_driver.log();
+    let begin = log.iter().position(|s| s == "BEGIN");
+    let rollback = log.iter().position(|s| s == "ROLLBACK");
+    assert!(begin.is_some() && rollback > begin, "{log:?}");
 
     // MongoDB is not a transfer endpoint.
     let mongo = connect_mongo().await;
@@ -376,6 +389,7 @@ async fn query_sources_take_their_columns_from_the_result() {
             source: source.as_ref(),
             target: mongo.as_ref(),
             spec: &spec,
+            same_server: false,
         },
         CancellationToken::new(),
     )
@@ -384,6 +398,47 @@ async fn query_sources_take_their_columns_from_the_result() {
         matches!(refused, Err(Error::Unsupported { .. })),
         "{refused:?}"
     );
+}
+
+#[tokio::test]
+async fn a_table_is_not_copied_onto_itself() {
+    let reg = registry(Vec::new());
+    let source = connect(Engine::Postgres, MockConfig::default()).await;
+    let target = connect(Engine::MySql, MockConfig::default()).await;
+    // The target container is the source's schema.
+    let mut spec = tables(&["parent"]);
+    spec.target = ObjectRef::schema(Some("db"), "src");
+    let mut renamed = spec.clone();
+    if let SourceObject::Table { target_name, .. } = &mut renamed.objects[0] {
+        *target_name = Some("parent_copy".into());
+    }
+    let run = |spec: &TransferSpec, same_server: bool| {
+        plan(
+            PlanInputs {
+                dialects: &reg,
+                source: source.as_ref(),
+                target: target.as_ref(),
+                spec,
+                same_server,
+            },
+            CancellationToken::new(),
+        )
+    };
+    let blocked = run(&spec, true).await.unwrap();
+    assert!(!blocked.runnable);
+    assert!(
+        blocked
+            .blocked
+            .iter()
+            .any(|b| b.contains("cannot be copied onto itself")),
+        "{:?}",
+        blocked.blocked
+    );
+    // Another server, or another name next to the source: fine.
+    let other_server = run(&spec, false).await.unwrap();
+    assert!(other_server.runnable, "{:?}", other_server.blocked);
+    let beside = run(&renamed, true).await.unwrap();
+    assert!(beside.runnable, "{:?}", beside.blocked);
 }
 
 async fn connect_mongo() -> Box<dyn Connection> {

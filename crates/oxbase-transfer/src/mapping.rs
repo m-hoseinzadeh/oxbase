@@ -34,6 +34,7 @@ use oxbase_types::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::cells::{TargetRules, TextDefaults};
 use crate::spec::{ColumnOverride, TransferOptions};
 
 /// The two engines and their mappers.
@@ -51,6 +52,11 @@ impl MappingContext<'_> {
     /// Source and target are the same engine (module docs, *Same engine*).
     pub fn same_engine(&self) -> bool {
         self.source_engine == self.target_engine
+    }
+
+    /// What the target engine accepts beyond its type mapping ([`crate::cells::target_rules`]).
+    pub fn target_rules(&self) -> TargetRules {
+        crate::cells::target_rules(self.target_engine, self.target_version)
     }
 }
 
@@ -217,16 +223,16 @@ pub fn fidelity_between(from: &DataType, to: &DataType) -> (Fidelity, Option<Str
                 widened(format!("every {from} value fits {to}"))
             } else {
                 narrowed(format!(
-                    "values that do not fit {to} are refused; extra decimal places are rounded"
+                    "values that do not fit {to} (too many digits or decimal places) are refused"
                 ))
             }
         }
-        (
-            T::Float { .. } | T::Decimal { .. },
-            T::Int { .. } | T::Float { .. } | T::Decimal { .. },
-        ) => narrowed(format!(
+        (T::Float { .. } | T::Decimal { .. }, T::Float { .. }) => narrowed(format!(
             "values are rounded to {to}; values outside its range are refused"
         )),
+        (T::Float { .. } | T::Decimal { .. }, T::Int { .. } | T::Decimal { .. }) => narrowed(
+            format!("values with a fraction {to} cannot hold, or outside its range, are refused"),
+        ),
         (_, T::Json { .. }) => match from {
             T::Json { .. } => (Fidelity::Exact, None),
             T::Char { .. } | T::VarChar { .. } | T::Text | T::Other { .. } => {
@@ -315,6 +321,29 @@ pub fn map_column(
     } else {
         ctx.target_mapper.map(&source_type, ctx.target_version)
     };
+    let typed_by_user = column_override.is_some_and(|o| o.data_type.is_some());
+    if !ctx.same_engine()
+        && column.auto_increment
+        && !typed_by_user
+        && matches!(source_type, DataType::Int { unsigned: true, .. })
+        && !matches!(mapping.data_type, DataType::Int { .. })
+    {
+        // An unsigned 64-bit id (MySQL `bigint unsigned AUTO_INCREMENT`) has no integer home
+        // on most engines; a signed bigint keeps it generated on the target.
+        let signed = ctx.target_mapper.map(&DataType::INT64, ctx.target_version);
+        if matches!(signed.data_type, DataType::Int { .. }) {
+            mapping = TypeMapping {
+                data_type: signed.data_type,
+                native_type: signed.native_type,
+                fidelity: Fidelity::Narrowed,
+                reason: Some(
+                    "an auto-increment column stays an integer so the target generates its \
+                     values: ids above 9223372036854775807 are refused"
+                        .to_owned(),
+                ),
+            };
+        }
+    }
     let mut overridden = false;
     let mut skipped = false;
     let mut target = column.name.clone();
@@ -370,23 +399,65 @@ fn unbounded(t: &DataType) -> bool {
     )
 }
 
-/// The name of index `name` of table `table` on another engine: prefixed with the table name
-/// (index names are per schema on some engines and per table on others), at most 60
-/// characters.
-fn index_name(table: &str, name: &str) -> String {
-    let full = if name.starts_with(table) {
-        name.to_owned()
-    } else {
-        format!("{table}_{name}")
+/// `true` for unbounded text (a `text` / `longtext` / `nvarchar(max)` column).
+fn unbounded_text(t: &DataType) -> bool {
+    matches!(
+        t,
+        DataType::Text | DataType::VarChar { length: None } | DataType::Char { length: None }
+    )
+}
+
+/// `true` for the types no index of a created table covers on any engine: JSON (PostgreSQL
+/// `json` has no B-tree ordering), arrays and engine-specific types.
+fn never_indexed(t: &DataType) -> bool {
+    matches!(
+        t,
+        DataType::Json { .. } | DataType::Array { .. } | DataType::Other { .. }
+    )
+}
+
+/// Bytes one value of `t` takes in an index key, for the target's key-size limit (text at
+/// `bytes_per_char` per character; a rough upper bound for the rest).
+fn key_bytes(t: &DataType, bytes_per_char: u32) -> u64 {
+    let n = match t {
+        DataType::Char { length: Some(n) } | DataType::VarChar { length: Some(n) } => {
+            n.saturating_mul(bytes_per_char)
+        }
+        DataType::Binary { length: Some(n) } | DataType::VarBinary { length: Some(n) } => *n,
+        DataType::Bool | DataType::Enum { .. } => 2,
+        DataType::Int { bits, .. } => u32::from(*bits / 8).max(1),
+        DataType::Uuid => 16,
+        DataType::Decimal { .. } => 32,
+        _ => 8,
+    };
+    u64::from(n)
+}
+
+/// The name of constraint or index `name` of table `source` on table `target` when the name
+/// must be new (another engine, or a copy in the source's own schema): a name that starts with
+/// the source table's name gets the target table's name in its place, any other is prefixed
+/// with it (index and constraint names are per schema on some engines and per table on
+/// others); at most 60 characters.
+pub(crate) fn constraint_name(source: &str, target: &str, name: &str) -> String {
+    let full = match name.strip_prefix(source) {
+        Some(rest) => format!("{target}{rest}"),
+        None => format!("{target}_{name}"),
     };
     full.chars().take(60).collect()
 }
 
+/// `true` when `a` and `b` live in the same database and schema (a copy next to its source:
+/// index and constraint names must be new there).
+pub(crate) fn same_container(a: &ObjectRef, b: &ObjectRef) -> bool {
+    a.catalog == b.catalog && a.schema == b.schema
+}
+
 /// A literal default that every SQL engine reads the same way, for a column of `target`
 /// type: a plain number (numeric columns) or a simple string literal (text, temporal and
-/// UUID columns). PostgreSQL casts (`'x'::text`), SQL Server parentheses (`((0))`) and `N`
-/// prefixes are taken off. `None` when the default is anything else.
-fn portable_default(default: &str, target: &DataType) -> Option<String> {
+/// UUID columns), or a boolean literal (`true`, `1`, `'t'`, ...) written the target's way
+/// ([`TargetRules::bool_literals`]). PostgreSQL casts (`'x'::text`), SQL Server parentheses
+/// (`((0))`) and `N` prefixes are taken off. `None` when the default is anything else.
+fn portable_default(default: &str, target: &DataType, rules: &TargetRules) -> Option<String> {
     let mut text = default.trim();
     while let Some(inner) = text.strip_prefix('(').and_then(|t| t.strip_suffix(')')) {
         text = inner.trim();
@@ -408,6 +479,15 @@ fn portable_default(default: &str, target: &DataType) -> Option<String> {
             && digits.bytes().all(|b| b.is_ascii_digit() || b == b'.')
             && digits.bytes().filter(|b| *b == b'.').count() <= 1
     };
+    if matches!(target, DataType::Bool) {
+        let truth = match text.to_ascii_lowercase().as_str() {
+            "true" | "1" | "'t'" | "'true'" | "'1'" | "b'1'" => true,
+            "false" | "0" | "'f'" | "'false'" | "'0'" | "b'0'" => false,
+            _ => return None,
+        };
+        let (yes, no) = rules.bool_literals;
+        return Some(if truth { yes } else { no }.to_owned());
+    }
     let string = text.len() >= 2
         && text.starts_with('\'')
         && text.ends_with('\'')
@@ -434,6 +514,53 @@ fn portable_default(default: &str, target: &DataType) -> Option<String> {
     }
 }
 
+/// Bounds the primary-key columns of `source` whose target type is unbounded text or binary
+/// when the target cannot key such a column ([`TargetRules::keys_on_unbounded`]): they become
+/// `varchar(n)` / `varbinary(n)` (`n` = [`TargetRules::key_text_length`]), narrowed, so the
+/// key survives and longer values are refused per row. Across engines only; overridden and
+/// skipped columns are left alone ([`target_table`] then leaves the key out with a warning).
+pub fn bound_key_columns(ctx: &MappingContext<'_>, source: &TableDef, columns: &mut [ColumnPlan]) {
+    let rules = ctx.target_rules();
+    if ctx.same_engine() || rules.keys_on_unbounded {
+        return;
+    }
+    let Some(pk) = &source.primary_key else {
+        return;
+    };
+    let n = rules.key_text_length;
+    for plan in columns
+        .iter_mut()
+        .filter(|p| !p.skipped && !p.overridden && pk.columns.contains(&p.source))
+    {
+        let bounded = match plan.mapping.data_type {
+            DataType::Text
+            | DataType::VarChar { length: None }
+            | DataType::Char { length: None } => DataType::VarChar { length: Some(n) },
+            DataType::VarBinary { length: None } | DataType::Binary { length: None } => {
+                DataType::VarBinary { length: Some(n) }
+            }
+            _ => continue,
+        };
+        let mapped = ctx.target_mapper.map(&bounded, ctx.target_version);
+        if mapped.fidelity == Fidelity::Unsupported || unbounded(&mapped.data_type) {
+            continue;
+        }
+        let (fidelity, _) = fidelity_between(&plan.source_type, &mapped.data_type);
+        let reason = format!(
+            "a primary-key column: {} cannot key unbounded text or binary, so it is created as \
+             {}; longer values are refused",
+            ctx.target_engine.display_name(),
+            mapped.data_type
+        );
+        plan.mapping = TypeMapping {
+            data_type: mapped.data_type,
+            native_type: mapped.native_type,
+            fidelity: fidelity.worst(Fidelity::Narrowed),
+            reason: Some(reason),
+        };
+    }
+}
+
 /// The table to create on the target for `source` (named `target`), from its column plans
 /// (module docs): relocated for the same engine, rebuilt with mapped types across engines,
 /// without foreign keys (they are added after the load). Returns the definition and its
@@ -441,7 +568,14 @@ fn portable_default(default: &str, target: &DataType) -> Option<String> {
 ///
 /// `columns` holds one plan per source column (in any order; matched by source name). A
 /// skipped column is left out of the table, except an auto-increment column (skipped because
-/// the target generates its values), which stays.
+/// the target generates its values) and, on the same engine, a computed column (skipped
+/// because the target computes it), which stay.
+///
+/// Index and constraint names are made new ([`constraint_name`]; the primary key's name is
+/// left to the target) across engines and for a copy in the source's own schema, where the
+/// source's names are taken. Across engines, a key or index the target cannot create (an
+/// unbounded or JSON column, a key longer than [`TargetRules::index_key_bytes`]) is left out
+/// with a warning.
 pub fn target_table(
     ctx: &MappingContext<'_>,
     source: &TableDef,
@@ -453,12 +587,18 @@ pub fn target_table(
     let plan_of = |name: &str| columns.iter().find(|p| p.source == name);
     // Source column name → target column name, for the columns the table keeps.
     let mut renamed: Vec<(String, String)> = Vec::new();
-    let mut out = TableDef::new(target);
     let same = ctx.same_engine();
+    let rules = ctx.target_rules();
+    let engine = ctx.target_engine.display_name();
+    // New index and constraint names: another engine, or a copy next to its source.
+    let rename = !same || same_container(&source.obj, &target);
+    let mut out = TableDef::new(target);
     for column in &source.columns {
         let plan = plan_of(&column.name)
             .ok_or_else(|| Error::internal(format!("no column plan for '{}'", column.name)))?;
-        if plan.skipped && !column.auto_increment {
+        let kept_when_skipped =
+            column.auto_increment || (same && column.generated.is_some() && !plan.overridden);
+        if plan.skipped && !kept_when_skipped {
             continue;
         }
         renamed.push((column.name.clone(), plan.target.clone()));
@@ -490,7 +630,16 @@ pub fn target_table(
         if let Some(default) = &column.default
             && !column.auto_increment
         {
-            match portable_default(default, &c.data_type) {
+            match portable_default(default, &c.data_type, &rules) {
+                Some(literal) if unbounded_text(&c.data_type) => match rules.text_defaults {
+                    TextDefaults::Plain => c.default = Some(literal),
+                    TextDefaults::Parenthesized => c.default = Some(format!("({literal})")),
+                    TextDefaults::Dropped => warnings.push(format!(
+                        "column {}: its default ({default}) is not copied ({engine} allows no \
+                         default on a text column)",
+                        plan.target
+                    )),
+                },
                 Some(literal) => c.default = Some(literal),
                 None if default.trim().eq_ignore_ascii_case("null") => {}
                 None => warnings.push(format!(
@@ -521,27 +670,63 @@ pub fn target_table(
             source.obj.display_name()
         )));
     }
-    let rename = |name: &str| -> Option<String> {
+    let target_of = |name: &str| -> Option<String> {
         renamed
             .iter()
             .find(|(s, _)| s == name)
             .map(|(_, t)| t.clone())
     };
-    let covers_unbounded = |name: &str| {
-        out.columns
+    // Why the target cannot create a key or index on `names` (target column names), across
+    // engines.
+    let key_problem = |names: &[&str]| -> Option<String> {
+        if same {
+            return None;
+        }
+        let defs: Vec<&ColumnDef> = names
             .iter()
-            .any(|c| c.name == name && unbounded(&c.data_type))
+            .filter_map(|n| out.columns.iter().find(|c| c.name == *n))
+            .collect();
+        if defs.iter().any(|c| {
+            never_indexed(&c.data_type) || (!rules.keys_on_unbounded && unbounded(&c.data_type))
+        }) {
+            return Some(format!(
+                "it covers a column of unbounded text, binary or JSON, which {engine} cannot \
+                 index"
+            ));
+        }
+        let limit = rules.index_key_bytes?;
+        let bytes: u64 = defs
+            .iter()
+            .map(|c| key_bytes(&c.data_type, rules.key_bytes_per_char))
+            .sum();
+        (bytes > u64::from(limit)).then(|| {
+            format!("its key takes up to {bytes} bytes, more than the {limit} {engine} allows")
+        })
     };
+    let source_name = source.obj.name.clone();
+    let target_name = out.obj.name.clone();
+    let new_name = |name: &str| constraint_name(&source_name, &target_name, name);
 
+    let mut primary_key = None;
+    let mut indexes = Vec::new();
+    let mut checks = Vec::new();
     if options.create_indexes {
         if let Some(pk) = &source.primary_key {
-            let mapped: Option<Vec<String>> = pk.columns.iter().map(|c| rename(c)).collect();
+            let mapped: Option<Vec<String>> = pk.columns.iter().map(|c| target_of(c)).collect();
             match mapped {
                 Some(cols) => {
-                    out.primary_key = Some(PrimaryKeyDef {
-                        name: pk.name.clone(),
-                        columns: cols,
-                    });
+                    let names: Vec<&str> = cols.iter().map(String::as_str).collect();
+                    match key_problem(&names) {
+                        Some(why) => {
+                            warnings.push(format!("the primary key is not copied: {why}"));
+                        }
+                        None => {
+                            primary_key = Some(PrimaryKeyDef {
+                                name: if rename { None } else { pk.name.clone() },
+                                columns: cols,
+                            });
+                        }
+                    }
                 }
                 None => warnings.push(
                     "the primary key is not copied: one of its columns is left out".to_owned(),
@@ -567,7 +752,7 @@ pub fn target_table(
                     parts.push(part.clone());
                     continue;
                 }
-                match rename(&part.name) {
+                match target_of(&part.name) {
                     Some(name) => parts.push(IndexColumn {
                         name,
                         is_expression: false,
@@ -583,23 +768,28 @@ pub fn target_table(
                 ));
                 continue;
             }
-            if !same && parts.iter().any(|p| covers_unbounded(&p.name)) {
-                warnings.push(format!(
-                    "index {label}: not copied (it covers a column of unbounded text, binary \
-                     or JSON, which not every engine can index)"
-                ));
+            let names: Vec<&str> = parts.iter().map(|p| p.name.as_str()).collect();
+            if let Some(why) = key_problem(&names) {
+                warnings.push(format!("index {label}: not copied ({why})"));
                 continue;
             }
             let mut copy = index.clone();
             copy.columns = parts;
+            if rename {
+                copy.name = new_name(&index.name);
+            }
             if !same {
-                copy.name = index_name(&out.obj.name, &index.name);
                 copy.extras = Extras::new();
             }
-            out.indexes.push(copy);
+            indexes.push(copy);
         }
         if same {
-            out.checks.clone_from(&source.checks);
+            checks.clone_from(&source.checks);
+            if rename {
+                for check in &mut checks {
+                    check.name = check.name.as_deref().map(&new_name);
+                }
+            }
         } else if !source.checks.is_empty() {
             warnings.push(format!(
                 "{} check constraint(s) not copied (engine-specific expressions)",
@@ -607,6 +797,9 @@ pub fn target_table(
             ));
         }
     }
+    out.primary_key = primary_key;
+    out.indexes = indexes;
+    out.checks = checks;
     out.comment.clone_from(&source.comment);
     if same {
         // The definition lives in the target container already (`target`); foreign keys are
@@ -1221,6 +1414,290 @@ mod tests {
         assert_eq!(def.indexes.len(), 4);
         assert_eq!(def.checks, source.checks);
         assert_eq!(def.foreign_keys.len(), 0);
+    }
+
+    #[test]
+    fn same_engine_tables_keep_computed_columns_and_rename_next_to_their_source() {
+        let pg = pg_version();
+        let ctx = MappingContext {
+            source_engine: Engine::Postgres,
+            source_version: &pg,
+            source_mapper: &PgTypeMapper,
+            target_engine: Engine::Postgres,
+            target_version: &pg,
+            target_mapper: &PgTypeMapper,
+        };
+        let source = source_table();
+        let mut plans: Vec<ColumnPlan> = source
+            .columns
+            .iter()
+            .map(|c| map_column(&ctx, c, None))
+            .collect();
+        // The plan skips the computed column's values (the target computes them).
+        plans[4].skipped = true;
+        let elsewhere = ObjectRef::schema(Some("db"), "dst").child(ObjectKind::Table, "orders");
+        let (def, _) = target_table(
+            &ctx,
+            &source,
+            elsewhere,
+            &plans,
+            &TransferOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(def.columns, source.columns);
+        assert_eq!(
+            def.column("total").unwrap().generated,
+            source.columns[4].generated
+        );
+        assert_eq!(
+            def.primary_key.as_ref().unwrap().name.as_deref(),
+            Some("orders_pkey")
+        );
+
+        // A copy in the source's own schema: index and constraint names are new.
+        let beside = ObjectRef::schema(Some("db"), "src").child(ObjectKind::Table, "orders_copy");
+        let (def, _) =
+            target_table(&ctx, &source, beside, &plans, &TransferOptions::default()).unwrap();
+        assert_eq!(def.primary_key.as_ref().unwrap().name, None);
+        let names: Vec<&str> = def.indexes.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "orders_copy_status_idx",
+                "orders_copy_by_note",
+                "orders_copy_lower_status",
+                "orders_copy_qty"
+            ]
+        );
+        assert_eq!(
+            def.checks[0].name.as_deref(),
+            Some("orders_copy_qty_positive")
+        );
+
+        // A user's skip still leaves the computed column out.
+        plans[4].overridden = true;
+        let (def, _) = target_table(
+            &ctx,
+            &source,
+            ObjectRef::schema(Some("db"), "dst").child(ObjectKind::Table, "orders"),
+            &plans,
+            &TransferOptions::default(),
+        )
+        .unwrap();
+        assert!(def.column("total").is_none());
+    }
+
+    fn keyed(name: &str, pk_name: &str, key: ColumnDef) -> TableDef {
+        let mut t = TableDef::new(ObjectRef::table(Some("db"), None, name));
+        let key_name = key.name.clone();
+        t.columns = vec![
+            key,
+            ColumnDef::new("label", DataType::VarChar { length: Some(1000) }),
+        ];
+        t.primary_key = Some(Pk {
+            name: Some(pk_name.into()),
+            columns: vec![key_name],
+        });
+        t.indexes = vec![IndexDef {
+            name: "label".into(),
+            columns: vec![IndexColumn::column("label")],
+            unique: true,
+            is_constraint: false,
+            predicate: None,
+            extras: Extras::new(),
+        }];
+        t
+    }
+
+    fn mapped(ctx: &MappingContext<'_>, source: &TableDef) -> (TableDef, Vec<String>) {
+        let mut plans: Vec<ColumnPlan> = source
+            .columns
+            .iter()
+            .map(|c| map_column(ctx, c, None))
+            .collect();
+        bound_key_columns(ctx, source, &mut plans);
+        let target = ObjectRef::database("dst").child(ObjectKind::Table, source.obj.name.clone());
+        target_table(ctx, source, target, &plans, &TransferOptions::default()).unwrap()
+    }
+
+    #[test]
+    fn keys_across_engines_get_new_names_and_bounded_columns() {
+        let (pg, my) = (pg_version(), my_version());
+        // MySQL names every primary key PRIMARY: PostgreSQL names them per table instead.
+        let my_to_pg = MappingContext {
+            source_engine: Engine::MySql,
+            source_version: &my,
+            source_mapper: &MYSQL,
+            target_engine: Engine::Postgres,
+            target_version: &pg,
+            target_mapper: &PgTypeMapper,
+        };
+        for name in ["a", "b"] {
+            let source = keyed(
+                name,
+                "PRIMARY",
+                ColumnDef::new("id", DataType::INT32).not_null(),
+            );
+            let (def, warnings) = mapped(&my_to_pg, &source);
+            assert_eq!(def.primary_key.as_ref().unwrap().name, None, "{warnings:?}");
+            // PostgreSQL indexes any text: the index stays, renamed after its table.
+            assert_eq!(def.indexes[0].name, format!("{name}_label"));
+        }
+
+        // A text key into MySQL becomes varchar(255), narrowed; varchar(1000) is too long a key.
+        let ctx = pg_to_mysql(&pg, &my);
+        let source = keyed(
+            "tags",
+            "tags_pkey",
+            ColumnDef::new("code", DataType::Text).not_null(),
+        );
+        let mut plans: Vec<ColumnPlan> = source
+            .columns
+            .iter()
+            .map(|c| map_column(&ctx, c, None))
+            .collect();
+        bound_key_columns(&ctx, &source, &mut plans);
+        assert_eq!(
+            plans[0].mapping.data_type,
+            DataType::VarChar { length: Some(255) }
+        );
+        assert_eq!(plans[0].mapping.fidelity, Fidelity::Narrowed);
+        assert!(
+            plans[0]
+                .mapping
+                .reason
+                .as_deref()
+                .unwrap()
+                .contains("primary-key column")
+        );
+        assert_eq!(
+            plans[1].mapping.data_type,
+            DataType::VarChar { length: Some(1000) }
+        );
+        let (def, warnings) = mapped(&ctx, &source);
+        assert_eq!(def.primary_key.as_ref().unwrap().columns, ["code"]);
+        assert_eq!(def.primary_key.as_ref().unwrap().name, None);
+        assert_eq!(def.indexes.len(), 0);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("index label: not copied (its key takes up to 4000 bytes")),
+            "{warnings:?}"
+        );
+
+        // An overridden key column keeps the user's type: the key is left out.
+        let mut plans: Vec<ColumnPlan> = source
+            .columns
+            .iter()
+            .map(|c| map_column(&ctx, c, None))
+            .collect();
+        plans[0].overridden = true;
+        bound_key_columns(&ctx, &source, &mut plans);
+        let target = ObjectRef::database("dst").child(ObjectKind::Table, "tags");
+        let (def, warnings) =
+            target_table(&ctx, &source, target, &plans, &TransferOptions::default()).unwrap();
+        assert!(def.primary_key.is_none());
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.starts_with("the primary key is not copied: it covers")),
+            "{warnings:?}"
+        );
+
+        // SQLite keys any text as it is.
+        let lite = ServerVersion::new(3, 50, 4);
+        let to_sqlite = MappingContext {
+            target_engine: Engine::Sqlite,
+            target_version: &lite,
+            target_mapper: &SqliteTypeMapper,
+            ..ctx
+        };
+        let (def, _) = mapped(&to_sqlite, &source);
+        assert_eq!(def.column("code").unwrap().data_type, DataType::Text);
+        assert!(def.primary_key.is_some());
+    }
+
+    #[test]
+    fn defaults_follow_the_target_rules() {
+        let (pg, my) = (pg_version(), my_version());
+        let mut source = TableDef::new(ObjectRef::table(Some("db"), Some("src"), "d"));
+        let mut note = ColumnDef::new("note", DataType::Text).not_null();
+        note.default = Some("''::text".into());
+        let mut flag = ColumnDef::new("flag", DataType::Bool);
+        flag.default = Some("true".into());
+        let mut off = ColumnDef::new("off", DataType::Bool);
+        off.default = Some("((0))".into());
+        source.columns = vec![note, flag, off];
+        let defaults = |ctx: &MappingContext<'_>| {
+            let (def, warnings) = mapped(ctx, &source);
+            let d: Vec<Option<String>> = def.columns.iter().map(|c| c.default.clone()).collect();
+            (d, warnings)
+        };
+        // MySQL 8.0.13+: a text default is an expression; booleans are 1 / 0.
+        let (d, _) = defaults(&pg_to_mysql(&pg, &my));
+        let want = |a: &str, b: &str, c: &str| {
+            vec![Some(a.to_owned()), Some(b.to_owned()), Some(c.to_owned())]
+        };
+        assert_eq!(d, want("('')", "1", "0"));
+        // Older MySQL refuses a text default: dropped with a warning.
+        let old = ServerVersion::new(8, 0, 12);
+        let (d, warnings) = defaults(&pg_to_mysql(&pg, &old));
+        assert_eq!(d[0], None);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("allows no default on a text column")),
+            "{warnings:?}"
+        );
+        // MariaDB and PostgreSQL take the literal.
+        let maria = MySqlTypeMapper { mariadb: true };
+        let mv = ServerVersion::new(11, 8, 9);
+        let to_maria = MappingContext {
+            target_engine: Engine::MariaDb,
+            target_version: &mv,
+            target_mapper: &maria,
+            ..pg_to_mysql(&pg, &my)
+        };
+        assert_eq!(defaults(&to_maria).0[0].as_deref(), Some("''"));
+        let ms = ServerVersion::new(16, 0, 0);
+        let ms_to_pg = MappingContext {
+            source_engine: Engine::MsSql,
+            source_version: &ms,
+            source_mapper: &crate::cells::mssql::MsSqlTypeMapper,
+            target_engine: Engine::Postgres,
+            target_version: &pg,
+            target_mapper: &PgTypeMapper,
+        };
+        assert_eq!(defaults(&ms_to_pg).0, want("''", "true", "false"));
+    }
+
+    #[test]
+    fn an_unsigned_bigint_id_stays_generated() {
+        let (pg, my) = (pg_version(), my_version());
+        let ctx = MappingContext {
+            source_engine: Engine::MySql,
+            source_version: &my,
+            source_mapper: &MYSQL,
+            target_engine: Engine::Postgres,
+            target_version: &pg,
+            target_mapper: &PgTypeMapper,
+        };
+        let mut id = ColumnDef::new(
+            "id",
+            DataType::Int {
+                bits: 64,
+                unsigned: true,
+            },
+        )
+        .not_null();
+        id.auto_increment = true;
+        let plan = map_column(&ctx, &id, None);
+        assert_eq!(plan.mapping.data_type, DataType::INT64);
+        assert_eq!(plan.mapping.fidelity, Fidelity::Narrowed);
+        // A plain unsigned bigint keeps its exact home.
+        id.auto_increment = false;
+        let plan = map_column(&ctx, &id, None);
+        assert_ne!(plan.mapping.data_type, DataType::INT64);
     }
 
     #[test]

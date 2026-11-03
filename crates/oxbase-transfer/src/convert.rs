@@ -15,8 +15,10 @@
 //!   lowercase hex only when the target is text);
 //! - text into a typed column (a query result typed as text by its driver, a PostgreSQL array
 //!   into a JSON column): parsed; failures are row issues;
-//! - checks against the target column: NOT NULL, `char(n)` / `varchar(n)` length, integer and
-//!   decimal range and scale (rounding is an issue only when digits would be lost).
+//! - checks against the target column: NOT NULL, `char(n)` / `varchar(n)` length (in UTF-16
+//!   code units where the target counts them, SQL Server), integer and decimal range and
+//!   scale (rounding is an issue only when digits would be lost), NaN and infinities where the
+//!   target refuses them (MySQL / MariaDB, SQL Server); see [`BatchConverter::with_rules`].
 //!
 //! A value that does not convert is NULL in the output plus a [`RowIssue`]; the pipeline then
 //! applies `ErrorMode` (stop at the first issue, or drop those rows and report them).
@@ -63,6 +65,7 @@ use oxbase_driver::cell_value;
 use oxbase_types::{DataType, Error, Result, Value};
 use serde::{Deserialize, Serialize};
 
+use crate::cells::TargetRules;
 use crate::mapping::{ColumnPlan, fidelity_between};
 
 /// Longest part of a value quoted in an issue message (characters).
@@ -100,6 +103,25 @@ pub struct BatchConverter {
     from: Vec<DataType>,
     /// The load schema with every field nullable (rows with issues keep a NULL).
     schema: SchemaRef,
+    checks: Checks,
+}
+
+/// What the target refuses besides its column types ([`TargetRules`]).
+#[derive(Debug, Clone, Copy)]
+struct Checks {
+    /// Lengths count UTF-16 code units.
+    utf16_lengths: bool,
+    /// Float columns take NaN and infinities.
+    non_finite_floats: bool,
+}
+
+impl Default for Checks {
+    fn default() -> Self {
+        Self {
+            utf16_lengths: false,
+            non_finite_floats: true,
+        }
+    }
 }
 
 impl BatchConverter {
@@ -148,7 +170,20 @@ impl BatchConverter {
             columns,
             from,
             schema,
+            checks: Checks::default(),
         })
+    }
+
+    /// Checks values the way the target engine does ([`TargetRules::utf16_lengths`],
+    /// [`TargetRules::non_finite_floats`]), so a value it would refuse is a row issue, not a
+    /// failed load. Without it, lengths count characters and every float passes.
+    #[must_use]
+    pub fn with_rules(mut self, rules: TargetRules) -> Self {
+        self.checks = Checks {
+            utf16_lengths: rules.utf16_lengths,
+            non_finite_floats: rules.non_finite_floats,
+        };
+        self
     }
 
     /// The source schema this converter reads.
@@ -174,7 +209,13 @@ impl BatchConverter {
                 ))
             })?;
             let mut column_issues = Vec::new();
-            let array = convert_column(source, &self.from[i], column, &mut column_issues)?;
+            let array = convert_column(
+                source,
+                &self.from[i],
+                column,
+                self.checks,
+                &mut column_issues,
+            )?;
             for (row, message) in column_issues {
                 issues.push((
                     row,
@@ -352,10 +393,19 @@ fn convert_column(
     array: &ArrayRef,
     from: &DataType,
     to: &LoadColumn,
+    checks: Checks,
     issues: &mut Vec<(usize, String)>,
 ) -> Result<ArrayRef> {
     let not_null = "NULL in a column that does not allow NULL".to_owned();
-    if passes_through(array.data_type(), from, &to.data_type) {
+    // Values the target checks its own way are looked at one by one.
+    let checked = match to.data_type {
+        DataType::Char { length: Some(_) } | DataType::VarChar { length: Some(_) } => {
+            checks.utf16_lengths
+        }
+        DataType::Float { .. } => !checks.non_finite_floats,
+        _ => false,
+    };
+    if !checked && passes_through(array.data_type(), from, &to.data_type) {
         if !to.nullable && array.null_count() > 0 {
             for row in (0..array.len()).filter(|&row| array.is_null(row)) {
                 issues.push((row, not_null.clone()));
@@ -373,7 +423,7 @@ fn convert_column(
             continue;
         }
         let converted = match cell_value(array.as_ref(), row) {
-            Ok(value) => convert_value(value, from, &to.data_type),
+            Ok(value) => convert_value(value, from, &to.data_type, checks),
             Err(e) => Err(e.to_string()),
         };
         match converted {
@@ -400,18 +450,18 @@ fn shown(text: &str) -> String {
 }
 
 /// One value into the load form of `to` (module docs, *How a value converts*).
-fn convert_value(value: Value, from: &DataType, to: &DataType) -> CellResult {
+fn convert_value(value: Value, from: &DataType, to: &DataType, checks: Checks) -> CellResult {
     let cannot = |value: &Value| format!("{} cannot be stored as {to}", describe(value));
     match to {
         DataType::Bool => to_bool(&value)
             .ok_or_else(|| cannot(&value))
             .map(Cell::Bool),
         DataType::Int { bits, unsigned } => to_int(&value, *bits, *unsigned, to),
-        DataType::Float { bits } => to_float(&value, *bits, to),
+        DataType::Float { bits } => to_float(&value, *bits, to, checks.non_finite_floats),
         DataType::Decimal { precision, scale } => to_decimal(&value, *precision, *scale, to),
         DataType::Char { length } | DataType::VarChar { length } => {
             let text = text_form(value);
-            check_length(&text, *length)?;
+            check_length(&text, *length, checks.utf16_lengths)?;
             Ok(Cell::Str(text))
         }
         DataType::Text | DataType::Interval | DataType::Array { .. } | DataType::Other { .. } => {
@@ -537,21 +587,26 @@ fn text_form(value: Value) -> String {
     }
 }
 
-/// `Err` when `text` is longer than `length` characters.
-fn check_length(text: &str, length: Option<u32>) -> std::result::Result<(), String> {
+/// `Err` when `text` is longer than `length` characters (UTF-16 code units with `utf16`: an
+/// emoji counts 2).
+fn check_length(text: &str, length: Option<u32>, utf16: bool) -> std::result::Result<(), String> {
     let Some(limit) = length.and_then(|n| usize::try_from(n).ok()) else {
         return Ok(());
     };
-    // Bytes bound the characters from above: most texts need no count.
+    // Bytes bound the characters and the UTF-16 units from above: most texts need no count.
     if text.len() <= limit {
         return Ok(());
     }
-    let count = text.chars().count();
+    let (count, unit) = if utf16 {
+        (text.encode_utf16().count(), "UTF-16 code units")
+    } else {
+        (text.chars().count(), "characters")
+    };
     if count <= limit {
         Ok(())
     } else {
         Err(format!(
-            "the text has {count} characters, more than the column's {limit}"
+            "the text has {count} {unit}, more than the column's {limit}"
         ))
     }
 }
@@ -627,7 +682,7 @@ fn float_to_int(f: f64) -> Option<i128> {
     clippy::cast_precision_loss,
     reason = "integers into a float column round, as the mapping's fidelity says"
 )]
-fn to_float(value: &Value, bits: u8, to: &DataType) -> CellResult {
+fn to_float(value: &Value, bits: u8, to: &DataType, non_finite: bool) -> CellResult {
     let v = match value {
         Value::Float(f) => *f,
         Value::Int(i) => *i as f64,
@@ -638,6 +693,9 @@ fn to_float(value: &Value, bits: u8, to: &DataType) -> CellResult {
             .map_err(|_| format!("{} is not a number", shown(t)))?,
         other => return Err(format!("{} cannot be stored as {to}", describe(other))),
     };
+    if !non_finite && !v.is_finite() {
+        return Err(format!("{v} cannot be stored as {to} on this target"));
+    }
     if bits <= 32 && v.is_finite() && v.abs() > f64::from(f32::MAX) {
         return Err(format!("{v} is outside the range of {to}"));
     }
@@ -688,7 +746,8 @@ impl Dec {
             Some(pos) => (&t[..pos], t[pos + 1..].parse::<i32>().ok()?),
             None => (t, 0),
         };
-        if exponent.abs() > 1_000 {
+        // `unsigned_abs`: `i32::MIN` has no positive counterpart.
+        if exponent.unsigned_abs() > 1_000 {
             return None;
         }
         let (int, frac) = mantissa.split_once('.').unwrap_or((mantissa, ""));
@@ -957,8 +1016,9 @@ mod tests {
         UInt64Type,
     };
     use arrow_array::{
-        BinaryArray, BooleanArray, Decimal128Array, FixedSizeBinaryArray, Float32Array, Int16Array,
-        Int32Array, Int64Array, StringArray, Time64MicrosecondArray, TimestampMicrosecondArray,
+        BinaryArray, BooleanArray, Decimal128Array, FixedSizeBinaryArray, Float32Array,
+        Float64Array, Int16Array, Int32Array, Int64Array, StringArray, Time64MicrosecondArray,
+        TimestampMicrosecondArray,
     };
     use arrow_schema::TimeUnit;
     use oxbase_dialect::TypeMapping;
@@ -992,6 +1052,97 @@ mod tests {
         let out = converter.convert(&batch, 1).unwrap();
         assert_eq!(out.batch.column(0).data_type(), &expected);
         out
+    }
+
+    #[test]
+    fn huge_exponents_are_not_numbers() {
+        for text in [
+            "1e-2147483648",
+            "1e2147483647",
+            "-5e-2147483648",
+            "1e-1001",
+            "1e1001",
+            "1e99999999999",
+        ] {
+            assert_eq!(Dec::parse(text), None, "{text}");
+        }
+        assert_eq!(Dec::parse("1e-1000").map(|d| d.frac.len()), Some(1_000));
+        let out = convert_one(
+            Arc::new(StringArray::from(vec!["1e-2147483648", "7"])),
+            DataType::Text,
+            DataType::INT32,
+            true,
+        );
+        assert_eq!(out.bad_rows, vec![0]);
+        assert!(
+            out.issues[0].message.contains("is not a number"),
+            "{:?}",
+            out.issues
+        );
+    }
+
+    /// [`convert_one`] with the target rules of `engine`.
+    fn convert_for(
+        engine: oxbase_types::Engine,
+        array: ArrayRef,
+        from: DataType,
+        to: DataType,
+    ) -> Converted {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "c",
+            array.data_type().clone(),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![array]).unwrap();
+        let plans = [plan("c", from, &to)];
+        let rules = crate::cells::target_rules(engine, &oxbase_types::ServerVersion::new(16, 0, 0));
+        let converter = BatchConverter::new(schema, &plans, vec![LoadColumn::new("c", to)])
+            .unwrap()
+            .with_rules(rules);
+        converter.convert(&batch, 1).unwrap()
+    }
+
+    #[test]
+    fn target_rules_check_utf16_lengths_and_non_finite_floats() {
+        use oxbase_types::Engine;
+        let emoji = || Arc::new(StringArray::from(vec!["😀😀", "ab"])) as ArrayRef;
+        let to = DataType::VarChar { length: Some(3) };
+        // Two characters, but four UTF-16 code units: SQL Server's nvarchar(3) refuses it.
+        let out = convert_for(Engine::MsSql, emoji(), to.clone(), to.clone());
+        assert_eq!(out.bad_rows, vec![0]);
+        assert!(
+            out.issues[0].message.contains("4 UTF-16 code units"),
+            "{:?}",
+            out.issues
+        );
+        assert_eq!(
+            convert_for(Engine::Postgres, emoji(), to.clone(), to).bad_rows,
+            Vec::<usize>::new()
+        );
+
+        let floats =
+            || Arc::new(Float64Array::from(vec![f64::NAN, 1.5, f64::INFINITY])) as ArrayRef;
+        let out = convert_for(
+            Engine::MySql,
+            floats(),
+            DataType::FLOAT64,
+            DataType::FLOAT64,
+        );
+        assert_eq!(out.bad_rows, vec![0, 2]);
+        let out = convert_for(
+            Engine::MsSql,
+            floats(),
+            DataType::FLOAT64,
+            DataType::Float { bits: 32 },
+        );
+        assert_eq!(out.bad_rows, vec![0, 2]);
+        let out = convert_for(
+            Engine::Postgres,
+            floats(),
+            DataType::FLOAT64,
+            DataType::FLOAT64,
+        );
+        assert_eq!(out.bad_rows, Vec::<usize>::new());
     }
 
     fn texts(out: &Converted) -> Vec<Option<String>> {

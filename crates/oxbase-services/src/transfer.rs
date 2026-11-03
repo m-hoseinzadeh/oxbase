@@ -184,7 +184,12 @@ impl TransferService {
         );
         let sessions = run::Sessions::open(&self.manager, &self.dialects, request, &cancel).await?;
         let prepared = sessions
-            .prepare(&self.dialects, &request.spec, &cancel)
+            .prepare(
+                &self.dialects,
+                &request.spec,
+                self.same_server(request),
+                &cancel,
+            )
             .await;
         sessions.close(&self.manager).await;
         prepared.map(|p| p.plan)
@@ -226,7 +231,12 @@ impl TransferService {
         let sessions =
             run::Sessions::open(&self.manager, &self.dialects, &request, &cancel).await?;
         let prepared = match sessions
-            .prepare(&self.dialects, &request.spec, &cancel)
+            .prepare(
+                &self.dialects,
+                &request.spec,
+                self.same_server(&request),
+                &cancel,
+            )
             .await
         {
             Ok(prepared) => prepared,
@@ -269,6 +279,21 @@ impl TransferService {
             id,
             events: receiver,
         })
+    }
+
+    /// `true` when the request's two base sessions are on one server: the same session, or
+    /// two sessions of one connection profile (a table must not be copied onto itself).
+    fn same_server(&self, request: &TransferRequest) -> bool {
+        if request.source_session == request.target_session {
+            return true;
+        }
+        match (
+            self.manager.get(request.source_session),
+            self.manager.get(request.target_session),
+        ) {
+            (Some(a), Some(b)) => a.summary().profile_id == b.summary().profile_id,
+            _ => false,
+        }
     }
 
     /// Cancels transfer `id`; `false` when it is unknown or already ended.

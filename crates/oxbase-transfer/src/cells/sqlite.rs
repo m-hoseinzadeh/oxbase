@@ -37,6 +37,20 @@ use oxbase_types::{DataType, ServerVersion};
 /// Significant digits a `NUMERIC`-affinity column keeps (a double).
 const NUMERIC_DIGITS: u32 = 15;
 
+/// SQLite as a transfer target: any type can be a key column, literal defaults as they are,
+/// booleans as `1` / `0`.
+pub(crate) const TARGET_RULES: super::TargetRules = super::TargetRules {
+    keys_on_unbounded: true,
+    key_text_length: 0,
+    index_key_bytes: None,
+    key_bytes_per_char: 1,
+    text_defaults: super::TextDefaults::Plain,
+    bool_literals: ("1", "0"),
+    utf16_lengths: false,
+    non_finite_floats: true,
+    fk_reenable_validates: false,
+};
+
 /// The SQLite [`TypeMapper`].
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SqliteTypeMapper;

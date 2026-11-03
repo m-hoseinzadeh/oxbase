@@ -10,7 +10,7 @@ float32                  -> float32                              exact
 float64                  -> float64                              exact
 decimal(18,4)            -> decimal(18,4)                        exact
 decimal(38,10)           -> decimal(38,10)                       exact
-decimal                  -> decimal(65,30)                       narrowed    unconstrained decimals become decimal(65,30): values with more than 35 integer digits are refused, more than 30 decimal places are rounded
+decimal                  -> decimal(65,30)                       narrowed    unconstrained decimals become decimal(65,30): values with more than 35 integer digits are refused, more than 30 decimal places are refused
 char(10)                 -> char(10)                             exact
 varchar(255)             -> varchar(255)                         exact
 varchar                  -> text                                 exact

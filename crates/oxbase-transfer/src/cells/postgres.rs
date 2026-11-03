@@ -46,6 +46,20 @@ const MAX_NUMERIC: u32 = 1_000;
 /// Fractional-second digits PostgreSQL keeps.
 const MAX_FRACTION: u8 = 6;
 
+/// PostgreSQL as a transfer target: any type can be a key column, literal defaults as they
+/// are, `true` / `false`, NaN and infinities stored.
+pub(crate) const TARGET_RULES: super::TargetRules = super::TargetRules {
+    keys_on_unbounded: true,
+    key_text_length: 0,
+    index_key_bytes: None,
+    key_bytes_per_char: 1,
+    text_defaults: super::TextDefaults::Plain,
+    bool_literals: ("true", "false"),
+    utf16_lengths: false,
+    non_finite_floats: true,
+    fk_reenable_validates: false,
+};
+
 /// Extra of a PostgreSQL `Type` object: the labels of an enum, as SQL literals.
 const ENUM_LABELS: PropId = PropId::from_static("enum_labels");
 /// Extra of a PostgreSQL `Type` object: the base type of a domain (`format_type` text).

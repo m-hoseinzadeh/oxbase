@@ -30,6 +30,13 @@ use oxbase_types::{BoundStatement, Engine, ObjectRef, Result, ServerVersion};
 /// The session setting [`BulkLoader::prepare`] runs.
 pub const UTC_SESSION_SQL: &str = "SET time_zone = '+00:00'";
 
+/// M8: the second setting [`BulkLoader::prepare`] runs: a loaded 0 in an `AUTO_INCREMENT`
+/// column is stored as 0, not replaced by a generated id (PostgreSQL, SQL Server and SQLite
+/// ids can be 0, and foreign keys may point at them). Added once to the session's `sql_mode`.
+pub const KEEP_ZERO_IDS_SQL: &str = "SET SESSION sql_mode = IF(FIND_IN_SET('NO_AUTO_VALUE_ON_ZERO', \
+     @@SESSION.sql_mode) > 0, @@SESSION.sql_mode, CONCAT_WS(',', NULLIF(@@SESSION.sql_mode, ''), \
+     'NO_AUTO_VALUE_ON_ZERO'))";
+
 /// The MySQL / MariaDB [`BulkLoader`]: [`BulkMethod::MultiRowInsert`]. See the module docs.
 pub struct MySqlBulkLoader {
     inner: InsertLoader,
@@ -72,7 +79,13 @@ impl BulkLoader for MySqlBulkLoader {
         cancel: CancellationToken,
     ) -> Result<()> {
         session
-            .run(&BoundStatement::new(UTC_SESSION_SQL, Vec::new()), cancel)
+            .run(
+                &BoundStatement::new(UTC_SESSION_SQL, Vec::new()),
+                cancel.clone(),
+            )
+            .await?;
+        session
+            .run(&BoundStatement::new(KEEP_ZERO_IDS_SQL, Vec::new()), cancel)
             .await
             .map(|_| ())
     }

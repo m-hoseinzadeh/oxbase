@@ -33,7 +33,7 @@
 //! | `other(name)` otherwise | - | unsupported |
 
 use oxbase_dialect::{Fidelity, TypeMapper, TypeMapping};
-use oxbase_types::{DataType, ServerVersion};
+use oxbase_types::{ColumnDef, DataType, ServerVersion};
 
 /// Longest `nchar(n)` / `nvarchar(n)` (characters).
 const MAX_NCHAR: u32 = 4_000;
@@ -59,6 +59,23 @@ const NATIVE: &[&str] = &[
     "smalldatetime",
 ];
 
+/// SQL Server as a transfer target: `nvarchar(max)` / `varbinary(max)` cannot be key columns
+/// (keys become `nvarchar(450)` / `varbinary(450)`: 900 bytes, the clustered key limit);
+/// literal defaults as they are; `bit` defaults `1` / `0`; `nvarchar(n)` counts UTF-16 code
+/// units; `float` / `real` refuse NaN and infinities; `WITH CHECK CHECK CONSTRAINT` checks the
+/// rows loaded while foreign keys were off.
+pub(crate) const TARGET_RULES: super::TargetRules = super::TargetRules {
+    keys_on_unbounded: false,
+    key_text_length: 450,
+    index_key_bytes: None,
+    key_bytes_per_char: 2,
+    text_defaults: super::TextDefaults::Plain,
+    bool_literals: ("1", "0"),
+    utf16_lengths: true,
+    non_finite_floats: false,
+    fk_reenable_validates: true,
+};
+
 /// The SQL Server [`TypeMapper`].
 #[derive(Debug, Clone, Copy, Default)]
 pub struct MsSqlTypeMapper;
@@ -69,6 +86,35 @@ fn has_json(version: &ServerVersion) -> bool {
 }
 
 impl TypeMapper for MsSqlTypeMapper {
+    /// The column's own type, `exact`, except the temporal types the load cannot carry whole:
+    /// rows travel with microseconds, so `time(7)` / `datetime2(7)` (the default precision)
+    /// lose their 7th fractional digit, and a `datetimeoffset` is stored as the same instant
+    /// at offset +00:00.
+    fn same_engine(&self, column: &ColumnDef, version: &ServerVersion) -> TypeMapping {
+        let _ = version;
+        let keep = TypeMapping::exact(column.data_type.clone()).native(column.native_type.clone());
+        let reason = match &column.data_type {
+            DataType::TimestampTz { .. } => Some(
+                "values are copied as instants: the offset becomes +00:00 and digits below a \
+                 microsecond are cut",
+            ),
+            DataType::Time { precision } | DataType::Timestamp { precision }
+                if precision.is_none_or(|p| p > 6) =>
+            {
+                Some("values are copied with microseconds: the 7th fractional digit is cut")
+            }
+            _ => None,
+        };
+        match reason {
+            Some(reason) => TypeMapping {
+                fidelity: Fidelity::Narrowed,
+                reason: Some(reason.to_owned()),
+                ..keep
+            },
+            None => keep,
+        }
+    }
+
     fn map(&self, data_type: &DataType, version: &ServerVersion) -> TypeMapping {
         let widened =
             |to: DataType, reason: &str| TypeMapping::with(to, "", Fidelity::Widened, reason);
@@ -131,7 +177,7 @@ impl TypeMapper for MsSqlTypeMapper {
                     "",
                     Fidelity::Narrowed,
                     "unconstrained decimals become decimal(38,10): values with more than 28 \
-                     integer digits are refused, more than 10 decimal places are rounded",
+                     integer digits are refused, more than 10 decimal places are refused",
                 ),
             },
             DataType::Char { length } => match length {
@@ -244,6 +290,48 @@ mod tests {
                     "{t}: no reason"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn same_engine_temporal_types_with_100_ns_digits_are_narrowed() {
+        let v = ServerVersion::new(16, 0, 0);
+        let column = |data_type: DataType, native: &str| {
+            let mut c = ColumnDef::new("c", data_type);
+            c.native_type = native.to_owned();
+            c
+        };
+        let cases = [
+            (
+                column(DataType::Timestamp { precision: Some(7) }, "datetime2(7)"),
+                Fidelity::Narrowed,
+            ),
+            (
+                column(DataType::Timestamp { precision: None }, "datetime2"),
+                Fidelity::Narrowed,
+            ),
+            (
+                column(DataType::Time { precision: Some(7) }, "time(7)"),
+                Fidelity::Narrowed,
+            ),
+            (
+                column(DataType::Timestamp { precision: Some(3) }, "datetime2(3)"),
+                Fidelity::Exact,
+            ),
+            (
+                column(
+                    DataType::TimestampTz { precision: Some(3) },
+                    "datetimeoffset(3)",
+                ),
+                Fidelity::Narrowed,
+            ),
+            (column(DataType::INT32, "int"), Fidelity::Exact),
+        ];
+        for (c, fidelity) in cases {
+            let m = MsSqlTypeMapper.same_engine(&c, &v);
+            assert_eq!(m.fidelity, fidelity, "{}", c.native_type);
+            assert_eq!(m.native_type, c.native_type);
+            assert_eq!(m.reason.is_some(), fidelity != Fidelity::Exact);
         }
     }
 

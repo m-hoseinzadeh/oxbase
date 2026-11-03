@@ -499,6 +499,12 @@ fn pg_transfer_set(s: &str) -> Vec<String> {
               '{{}}', '{{}}', 'sad')"
         ),
         format!("INSERT INTO {s}.m8_types DEFAULT VALUES"),
+        // Id 0 is a valid id: MySQL must keep it, not generate one.
+        format!("INSERT INTO {s}.m8_types (id) VALUES (0)"),
+        // A text primary key (MySQL cannot key longtext) and a text default (MySQL refuses a
+        // literal default on a TEXT column).
+        format!("CREATE TABLE {s}.m8_tags (code text PRIMARY KEY, label text NOT NULL DEFAULT '')"),
+        format!("INSERT INTO {s}.m8_tags (code) VALUES ('a'), ('b')"),
         format!("CREATE TABLE {s}.m8_parent (id integer PRIMARY KEY, name varchar(40) NOT NULL)"),
         format!(
             "CREATE TABLE {s}.m8_child (id integer PRIMARY KEY, parent_id integer NOT NULL \
@@ -546,7 +552,7 @@ async fn postgres_to_mysql_type_set() {
 
     let db = string(table(table(&live.fx, "engines"), "postgres"), "database");
     // Child first: the plan must reorder.
-    let objects = ["m8_child", "m8_types", "m8_tree", "m8_parent"]
+    let objects = ["m8_child", "m8_types", "m8_tree", "m8_parent", "m8_tags"]
         .iter()
         .map(|t| source_table(Some(&db), Some(&s), t))
         .collect();
@@ -630,8 +636,31 @@ async fn postgres_to_mysql_type_set() {
             TYPES_COLUMNS.join(", ")
         ))
         .await;
-    assert_eq!(source.len(), 3);
+    assert_eq!(source.len(), 4);
     assert_same_rows(&TYPES_COLUMNS, &source, &target, "m8_types");
+    assert_eq!(
+        my.count(&format!("SELECT COUNT(*) FROM {s}.m8_types WHERE id = 0"))
+            .await,
+        1
+    );
+    // The text key became varchar(255) and stayed the primary key; the default came along.
+    let tags = my
+        .query(&format!(
+            "SELECT COLUMN_NAME, COLUMN_TYPE, COLUMN_KEY FROM information_schema.COLUMNS WHERE \
+             TABLE_SCHEMA = '{s}' AND TABLE_NAME = 'm8_tags' ORDER BY ORDINAL_POSITION"
+        ))
+        .await;
+    assert_eq!(canon(&tags[0][1]), "varchar(255)", "{tags:?}");
+    assert_eq!(canon(&tags[0][2]), "PRI", "{tags:?}");
+    assert_eq!(
+        my.count(&format!(
+            "SELECT COUNT(*) FROM {s}.m8_tags WHERE label = ''"
+        ))
+        .await,
+        2
+    );
+    my.exec(&[format!("INSERT INTO {s}.m8_tags (code) VALUES ('c')")])
+        .await;
     for (t, n) in [("m8_parent", 2), ("m8_child", 3), ("m8_tree", 2)] {
         assert_eq!(
             my.count(&format!("SELECT COUNT(*) FROM {s}.{t}")).await,
@@ -797,8 +826,57 @@ async fn mysql_to_postgres() {
         pg.count(&format!("SELECT max(id) FROM {s}.m8_data")).await,
         5
     );
+
+    // Two keyed tables at once: MySQL names both primary keys PRIMARY, PostgreSQL needs a
+    // name per schema.
+    let b = format!("{s}_b");
+    my.exec(&[
+        format!(
+            "CREATE TABLE {s}.m8_more (id int PRIMARY KEY, label varchar(10) NOT NULL DEFAULT \
+             'x', flag tinyint(1) NOT NULL DEFAULT 1)"
+        ),
+        format!("INSERT INTO {s}.m8_more (id) VALUES (1), (2)"),
+    ])
+    .await;
+    pg.exec(&[format!("CREATE SCHEMA {b}")]).await;
+    let objects = vec![
+        source_table(Some(&s), None, "m8_data"),
+        source_table(Some(&s), None, "m8_more"),
+    ];
+    let (_, report) = live
+        .run(request(
+            &my,
+            &pg,
+            spec(objects, ObjectRef::schema(Some("oxbase_test"), b.clone())),
+        ))
+        .await;
+    for t in &report.tables {
+        assert_eq!(t.status, TableStatus::Done, "{t:?}");
+    }
+    assert_eq!(
+        pg.count(&format!(
+            "SELECT count(*) FROM information_schema.table_constraints WHERE \
+             table_schema = '{b}' AND constraint_type = 'PRIMARY KEY'"
+        ))
+        .await,
+        2
+    );
+    // The defaults came along (the boolean one in PostgreSQL's spelling).
+    pg.exec(&[format!("INSERT INTO {b}.m8_more (id) VALUES (3)")])
+        .await;
+    assert_eq!(
+        pg.count(&format!(
+            "SELECT count(*) FROM {b}.m8_more WHERE label = 'x' AND flag IS NOT NULL"
+        ))
+        .await,
+        3
+    );
     my.try_exec(&[format!("DROP DATABASE {s}")]).await;
-    pg.try_exec(&[format!("DROP SCHEMA {s} CASCADE")]).await;
+    pg.try_exec(&[
+        format!("DROP SCHEMA {s} CASCADE"),
+        format!("DROP SCHEMA {b} CASCADE"),
+    ])
+    .await;
 }
 
 async fn mssql_source(ms: &Session, s: &str) {

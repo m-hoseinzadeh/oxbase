@@ -598,16 +598,26 @@ impl BulkLoader for MsSqlBulkLoader {
         self.limits
     }
 
-    /// M8: per table, `ALTER TABLE t NOCHECK CONSTRAINT ALL` and, after the load,
-    /// `ALTER TABLE t WITH CHECK CHECK CONSTRAINT ALL` (which checks the loaded rows, so the
-    /// constraints stay trusted).
+    /// M8: per table, `ALTER TABLE t NOCHECK CONSTRAINT <fk>` for each of the table's foreign
+    /// keys (`sys.foreign_keys`; its check constraints stay on) and, after the load, `ALTER
+    /// TABLE t WITH CHECK CHECK CONSTRAINT <fk>` (which checks the loaded rows, so the keys
+    /// stay trusted, and fails when a row breaks one). One batch each, built on the server.
     fn foreign_key_checks(&self, table: &ObjectRef, enabled: bool) -> Option<Vec<String>> {
-        let name = BracketQuoting.qualify(table);
-        Some(vec![if enabled {
-            format!("ALTER TABLE {name} WITH CHECK CHECK CONSTRAINT ALL")
+        let name = BracketQuoting.qualify(table).replace('\'', "''");
+        let action = if enabled {
+            "WITH CHECK CHECK"
         } else {
-            format!("ALTER TABLE {name} NOCHECK CONSTRAINT ALL")
-        }])
+            "NOCHECK"
+        };
+        Some(vec![format!(
+            "DECLARE @oxbase_fk nvarchar(max) = N''; \
+             SELECT @oxbase_fk = @oxbase_fk + N'ALTER TABLE ' + \
+             QUOTENAME(OBJECT_SCHEMA_NAME(fk.parent_object_id)) + N'.' + \
+             QUOTENAME(OBJECT_NAME(fk.parent_object_id)) + N' {action} CONSTRAINT ' + \
+             QUOTENAME(fk.name) + N'; ' \
+             FROM sys.foreign_keys AS fk WHERE fk.parent_object_id = OBJECT_ID(N'{name}'); \
+             EXEC sys.sp_executesql @oxbase_fk;"
+        )])
     }
 
     /// The expected rate: parameterized multi-row `INSERT`s, not TDS bulk load (contracts §13).
@@ -677,6 +687,20 @@ mod tests {
     use arrow_array::ArrayRef;
     use oxbase_dialect::bulk::LoadColumn;
     use oxbase_types::ObjectRef;
+
+    #[test]
+    fn foreign_key_checks_touch_only_the_tables_foreign_keys() {
+        let loader = MsSqlBulkLoader::new();
+        let table = ObjectRef::table(Some("db"), Some("s"), "o'k");
+        let off = loader.foreign_key_checks(&table, false).unwrap();
+        assert_eq!(off.len(), 1);
+        assert!(off[0].contains("FROM sys.foreign_keys AS fk"), "{}", off[0]);
+        assert!(off[0].contains("[s].[o''k]')"), "{}", off[0]);
+        assert!(off[0].contains(" NOCHECK CONSTRAINT "), "{}", off[0]);
+        assert!(!off[0].contains("ALL"), "{}", off[0]);
+        let on = loader.foreign_key_checks(&table, true).unwrap();
+        assert!(on[0].contains(" WITH CHECK CHECK CONSTRAINT "), "{}", on[0]);
+    }
 
     #[test]
     fn decimal_padding() {

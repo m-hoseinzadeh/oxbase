@@ -76,6 +76,37 @@ const NATIVE: &[&str] = &[
     "inet6",
 ];
 
+/// MySQL / MariaDB as a transfer target: `TEXT` / `BLOB` columns cannot be key columns without
+/// a prefix (keys become `varchar(255)` / `varbinary(255)`); an InnoDB index key holds at most
+/// 3 072 bytes (4 per `utf8mb4` character); a literal default on a `TEXT` column is refused by
+/// MySQL before 8.0.13 and must be an expression `('x')` from 8.0.13 (MariaDB accepts it
+/// since 10.2.1); booleans are `1` / `0`; `float` / `double` refuse NaN and infinities;
+/// `SET FOREIGN_KEY_CHECKS = 1` does not check the rows loaded meanwhile.
+pub(crate) fn target_rules(mariadb: bool, version: &ServerVersion) -> super::TargetRules {
+    let text_defaults = if mariadb {
+        if version.at_least_patch(10, 2, 1) {
+            super::TextDefaults::Plain
+        } else {
+            super::TextDefaults::Dropped
+        }
+    } else if version.at_least_patch(8, 0, 13) {
+        super::TextDefaults::Parenthesized
+    } else {
+        super::TextDefaults::Dropped
+    };
+    super::TargetRules {
+        keys_on_unbounded: false,
+        key_text_length: 255,
+        index_key_bytes: Some(3_072),
+        key_bytes_per_char: 4,
+        text_defaults,
+        bool_literals: ("1", "0"),
+        utf16_lengths: false,
+        non_finite_floats: false,
+        fk_reenable_validates: false,
+    }
+}
+
 /// The MySQL / MariaDB [`TypeMapper`].
 #[derive(Debug, Clone, Copy, Default)]
 pub struct MySqlTypeMapper {
@@ -132,8 +163,8 @@ impl MySqlTypeMapper {
                         Fidelity::Narrowed,
                         format!(
                             "{engine} decimals have at most {MAX_PRECISION} digits and \
-                             {MAX_SCALE} decimal places: longer values are refused, extra \
-                             places rounded"
+                             {MAX_SCALE} decimal places: values with more digits or more \
+                             decimal places are refused"
                         ),
                     )
                 }
@@ -147,7 +178,7 @@ impl MySqlTypeMapper {
                     format!(
                         "unconstrained decimals become decimal({MAX_PRECISION},{MAX_SCALE}): \
                          values with more than {} integer digits are refused, more than \
-                         {MAX_SCALE} decimal places are rounded",
+                         {MAX_SCALE} decimal places are refused",
                         MAX_PRECISION - MAX_SCALE
                     ),
                 ),

@@ -5,7 +5,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use oxbase_dialect::{BulkLoader, DialectRegistry};
+use oxbase_dialect::{BulkLoader, DatabaseScope, DialectRegistry};
 use oxbase_driver::Connection;
 use oxbase_sql::DdlVerb;
 use oxbase_transfer::pipeline::{
@@ -15,8 +15,8 @@ use oxbase_types::{BoundStatement, Error, ErrorCategory, Result, ScriptStep, Ste
 use tokio::sync::mpsc;
 
 use super::{
-    ErrorMode, IdentityMode, TableMode, TableProgress, TableReport, TableStatus, TransferEvent,
-    TransferReport, TransferRequest, TransferSpec,
+    ErrorMode, FkChecks, IdentityMode, TableMode, TableProgress, TableReport, TableStatus,
+    TransferEvent, TransferReport, TransferRequest, TransferSpec,
 };
 use crate::import::{WorkSession, close_work_session, work_session};
 use crate::query::ErrorInfo;
@@ -29,6 +29,9 @@ use crate::{CancellationToken, ConnectionManager, SessionGuard, SessionHandle};
 const CLOSE_WAIT: Duration = Duration::from_millis(500);
 /// How long dropping a table the run created may take.
 const DROP_WAIT: Duration = Duration::from_secs(5);
+/// ... after a cancel (the run reports `Cancelled` within 2 s; a table left behind is named
+/// in the report).
+const DROP_WAIT_CANCELLED: Duration = Duration::from_millis(500);
 /// Row issues sent as events per table.
 const MAX_ROW_ERROR_EVENTS: usize = 100;
 
@@ -40,7 +43,9 @@ pub(super) struct Sessions {
 
 impl Sessions {
     /// Opens the source session on the first source object's database and the target session
-    /// on the target container's database.
+    /// on the target container's database. Source objects in two databases are refused on
+    /// engines whose session sees one database (PostgreSQL): the session would read the wrong
+    /// one.
     pub(super) async fn open(
         manager: &Arc<ConnectionManager>,
         dialects: &DialectRegistry,
@@ -48,6 +53,28 @@ impl Sessions {
         cancel: &CancellationToken,
     ) -> Result<Self> {
         let spec = &request.spec;
+        if let Some(base) = manager.get(request.source_session) {
+            let engine = base.summary().engine;
+            if dialects
+                .tree_layout(engine)
+                .is_ok_and(|l| l.scope == DatabaseScope::Session)
+            {
+                let mut names = spec
+                    .objects
+                    .iter()
+                    .filter_map(|o| o.source_ref())
+                    .filter_map(|r| r.database_name());
+                if let Some(first) = names.next()
+                    && let Some(other) = names.find(|n| *n != first)
+                {
+                    return Err(Error::invalid_input(format!(
+                        "the source objects are in two databases ({first}, {other}): a {} \
+                         transfer reads one database",
+                        engine.display_name()
+                    )));
+                }
+            }
+        }
         let source_db = spec
             .objects
             .iter()
@@ -106,11 +133,13 @@ impl Sessions {
         Ok((source, target))
     }
 
-    /// The plan and what the run needs, read on both sessions.
+    /// The plan and what the run needs, read on both sessions (`same_server`:
+    /// [`PlanInputs::same_server`]).
     pub(super) async fn prepare(
         &self,
         dialects: &DialectRegistry,
         spec: &TransferSpec,
+        same_server: bool,
         cancel: &CancellationToken,
     ) -> Result<Prepared> {
         let _guards = self.lock(cancel).await?;
@@ -120,6 +149,7 @@ impl Sessions {
                 source: self.source().connection().as_ref(),
                 target: self.target().connection().as_ref(),
                 spec,
+                same_server,
             },
             cancel.clone(),
         )
@@ -206,6 +236,7 @@ impl Job {
         } else {
             TransferEvent::Finished { report }
         };
+        let cancelled = matches!(event, TransferEvent::Cancelled { .. });
         let Self {
             sessions,
             manager,
@@ -213,6 +244,13 @@ impl Job {
             ticket,
             ..
         } = self;
+        if cancelled {
+            // The cancel answers first; the work sessions close behind it.
+            let _ = events.send(event).await;
+            drop(ticket);
+            tokio::spawn(async move { sessions.close(&manager).await });
+            return;
+        }
         sessions.close(&manager).await;
         let _ = events.send(event).await;
         drop(ticket);
@@ -376,7 +414,44 @@ impl Job {
         let mut outside = false;
         if !prepared.ddl_in_transaction && !prepared.ddl.is_empty() {
             let atomic = plan.transactional_ddl && atomic_steps(&prepared.ddl);
-            if let Err(e) = run_steps(self.target(), &prepared.ddl, atomic, token).await {
+            // A truncate that commits on its own runs before the copy switches foreign-key
+            // checks off: switch them off around it too (a referenced parent table).
+            let switched = self.request.spec.options.fk_checks == FkChecks::Disable
+                && table.exists
+                && table.mode == TableMode::Truncate;
+            let fk_switch = |on: bool| -> Vec<ScriptStep> {
+                if !switched {
+                    return Vec::new();
+                }
+                loader
+                    .foreign_key_checks(&table.target, on)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(ScriptStep::new)
+                    .collect()
+            };
+            let off = fk_switch(false);
+            let mut result = run_steps(self.target(), &off, false, token).await;
+            if result.is_ok() {
+                result = run_steps(self.target(), &prepared.ddl, atomic, token).await;
+            }
+            if !off.is_empty() {
+                let always = CancellationToken::new();
+                let on = fk_switch(true);
+                let restored =
+                    tokio::time::timeout(DROP_WAIT, run_steps(self.target(), &on, false, &always))
+                        .await;
+                if result.is_ok() && !matches!(restored, Ok(Ok(()))) {
+                    result = Err(Error::sql(
+                        None::<String>,
+                        format!(
+                            "switching foreign-key checks back on for {} failed",
+                            table.target.display_name()
+                        ),
+                    ));
+                }
+            }
+            if let Err(e) = result {
                 let mut report = not_run(index, table.target.clone());
                 report.status = if e.is_cancelled() {
                     TableStatus::Cancelled
@@ -433,7 +508,12 @@ impl Job {
             }
         };
         if report.status != TableStatus::Done && outside {
-            self.after_failure(table.mode, table.exists, prepared, &mut report)
+            let wait = if token.is_cancelled() {
+                DROP_WAIT_CANCELLED
+            } else {
+                DROP_WAIT
+            };
+            self.after_failure(table.mode, table.exists, prepared, wait, &mut report)
                 .await;
         }
         report
@@ -446,6 +526,7 @@ impl Job {
         mode: TableMode,
         existed: bool,
         prepared: &PreparedTable,
+        wait: Duration,
         report: &mut TableReport,
     ) {
         let table = report.target.display_name();
@@ -467,7 +548,7 @@ impl Job {
         };
         let never = CancellationToken::new();
         let dropping = run_steps(self.target(), &prepared.drop_created, false, &never);
-        report.left_behind = match tokio::time::timeout(DROP_WAIT, dropping).await {
+        report.left_behind = match tokio::time::timeout(wait, dropping).await {
             Ok(Ok(())) => format!("{old}the table the transfer created was dropped"),
             Ok(Err(e)) => format!(
                 "{old}{table} was created and holds {committed} rows: dropping it failed ({e})"

@@ -18,10 +18,13 @@
 //!    using the **source** definitions), so parents load before children; cycles are reported
 //!    and load in insertion order (their foreign keys come after the load anyway).
 //! 5. `runnable` is false (with `blocked` reasons) when a column is `unsupported`, a mode check
-//!    failed, or a table name collides under the target's case rules.
+//!    failed, a table name collides under the target's case rules, or (source and target on
+//!    one server, [`PlanInputs::same_server`]) a target table is one of the source objects.
 //!
 //! Nothing is written during planning: [`plan`] is also the **dry run** (target DDL and the
-//! mapping report).
+//! mapping report). A query source is read inside a transaction that is always rolled back,
+//! so a statement that writes leaves nothing behind (where the engine's transactions cover
+//! it).
 //!
 //! # Run ([`copy_table`], called per table by the services in plan order)
 //!
@@ -71,15 +74,17 @@ use oxbase_dialect::{
 };
 use oxbase_driver::{CancellationToken, Connection, ResultItem, ResultStream, Tx};
 use oxbase_types::{
-    BoundStatement, ColumnDef, DataType, Engine, Error, ErrorCategory, Extras, ForeignKeyDef,
-    ObjectDef, ObjectKind, ObjectRef, Result, Script, ScriptStep, ServerVersion, StepPhase,
-    TableDataQuery, TableDef,
+    BoundStatement, CaseRules, ColumnDef, DataType, Engine, Error, ErrorCategory, Extras,
+    ForeignKeyDef, ObjectDef, ObjectKind, ObjectRef, Result, Script, ScriptStep, ServerVersion,
+    StepPhase, TableDataQuery, TableDef,
 };
 use serde::{Deserialize, Serialize};
 
+use crate::cells::target_rules;
 use crate::convert::{BatchConverter, RowIssue};
 use crate::mapping::{
-    ColumnPlan, MappingContext, case_rules, fidelity_between, map_column, same_name, target_table,
+    ColumnPlan, MappingContext, bound_key_columns, case_rules, constraint_name, fidelity_between,
+    map_column, same_container, same_name, target_table,
 };
 use crate::spec::{
     ErrorMode, FkChecks, IdentityMode, SourceObject, TableMode, TransactionScope, TransferOptions,
@@ -99,6 +104,9 @@ const CLEANUP_WAIT: Duration = Duration::from_millis(500);
 /// How long the rest of an abandoned source stream is drained (so the session can run the
 /// next statement).
 const DRAIN_WAIT: Duration = Duration::from_secs(1);
+/// What draining, rollback and clean-up may take together once a copy is cancelled (the run
+/// reports `Cancelled` within 2 s of the cancel).
+const CANCEL_BUDGET: Duration = Duration::from_millis(1_100);
 
 /// The plan of one target table.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -168,6 +176,9 @@ pub struct PlanInputs<'a> {
     pub source: &'a dyn Connection,
     pub target: &'a dyn Connection,
     pub spec: &'a TransferSpec,
+    /// Source and target are sessions on one server (the same base session or profile): a
+    /// target table that is one of the source objects is refused.
+    pub same_server: bool,
 }
 
 /// What running one planned table needs besides its [`TablePlan`] (built by [`prepare`] next
@@ -228,6 +239,7 @@ pub async fn prepare(inputs: PlanInputs<'_>, cancel: CancellationToken) -> Resul
         source,
         target,
         spec,
+        same_server,
     } = inputs;
     spec.validate()?;
     let (se, te) = (source.engine(), target.engine());
@@ -259,10 +271,11 @@ pub async fn prepare(inputs: PlanInputs<'_>, cancel: CancellationToken) -> Resul
     let fk_generator = dialects.ddl(te, ObjectKind::ForeignKey).ok();
     let table_fetcher = dialects.fetcher(te, ObjectKind::Table)?;
     let loader = dialects.bulk_loader(te)?;
-    let transactional_ddl = match dialects.capabilities(te) {
-        Ok(caps) => caps.designer(&tv).transactional_ddl,
-        Err(_) => true,
-    };
+    // Without a capabilities role, claim the safe thing: DDL may commit at once.
+    let transactional_ddl = dialects
+        .capabilities(te)
+        .is_ok_and(|caps| caps.designer(&tv).transactional_ddl);
+    let rules = ctx.target_rules();
     let attached = dialects
         .tree_layout(te)
         .is_ok_and(|l| l.scope == DatabaseScope::Attached);
@@ -324,6 +337,9 @@ pub async fn prepare(inputs: PlanInputs<'_>, cancel: CancellationToken) -> Resul
             }
             columns.push(plan);
         }
+        if src.is_table {
+            bound_key_columns(&ctx, &src.def, &mut columns);
+        }
 
         // Does the target table exist?
         let existing = match table_fetcher
@@ -338,6 +354,18 @@ pub async fn prepare(inputs: PlanInputs<'_>, cancel: CancellationToken) -> Resul
         let exists = existing.is_some();
         let mode = options.mode;
         let label = target_ref.display_name();
+        if same_server
+            && spec
+                .objects
+                .iter()
+                .filter_map(SourceObject::source_ref)
+                .any(|r| same_object(case, r, &target_ref))
+        {
+            blocked.push(format!(
+                "{label} is a source of this transfer: a table cannot be copied onto itself \
+                 (choose another target schema or name)"
+            ));
+        }
         let mut ddl: Vec<ScriptStep> = Vec::new();
         let mut ddl_preview: Vec<String> = Vec::new();
         let mut drop_created = Vec::new();
@@ -446,16 +474,20 @@ pub async fn prepare(inputs: PlanInputs<'_>, cancel: CancellationToken) -> Resul
             && ddl
                 .iter()
                 .all(|s| s.transactional && s.phase == StepPhase::Main);
-        if options.fk_checks == FkChecks::Disable
-            && exists
-            && mode != TableMode::Replace
-            && loader.foreign_key_checks(&target_ref, false).is_none()
-        {
-            table_warnings.push(format!(
-                "{} cannot switch foreign-key checks off for a session: {label} loads with \
-                 its foreign keys checked",
-                te.display_name()
-            ));
+        if options.fk_checks == FkChecks::Disable && exists && mode != TableMode::Replace {
+            if loader.foreign_key_checks(&target_ref, false).is_none() {
+                table_warnings.push(format!(
+                    "{} cannot switch foreign-key checks off for a session: {label} loads with \
+                     its foreign keys checked",
+                    te.display_name()
+                ));
+            } else if !rules.fk_reenable_validates {
+                table_warnings.push(format!(
+                    "{label} loads with foreign-key checks off, and {} does not check the \
+                     loaded rows when they are switched back on: rows without a parent stay",
+                    te.display_name()
+                ));
+            }
         }
         tables.push(TablePlan {
             object: index,
@@ -515,7 +547,7 @@ pub async fn prepare(inputs: PlanInputs<'_>, cancel: CancellationToken) -> Resul
                     ));
                     continue;
                 };
-                let Some(planned) =
+                let Some(mut planned) =
                     planned_foreign_key(fk, &tables[i], &tables[parent], ctx.same_engine())
                 else {
                     tables[i].warnings.push(format!(
@@ -530,6 +562,13 @@ pub async fn prepare(inputs: PlanInputs<'_>, cancel: CancellationToken) -> Resul
                     ));
                     continue;
                 };
+                // Foreign-key names are unique per schema on some engines: new names across
+                // engines and next to the source.
+                if !ctx.same_engine() || same_container(&source_table.def.obj, &tables[i].target) {
+                    planned.name = planned.name.as_deref().map(|n| {
+                        constraint_name(&source_table.def.obj.name, &tables[i].target.name, n)
+                    });
+                }
                 let def = ObjectDef::ForeignKey {
                     table: tables[i].target.clone(),
                     foreign_key: planned,
@@ -605,6 +644,18 @@ pub async fn prepare(inputs: PlanInputs<'_>, cancel: CancellationToken) -> Resul
         },
         tables: prepared,
     })
+}
+
+/// `true` when `a` and `b` name the same table under `case` (a missing database or schema
+/// part matches any).
+fn same_object(case: CaseRules, a: &ObjectRef, b: &ObjectRef) -> bool {
+    let part = |x: &Option<String>, y: &Option<String>| match (x, y) {
+        (Some(x), Some(y)) => same_name(case.schemas, x, y),
+        _ => true,
+    };
+    same_name(case.relations, &a.name, &b.name)
+        && part(&a.schema, &b.schema)
+        && part(&a.catalog, &b.catalog)
 }
 
 fn check(cancel: &CancellationToken) -> Result<()> {
@@ -698,7 +749,7 @@ async fn read_source(
         }
         SourceObject::Query { sql, target_name } => {
             let select = BoundStatement::new(sql.clone(), Vec::new());
-            let schema = result_schema(source, &select, cancel).await?;
+            let schema = query_schema(source, &select, cancel).await?;
             Ok(SourceTable {
                 def: table_from_schema(
                     ObjectRef::new(ObjectKind::Table, target_name.clone()),
@@ -735,9 +786,35 @@ async fn result_schema(
     cancel: &CancellationToken,
 ) -> Result<SchemaRef> {
     let token = cancel.child_token();
-    let mut stream = connection
+    let stream = connection
         .execute(&statement.sql, &statement.params, token.clone())
         .await?;
+    first_schema(stream, &token).await
+}
+
+/// [`result_schema`] of a user's query, inside a transaction that is rolled back whatever
+/// happens: planning (the dry run) must not change data, and the query may write.
+async fn query_schema(
+    connection: &dyn Connection,
+    statement: &BoundStatement,
+    cancel: &CancellationToken,
+) -> Result<SchemaRef> {
+    let tx = cancellable(cancel, connection.begin()).await?;
+    let token = cancel.child_token();
+    let result = async {
+        let stream = tx
+            .execute(&statement.sql, &statement.params, token.clone())
+            .await?;
+        first_schema(stream, &token).await
+    }
+    .await;
+    let _ = tokio::time::timeout(ROLLBACK_WAIT, tx.rollback()).await;
+    result
+}
+
+/// The schema of the first result set of `stream`; then cancels it (`token`) and drains the
+/// rest.
+async fn first_schema(mut stream: ResultStream, token: &CancellationToken) -> Result<SchemaRef> {
     let mut found = None;
     while let Some(item) = stream.next().await {
         match item? {
@@ -760,8 +837,13 @@ async fn result_schema(
 }
 
 /// Reads the rest of an abandoned stream (bounded), so its session can run the next statement.
-async fn drain(mut stream: ResultStream) {
-    let _ = tokio::time::timeout(DRAIN_WAIT, async {
+async fn drain(stream: ResultStream) {
+    drain_for(stream, DRAIN_WAIT).await;
+}
+
+/// [`drain`] for at most `wait`.
+async fn drain_for(mut stream: ResultStream, wait: Duration) {
+    let _ = tokio::time::timeout(wait, async {
         while let Some(item) = stream.next().await {
             if item.is_err() {
                 break;
@@ -1049,21 +1131,28 @@ pub async fn copy_table(
         pending: Vec::new(),
         loader_prepared: false,
         fk_off: false,
+        fk_restore_error: None,
+        deadline: None,
         stream: Mutex::new(None),
     };
     let source_token = run.cancel.child_token();
     let outcome = run.run(&source_token).await;
     if outcome.is_err() {
+        if run.cancel.is_cancelled() {
+            // Clean-up after a cancel is bounded as a whole.
+            run.deadline = Some(Instant::now() + CANCEL_BUDGET);
+        }
         // Stop the source statement and read what is left of it, so the source session can
         // run the next table's statement.
         source_token.cancel();
+        let wait = run.wait(DRAIN_WAIT);
         if let Some(stream) = run
             .stream
             .get_mut()
             .unwrap_or_else(PoisonError::into_inner)
             .take()
         {
-            drain(stream).await;
+            drain_for(stream, wait).await;
         }
         run.abort().await;
     }
@@ -1091,6 +1180,10 @@ struct Copier<'a> {
     loader_prepared: bool,
     /// Foreign-key checks are off on the target session.
     fk_off: bool,
+    /// Switching foreign-key checks back on failed (the table report says so).
+    fk_restore_error: Option<String>,
+    /// After a cancel: when the clean-up must be over ([`CANCEL_BUDGET`]).
+    deadline: Option<Instant>,
     /// The source rows (in a mutex only so the copier is `Sync`: a stream is `Send` but not
     /// `Sync`, and the copier is borrowed across awaits; it is only ever used through
     /// `&mut self`, so the lock is never contended).
@@ -1150,7 +1243,9 @@ impl Copier<'_> {
                 "the source statement returns no rows (it must be a SELECT)",
             ));
         };
-        let converter = BatchConverter::new(schema, &job.plan.columns, job.columns.to_vec())?;
+        let rules = target_rules(job.target.engine(), job.target_version);
+        let converter =
+            BatchConverter::new(schema, &job.plan.columns, job.columns.to_vec())?.with_rules(rules);
 
         // 2. Foreign-key checks off for a table that existed before (new tables get their
         //    foreign keys after the load).
@@ -1247,18 +1342,29 @@ impl Copier<'_> {
         Ok(())
     }
 
+    /// `limit`, cut to what is left of the cancel budget after a cancel.
+    fn wait(&self, limit: Duration) -> Duration {
+        match self.deadline {
+            Some(deadline) => limit.min(deadline.saturating_duration_since(Instant::now())),
+            None => limit,
+        }
+    }
+
     /// Rolls the open transaction back (bounded).
     async fn abort(&mut self) {
+        let wait = self.wait(ROLLBACK_WAIT);
         if let Some(tx) = self.tx.take() {
-            let _ = tokio::time::timeout(ROLLBACK_WAIT, tx.rollback()).await;
+            let _ = tokio::time::timeout(wait, tx.rollback()).await;
         }
         self.ddl_in_open_tx = false;
     }
 
-    /// `BulkLoader::finish` and foreign-key checks back on (best effort after a failure).
+    /// `BulkLoader::finish` (best effort after a failure) and foreign-key checks back on
+    /// (a failure is kept for the report: the constraints may stay off, or the loaded rows
+    /// broke them).
     async fn clean_up(&mut self, failed: bool) {
         let token = CancellationToken::new();
-        let wait = if failed {
+        let limit = if failed {
             CLEANUP_WAIT
         } else {
             Duration::from_secs(30)
@@ -1266,6 +1372,7 @@ impl Copier<'_> {
         if self.loader_prepared {
             let session = LoadSession::new(self.job.target, None);
             let target = self.load_target();
+            let wait = self.wait(limit);
             let _ = tokio::time::timeout(
                 wait,
                 self.job.loader.finish(session, &target, token.clone()),
@@ -1279,9 +1386,22 @@ impl Copier<'_> {
                 .foreign_key_checks(&self.job.plan.target, true)
         {
             let session = LoadSession::new(self.job.target, None);
+            // Switching the checks back on matters even after a failure: at least a moment.
+            let wait = self.wait(limit).max(Duration::from_millis(200));
             for sql in statements {
                 let statement = BoundStatement::new(sql, Vec::new());
-                let _ = tokio::time::timeout(wait, session.run(&statement, token.clone())).await;
+                let error = match tokio::time::timeout(wait, session.run(&statement, token.clone()))
+                    .await
+                {
+                    Ok(Ok(_)) => continue,
+                    Ok(Err(e)) => e.to_string(),
+                    Err(_) => "it took too long".to_owned(),
+                };
+                self.fk_restore_error = Some(format!(
+                    "switching foreign-key checks back on for {} failed: {error}",
+                    self.job.plan.target.display_name()
+                ));
+                break;
             }
         }
     }
@@ -1401,13 +1521,25 @@ impl Copier<'_> {
 
     fn report(&mut self, outcome: &Result<()>) -> TableReport {
         self.progress.elapsed_ms = millis(self.started);
-        let (status, error) = match outcome {
+        let (mut status, mut error) = match outcome {
             Ok(()) => (TableStatus::Done, None),
             Err(e) if e.is_cancelled() || self.cancel.is_cancelled() => {
                 (TableStatus::Cancelled, None)
             }
             Err(e) => (TableStatus::Failed, Some(e.to_string())),
         };
+        let mut left_behind = self.left_behind(outcome.is_ok());
+        if let Some(fk) = &self.fk_restore_error {
+            // The rows are in; the table's foreign keys may be off or broken by them.
+            left_behind = format!(
+                "{left_behind}; its foreign-key checks may still be off, or loaded rows break \
+                 them: check the table's constraints"
+            );
+            if status == TableStatus::Done {
+                status = TableStatus::Failed;
+                error = Some(fk.clone());
+            }
+        }
         TableReport {
             table: self.job.plan.object,
             target: self.job.plan.target.clone(),
@@ -1416,7 +1548,7 @@ impl Copier<'_> {
             issues: std::mem::take(&mut self.issues),
             issues_truncated: self.issues_truncated,
             error,
-            left_behind: self.left_behind(outcome.is_ok()),
+            left_behind,
         }
     }
 
