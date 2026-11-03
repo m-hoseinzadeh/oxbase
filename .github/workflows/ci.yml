@@ -237,14 +237,15 @@ jobs:
       # (tests/docker/init/*/06-m8.sql, mssql/07-m8.sql, sqlite/03-04) the seed, sync_structure,
       # sync_data and backup cells of the five SQL engines and the 20-cell transfer matrix (PG ->
       # MySQL with the [m8.transfer] set must pass), printed as tables. Cells of streams that
-      # have not landed are pending; the integrator adds OXBASE_CONFORMANCE_REQUIRE_M8: "1" below
-      # once they are merged (then every cell must pass and missing_m8_roles must be empty).
+      # OXBASE_CONFORMANCE_REQUIRE_M8=1 (all M8 streams are merged): every cell must pass,
+      # nothing pending, and missing_m8_roles must be empty.
       - name: Run conformance harness
         env:
           OXBASE_CONFORMANCE_REQUIRE_M2_FETCH: "1"
           OXBASE_CONFORMANCE_REQUIRE_M3_ROUNDTRIP: "1"
           OXBASE_CONFORMANCE_REQUIRE_M4: "1"
           OXBASE_CONFORMANCE_REQUIRE_M7: "1"
+          OXBASE_CONFORMANCE_REQUIRE_M8: "1"
         run: cargo test -p oxbase-conformance --locked -- --include-ignored --nocapture --test-threads 1
 
       # Driver, tunnel and connection-manager live tests (SSH bastion, TLS-only users, cancel),
@@ -263,7 +264,8 @@ jobs:
       # and console live tests and the services' m7_*_live tests (browse, edit and query on both
       # engines). The REQUIRE switches turn a missing M7 fixture, seed or cell into a failure.
       # M8: the oxbase-transfer, oxbase-diff and oxbase-backup live tests (with the services'
-      # m8_*_live tests above) against the [m8] seed.
+      # m8_*_live tests above) against the [m8] seed. OXBASE_SERVICES_REQUIRE_M8=1: a missing
+      # M8 fixture, seed or cell fails instead of being pending.
       - name: Run M1-M5 live tests
         env:
           OXBASE_SERVICES_REQUIRE_M3_CELLS: "1"
@@ -271,6 +273,7 @@ jobs:
           OXBASE_SERVICES_REQUIRE_M7: "1"
           OXBASE_REDIS_REQUIRE_M7: "1"
           OXBASE_SHELL_REQUIRE_M7_SEED: "1"
+          OXBASE_SERVICES_REQUIRE_M8: "1"
         run: cargo test -p oxbase-net -p oxbase-pg -p oxbase-mysql -p oxbase-sqlite -p oxbase-mssql -p oxbase-mongo -p oxbase-redis -p oxbase-services -p oxbase-io -p oxbase-transfer -p oxbase-diff -p oxbase-backup --locked -- --include-ignored --test-threads 1 --nocapture
 
       - name: Dump fixture logs
@@ -489,7 +492,8 @@ jobs:
       # M3: the table-data edit step is mandatory (a skip fails the job). M5: so is the
       # import / export step (the debug app's --e2e-file-dir hook, ui/e2e/README.md). M6: so is
       # the code-insight step (completion, diagnostics, format, IPC latency). M7: so is the
-      # MongoDB / Redis step (collection, shell, key browser, console; screenshots).
+      # MongoDB / Redis step (collection, shell, key browser, console; screenshots). M8: so are
+      # the structure sync, data sync, transfer and backup steps (docs/m8-contracts.md §8.4).
       - name: Webview smoke test
         env:
           OXBASE_E2E_OUT: ${{ runner.temp }}/e2e
@@ -497,6 +501,7 @@ jobs:
           OXBASE_E2E_REQUIRE_M5: "1"
           OXBASE_E2E_REQUIRE_M6: "1"
           OXBASE_E2E_REQUIRE_M7: "1"
+          OXBASE_E2E_REQUIRE_M8: "1"
         run: bash scripts/e2e-smoke.sh
 
       - name: Upload e2e results

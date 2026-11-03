@@ -40,9 +40,7 @@ pub use spec::{
 };
 
 /// Registers the type mapper of each SQL engine (PostgreSQL, MySQL, MariaDB, SQLite, SQL
-/// Server) in `reg`. Called by `oxbase_services::default_dialects` once the transfer stream
-/// fills the cells (the call is commented there until then, so `missing_m8_roles` keeps
-/// reporting them).
+/// Server) in `reg`. Called by `oxbase_services::default_dialects`.
 pub fn register(reg: &mut DialectRegistry) {
     reg.register_type_mapper(Engine::Postgres, Arc::new(cells::postgres::PgTypeMapper))
         .register_type_mapper(

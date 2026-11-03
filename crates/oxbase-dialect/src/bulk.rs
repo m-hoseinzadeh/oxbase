@@ -403,8 +403,9 @@ pub trait BulkLoader: Send + Sync {
     /// dependency order and foreign keys added after the load instead. Engines (transfer
     /// stream): MySQL / MariaDB `SET FOREIGN_KEY_CHECKS = 0 / 1` (session), SQLite `PRAGMA
     /// foreign_keys = OFF / ON` (session, outside a transaction), SQL Server `ALTER TABLE t
-    /// NOCHECK CONSTRAINT ALL` / `WITH CHECK CHECK CONSTRAINT ALL` (per table; re-enabling
-    /// validates the loaded rows).
+    /// NOCHECK CONSTRAINT fk` / `WITH CHECK CHECK CONSTRAINT fk` for each foreign key of the
+    /// table (not `ALL`, which would also switch check constraints; re-enabling validates the
+    /// loaded rows).
     fn foreign_key_checks(&self, table: &ObjectRef, enabled: bool) -> Option<Vec<String>> {
         let _ = (table, enabled);
         None
