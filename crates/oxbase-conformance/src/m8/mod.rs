@@ -302,7 +302,8 @@ impl M8Report {
                     .iter()
                     .map(|m| format!("missing role: {m}")),
             );
-            for engine in M8_ENGINES {
+            // OXBASE_CONFORMANCE_ENGINES: only the selected engines are required.
+            for engine in M8_ENGINES.into_iter().filter(|&e| adapter::is_selected(e)) {
                 if !self.cells.iter().any(|c| c.engine_kind == engine) {
                     out.push(format!("no {engine} fixture ran the M8 cells"));
                 }

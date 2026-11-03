@@ -827,8 +827,12 @@ async fn a_cancelled_run_reports_the_reconnect() {
     let other = connect(&params()).await;
     run(&other, &format!("LPUSH {queue} x")).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
+    let len = scalar(&other, &format!("LLEN {queue}")).await;
+    // Remove the list before asserting, so a failure does not leave it behind either.
+    run(&other, &format!("DEL {queue}")).await;
+    other.close().await.unwrap();
     assert_eq!(
-        scalar(&other, &format!("LLEN {queue}")).await.as_deref(),
+        len.as_deref(),
         Some("1"),
         "the dropped BLPOP consumed the element"
     );

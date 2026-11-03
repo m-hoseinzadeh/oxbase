@@ -1,0 +1,80 @@
+name: QA
+
+# Every live (Docker-backed) test of every engine, one database at a time, with a cleanup check
+# between databases (scripts/qa-engines.mjs): postgres, mysql, mariadb, sqlite, mssql, mongodb,
+# redis, then the cross-engine stages (data transfer between two engines, the M8 transfer matrix
+# pair by pair). Each stage starts only its own fixtures, reports the server objects its tests
+# left behind, and is torn down with its volumes before the next one starts. The summary (feature
+# x database matrix, failures, leaks) is the job summary; logs and JSON are the qa-results
+# artifact. Manual runs, plus pushes to the wip/qa branch.
+on:
+  workflow_dispatch:
+    inputs:
+      stages:
+        description: "Stages to run, comma-separated (e.g. postgres,mssql+postgres); empty = all"
+        required: false
+        default: ""
+  push:
+    branches: ["wip/qa"]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_NET_RETRY: "10"
+  RUST_BACKTRACE: short
+  RUSTUP_MAX_RETRIES: "10"
+
+jobs:
+  qa:
+    name: QA (one database at a time)
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+
+      # The conformance job's cache: the same packages in the same profile.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: conformance
+          save-if: false
+
+      - name: Generate fixture TLS PKI and SSH keys
+        run: bash scripts/fixtures-certs.sh
+
+      - name: Run every live test, one database at a time
+        env:
+          STAGES: ${{ inputs.stages }}
+        run: |
+          echo "kernel: $(uname -r)"
+          if [[ -n "${STAGES:-}" ]]; then
+            node scripts/qa-engines.mjs --out "$RUNNER_TEMP/qa" --stages "$STAGES"
+          else
+            node scripts/qa-engines.mjs --out "$RUNNER_TEMP/qa"
+          fi
+
+      - name: Upload QA results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: qa-results
+          path: ${{ runner.temp }}/qa
+          if-no-files-found: warn
+
+      - name: Tear down database fixtures
+        if: always()
+        run: bash scripts/ci-fixtures.sh down

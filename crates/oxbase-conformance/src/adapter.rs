@@ -25,6 +25,50 @@ pub fn engine_from_fixture_kind(kind: &str) -> Option<Engine> {
         .find(|e| e.as_str().eq_ignore_ascii_case(kind))
 }
 
+/// The environment variable that limits a run to some engines: a comma-separated list of
+/// [`Engine::as_str`] names (`postgres,mysql`). Unset or empty means every engine. The QA
+/// workflow (`scripts/qa-engines.mjs`) sets it so one database at a time is tested: fixtures
+/// of other engines are left out of [`crate::fixtures::Fixtures::resolve`], and the guards only
+/// require the selected engines.
+pub const ENGINES_ENV: &str = "OXBASE_CONFORMANCE_ENGINES";
+
+/// The engines [`ENGINES_ENV`] selects, or `None` for every engine.
+///
+/// # Panics
+///
+/// When the variable names an unknown engine.
+pub fn selected_engines() -> Option<Vec<Engine>> {
+    selected_from(std::env::var(ENGINES_ENV).ok().as_deref())
+}
+
+/// [`selected_engines`] for the value `value`.
+///
+/// # Panics
+///
+/// When `value` names an unknown engine.
+pub fn selected_from(value: Option<&str>) -> Option<Vec<Engine>> {
+    let value = value?.trim();
+    if value.is_empty() {
+        return None;
+    }
+    Some(
+        value
+            .split(',')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(|name| {
+                engine_from_fixture_kind(name)
+                    .unwrap_or_else(|| panic!("{ENGINES_ENV}: unknown engine {name:?}"))
+            })
+            .collect(),
+    )
+}
+
+/// Whether `engine` is part of this run ([`ENGINES_ENV`]).
+pub fn is_selected(engine: Engine) -> bool {
+    selected_engines().is_none_or(|selected| selected.contains(&engine))
+}
+
 /// The dialect registry the harness reads applicability and fetchers from:
 /// [`oxbase_services::default_dialects`].
 pub fn registry() -> DialectRegistry {
@@ -108,6 +152,17 @@ pub fn applies(registry: &DialectRegistry, engine: Engine, kind: ObjectKind) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn engine_selection_parses_lists() {
+        assert_eq!(selected_from(None), None);
+        assert_eq!(selected_from(Some("  ")), None);
+        assert_eq!(
+            selected_from(Some("postgres, mysql,")),
+            Some(vec![Engine::Postgres, Engine::MySql])
+        );
+        assert!(std::panic::catch_unwind(|| selected_from(Some("pg"))).is_err());
+    }
 
     #[test]
     fn fixture_kind_round_trips() {

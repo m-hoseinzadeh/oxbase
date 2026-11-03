@@ -113,7 +113,11 @@ async fn drop_all(c: &dyn Connection, schema: &str, p: &str) {
         format!("DROP SEQUENCE IF EXISTS {schema}.{p}seq"),
         format!("DROP TYPE IF EXISTS {schema}.{p}mood"),
     ] {
-        let _ = c.execute(&sql, &[], CancellationToken::new()).await;
+        // Drain the result: dropping a result stream cancels its statement, so the drop
+        // could be cancelled before it ran and leave the object behind.
+        if let Ok(stream) = c.execute(&sql, &[], CancellationToken::new()).await {
+            let _ = oxbase_driver::collect(stream).await;
+        }
     }
 }
 
