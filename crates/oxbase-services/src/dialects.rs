@@ -33,7 +33,7 @@ pub fn default_dialects() -> DialectRegistry {
 
     // M8 (docs/m8-contracts.md §1): the transfer stream uncomments this line (and only this
     // line) once its TypeMapper cells are filled; until then `missing_m8_roles` reports them.
-    // oxbase_transfer::register(&mut reg);
+    oxbase_transfer::register(&mut reg);
 
     mark_provisional(&mut reg);
     reg
@@ -131,6 +131,25 @@ mod tests {
             ObjectKind::Sequence
         ));
         assert!(provisional_applicable(Engine::Sqlite, ObjectKind::Database));
+    }
+
+    /// M8 transfer: every SQL engine maps types (`docs/m8-contracts.md` §1); MongoDB and Redis
+    /// are not transfer endpoints.
+    #[test]
+    fn every_sql_engine_has_a_type_mapper() {
+        let reg = default_dialects();
+        for engine in oxbase_dialect::M8_ENGINES {
+            assert!(reg.has_type_mapper(engine), "{engine}");
+            assert!(
+                !reg.missing_m8_roles(engine)
+                    .iter()
+                    .any(|m| m.contains("TypeMapper")),
+                "{engine}: {:?}",
+                reg.missing_m8_roles(engine)
+            );
+        }
+        assert!(!reg.has_type_mapper(Engine::MongoDb));
+        assert!(!reg.has_type_mapper(Engine::Redis));
     }
 
     #[test]

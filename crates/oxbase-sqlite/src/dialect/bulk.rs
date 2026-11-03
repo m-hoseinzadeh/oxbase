@@ -32,7 +32,7 @@ use async_trait::async_trait;
 use oxbase_dialect::bulk::{BulkLimits, BulkLoader, BulkMethod, LoadSession, LoadTarget};
 use oxbase_dialect::{AnsiQuoting, InsertLoader};
 use oxbase_driver::CancellationToken;
-use oxbase_types::{DataType, Engine, Result, ServerVersion};
+use oxbase_types::{DataType, Engine, ObjectRef, Result, ServerVersion};
 
 use super::ddl::{EXACT_DECIMAL, NUMERIC_EXACT_DIGITS};
 use crate::convert::{Affinity, affinity};
@@ -67,6 +67,15 @@ impl BulkLoader for SqliteBulkLoader {
 
     fn limits(&self, _version: &ServerVersion) -> BulkLimits {
         self.limits
+    }
+
+    /// M8: `PRAGMA foreign_keys = OFF / ON` (a session setting; it has no effect inside a
+    /// transaction, so the caller runs it outside one).
+    fn foreign_key_checks(&self, _table: &ObjectRef, enabled: bool) -> Option<Vec<String>> {
+        Some(vec![format!(
+            "PRAGMA foreign_keys = {}",
+            if enabled { "ON" } else { "OFF" }
+        )])
     }
 
     /// A warning per decimal target column of `NUMERIC` affinity whose values may have more
