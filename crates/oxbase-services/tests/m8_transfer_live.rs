@@ -177,24 +177,22 @@ impl Live {
     }
 
     async fn run(&self, request: TransferRequest) -> (Vec<TransferEvent>, TransferReport) {
-        let handle = self
+        let mut handle = self
             .service
             .start(request)
             .await
             .unwrap_or_else(|e| panic!("start failed: {e}"));
-        let events = drain(handle, Duration::from_secs(120)).await;
-        match events.last() {
-            Some(TransferEvent::Finished { report }) => {
-                let report = report.clone();
-                (events, report)
-            }
+        let events = drain(&mut handle, Duration::from_secs(120)).await;
+        let report = match events.last() {
+            Some(TransferEvent::Finished { report }) => report.clone(),
             other => panic!("the transfer did not finish: {other:?}"),
-        }
+        };
+        (events, report)
     }
 }
 
 /// Every event of a run up to the terminal one.
-async fn drain(mut handle: TransferHandle, limit: Duration) -> Vec<TransferEvent> {
+async fn drain(handle: &mut TransferHandle, limit: Duration) -> Vec<TransferEvent> {
     let mut events = Vec::new();
     let deadline = Instant::now() + limit;
     loop {
@@ -382,11 +380,21 @@ fn canon(value: &Value) -> String {
         Value::Date(d) => d.to_string(),
         Value::Time(t) => t.format("%H:%M:%S%.6f").to_string(),
         Value::Timestamp(_) | Value::TimestampTz(_) => instant(value)
-            .map(|t| t.format("%Y-%m-%d %H:%M:%S%.6f").to_string())
-            .unwrap_or_default(),
+            .map_or_else(String::new, |t| {
+                t.format("%Y-%m-%d %H:%M:%S%.6f").to_string()
+            }),
         Value::Uuid(u) => u.to_string(),
         Value::Json(j) => j.to_string(),
     }
+}
+
+/// The bits of `x` as a 32-bit float (`real` columns hold f32 values).
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "the values come from 32-bit float columns"
+)]
+fn f32_bits(x: f64) -> u32 {
+    (x as f32).to_bits()
 }
 
 /// `true` when `a` (source) and `b` (target) hold the same value of column `column` (rules of
@@ -397,11 +405,7 @@ fn same(column: &str, a: &Value, b: &Value) -> bool {
     }
     match column {
         "c_real" => match (a, b) {
-            (Value::Float(x), Value::Float(y)) => {
-                #[allow(clippy::cast_possible_truncation, reason = "real columns hold f32")]
-                let same = (*x as f32).to_bits() == (*y as f32).to_bits();
-                same
-            }
+            (Value::Float(x), Value::Float(y)) => f32_bits(*x) == f32_bits(*y),
             _ => false,
         },
         "c_double" => match (a, b) {
@@ -951,7 +955,7 @@ async fn continue_mode_skips_and_reports_a_bad_row() {
             .any(|e| matches!(e, TransferEvent::RowError { .. })),
         "{events2:?}"
     );
-    assert!(!events.is_empty());
+    assert_ne!(events.len(), 0);
     assert_eq!(
         pg.count(&format!("SELECT count(*) FROM {t}.m8_data")).await,
         1
@@ -960,12 +964,12 @@ async fn continue_mode_skips_and_reports_a_bad_row() {
     // `stop` (the default) fails the table at the first issue; the created table rolls back.
     pg.exec(&[format!("DROP TABLE {t}.m8_data")]).await;
     transfer.options.errors = ErrorMode::Stop;
-    let handle = live
+    let mut handle = live
         .service
         .start(request(&pg, &pg, transfer))
         .await
         .unwrap();
-    let events = drain(handle, Duration::from_secs(60)).await;
+    let events = drain(&mut handle, Duration::from_secs(60)).await;
     match events.last() {
         Some(TransferEvent::Failed { error, report }) => {
             assert!(error.message.contains("row 1"), "{error:?}");
@@ -1036,7 +1040,7 @@ async fn cancel_case(live: &Live, pg: &Session, stop: impl FnOnce(&TransferHandl
     assert!(live.service.is_running(handle.id));
     let stopped = Instant::now();
     stop(&handle);
-    let rest = drain(handle, Duration::from_secs(10)).await;
+    let rest = drain(&mut handle, Duration::from_secs(10)).await;
     assert!(
         stopped.elapsed() < Duration::from_secs(2),
         "took {:?}",
@@ -1092,7 +1096,7 @@ async fn closing_the_source_session_cancels_the_transfer() {
         assert_eq!(service.cancel_session(pg.id()), 1);
     })
     .await;
-    assert!(!left.is_empty());
+    assert_ne!(left, "");
     live.manager.close(pg.id()).await.unwrap();
     live.manager.close(source.id()).await.unwrap();
 }

@@ -453,7 +453,7 @@ pub fn target_table(
     let plan_of = |name: &str| columns.iter().find(|p| p.source == name);
     // Source column name → target column name, for the columns the table keeps.
     let mut renamed: Vec<(String, String)> = Vec::new();
-    let mut out = TableDef::new(target.clone());
+    let mut out = TableDef::new(target);
     let same = ctx.same_engine();
     for column in &source.columns {
         let plan = plan_of(&column.name)
@@ -593,7 +593,7 @@ pub fn target_table(
             let mut copy = index.clone();
             copy.columns = parts;
             if !same {
-                copy.name = index_name(&target.name, &index.name);
+                copy.name = index_name(&out.obj.name, &index.name);
                 copy.extras = Extras::new();
             }
             out.indexes.push(copy);

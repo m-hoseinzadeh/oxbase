@@ -465,12 +465,8 @@ impl Job {
         } else {
             ""
         };
-        let dropping = run_steps(
-            self.target(),
-            &prepared.drop_created,
-            false,
-            &CancellationToken::new(),
-        );
+        let never = CancellationToken::new();
+        let dropping = run_steps(self.target(), &prepared.drop_created, false, &never);
         report.left_behind = match tokio::time::timeout(DROP_WAIT, dropping).await {
             Ok(Ok(())) => format!("{old}the table the transfer created was dropped"),
             Ok(Err(e)) => format!(

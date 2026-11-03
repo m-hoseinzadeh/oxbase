@@ -426,7 +426,7 @@ struct CopyRun {
 
 async fn run_copy(
     config: MockConfig,
-    options: TransferOptions,
+    options: &TransferOptions,
     cancel: CancellationToken,
 ) -> CopyRun {
     let driver = MockDriver::new(Engine::MySql).with_config(config);
@@ -473,7 +473,7 @@ async fn run_copy(
             target_version: &version,
             loader: &loader,
             columns: &columns,
-            options: &options,
+            options,
         },
         &on_progress,
         cancel,
@@ -496,7 +496,7 @@ async fn copies_in_one_transaction_with_the_ddl_inside() {
     // 3 batches of 4 rows: names `row 0` .. `row 11` are too long for varchar(5) from row 10.
     let copy = run_copy(
         MockConfig::default(),
-        TransferOptions {
+        &TransferOptions {
             errors: ErrorMode::Continue,
             ..TransferOptions::default()
         },
@@ -527,7 +527,7 @@ async fn copies_in_one_transaction_with_the_ddl_inside() {
 async fn per_batch_commits_and_stop_on_the_first_issue() {
     let copy = run_copy(
         MockConfig::default(),
-        TransferOptions {
+        &TransferOptions {
             batch_rows: 3,
             transaction: TransactionScope::PerBatch,
             errors: ErrorMode::Stop,
@@ -563,7 +563,7 @@ async fn a_cancelled_copy_rolls_back() {
             rows_per_batch: 2,
             batch_delay: Duration::from_millis(20),
         },
-        TransferOptions {
+        &TransferOptions {
             errors: ErrorMode::Continue,
             ..TransferOptions::default()
         },

@@ -57,6 +57,7 @@
 
 use std::collections::HashSet;
 use std::future::Future;
+use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use arrow_array::{BooleanArray, RecordBatch};
@@ -252,7 +253,6 @@ pub async fn prepare(inputs: PlanInputs<'_>, cancel: CancellationToken) -> Resul
         target_mapper: target_mapper.as_ref(),
     };
     check_container(dialects, target, &spec.target, &cancel).await?;
-    let source_quoting = dialects.quoting(se)?;
     let target_quoting = dialects.quoting(te)?;
     let terminator = target_quoting.script_terminator();
     let generator = dialects.ddl(te, ObjectKind::Table)?;
@@ -665,14 +665,11 @@ async fn read_source(
     match object {
         SourceObject::Table { table, filter, .. } => {
             let fetcher = dialects.fetcher(engine, ObjectKind::Table)?;
-            let def = match fetcher.load(source, table, cancel.clone()).await? {
-                ObjectDef::Table(def) => def,
-                _ => {
-                    return Err(Error::internal(format!(
-                        "the table fetcher returned something else for {}",
-                        table.display_name()
-                    )));
-                }
+            let ObjectDef::Table(def) = fetcher.load(source, table, cancel.clone()).await? else {
+                return Err(Error::internal(format!(
+                    "the table fetcher returned something else for {}",
+                    table.display_name()
+                )));
             };
             let mut query = TableDataQuery::new(table.clone());
             query.filter.clone_from(filter);
@@ -1052,7 +1049,7 @@ pub async fn copy_table(
         pending: Vec::new(),
         loader_prepared: false,
         fk_off: false,
-        stream: None,
+        stream: Mutex::new(None),
     };
     let source_token = run.cancel.child_token();
     let outcome = run.run(&source_token).await;
@@ -1060,7 +1057,12 @@ pub async fn copy_table(
         // Stop the source statement and read what is left of it, so the source session can
         // run the next table's statement.
         source_token.cancel();
-        if let Some(stream) = run.stream.take() {
+        if let Some(stream) = run
+            .stream
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
             drain(stream).await;
         }
         run.abort().await;
@@ -1089,8 +1091,10 @@ struct Copier<'a> {
     loader_prepared: bool,
     /// Foreign-key checks are off on the target session.
     fk_off: bool,
-    /// The source rows.
-    stream: Option<ResultStream>,
+    /// The source rows (in a mutex only so the copier is `Sync`: a stream is `Send` but not
+    /// `Sync`, and the copier is borrowed across awaits; it is only ever used through
+    /// `&mut self`, so the lock is never contended).
+    stream: Mutex<Option<ResultStream>>,
 }
 
 impl Copier<'_> {
@@ -1123,7 +1127,10 @@ impl Copier<'_> {
                 .execute(&select.sql, &select.params, source_token.clone()),
         )
         .await?;
-        self.stream = Some(stream);
+        *self
+            .stream
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner) = Some(stream);
         let mut schema = None;
         let mut first: Option<RecordBatch> = None;
         while schema.is_none() {
@@ -1190,7 +1197,10 @@ impl Copier<'_> {
                 Some(Ok(_)) => {}
             }
         }
-        self.stream = None;
+        *self
+            .stream
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner) = None;
         self.flush(true).await?;
         self.commit().await?;
         self.report_progress(true);
@@ -1199,7 +1209,11 @@ impl Copier<'_> {
 
     /// The next item of the source stream (`Cancelled` once the run is cancelled).
     async fn next(&mut self) -> Option<Result<ResultItem>> {
-        let stream = self.stream.as_mut()?;
+        let stream = self
+            .stream
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_mut()?;
         next_item(stream, &self.cancel).await
     }
 
@@ -1435,11 +1449,12 @@ impl Copier<'_> {
             };
         }
         match plan.mode {
-            TableMode::Create => "rolled back: no table was created".to_owned(),
             TableMode::Replace if plan.exists => {
                 format!("rolled back: the old {table} is as it was")
             }
-            TableMode::Replace => "rolled back: no table was created".to_owned(),
+            TableMode::Create | TableMode::Replace => {
+                "rolled back: no table was created".to_owned()
+            }
             TableMode::Truncate | TableMode::Append => {
                 format!("rolled back: {table} is as it was")
             }

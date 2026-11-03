@@ -258,34 +258,36 @@ enum Cell {
 
 /// A builder of one load-schema column.
 enum Out {
-    Bool(BooleanBuilder),
-    I64(Int64Builder),
-    U64(UInt64Builder),
-    F64(Float64Builder),
-    Str(StringBuilder),
-    Bin(BinaryBuilder),
-    Date(Date32Builder),
-    Time(Time64MicrosecondBuilder),
-    Ts(TimestampMicrosecondBuilder),
-    Uuid(FixedSizeBinaryBuilder),
+    Bool(Box<BooleanBuilder>),
+    I64(Box<Int64Builder>),
+    U64(Box<UInt64Builder>),
+    F64(Box<Float64Builder>),
+    Str(Box<StringBuilder>),
+    Bin(Box<BinaryBuilder>),
+    Date(Box<Date32Builder>),
+    Time(Box<Time64MicrosecondBuilder>),
+    Ts(Box<TimestampMicrosecondBuilder>),
+    Uuid(Box<FixedSizeBinaryBuilder>),
 }
 
 impl Out {
     fn new(arrow: &ArrowType, rows: usize) -> Result<Self> {
         Ok(match arrow {
-            ArrowType::Boolean => Self::Bool(BooleanBuilder::with_capacity(rows)),
-            ArrowType::Int64 => Self::I64(Int64Builder::with_capacity(rows)),
-            ArrowType::UInt64 => Self::U64(UInt64Builder::with_capacity(rows)),
-            ArrowType::Float64 => Self::F64(Float64Builder::with_capacity(rows)),
-            ArrowType::Utf8 => Self::Str(StringBuilder::with_capacity(rows, rows * 16)),
-            ArrowType::Binary => Self::Bin(BinaryBuilder::with_capacity(rows, rows * 16)),
-            ArrowType::Date32 => Self::Date(Date32Builder::with_capacity(rows)),
-            ArrowType::Time64(_) => Self::Time(Time64MicrosecondBuilder::with_capacity(rows)),
-            ArrowType::Timestamp(_, _) => Self::Ts(
+            ArrowType::Boolean => Self::Bool(Box::new(BooleanBuilder::with_capacity(rows))),
+            ArrowType::Int64 => Self::I64(Box::new(Int64Builder::with_capacity(rows))),
+            ArrowType::UInt64 => Self::U64(Box::new(UInt64Builder::with_capacity(rows))),
+            ArrowType::Float64 => Self::F64(Box::new(Float64Builder::with_capacity(rows))),
+            ArrowType::Utf8 => Self::Str(Box::new(StringBuilder::with_capacity(rows, rows * 16))),
+            ArrowType::Binary => Self::Bin(Box::new(BinaryBuilder::with_capacity(rows, rows * 16))),
+            ArrowType::Date32 => Self::Date(Box::new(Date32Builder::with_capacity(rows))),
+            ArrowType::Time64(_) => {
+                Self::Time(Box::new(Time64MicrosecondBuilder::with_capacity(rows)))
+            }
+            ArrowType::Timestamp(_, _) => Self::Ts(Box::new(
                 TimestampMicrosecondBuilder::with_capacity(rows).with_data_type(arrow.clone()),
-            ),
+            )),
             ArrowType::FixedSizeBinary(16) => {
-                Self::Uuid(FixedSizeBinaryBuilder::with_capacity(rows, 16))
+                Self::Uuid(Box::new(FixedSizeBinaryBuilder::with_capacity(rows, 16)))
             }
             other => {
                 return Err(Error::internal(format!(
@@ -417,7 +419,7 @@ fn convert_value(value: Value, from: &DataType, to: &DataType) -> CellResult {
         }
         DataType::Enum { labels } => {
             let text = text_form(value);
-            if labels.is_empty() || labels.iter().any(|l| *l == text) {
+            if labels.is_empty() || labels.contains(&text) {
                 Ok(Cell::Str(text))
             } else {
                 Err(format!("{} is not one of the values of {to}", shown(&text)))
@@ -982,11 +984,13 @@ mod tests {
             true,
         )]));
         let batch = RecordBatch::try_new(Arc::clone(&schema), vec![array]).unwrap();
-        let mut column = LoadColumn::new("c", to.clone());
+        let plans = [plan("c", from, &to)];
+        let expected = load_arrow_type(&to);
+        let mut column = LoadColumn::new("c", to);
         column.nullable = nullable;
-        let converter = BatchConverter::new(schema, &[plan("c", from, &to)], vec![column]).unwrap();
+        let converter = BatchConverter::new(schema, &plans, vec![column]).unwrap();
         let out = converter.convert(&batch, 1).unwrap();
-        assert_eq!(out.batch.column(0).data_type(), &load_arrow_type(&to));
+        assert_eq!(out.batch.column(0).data_type(), &expected);
         out
     }
 
