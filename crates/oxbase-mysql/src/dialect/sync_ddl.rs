@@ -350,7 +350,7 @@ fn alter_sequence(old: &SequenceDef, new: &SequenceDef) -> Script {
 
 /// The warning every script with more than one statement carries.
 pub(crate) fn not_atomic_warning(script: &mut Script) {
-    if script.len() > 1 && !script.warnings.iter().any(|w| w == NOT_ATOMIC) {
+    if script.len() > 1 && !script.warnings.iter().any(|w| w.as_str() == NOT_ATOMIC) {
         script.warn(NOT_ATOMIC);
     }
 }
@@ -359,7 +359,6 @@ pub(crate) fn not_atomic_warning(script: &mut Script) {
 mod tests {
     use super::*;
     use oxbase_types::{RoutineArg, ServerVersion, TriggerLevel};
-    use pretty_assertions::assert_eq;
 
     fn db() -> ObjectRef {
         ObjectRef::database("m8_tgt")

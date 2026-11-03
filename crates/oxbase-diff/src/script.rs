@@ -123,7 +123,7 @@ pub fn sync_script(
                     DiffStatus::OnlyInSource | DiffStatus::Different => true,
                 }
             } else {
-                status != DiffStatus::Same && selection.iter().any(|s| *s == p.id)
+                status != DiffStatus::Same && selection.contains(&p.id)
             };
             picked.then_some((p, status))
         })

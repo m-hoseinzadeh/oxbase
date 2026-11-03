@@ -113,7 +113,6 @@ impl DdlGenerator for SqliteSyncDdl {
 mod tests {
     use super::*;
     use oxbase_types::{Extras, ServerVersion, TriggerEvent, TriggerLevel, TriggerTiming};
-    use pretty_assertions::assert_eq;
 
     #[test]
     fn views_and_triggers() {

@@ -35,7 +35,6 @@ fn registry() -> DialectRegistry {
 
 /// One engine's pair of containers.
 struct Pair {
-    key: &'static str,
     engine: Engine,
     version: ServerVersion,
     source: ObjectRef,
@@ -76,7 +75,6 @@ fn pair(key: &'static str) -> Pair {
         ),
     };
     Pair {
-        key,
         engine,
         version,
         source,

@@ -336,7 +336,7 @@ fn replaceable(old: &RoutineDef, new: &RoutineDef) -> bool {
         && old.args.iter().zip(&new.args).all(|(a, b)| {
             a.name == b.name
                 && a.mode == b.mode
-                && same_text(Some(&a.native_type), Some(&b.native_type))
+                && same_text(Some(a.native_type.as_str()), Some(b.native_type.as_str()))
                 && same_text(a.default.as_deref(), b.default.as_deref())
         })
 }
@@ -498,7 +498,6 @@ fn alter_sequence(old: &SequenceDef, new: &SequenceDef) -> Script {
 mod tests {
     use super::*;
     use oxbase_types::{Extras, ServerVersion};
-    use pretty_assertions::assert_eq;
 
     fn schema() -> ObjectRef {
         ObjectRef::schema(Some("oxbase_test"), "m8_tgt")
