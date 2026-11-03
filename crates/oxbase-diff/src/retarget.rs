@@ -46,13 +46,12 @@ pub fn retarget_sql(engine: Engine, text: &str, from: &Location, to: &Location) 
                 inner_start,
                 inner_end,
             } if dialect == SqlDialect::Postgres && regclass_follows(text, &tokens, pos) => {
-                names.regclass(&text[inner_start..inner_end]).map(|inner| {
-                    format!(
-                        "{}{inner}{}",
-                        &text[token.start..inner_start],
-                        &text[inner_end..token.end]
-                    )
-                })
+                let prefix = &text[token.start..inner_start];
+                // `E'...'` reads backslashes as escapes.
+                let escapes = prefix.starts_with(['E', 'e']);
+                names
+                    .regclass(&text[inner_start..inner_end], escapes)
+                    .map(|inner| format!("{prefix}{inner}{}", &text[inner_end..token.end]))
             }
             _ => None,
         };
@@ -163,7 +162,9 @@ impl<'a> Names<'a> {
     }
 
     /// The inner text of a PostgreSQL `'schema.name'::regclass` literal with the schema moved.
-    fn regclass(&self, inner: &str) -> Option<String> {
+    /// The new schema name is escaped for the string literal (quotes doubled; backslashes too
+    /// in an `E'...'` string), so no target name can end the literal early.
+    fn regclass(&self, inner: &str, escapes: bool) -> Option<String> {
         let (from, to) = self.schema?;
         let parts = split_path(inner);
         if parts.len() < 2 {
@@ -171,11 +172,21 @@ impl<'a> Names<'a> {
         }
         let first = parts[0];
         let quoted = first.starts_with('"');
-        if !self.matches(first, quoted, from) {
+        // The literal's own escapes undone: `'it''s'` holds `it's`.
+        let unescaped = first.replace("''", "'");
+        if !self.matches(&unescaped, quoted, from) {
             return None;
         }
         let rest = &inner[first.len()..];
-        Some(format!("{}{rest}", self.spell(first, quoted, to)))
+        let spelled = self.spell(&unescaped, quoted, to);
+        let mut literal = String::with_capacity(spelled.len() + 2);
+        for c in spelled.chars() {
+            if c == '\'' || (escapes && c == '\\') {
+                literal.push(c);
+            }
+            literal.push(c);
+        }
+        Some(format!("{literal}{rest}"))
     }
 }
 
@@ -295,6 +306,42 @@ mod tests {
             "nextval('m8_tgt.invoice_seq'::regclass)"
         );
         assert_eq!(pg("'m8_src.x'::text"), "'m8_src.x'::text");
+    }
+
+    fn pg_to(target: &str, text: &str) -> String {
+        retarget_sql(
+            Engine::Postgres,
+            text,
+            &Location::new(None, Some("m8_src")),
+            &Location::new(None, Some(target)),
+        )
+    }
+
+    #[test]
+    fn regclass_literals_escape_the_target_name() {
+        // A quote in the target name is doubled inside the literal (and quoted as a name).
+        assert_eq!(
+            pg_to("x'y", "nextval('m8_src.seq'::regclass)"),
+            "nextval('\"x''y\".seq'::regclass)"
+        );
+        assert_eq!(pg_to("x'y", "SELECT m8_src.f()"), "SELECT \"x'y\".f()");
+        // A double quote is doubled as part of the quoted name only.
+        assert_eq!(
+            pg_to("a\"b", "nextval('m8_src.seq'::regclass)"),
+            "nextval('\"a\"\"b\".seq'::regclass)"
+        );
+        // A backslash is plain in a standard string, doubled in an E'' string.
+        assert_eq!(
+            pg_to("a\\b", "nextval('m8_src.seq'::regclass)"),
+            "nextval('\"a\\b\".seq'::regclass)"
+        );
+        assert_eq!(
+            pg_to("a\\b", "nextval(E'm8_src.seq'::regclass)"),
+            "nextval(E'\"a\\\\b\".seq'::regclass)"
+        );
+        // An attempt to close the literal stays inside it.
+        let out = pg_to("t'); DROP TABLE x; --", "nextval('m8_src.seq'::regclass)");
+        assert_eq!(out, "nextval('\"t''); DROP TABLE x; --\".seq'::regclass)");
     }
 
     #[test]

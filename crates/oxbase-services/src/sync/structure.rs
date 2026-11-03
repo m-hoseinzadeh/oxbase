@@ -6,7 +6,10 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
 use oxbase_dialect::{DatabaseScope, DialectRegistry};
-use oxbase_diff::{SchemaSnapshot, StructureOptions, item_id, load_snapshot, sync_script};
+use oxbase_diff::{
+    DiffCounts, SchemaSnapshot, StructureOptions, item_id, load_snapshot, sync_script,
+};
+use oxbase_driver::collect;
 use oxbase_types::{Error, ObjectDef, ObjectKind, ObjectRef, Result};
 
 use super::{
@@ -104,6 +107,28 @@ async fn container_session(
     Ok((child, true))
 }
 
+/// Runs the engine's set-up of a dedicated structure sync session (`Quoting::sync_session`):
+/// `apply_into` `None` for a session that reads definitions, the target schema for the one
+/// that applies a script.
+async fn prepare_session(
+    service: &StructureSyncService,
+    session: &SessionHandle,
+    apply_into: Option<&str>,
+    cancel: &CancellationToken,
+) -> Result<()> {
+    let Ok(quoting) = service.dialects.quoting(session.summary().engine) else {
+        return Ok(());
+    };
+    for sql in quoting.sync_session(apply_into) {
+        let stream = session
+            .connection()
+            .execute(&sql, &[], cancel.clone())
+            .await?;
+        collect(stream).await?;
+    }
+    Ok(())
+}
+
 async fn close_quietly(service: &StructureSyncService, session: &SessionHandle) {
     if let Err(e) = service.manager.close(session.id()).await {
         tracing::debug!(error = %e, "closing a structure sync session failed");
@@ -121,6 +146,9 @@ async fn snapshot(
     let (reader, dedicated) = container_session(service, base, container, cancel).await?;
     let result = async {
         let _guard = until_cancelled(cancel, async { Ok(reader.exclusive().await) }).await?;
+        if dedicated {
+            prepare_session(service, &reader, None, cancel).await?;
+        }
         load_snapshot(
             &service.dialects,
             reader.connection().as_ref(),
@@ -267,27 +295,43 @@ fn stale_item(
         .cloned()
 }
 
-/// Every applied item is equal now, or gone from both sides, or (an object only in the target
-/// that the script re-created because it reads something that changed, not one it dropped)
-/// still only in the target.
+/// Every item of the script is where the apply should have left it: a selected (`picked`)
+/// item is equal now or gone from both sides; an item the script only re-created as it was (a
+/// view that reads a changed table, not selected itself) has the status it had before.
 fn applied_in_sync(
     before: &StructureDiff,
     after: &StructureDiff,
     items: &[String],
-    dropped: impl Fn(&str) -> bool,
+    picked: impl Fn(&str) -> bool,
 ) -> bool {
-    items
-        .iter()
-        .all(|id| match after.item(id).map(|i| i.status) {
-            None | Some(DiffStatus::Same) => true,
-            Some(DiffStatus::OnlyInTarget) => {
-                !dropped(id)
-                    && before
-                        .item(id)
-                        .is_some_and(|i| i.status == DiffStatus::OnlyInTarget)
-            }
-            Some(DiffStatus::OnlyInSource | DiffStatus::Different) => false,
-        })
+    items.iter().all(|id| {
+        let now = after.item(id).map(|i| i.status);
+        if matches!(now, None | Some(DiffStatus::Same)) {
+            return true;
+        }
+        !picked(id) && now == before.item(id).map(|i| i.status)
+    })
+}
+
+/// The report's re-compare when it failed after the script ran: no items, the failure as a
+/// warning (the apply itself is reported as it went).
+fn failed_recompare(kept: &KeptCompare, error: &Error) -> StructureCompareResult {
+    let compared = &kept.request;
+    StructureCompareResult {
+        compare_id: OperationId::new(),
+        diff: StructureDiff {
+            engine: kept.diff.engine,
+            source: compared.source.clone(),
+            target: compared.target.clone(),
+            items: Vec::new(),
+            warnings: vec![format!(
+                "the compare after the apply failed ({error}); compare again to see the result"
+            )],
+        },
+        counts: DiffCounts::default(),
+        skipped: Vec::new(),
+        elapsed_ms: 0,
+    }
 }
 
 pub(super) async fn apply(
@@ -331,6 +375,21 @@ pub(super) async fn apply(
 
     let (session, dedicated) =
         container_session(service, &target_base, &compared.target, &token).await?;
+    let prepared = if dedicated && compared.target.kind == ObjectKind::Schema {
+        prepare_session(
+            service,
+            &session,
+            Some(compared.target.name.as_str()),
+            &token,
+        )
+        .await
+    } else {
+        Ok(())
+    };
+    if let Err(e) = prepared {
+        close_quietly(service, &session).await;
+        return Err(e);
+    }
     let outcome = execute_script(&session, &script.script, script.atomic, token.clone()).await;
     if dedicated {
         close_quietly(service, &session).await;
@@ -347,19 +406,26 @@ pub(super) async fn apply(
     }
     drop(ticket);
 
-    // A cancelled apply still re-compares: the token only stopped the script.
-    let recompare = compare(service, compared, CancellationToken::new()).await?;
-    // Objects only in the target were dropped when the selection (or, without one, the
-    // compare's options) asked for drops.
-    let dropped = |id: &str| {
+    // The re-compare runs under the request's token (cancel stops it too). Its failure does
+    // not turn an apply that ran into an error: the report says so instead.
+    let (recompare, recompared) = match compare(service, compared, cancel).await {
+        Ok(result) => (result, true),
+        Err(e) => (failed_recompare(&kept, &e), false),
+    };
+    // What the script was asked to apply: the selection, or without one every item that
+    // differs (objects only in the target when the compare's options include drops).
+    let picked = |id: &str| {
         if request.selection.is_empty() {
-            compared.options.include_drops
+            kept.diff.item(id).is_some_and(|i| {
+                i.status != DiffStatus::OnlyInTarget || compared.options.include_drops
+            })
         } else {
             request.selection.iter().any(|s| s.as_str() == id)
         }
     };
-    let in_sync =
-        outcome.committed && applied_in_sync(&kept.diff, &recompare.diff, &script.items, dropped);
+    let in_sync = outcome.committed
+        && recompared
+        && applied_in_sync(&kept.diff, &recompare.diff, &script.items, picked);
     Ok(StructureApplyReport {
         script,
         outcome,
@@ -468,12 +534,13 @@ mod tests {
             }],
             warnings: Vec::new(),
         };
-        let no_drops = |_: &str| false;
+        let all = |_: &str| true;
+        let none = |_: &str| false;
         assert!(applied_in_sync(
             &diff,
             &diff,
             &items(&["table:a", "table:gone"]),
-            no_drops
+            all
         ));
         let mut different = diff.clone();
         different.items[0].status = DiffStatus::Different;
@@ -481,20 +548,40 @@ mod tests {
             &diff,
             &different,
             &items(&["table:a"]),
-            no_drops
+            all
+        ));
+        // Not selected, re-created as it was: still different is fine.
+        assert!(applied_in_sync(
+            &different,
+            &different,
+            &items(&["table:a"]),
+            none
         ));
         // Only in the target before and after: fine when it was re-created, not when it was
         // to be dropped.
         let mut only_target = diff.clone();
         only_target.items[0].status = DiffStatus::OnlyInTarget;
         let ids = items(&["table:a"]);
-        assert!(applied_in_sync(&only_target, &only_target, &ids, no_drops));
-        assert!(!applied_in_sync(
-            &only_target,
-            &only_target,
-            &ids,
-            |_: &str| true
-        ));
-        assert!(!applied_in_sync(&diff, &only_target, &ids, no_drops));
+        assert!(applied_in_sync(&only_target, &only_target, &ids, none));
+        assert!(!applied_in_sync(&only_target, &only_target, &ids, all));
+        assert!(!applied_in_sync(&diff, &only_target, &ids, none));
+
+        // A failed re-compare is a report, not an error.
+        let kept = KeptCompare {
+            request: StructureCompareRequest {
+                source_session: SessionId::new(),
+                source: ObjectRef::database("main"),
+                target_session: SessionId::new(),
+                target: ObjectRef::database("main"),
+                options: StructureOptions::default(),
+            },
+            source: snapshot_of(Vec::new()),
+            target: snapshot_of(Vec::new()),
+            diff: diff.clone(),
+        };
+        let failed = failed_recompare(&kept, &Error::Cancelled);
+        assert!(failed.diff.items.is_empty());
+        assert_eq!(failed.diff.warnings.len(), 1);
+        assert_eq!(failed.counts, DiffCounts::default());
     }
 }

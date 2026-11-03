@@ -13,8 +13,10 @@
 //!   trigger name carries the table's database, as the server requires); an alter drops and
 //!   creates.
 //! - MariaDB sequences: `CREATE SEQUENCE db.s [AS type] START WITH ... MINVALUE ... MAXVALUE ...
-//!   INCREMENT BY ... [CACHE n] [NO]CYCLE [COMMENT = ...]`; an alter is `ALTER SEQUENCE` with every
-//!   option, or a drop and a create when the value type or the comment changes.
+//!   INCREMENT BY ... [CACHE n] [NO]CYCLE [COMMENT = ...]`. An alter keeps the sequence and its
+//!   current value: `ALTER SEQUENCE` with every option, `ALTER TABLE db.s COMMENT = ...` for the
+//!   comment (a sequence is a table). Only a new value type needs a drop and a create; that
+//!   drop stays destructive (the sequence starts again) and the script warns.
 //!
 //! Every statement commits on its own (`transactional = false`); drops are destructive.
 
@@ -116,10 +118,23 @@ impl DdlGenerator for MySqlSyncDdl {
         match (old, new) {
             (ObjectDef::View(_), ObjectDef::View(v)) => Ok(create_view(v, true)),
             (ObjectDef::Sequence(a), ObjectDef::Sequence(b))
-                if same_text(a.data_type.as_deref(), b.data_type.as_deref())
-                    && a.comment == b.comment =>
+                if same_text(a.data_type.as_deref(), b.data_type.as_deref()) =>
             {
-                Ok(alter_sequence(a, b))
+                let mut script = alter_sequence(a, b);
+                not_atomic_warning(&mut script);
+                Ok(script)
+            }
+            (ObjectDef::Sequence(_), ObjectDef::Sequence(b)) => {
+                // The drop stays destructive: the sequence starts again.
+                let mut script = self.drop_object(&old.object_ref(), ctx)?;
+                script.append(self.create(new, ctx)?);
+                script.warn(format!(
+                    "sequence {} is dropped and created again (its value type changes): it \
+                     starts again at {}",
+                    b.obj.name, b.start
+                ));
+                not_atomic_warning(&mut script);
+                Ok(script)
             }
             _ if old.kind() != new.kind() => Err(Error::invalid_input(format!(
                 "cannot alter a {} into a {}",
@@ -335,14 +350,21 @@ fn create_sequence(s: &SequenceDef) -> Script {
     script
 }
 
+/// The options and the comment changed in place (the current value stays).
 fn alter_sequence(old: &SequenceDef, new: &SequenceDef) -> Script {
-    let mut before = old.clone();
-    before.obj.clone_from(&new.obj);
     let mut script = Script::new();
-    if before != *new {
+    if sequence_options(old) != sequence_options(new) {
         script.push_step(step(
             format!("ALTER SEQUENCE {}{}", q(&new.obj), sequence_options(new)),
             format!("Change sequence {}", new.obj.name),
+        ));
+    }
+    let before = old.comment.as_deref().unwrap_or_default();
+    let after = new.comment.as_deref().unwrap_or_default();
+    if before != after {
+        script.push_step(step(
+            format!("ALTER TABLE {} COMMENT = {}", q(&new.obj), lit(after)),
+            format!("Change the comment of sequence {}", new.obj.name),
         ));
     }
     script
@@ -513,6 +535,33 @@ mod tests {
                 "ALTER SEQUENCE `m8_tgt`.`invoice_seq` START WITH 1000 MINVALUE 1 MAXVALUE 9999999 INCREMENT BY 5 NOCYCLE"
             ]
         );
+        // A comment changes in place, with the options kept.
+        let mut commented = s.clone();
+        commented.comment = Some("it's".into());
+        let script = MARIADB
+            .alter(
+                &ObjectDef::Sequence(s.clone()),
+                &ObjectDef::Sequence(commented.clone()),
+                &ctx,
+            )
+            .unwrap();
+        assert_eq!(
+            sql(&script),
+            ["ALTER TABLE `m8_tgt`.`invoice_seq` COMMENT = 'it''s'"]
+        );
+        assert!(!script.is_destructive());
+        let script = MARIADB
+            .alter(
+                &ObjectDef::Sequence(commented),
+                &ObjectDef::Sequence(s.clone()),
+                &ctx,
+            )
+            .unwrap();
+        assert_eq!(
+            sql(&script),
+            ["ALTER TABLE `m8_tgt`.`invoice_seq` COMMENT = ''"]
+        );
+        // A new value type: drop and create, destructive, with a warning.
         changed.data_type = Some("int".into());
         let script = MARIADB
             .alter(
@@ -522,6 +571,8 @@ mod tests {
             )
             .unwrap();
         assert_eq!(script.steps[0].sql, "DROP SEQUENCE `m8_tgt`.`invoice_seq`");
+        assert!(script.is_destructive());
+        assert!(script.warnings.iter().any(|w| w.contains("starts again")));
         assert!(MYSQL.create(&ObjectDef::Sequence(s), &ctx).is_err());
         let mut many = Script::new();
         many.push("a").push("b");

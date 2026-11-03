@@ -53,6 +53,6 @@ SELECT * FROM pragma_foreign_key_check(NULL, 'main') WHERE "table" = 'products' 
 ALTER TABLE "main"."select" ADD COLUMN "order" INT4;
 CREATE VIEW "main"."active_customers" AS SELECT id, name, email FROM customers;
 CREATE TRIGGER orders_audit AFTER INSERT ON orders BEGIN INSERT INTO order_audit (order_id) VALUES (NEW.id); END;
-PRAGMA foreign_keys = ON;
-PRAGMA legacy_alter_table = OFF;
-PRAGMA legacy_alter_table = ON;
+-- only when fk = 1: PRAGMA foreign_keys = ON
+-- only when legacy_alter = 0: PRAGMA legacy_alter_table = OFF
+-- only when legacy_alter = 1: PRAGMA legacy_alter_table = ON

@@ -49,7 +49,6 @@ mod sync_ddl;
 
 use std::sync::Arc;
 
-use oxbase_dialect::compare::DefaultRules;
 use oxbase_dialect::{
     BracketQuoting, ChildGroup, DESIGNER_KINDS, DatabaseScope, DefinitionComparator,
     DialectRegistry, TreeLayout,
@@ -112,7 +111,11 @@ pub fn register(reg: &mut DialectRegistry) {
     let sync = Arc::new(sync_ddl::MsSqlSyncDdl);
     for kind in sync_ddl::KINDS {
         reg.register_ddl(engine, kind, sync.clone());
-        reg.register_comparator(engine, kind, Arc::new(DefinitionComparator(DefaultRules)));
+        reg.register_comparator(
+            engine,
+            kind,
+            Arc::new(DefinitionComparator(sync_ddl::MsSqlSyncRules)),
+        );
     }
 }
 

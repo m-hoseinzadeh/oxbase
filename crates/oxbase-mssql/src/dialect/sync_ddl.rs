@@ -6,19 +6,28 @@
 //! - Views: `CREATE VIEW [s].[v] [(columns)] [WITH SCHEMABINDING] AS <query>` (the query as
 //!   `sys.sql_modules` keeps it after the header).
 //! - Functions, procedures, triggers: the module text the server keeps (`sys.sql_modules`, a
-//!   complete `CREATE` statement, names already moved by the caller); a disabled trigger is
-//!   disabled again (`DISABLE TRIGGER`). An encrypted module has no text and is refused.
+//!   complete `CREATE` statement, names already moved by the caller), with the header's object
+//!   name (and a trigger's `ON` table) written qualified with the definition's own schema: a
+//!   module created unqualified would otherwise land in the applying login's default schema. A
+//!   disabled trigger is disabled again (`DISABLE TRIGGER`). An encrypted module has no text
+//!   and is refused.
 //! - Sequences: `CREATE SEQUENCE [s].[q] AS type START WITH ... INCREMENT BY ... MINVALUE ...
-//!   MAXVALUE ... [NO] CYCLE [CACHE n | NO CACHE]`; an alter is `ALTER SEQUENCE` when the value
-//!   type, the start and the comment stay, else a drop and a create.
-//! - Comments: the `MS_Description` extended property (`sys.sp_addextendedproperty`).
+//!   MAXVALUE ... [NO] CYCLE [CACHE n | NO CACHE]`. An alter keeps the sequence (and its current
+//!   value): `ALTER SEQUENCE` for the options and the extended-property procedures for the
+//!   comment. Only a new value type or start value needs a drop and a create; that drop stays
+//!   destructive (the sequence starts again at `START WITH`) and the script warns.
+//! - Comments: the `MS_Description` extended property (`sys.sp_addextendedproperty`,
+//!   `sp_updateextendedproperty`, `sp_dropextendedproperty`).
 //!
 //! Views, routines and triggers are altered by a drop and a create rather than `CREATE OR
-//! ALTER`, so the module text the server keeps is exactly the source's (a structure compare
-//! compares that text). Every statement is transactional; drops are destructive.
+//! ALTER`, so the module text the server keeps is the source's (a structure compare compares
+//! that text, with [`MsSqlSyncRules`] ignoring how the header spells the object's name); the
+//! script warns that permissions granted on them are lost. Every statement is transactional;
+//! drops are destructive.
 
 use std::fmt::Write as _;
 
+use oxbase_dialect::compare::{CompareRules, normalize_ws};
 use oxbase_dialect::{BracketQuoting, DdlContext, DdlGenerator, Quoting};
 use oxbase_types::{
     Error, ObjectDef, ObjectKind, ObjectRef, Result, RoutineDef, Script, ScriptStep, SequenceDef,
@@ -80,10 +89,23 @@ fn comment_step(
     schema: &str,
     text: &str,
 ) -> ScriptStep {
+    property_step("sp_addextendedproperty", level1, level2, schema, Some(text))
+}
+
+/// One `MS_Description` extended-property procedure call (`value` for add and update).
+fn property_step(
+    procedure: &str,
+    level1: (&str, &str),
+    level2: Option<(&str, &str)>,
+    schema: &str,
+    value: Option<&str>,
+) -> ScriptStep {
+    let value = value
+        .map(|v| format!(", @value = {}", lit(v)))
+        .unwrap_or_default();
     let mut sql = format!(
-        "EXEC sys.sp_addextendedproperty @name = N'MS_Description', @value = {}, \
+        "EXEC sys.{procedure} @name = N'MS_Description'{value}, \
          @level0type = N'SCHEMA', @level0name = {}, @level1type = N'{}', @level1name = {}",
-        lit(text),
         lit(schema),
         level1.0,
         lit(level1.1)
@@ -97,6 +119,190 @@ fn comment_step(
     }
     let what = level2.map_or(level1.1, |(_, name)| name);
     step(sql, format!("Comment on {what}"))
+}
+
+/// Rules of the definition comparator: a module header names its object the way it was
+/// created (`CREATE PROCEDURE p`, `CREATE PROCEDURE [s].[p]`); the compared object is already
+/// known, so only the rest of the text counts.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct MsSqlSyncRules;
+
+impl CompareRules for MsSqlSyncRules {
+    fn same_expression(&self, old: &str, new: &str) -> bool {
+        normalize_ws(&header_names_bare(old)) == normalize_ws(&header_names_bare(new))
+    }
+}
+
+/// A token of a module header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tok {
+    Word,
+    Quoted,
+    Dot,
+    Other,
+}
+
+/// The first `limit` tokens of T-SQL `text` (byte ranges), comments and whitespace skipped.
+fn header_tokens(text: &str, limit: usize) -> Vec<(Tok, usize, usize)> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() && out.len() < limit {
+        let c = bytes[i];
+        if c.is_ascii_whitespace() {
+            i += 1;
+        } else if bytes[i..].starts_with(b"--") {
+            i = bytes[i..]
+                .iter()
+                .position(|&b| b == b'\n')
+                .map_or(bytes.len(), |n| i + n);
+        } else if bytes[i..].starts_with(b"/*") {
+            let mut depth = 0_usize;
+            while i < bytes.len() {
+                if bytes[i..].starts_with(b"/*") {
+                    depth += 1;
+                    i += 2;
+                } else if bytes[i..].starts_with(b"*/") {
+                    depth -= 1;
+                    i += 2;
+                    if depth == 0 {
+                        break;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+        } else if c == b'[' || c == b'"' {
+            let close = if c == b'[' { b']' } else { b'"' };
+            let start = i;
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == close {
+                    if bytes.get(i + 1) == Some(&close) {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            out.push((Tok::Quoted, start, i));
+        } else if c == b'.' {
+            out.push((Tok::Dot, i, i + 1));
+            i += 1;
+        } else if c.is_ascii_alphanumeric() || matches!(c, b'_' | b'@' | b'#' | b'$') || c >= 0x80 {
+            let start = i;
+            while i < bytes.len()
+                && (bytes[i].is_ascii_alphanumeric()
+                    || matches!(bytes[i], b'_' | b'@' | b'#' | b'$')
+                    || bytes[i] >= 0x80)
+            {
+                i += 1;
+            }
+            out.push((Tok::Word, start, i));
+        } else {
+            // One ASCII character (every other byte above is part of a word).
+            out.push((Tok::Other, i, i + 1));
+            i += 1;
+        }
+    }
+    out
+}
+
+/// The byte ranges of the object name in a `CREATE [OR ALTER] {PROCEDURE | PROC | FUNCTION |
+/// TRIGGER | VIEW} name` header and, for a trigger, of the table after `ON`, with the value of
+/// each name's last part. `None` when the text does not start like that.
+fn header_names(text: &str) -> Option<Vec<(usize, usize, String)>> {
+    let tokens = header_tokens(text, 64);
+    let word = |i: usize, w: &str| {
+        tokens
+            .get(i)
+            .is_some_and(|&(k, a, b)| k == Tok::Word && text[a..b].eq_ignore_ascii_case(w))
+    };
+    let mut i = 0;
+    if !word(i, "CREATE") {
+        return None;
+    }
+    i += 1;
+    if word(i, "OR") && word(i + 1, "ALTER") {
+        i += 2;
+    }
+    let trigger = word(i, "TRIGGER");
+    if !(trigger
+        || ["PROCEDURE", "PROC", "FUNCTION", "VIEW"]
+            .iter()
+            .any(|w| word(i, w)))
+    {
+        return None;
+    }
+    i += 1;
+    // A multi-part name: name (. name)*; returns the next token, the range, the last part.
+    let name_at = |first: usize| -> Option<(usize, usize, usize, String)> {
+        let start = tokens.get(first)?.1;
+        let mut i = first;
+        loop {
+            let &(kind, a, b) = tokens.get(i)?;
+            if !matches!(kind, Tok::Word | Tok::Quoted) {
+                return None;
+            }
+            if tokens.get(i + 1).is_some_and(|t| t.0 == Tok::Dot) {
+                i += 2;
+            } else {
+                return Some((i + 1, start, b, part_value(&text[a..b])));
+            }
+        }
+    };
+    let (next, start, end, last) = name_at(i)?;
+    let mut out = vec![(start, end, last)];
+    if trigger {
+        if !word(next, "ON") {
+            return None;
+        }
+        let (_, start, end, last) = name_at(next + 1)?;
+        out.push((start, end, last));
+    }
+    Some(out)
+}
+
+/// The value of one name part (`[a]]b]` is `a]b`, `"x"` is `x`).
+fn part_value(part: &str) -> String {
+    let close = match part.as_bytes().first() {
+        Some(b'[') => "]",
+        Some(b'"') => "\"",
+        _ => return part.to_owned(),
+    };
+    let body = part
+        .get(1..part.len().saturating_sub(1))
+        .unwrap_or_default();
+    body.replace(&close.repeat(2), close)
+}
+
+/// `text` with the header names replaced by their last part, lower-cased (for comparing).
+fn header_names_bare(text: &str) -> String {
+    let Some(names) = header_names(text) else {
+        return text.to_owned();
+    };
+    let mut out = text.to_owned();
+    for (start, end, last) in names.into_iter().rev() {
+        out.replace_range(start..end, &last.to_lowercase());
+    }
+    out
+}
+
+/// `text` with the header's object name written as `name` and a trigger's table as `table`.
+fn qualify_header(text: &str, name: &str, table: Option<&str>) -> String {
+    let Some(names) = header_names(text) else {
+        return text.to_owned();
+    };
+    let mut out = text.to_owned();
+    for (i, (start, end, _)) in names.into_iter().enumerate().rev() {
+        let with = if i == 0 { Some(name) } else { table };
+        if let Some(with) = with {
+            out.replace_range(start..end, with);
+        }
+    }
+    out
 }
 
 /// The module text of a routine or trigger, ready to run.
@@ -128,9 +334,22 @@ impl DdlGenerator for MsSqlSyncDdl {
     fn alter(&self, old: &ObjectDef, new: &ObjectDef, ctx: &DdlContext<'_>) -> Result<Script> {
         match (old, new) {
             (ObjectDef::Sequence(a), ObjectDef::Sequence(b))
-                if a.data_type == b.data_type && a.start == b.start && a.comment == b.comment =>
+                if same_type(a.data_type.as_deref(), b.data_type.as_deref())
+                    && a.start == b.start =>
             {
                 Ok(alter_sequence(a, b))
+            }
+            (ObjectDef::Sequence(_), ObjectDef::Sequence(b)) => {
+                // The drop stays destructive: the sequence starts again.
+                let mut script = self.drop_object(&old.object_ref(), ctx)?;
+                script.append(self.create(new, ctx)?);
+                script.warn(format!(
+                    "sequence {} is dropped and created again (its value type or start value \
+                     changes): it starts again at {}, and SQL Server refuses the drop while a \
+                     default uses it",
+                    b.obj.name, b.start
+                ));
+                Ok(script)
             }
             _ if old.kind() != new.kind() => Err(Error::invalid_input(format!(
                 "cannot alter a {} into a {}",
@@ -144,6 +363,7 @@ impl DdlGenerator for MsSqlSyncDdl {
                     s.destructive = false;
                 }
                 script.append(self.create(new, ctx)?);
+                script.warn(PERMISSIONS_LOST);
                 Ok(script)
             }
         }
@@ -197,8 +417,22 @@ fn create_view(v: &ViewDef) -> Script {
     script
 }
 
+/// The warning of an alter that drops and creates a module.
+const PERMISSIONS_LOST: &str = "views, routines and triggers that are dropped and created again \
+                                lose the permissions granted on them; grant them again after \
+                                the apply";
+
+fn same_type(a: Option<&str>, b: Option<&str>) -> bool {
+    let norm = |t: Option<&str>| t.map(|t| t.trim().to_lowercase()).unwrap_or_default();
+    norm(a) == norm(b)
+}
+
 fn create_routine(r: &RoutineDef) -> Result<Script> {
-    let sql = module_text(r.definition.as_deref(), &r.obj)?;
+    let sql = qualify_header(
+        &module_text(r.definition.as_deref(), &r.obj)?,
+        &q(&r.obj),
+        None,
+    );
     let (kind, what) = if r.obj.kind == ObjectKind::Procedure {
         ("PROCEDURE", "procedure")
     } else {
@@ -224,7 +458,11 @@ fn create_trigger(t: &TriggerDef) -> Result<Script> {
         .ok_or_else(|| Error::invalid_input(format!("trigger {} names no table", t.obj.name)))?;
     let mut script = Script::new();
     script.push_step(step(
-        module_text(t.definition.as_deref(), &t.obj)?,
+        qualify_header(
+            &module_text(t.definition.as_deref(), &t.obj)?,
+            &q(&t.obj),
+            Some(q(&table).as_str()),
+        ),
         format!("Create trigger {} on {}", t.obj.name, table.name),
     ));
     if !t.enabled {
@@ -289,15 +527,40 @@ fn create_sequence(s: &SequenceDef) -> Script {
     script
 }
 
+/// The options and the comment changed in place (the current value stays).
 fn alter_sequence(old: &SequenceDef, new: &SequenceDef) -> Script {
-    let mut before = old.clone();
-    before.obj.clone_from(&new.obj);
     let mut script = Script::new();
-    if before != *new {
+    if sequence_options(old) != sequence_options(new) {
         script.push_step(step(
             format!("ALTER SEQUENCE {}{}", q(&new.obj), sequence_options(new)),
             format!("Change sequence {}", new.obj.name),
         ));
+    }
+    let level1 = ("SEQUENCE", new.obj.name.as_str());
+    let schema = schema_name(&new.obj);
+    let comment = match (
+        comment_text(old.comment.as_deref()),
+        comment_text(new.comment.as_deref()),
+    ) {
+        (None, Some(text)) => Some(comment_step(level1, None, schema, text)),
+        (Some(before), Some(text)) if before != text => Some(
+            property_step(
+                "sp_updateextendedproperty",
+                level1,
+                None,
+                schema,
+                Some(text),
+            )
+            .described(format!("Change the comment of {}", new.obj.name)),
+        ),
+        (Some(_), None) => Some(
+            property_step("sp_dropextendedproperty", level1, None, schema, None)
+                .described(format!("Remove the comment of {}", new.obj.name)),
+        ),
+        _ => None,
+    };
+    if let Some(comment) = comment {
+        script.push_step(comment);
     }
     script
 }
@@ -443,6 +706,134 @@ mod tests {
                 .sql
                 .ends_with(" NO CYCLE NO CACHE")
         );
+    }
+
+    #[test]
+    fn unqualified_module_headers_are_written_with_the_schema() {
+        let version = ServerVersion::new(17, 0, 0);
+        let ctx = DdlContext::new(&version);
+        let mut p = RoutineDef::new(schema().child(ObjectKind::Procedure, "touch_order"));
+        p.definition = Some(
+            "-- keeps totals\n/* note */ create   proc touch_order @p_id int AS UPDATE orders SET total = total"
+                .into(),
+        );
+        let script = MsSqlSyncDdl
+            .create(&ObjectDef::Routine(p.clone()), &ctx)
+            .unwrap();
+        assert_eq!(
+            sql(&script),
+            [
+                "-- keeps totals\n/* note */ create   proc [m8_tgt].[touch_order] @p_id int AS UPDATE orders SET total = total"
+            ]
+        );
+        let table = ObjectRef::table(Some("oxbase_test"), Some("m8_tgt"), "orders");
+        let mut trigger = TriggerDef {
+            obj: table.child(ObjectKind::Trigger, "orders_audit"),
+            timing: TriggerTiming::After,
+            events: vec![TriggerEvent::Insert],
+            update_columns: Vec::new(),
+            level: TriggerLevel::Statement,
+            condition: None,
+            function: None,
+            body: None,
+            definition: Some(
+                "CREATE TRIGGER orders_audit ON dbo.[orders] AFTER INSERT AS SET NOCOUNT ON".into(),
+            ),
+            enabled: true,
+            comment: None,
+            extras: Extras::new(),
+        };
+        let script = MsSqlSyncDdl
+            .create(&ObjectDef::Trigger(trigger.clone()), &ctx)
+            .unwrap();
+        assert_eq!(
+            sql(&script),
+            [
+                "CREATE TRIGGER [m8_tgt].[orders_audit] ON [m8_tgt].[orders] AFTER INSERT AS SET NOCOUNT ON"
+            ]
+        );
+        // Text that does not start with a module header is left alone.
+        assert_eq!(qualify_header("SELECT 1", "[s].[x]", None), "SELECT 1");
+
+        // The compare ignores how the header spells the name, not the rest.
+        let rules = MsSqlSyncRules;
+        assert!(rules.same_expression(
+            "CREATE PROCEDURE touch_order AS SELECT 1",
+            "CREATE  PROCEDURE [m8_tgt].[Touch_Order]\nAS SELECT 1"
+        ));
+        assert!(!rules.same_expression(
+            "CREATE PROCEDURE touch_order AS SELECT 1",
+            "CREATE PROCEDURE [m8_tgt].[touch_order] AS SELECT 2"
+        ));
+        assert!(rules.same_expression(
+            "CREATE TRIGGER t ON orders AFTER INSERT AS SELECT 1",
+            "CREATE TRIGGER [s].[t] ON [s].[orders] AFTER INSERT AS SELECT 1"
+        ));
+        assert!(!rules.same_expression(
+            "CREATE TRIGGER t ON orders AFTER INSERT AS SELECT 1",
+            "CREATE TRIGGER [s].[t] ON [s].[items] AFTER INSERT AS SELECT 1"
+        ));
+        assert_eq!(part_value("[a]]b]"), "a]b");
+        assert_eq!(part_value("\"x\"\"y\""), "x\"y");
+        trigger.definition = None;
+        assert!(
+            MsSqlSyncDdl
+                .create(&ObjectDef::Trigger(trigger), &ctx)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn sequence_comments_change_in_place() {
+        let version = ServerVersion::new(17, 0, 0);
+        let ctx = DdlContext::new(&version);
+        let mut seq = SequenceDef::new(schema().child(ObjectKind::Sequence, "ticket_seq"));
+        seq.data_type = Some("int".into());
+        seq.start = 1;
+        let mut commented = seq.clone();
+        commented.comment = Some("Tickets".into());
+        let alter = |a: &SequenceDef, b: &SequenceDef| {
+            MsSqlSyncDdl
+                .alter(
+                    &ObjectDef::Sequence(a.clone()),
+                    &ObjectDef::Sequence(b.clone()),
+                    &ctx,
+                )
+                .unwrap()
+        };
+        let script = alter(&seq, &commented);
+        assert_eq!(
+            sql(&script),
+            [
+                "EXEC sys.sp_addextendedproperty @name = N'MS_Description', @value = N'Tickets', @level0type = N'SCHEMA', @level0name = N'm8_tgt', @level1type = N'SEQUENCE', @level1name = N'ticket_seq'"
+            ]
+        );
+        assert!(!script.is_destructive());
+        let mut changed = commented.clone();
+        changed.comment = Some("Ticket numbers".into());
+        assert_eq!(
+            sql(&alter(&commented, &changed)),
+            [
+                "EXEC sys.sp_updateextendedproperty @name = N'MS_Description', @value = N'Ticket numbers', @level0type = N'SCHEMA', @level0name = N'm8_tgt', @level1type = N'SEQUENCE', @level1name = N'ticket_seq'"
+            ]
+        );
+        assert_eq!(
+            sql(&alter(&commented, &seq)),
+            [
+                "EXEC sys.sp_dropextendedproperty @name = N'MS_Description', @level0type = N'SCHEMA', @level0name = N'm8_tgt', @level1type = N'SEQUENCE', @level1name = N'ticket_seq'"
+            ]
+        );
+        // The same type spelled another way changes nothing.
+        let mut spelled = seq.clone();
+        spelled.data_type = Some(" INT".into());
+        assert!(alter(&seq, &spelled).is_empty());
+        // A new value type: drop and create, destructive, with a warning.
+        let mut wider = seq.clone();
+        wider.data_type = Some("bigint".into());
+        let script = alter(&seq, &wider);
+        assert_eq!(script.steps[0].sql, "DROP SEQUENCE [m8_tgt].[ticket_seq]");
+        assert!(script.is_destructive());
+        assert_eq!(script.warnings.len(), 1);
     }
 
     #[test]

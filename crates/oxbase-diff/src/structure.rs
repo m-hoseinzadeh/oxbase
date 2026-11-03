@@ -167,7 +167,7 @@ pub async fn load_snapshot(
         listed.extend(
             summaries
                 .into_iter()
-                .filter(|s| !s.system && !is_excluded(&s.obj, &options.exclude))
+                .filter(|s| !s.system && !is_excluded(&s.obj, options))
                 .map(|s| s.obj),
         );
     }
@@ -244,7 +244,7 @@ async fn load_triggers(
         }
     };
     for summary in summaries {
-        if summary.system || is_excluded(&summary.obj, &options.exclude) {
+        if summary.system || is_excluded(&summary.obj, options) {
             continue;
         }
         check(cancel)?;
@@ -268,21 +268,33 @@ fn check(cancel: &CancellationToken) -> Result<()> {
     }
 }
 
-/// `true` when `r` is one of `exclude` (by kind, name, owning table and signature; container
-/// parts are not compared, so a source- or a target-side ref both work), or a trigger of an
-/// excluded table or view.
-fn is_excluded(r: &ObjectRef, exclude: &[ObjectRef]) -> bool {
-    exclude.iter().any(|e| {
+/// `true` when `r` is one of `options.exclude` (by kind, name, owning table and signature;
+/// container parts are not compared, so a source- or a target-side ref both work; names folded
+/// with [`StructureOptions::ignore_case`]), or a trigger of an excluded table or view.
+fn is_excluded(r: &ObjectRef, options: &StructureOptions) -> bool {
+    let same_name = |a: &str, b: &str| {
+        if options.ignore_case {
+            a.to_lowercase() == b.to_lowercase()
+        } else {
+            a == b
+        }
+    };
+    let same_opt = |a: Option<&str>, b: Option<&str>| match (a, b) {
+        (None, _) => true,
+        (Some(a), Some(b)) => same_name(a, b),
+        (Some(_), None) => false,
+    };
+    options.exclude.iter().any(|e| {
         let same = e.kind == r.kind
-            && e.name == r.name
-            && (e.parent.is_none() || e.parent == r.parent)
-            && (e.signature.is_none() || e.signature == r.signature);
+            && same_name(&e.name, &r.name)
+            && same_opt(e.parent.as_deref(), r.parent.as_deref())
+            && same_opt(e.signature.as_deref(), r.signature.as_deref());
         let owner = r.kind == ObjectKind::Trigger
             && matches!(
                 e.kind,
                 ObjectKind::Table | ObjectKind::View | ObjectKind::MatView
             )
-            && r.parent.as_deref() == Some(e.name.as_str());
+            && r.parent.as_deref().is_some_and(|p| same_name(p, &e.name));
         same || owner
     })
 }
@@ -397,7 +409,12 @@ pub fn compare(
     let terminator = dialects
         .quoting(engine)
         .map_or(";", |q| q.script_terminator());
-    let mut warnings: Vec<String> = Vec::new();
+    let mut warnings: Vec<String> = duplicate_warnings(source, options);
+    for warning in duplicate_warnings(target, options) {
+        if !warnings.contains(&warning) {
+            warnings.push(warning);
+        }
+    }
     let mut items = Vec::with_capacity(pairs.len());
     for p in &pairs {
         let (status, properties) = match (&p.source, &p.target) {
@@ -457,6 +474,35 @@ pub fn compare(
     })
 }
 
+/// With [`StructureOptions::ignore_case`]: one warning per set of objects of a snapshot whose
+/// names differ only in case (only the first of them is matched; the others are reported as
+/// only on their side).
+fn duplicate_warnings(snapshot: &SchemaSnapshot, options: &StructureOptions) -> Vec<String> {
+    if !options.ignore_case {
+        return Vec::new();
+    }
+    let mut seen: HashMap<Key, String> = HashMap::new();
+    let mut out = Vec::new();
+    for def in &snapshot.objects {
+        if !options.kinds.contains(&def.kind()) {
+            continue;
+        }
+        let r = def.object_ref();
+        let shown = item_id(&r);
+        match seen.get(&key_of(&r, true)) {
+            Some(first) => out.push(format!(
+                "{first} and {shown} of {} differ only in case: matching ignores case, so only \
+                 {first} is matched",
+                snapshot.container.name
+            )),
+            None => {
+                seen.insert(key_of(&r, true), shown);
+            }
+        }
+    }
+    out
+}
+
 /// The comparison without an engine comparator: the shared walks with default rules.
 fn default_diff(old: &ObjectDef, new: &ObjectDef) -> Vec<PropertyDiff> {
     match old {
@@ -474,7 +520,7 @@ fn filter_properties(found: Vec<PropertyDiff>, options: &StructureOptions) -> Ve
     found
         .into_iter()
         .filter(|d| match &d.prop {
-            Some(p) if *p == props::COLLATION => options.compare_collations,
+            Some(p) if *p == props::COLLATION || *p == props::CHARSET => options.compare_collations,
             Some(p) if *p == props::COMMENT => options.compare_comments,
             Some(p) if *p == props::OWNER || *p == props::DEFINER => options.compare_ownership,
             _ => true,
@@ -561,7 +607,7 @@ pub(crate) fn pair_objects(
     let from = Location::of_container(&source.container);
     let to = Location::of_container(&target.container);
     let wanted = |def: &ObjectDef| {
-        options.kinds.contains(&def.kind()) && !is_excluded(&def.object_ref(), &options.exclude)
+        options.kinds.contains(&def.kind()) && !is_excluded(&def.object_ref(), options)
     };
 
     let mut by_key: HashMap<Key, usize> = HashMap::new();
@@ -579,7 +625,7 @@ pub(crate) fn pair_objects(
         relocate_def(&mut moved, &from, &to);
         retarget_def(engine, &mut moved, &from, &to);
         let moved_ref = moved.object_ref();
-        if is_excluded(&moved_ref, &options.exclude) {
+        if is_excluded(&moved_ref, options) {
             continue;
         }
         let found = by_key
@@ -662,6 +708,8 @@ fn retarget_def(engine: Engine, def: &mut ObjectDef, from: &Location, to: &Locat
     match def {
         ObjectDef::Table(t) => {
             for c in &mut t.columns {
+                // A user-defined type of the source schema (`m8_src.mood`).
+                fix(&mut c.native_type);
                 if let Some(d) = &mut c.default {
                     fix(d);
                 }
@@ -720,8 +768,11 @@ fn take_switched_off(source: &mut ObjectDef, target: &ObjectDef, options: &Struc
     if !options.compare_ownership {
         extras_to_copy.extend([props::OWNER, props::DEFINER]);
     }
+    // A column's character set travels with its collation (MySQL / MariaDB keep it in the
+    // column's extras): both come from the target, so a script never mixes them.
+    let collation_extras = [props::COLLATION, props::CHARSET];
     if !options.compare_collations {
-        extras_to_copy.extend([props::COLLATION, props::CHARSET]);
+        extras_to_copy.extend(collation_extras.iter().cloned());
     }
     match (source, target) {
         (ObjectDef::Table(s), ObjectDef::Table(t)) => {
@@ -737,6 +788,7 @@ fn take_switched_off(source: &mut ObjectDef, target: &ObjectDef, options: &Struc
                 }
                 if !options.compare_collations {
                     column.collation.clone_from(&other.collation);
+                    copy_extras(&mut column.extras, &other.extras, &collation_extras);
                 }
             }
             copy_extras(&mut s.extras, &t.extras, &extras_to_copy);

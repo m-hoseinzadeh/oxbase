@@ -152,6 +152,11 @@ impl Live {
 
     /// A base session: the fixture server (MySQL / MariaDB as root), or SQLite file `file`.
     async fn open(&self, file: &str) -> SessionHandle {
+        self.open_as(file, None).await
+    }
+
+    /// [`Live::open`], logging in as `login` (user, password) on a server engine.
+    async fn open_as(&self, file: &str, login: Option<(&str, &str)>) -> SessionHandle {
         let profile = if self.engine == Engine::Sqlite {
             ConnectionProfile::new(
                 format!("m8 {}", self.key),
@@ -174,10 +179,10 @@ impl Live {
                 },
             );
             let mysql = matches!(self.engine, Engine::MySql | Engine::MariaDb);
-            let (user, password) = if mysql {
-                ("root".to_owned(), string(e, "root_password"))
-            } else {
-                (string(e, "user"), string(e, "password"))
+            let (user, password) = match login {
+                Some((user, password)) => (user.to_owned(), password.to_owned()),
+                None if mysql => ("root".to_owned(), string(e, "root_password")),
+                None => (string(e, "user"), string(e, "password")),
             };
             p.user = Some(user);
             p.database = Some(self.database.clone());
@@ -890,6 +895,7 @@ async fn scratch_steps(live: &Live, names: &[String; 4], sessions: &[SessionHand
         .collect();
     left.sort_unstable();
     let only_in_target = expected(engine);
+    let reverse_needed = !left.is_empty();
     let mut kept: Vec<&str> = only_in_target
         .iter()
         .filter(|(_, s)| *s == DiffStatus::OnlyInTarget)
@@ -898,6 +904,23 @@ async fn scratch_steps(live: &Live, names: &[String; 4], sessions: &[SessionHand
     kept.sort_unstable();
     assert_eq!(left, kept, "{key}");
     assert!(recompare.diff.is_in_sync(false), "{key}");
+
+    // The other direction: the second target (with its own objects kept) is the source now,
+    // so the objects only it has are created in the second source.
+    if reverse_needed {
+        let reverse = live
+            .compare((&sessions[3], &target), (&sessions[2], &source), true)
+            .await;
+        for id in &kept {
+            assert_eq!(
+                reverse.diff.item(id).map(|i| i.status),
+                Some(DiffStatus::OnlyInSource),
+                "{key}: reverse: {id}"
+            );
+        }
+        let recompare = live.apply_all(&reverse, "reverse direction").await;
+        assert!(recompare.diff.is_in_sync(true), "{key}");
+    }
 }
 
 #[tokio::test]
@@ -928,6 +951,326 @@ async fn mssql_scratch_pairs() {
 #[ignore = "runs against SQLite files (with the live tests)"]
 async fn sqlite_scratch_pairs() {
     scratch_cycle("sqlite", Engine::Sqlite).await;
+}
+
+// --- edge cases ---------------------------------------------------------------------------------
+
+/// The seed of one side of the edge-case pair (`c` the container, `tok` the run's token):
+/// a parent key and the child column widened from INT to BIGINT on the source side (the
+/// foreign key between them must be dropped and added back); on PostgreSQL and SQL Server a
+/// column default moved from `old_seq` (only in the target) to `new_seq`; on MariaDB and SQL
+/// Server a sequence whose comment changes (in place); on PostgreSQL a view and a trigger
+/// read through a session whose `search_path` lists the source schema; on SQL Server a
+/// procedure whose stored header is unqualified (created in `dbo`, then moved) and a trigger
+/// whose header names it without its schema.
+fn edge_seed(engine: Engine, c: &str, source: bool, tok: &str) -> Vec<String> {
+    let int = if source { "bigint" } else { "integer" };
+    let seq = if source { "new_seq" } else { "old_seq" };
+    let mut out: Vec<String> = Vec::new();
+    match engine {
+        Engine::Postgres => {
+            out.push(format!("CREATE SCHEMA {c}"));
+            out.push(format!(
+                "CREATE TABLE {c}.customers (id {int} PRIMARY KEY, name varchar(50))"
+            ));
+            out.push(format!(
+                "CREATE TABLE {c}.orders (id integer PRIMARY KEY, customer_id {int} NOT NULL, CONSTRAINT orders_customer_fk FOREIGN KEY (customer_id) REFERENCES {c}.customers (id))"
+            ));
+            out.push(format!("CREATE SEQUENCE {c}.{seq}"));
+            out.push(format!(
+                "CREATE TABLE {c}.tickets (id bigint PRIMARY KEY DEFAULT nextval('{c}.{seq}'))"
+            ));
+            let columns = if source { "id, name" } else { "name" };
+            out.push(format!(
+                "CREATE VIEW {c}.customer_names AS SELECT {columns} FROM {c}.customers"
+            ));
+            out.push(format!(
+                "CREATE FUNCTION {c}.touch() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$"
+            ));
+            if source {
+                out.push(format!(
+                    "CREATE TRIGGER orders_touch BEFORE UPDATE ON {c}.orders FOR EACH ROW EXECUTE FUNCTION {c}.touch()"
+                ));
+            }
+        }
+        Engine::MySql | Engine::MariaDb => {
+            let int = if source { "BIGINT" } else { "INT" };
+            out.push(format!("CREATE DATABASE `{c}`"));
+            out.push(format!(
+                "CREATE TABLE `{c}`.customers (id {int} NOT NULL PRIMARY KEY, name VARCHAR(50) NULL)"
+            ));
+            out.push(format!(
+                "CREATE TABLE `{c}`.orders (id INT NOT NULL PRIMARY KEY, customer_id {int} NOT NULL, CONSTRAINT orders_customer_fk FOREIGN KEY (customer_id) REFERENCES `{c}`.customers (id))"
+            ));
+            if engine == Engine::MariaDb {
+                let comment = if source { " COMMENT = 'Tickets'" } else { "" };
+                out.push(format!("CREATE SEQUENCE `{c}`.cmt_seq{comment}"));
+            }
+        }
+        Engine::MsSql => {
+            out.push(format!("CREATE SCHEMA [{c}]"));
+            out.push(format!(
+                "CREATE TABLE [{c}].customers (id {int} NOT NULL CONSTRAINT pk_customers PRIMARY KEY, name nvarchar(50) NULL)"
+            ));
+            let int = if source { "bigint" } else { "int" };
+            out.push(format!(
+                "CREATE TABLE [{c}].orders (id int NOT NULL CONSTRAINT pk_orders PRIMARY KEY, customer_id {int} NOT NULL, CONSTRAINT orders_customer_fk FOREIGN KEY (customer_id) REFERENCES [{c}].customers (id))"
+            ));
+            out.push(format!(
+                "CREATE SEQUENCE [{c}].{seq} AS bigint START WITH 1"
+            ));
+            out.push(format!(
+                "CREATE TABLE [{c}].tickets (id bigint NOT NULL CONSTRAINT pk_tickets PRIMARY KEY CONSTRAINT df_tickets_id DEFAULT (NEXT VALUE FOR [{c}].{seq}))"
+            ));
+            out.push(format!("CREATE SEQUENCE [{c}].cmt_seq AS int START WITH 1"));
+            if source {
+                out.push(format!(
+                    "EXEC sys.sp_addextendedproperty @name = N'MS_Description', @value = N'Tickets', @level0type = N'SCHEMA', @level0name = N'{c}', @level1type = N'SEQUENCE', @level1name = N'cmt_seq'"
+                ));
+                // Created unqualified (in dbo), then moved: the stored header keeps no schema.
+                out.push(format!("CREATE PROCEDURE m8e_{tok}_p AS SELECT 1 AS one"));
+                out.push(format!("ALTER SCHEMA [{c}] TRANSFER dbo.m8e_{tok}_p"));
+                out.push(format!(
+                    "CREATE TRIGGER orders_note ON [{c}].orders AFTER UPDATE AS SET NOCOUNT ON"
+                ));
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+/// What the edge-case compare reports (with drops).
+fn edge_expected(engine: Engine, tok: &str) -> Vec<(String, DiffStatus)> {
+    let mut out = vec![
+        ("table:customers".to_owned(), DiffStatus::Different),
+        ("table:orders".to_owned(), DiffStatus::Different),
+    ];
+    let mut add = |id: &str, s: DiffStatus| out.push((id.to_owned(), s));
+    if matches!(engine, Engine::Postgres | Engine::MsSql) {
+        add("table:tickets", DiffStatus::Different);
+        add("sequence:new_seq", DiffStatus::OnlyInSource);
+        add("sequence:old_seq", DiffStatus::OnlyInTarget);
+    }
+    if matches!(engine, Engine::MariaDb | Engine::MsSql) {
+        add("sequence:cmt_seq", DiffStatus::Different);
+    }
+    match engine {
+        Engine::Postgres => {
+            add("view:customer_names", DiffStatus::Different);
+            add("function:touch()", DiffStatus::Same);
+            add("trigger:orders.orders_touch", DiffStatus::OnlyInSource);
+        }
+        Engine::MsSql => {
+            add(&format!("procedure:m8e_{tok}_p"), DiffStatus::OnlyInSource);
+            add("trigger:orders.orders_note", DiffStatus::OnlyInSource);
+        }
+        _ => {}
+    }
+    out
+}
+
+/// The pair whose apply fails late (a NULL in a column the source makes NOT NULL), on the
+/// engines that run the script in one transaction.
+fn rollback_seed(engine: Engine, c: &str, source: bool) -> Vec<String> {
+    let null = if source { "NOT NULL" } else { "NULL" };
+    match engine {
+        Engine::Postgres => {
+            let mut out = vec![
+                format!("CREATE SCHEMA {c}"),
+                format!("CREATE TABLE {c}.notes (id integer PRIMARY KEY, body text {null})"),
+            ];
+            if source {
+                out.push(format!("CREATE TABLE {c}.extra (id integer PRIMARY KEY)"));
+            } else {
+                out.push(format!("INSERT INTO {c}.notes VALUES (1, NULL)"));
+            }
+            out
+        }
+        Engine::MsSql => {
+            let mut out = vec![
+                format!("CREATE SCHEMA [{c}]"),
+                format!(
+                    "CREATE TABLE [{c}].notes (id int NOT NULL CONSTRAINT pk_notes PRIMARY KEY, body nvarchar(100) {null})"
+                ),
+            ];
+            if source {
+                out.push(format!(
+                    "CREATE TABLE [{c}].extra (id int NOT NULL CONSTRAINT pk_extra PRIMARY KEY)"
+                ));
+            } else {
+                out.push(format!("INSERT INTO [{c}].notes VALUES (1, NULL)"));
+            }
+            out
+        }
+        _ => {
+            let mut out = vec![format!(
+                "CREATE TABLE notes (id INTEGER NOT NULL PRIMARY KEY, body TEXT {null})"
+            )];
+            if source {
+                out.push("CREATE TABLE extra (id INTEGER NOT NULL PRIMARY KEY)".to_owned());
+            } else {
+                out.push("INSERT INTO notes VALUES (1, NULL)".to_owned());
+            }
+            out
+        }
+    }
+}
+
+/// A PostgreSQL login whose `search_path` lists `schema` first (the source of the edge pair
+/// is read through it, so the server prints that schema's names unqualified unless the
+/// structure sync session says otherwise).
+fn pg_role(tok: &str, schema: &str) -> (String, String, Vec<String>, Vec<String>) {
+    let role = format!("m8r_{tok}");
+    let password = format!("Pw_{tok}_Edge1");
+    let setup = vec![
+        format!("CREATE ROLE {role} LOGIN PASSWORD '{password}'"),
+        format!("GRANT USAGE ON SCHEMA {schema} TO {role}"),
+        format!("GRANT SELECT ON ALL TABLES IN SCHEMA {schema} TO {role}"),
+        format!("GRANT SELECT ON ALL SEQUENCES IN SCHEMA {schema} TO {role}"),
+        format!("ALTER ROLE {role} SET search_path = {schema}, public"),
+    ];
+    let teardown = vec![format!("DROP ROLE IF EXISTS {role}")];
+    (role, password, setup, teardown)
+}
+
+/// The edge-case cycle of one engine (see [`edge_seed`] and [`rollback_seed`]).
+async fn edge_cycle(key: &'static str, engine: Engine) {
+    let live = Live::new(key, engine);
+    let tok = token();
+    let names = [
+        format!("m8_e_{tok}_s"),
+        format!("m8_e_{tok}_t"),
+        format!("m8_e_{tok}_s3"),
+        format!("m8_e_{tok}_t3"),
+    ];
+    let admin = live.open("edge_admin.sqlite").await;
+    for name in &names {
+        live.run_quietly(&admin, &drop_container(engine, name))
+            .await;
+    }
+    let steps = std::panic::AssertUnwindSafe(edge_steps(&live, &tok, &names, &admin));
+    let result = futures::FutureExt::catch_unwind(steps).await;
+    for name in &names {
+        live.run_quietly(&admin, &drop_container(engine, name))
+            .await;
+    }
+    if engine == Engine::Postgres {
+        let (_, _, _, teardown) = pg_role(&tok, &names[0]);
+        live.run_quietly(&admin, &teardown).await;
+    }
+    live.manager.close_all().await.unwrap();
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+    report(&format!("{key}: edge cases applied and in sync"));
+}
+
+async fn edge_steps(live: &Live, tok: &str, names: &[String; 4], admin: &SessionHandle) {
+    let engine = live.engine;
+    let key = live.key;
+    if engine != Engine::Sqlite {
+        let source = live.container(&names[0]);
+        let target = live.container(&names[1]);
+        live.run(admin, &edge_seed(engine, &names[0], true, tok))
+            .await;
+        live.run(admin, &edge_seed(engine, &names[1], false, tok))
+            .await;
+        let reader = if engine == Engine::Postgres {
+            let (role, password, setup, _) = pg_role(tok, &names[0]);
+            live.run(admin, &setup).await;
+            live.open_as("", Some((role.as_str(), password.as_str())))
+                .await
+        } else {
+            live.open("").await
+        };
+        let compared = live
+            .compare((&reader, &source), (admin, &target), true)
+            .await;
+        check_statuses(key, &compared, &edge_expected(engine, tok));
+        let recompare = live.apply_all(&compared, "edge cases with drops").await;
+        assert!(recompare.diff.is_in_sync(true), "{key}");
+    }
+
+    // A script that fails late rolls back whole on the engines with transactional DDL.
+    if matches!(engine, Engine::Postgres | Engine::MsSql | Engine::Sqlite) {
+        let (source_session, target_session) = if engine == Engine::Sqlite {
+            (
+                live.open("rollback_s.sqlite").await,
+                live.open("rollback_t.sqlite").await,
+            )
+        } else {
+            (admin.clone(), admin.clone())
+        };
+        live.run(&source_session, &rollback_seed(engine, &names[2], true))
+            .await;
+        live.run(&target_session, &rollback_seed(engine, &names[3], false))
+            .await;
+        let source = live.container(&names[2]);
+        let target = live.container(&names[3]);
+        let compared = live
+            .compare((&source_session, &source), (&target_session, &target), true)
+            .await;
+        let before: Vec<(String, DiffStatus)> = vec![
+            ("table:notes".to_owned(), DiffStatus::Different),
+            ("table:extra".to_owned(), DiffStatus::OnlyInSource),
+        ];
+        check_statuses(key, &compared, &before);
+        let applied = live
+            .sync
+            .apply(
+                &StructureApplyRequest {
+                    compare_id: compared.compare_id,
+                    selection: Vec::new(),
+                    confirm_destructive: true,
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{key}: rollback apply: {e}"));
+        assert!(applied.script.atomic, "{key}");
+        assert!(
+            !applied.outcome.committed && !applied.in_sync,
+            "{key}: the failing script committed: {:#?}",
+            applied.outcome
+        );
+        assert!(
+            applied.outcome.steps.iter().any(|s| s.error.is_some()),
+            "{key}: no step failed"
+        );
+        // The target is as it was: the same differences.
+        check_statuses(key, &applied.recompare, &before);
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs the Docker fixtures"]
+async fn postgres_sync_edges() {
+    edge_cycle("postgres", Engine::Postgres).await;
+}
+
+#[tokio::test]
+#[ignore = "needs the Docker fixtures"]
+async fn mysql_sync_edges() {
+    edge_cycle("mysql", Engine::MySql).await;
+}
+
+#[tokio::test]
+#[ignore = "needs the Docker fixtures"]
+async fn mariadb_sync_edges() {
+    edge_cycle("mariadb", Engine::MariaDb).await;
+}
+
+#[tokio::test]
+#[ignore = "needs the Docker fixtures"]
+async fn mssql_sync_edges() {
+    edge_cycle("mssql", Engine::MsSql).await;
+}
+
+#[tokio::test]
+#[ignore = "runs against SQLite files (with the live tests)"]
+async fn sqlite_sync_edges() {
+    edge_cycle("sqlite", Engine::Sqlite).await;
 }
 
 // --- the [m8] fixture pair --------------------------------------------------------------------
