@@ -264,7 +264,8 @@ fn failed_all(e: &ResolvedEngine, why: &str) -> Vec<ConnCell> {
 /// Shared state of one run: the manager and the fixture definitions. The M2 fetch checks
 /// ([`crate::fetch`]) open their sessions through it too.
 pub(crate) struct Ctx {
-    pub(crate) mgr: ConnectionManager,
+    /// Shared so the M8 services ([`crate::m8`]) can hold it too.
+    pub(crate) mgr: Arc<ConnectionManager>,
     secrets: Arc<MemorySecretStore>,
     // Boxed: every check future holds a Ctx, and the fixtures file is large.
     fixtures: Box<Fixtures>,
@@ -275,11 +276,11 @@ type CheckResult = Result<String, String>;
 impl Ctx {
     pub(crate) fn new(fixtures: &Fixtures) -> Self {
         let secrets = Arc::new(MemorySecretStore::new());
-        let mgr = ConnectionManager::new(
+        let mgr = Arc::new(ConnectionManager::new(
             default_drivers(),
             secrets.clone(),
             Arc::new(RusshTunnelProvider::new()),
-        );
+        ));
         Self {
             mgr,
             secrets,

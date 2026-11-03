@@ -4414,12 +4414,14 @@ name = "oxbase-conformance"
 version = "0.7.0"
 dependencies = [
  "arrow-array",
+ "arrow-cast",
  "async-trait",
  "futures",
  "oxbase-dialect",
  "oxbase-driver",
  "oxbase-net",
  "oxbase-services",
+ "oxbase-sql",
  "oxbase-store",
  "oxbase-types",
  "pretty_assertions",

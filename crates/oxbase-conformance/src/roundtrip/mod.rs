@@ -64,7 +64,7 @@
 //! the M3 engines into failures.
 
 mod cells;
-mod exec;
+pub(crate) mod exec;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

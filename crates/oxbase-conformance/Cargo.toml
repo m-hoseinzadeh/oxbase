@@ -34,6 +34,9 @@ toml.workspace = true
 thiserror.workspace = true
 # M3 round trip (src/roundtrip/exec.rs): script captures read the first cell of a catalog answer.
 arrow-array.workspace = true
+# M8 (src/m8): seed scripts split into statements, and values read back as display text.
+oxbase-sql.workspace = true
+arrow-cast.workspace = true
 
 [dev-dependencies]
 pretty_assertions.workspace = true
