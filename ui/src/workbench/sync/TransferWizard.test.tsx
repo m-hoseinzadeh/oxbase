@@ -320,3 +320,48 @@ describe("TransferWizard", () => {
     expect(screen.getByTestId("transfer-start")).toBeDisabled();
   });
 });
+
+describe("TransferWizard type report", () => {
+  beforeEach(() => {
+    resetConnectionsStore();
+    resetSyncStore();
+    mockCore({
+      transfer_pair_report: () => ({
+        source: "postgres",
+        target: "mysql",
+        rows: [
+          {
+            logical: { type: "uuid" },
+            mapping: {
+              dataType: { type: "char", length: 36 },
+              nativeType: "char(36)",
+              fidelity: "widened",
+              reason: "MySQL has no uuid type: the text form is stored",
+            },
+          },
+        ],
+      }),
+    });
+  });
+
+  it("shows how types map between the two engines on demand", async () => {
+    await renderWizard();
+    next();
+    fireEvent.change(screen.getByLabelText("Target connection"), { target: { value: MYSQL.id } });
+    const details = await screen.findByTestId("transfer-pair-report");
+    expect(callsOf("transfer_pair_report")).toHaveLength(0);
+    (details as HTMLDetailsElement).open = true;
+    fireEvent(details, new Event("toggle"));
+    await waitFor(() => expect(callsOf("transfer_pair_report")).toHaveLength(1));
+    expect(callsOf("transfer_pair_report")[0]).toEqual({
+      sourceSession: PG_SOURCE.id,
+      targetSession: MYSQL.id,
+    });
+    expect(await within(details).findByText("char(36)")).toBeInTheDocument();
+    expect(within(details).getByTestId("fidelity-badge")).toHaveAttribute(
+      "title",
+      "MySQL has no uuid type: the text form is stored",
+    );
+    expect(details).toHaveTextContent("How types map from PostgreSQL to MySQL");
+  });
+});

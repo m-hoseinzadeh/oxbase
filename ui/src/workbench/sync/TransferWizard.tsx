@@ -57,6 +57,7 @@ import {
   transferReducer,
   transferTotals,
 } from "./model";
+import { PairReportView } from "./PairReportView";
 import { Acknowledge, FidelityBadge, Note, RunBar, WarningList } from "./parts";
 import { setSyncBusy, type TransferInit } from "./store";
 
@@ -389,6 +390,9 @@ export function TransferWizard({ init, onClose }: { init: TransferInit; onClose:
           <Note tone="info">
             {`${sourceSession.profile_name} · ${containerLabel(source.container)} → ${targetSession.profile_name} · ${containerLabel(target.container)}`}
           </Note>
+        ) : null}
+        {sourceSession && targetSession ? (
+          <PairReportView sourceSession={sourceSession.id} targetSession={targetSession.id} />
         ) : null}
       </div>
     );
