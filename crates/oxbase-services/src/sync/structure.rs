@@ -267,11 +267,27 @@ fn stale_item(
         .cloned()
 }
 
-/// Every applied item is equal now (or gone from both sides).
-fn applied_in_sync(diff: &StructureDiff, items: &[String]) -> bool {
+/// Every applied item is equal now, or gone from both sides, or (an object only in the target
+/// that the script re-created because it reads something that changed, not one it dropped)
+/// still only in the target.
+fn applied_in_sync(
+    before: &StructureDiff,
+    after: &StructureDiff,
+    items: &[String],
+    dropped: impl Fn(&str) -> bool,
+) -> bool {
     items
         .iter()
-        .all(|id| diff.item(id).is_none_or(|i| i.status == DiffStatus::Same))
+        .all(|id| match after.item(id).map(|i| i.status) {
+            None | Some(DiffStatus::Same) => true,
+            Some(DiffStatus::OnlyInTarget) => {
+                !dropped(id)
+                    && before
+                        .item(id)
+                        .is_some_and(|i| i.status == DiffStatus::OnlyInTarget)
+            }
+            Some(DiffStatus::OnlyInSource | DiffStatus::Different) => false,
+        })
 }
 
 pub(super) async fn apply(
@@ -333,7 +349,17 @@ pub(super) async fn apply(
 
     // A cancelled apply still re-compares: the token only stopped the script.
     let recompare = compare(service, compared, CancellationToken::new()).await?;
-    let in_sync = outcome.committed && applied_in_sync(&recompare.diff, &script.items);
+    // Objects only in the target were dropped when the selection (or, without one, the
+    // compare's options) asked for drops.
+    let dropped = |id: &str| {
+        if request.selection.is_empty() {
+            compared.options.include_drops
+        } else {
+            request.selection.iter().any(|s| s.as_str() == id)
+        }
+    };
+    let in_sync =
+        outcome.committed && applied_in_sync(&kept.diff, &recompare.diff, &script.items, dropped);
     Ok(StructureApplyReport {
         script,
         outcome,
@@ -442,9 +468,33 @@ mod tests {
             }],
             warnings: Vec::new(),
         };
-        assert!(applied_in_sync(&diff, &items(&["table:a", "table:gone"])));
+        let no_drops = |_: &str| false;
+        assert!(applied_in_sync(
+            &diff,
+            &diff,
+            &items(&["table:a", "table:gone"]),
+            no_drops
+        ));
         let mut different = diff.clone();
         different.items[0].status = DiffStatus::Different;
-        assert!(!applied_in_sync(&different, &items(&["table:a"])));
+        assert!(!applied_in_sync(
+            &diff,
+            &different,
+            &items(&["table:a"]),
+            no_drops
+        ));
+        // Only in the target before and after: fine when it was re-created, not when it was
+        // to be dropped.
+        let mut only_target = diff.clone();
+        only_target.items[0].status = DiffStatus::OnlyInTarget;
+        let ids = items(&["table:a"]);
+        assert!(applied_in_sync(&only_target, &only_target, &ids, no_drops));
+        assert!(!applied_in_sync(
+            &only_target,
+            &only_target,
+            &ids,
+            |_: &str| true
+        ));
+        assert!(!applied_in_sync(&diff, &only_target, &ids, no_drops));
     }
 }

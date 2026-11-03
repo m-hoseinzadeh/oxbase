@@ -732,7 +732,10 @@ fn expected(engine: Engine) -> Vec<(String, DiffStatus)> {
             add("function:add_one(n integer)", DiffStatus::Different);
             add("function:audit_order()", DiffStatus::Same);
             add("function:old_fn()", DiffStatus::OnlyInTarget);
-            add("procedure:touch_order(p_id integer)", DiffStatus::Different);
+            add(
+                "procedure:touch_order(IN p_id integer)",
+                DiffStatus::Different,
+            );
             add("trigger:orders.orders_audit_upd", DiffStatus::OnlyInSource);
         }
         Engine::MySql | Engine::MariaDb | Engine::MsSql => {
