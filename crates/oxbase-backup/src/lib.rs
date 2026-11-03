@@ -23,6 +23,8 @@
 pub mod archive;
 pub mod backup;
 pub mod format;
+mod load;
+mod objects;
 pub mod restore;
 
 pub use archive::{EntryCheck, VerifyReport};
@@ -31,6 +33,8 @@ pub use format::{
     BackupContent, BackupSource, Compression, EntryInfo, FILE_EXTENSION, FORMAT_VERSION, Manifest,
     ManifestObject, TableData,
 };
+pub use objects::move_definition;
 pub use restore::{
-    RestoreContent, RestoreOptions, RestoreProgress, RestoreReport, RestoredObject, RestoredStatus,
+    RestoreContent, RestoreOptions, RestoreOutcome, RestoreProgress, RestoreReport, RestoredObject,
+    RestoredStatus,
 };
