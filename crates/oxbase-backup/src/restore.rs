@@ -16,8 +16,9 @@
 //!    differs ("exists and differs; restore with drop existing"). The target container itself
 //!    must exist (M8 does not create databases or schemas).
 //! 3. **Data** (content `structure_and_data` / `data_only`): per selected table in manifest
-//!    order (parents first): optionally empty it ([`RestoreOptions::truncate_before_load`],
-//!    always for a table the structure step just created), then stream its batches from the
+//!    order (parents first): optionally empty it first ([`RestoreOptions::truncate_before_load`]
+//!    on tables that existed: every such table is emptied with `DELETE` in one transaction,
+//!    children before parents, before the first load), then stream its batches from the
 //!    archive into the target engine's `BulkLoader` (they are already in the load schema), one
 //!    transaction per table, foreign-key checks off where the engine allows
 //!    (`BulkLoader::foreign_key_checks`) when tables form a cycle, identity values kept
@@ -29,10 +30,31 @@
 //! Destructive restores (drop existing, truncate) need the caller's confirmation
 //! ([`RestoreOptions::confirm_destructive`]); the services refuse without it.
 
-use oxbase_dialect::DialectRegistry;
-use oxbase_driver::{CancellationToken, Connection};
-use oxbase_types::{ObjectRef, Result};
+use std::collections::{BTreeSet, HashMap};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+
+use arrow_array::RecordBatch;
+use oxbase_dialect::deps::same_table;
+use oxbase_dialect::sql::SqlWriter;
+use oxbase_dialect::{
+    BulkLoader, DdlContext, DialectRegistry, LoadColumn, LoadSession, LoadTarget,
+    table_dependencies,
+};
+use oxbase_driver::{CancellationToken, Connection, Tx};
+use oxbase_types::{
+    BoundStatement, Engine, Error, Location, ObjectDef, ObjectKind, ObjectRef, Result, Script,
+    TableDef, relocate_def,
+};
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
+
+use crate::archive::ArchiveReader;
+use crate::backup::{elapsed_ms, until_cancelled};
+use crate::format::{BackupContent, Manifest, ManifestObject};
+use crate::objects::retarget_text;
 
 /// What a restore writes.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -181,12 +203,990 @@ pub async fn restore(
     on_progress: &(dyn Fn(&RestoreProgress) + Send + Sync),
     cancel: CancellationToken,
 ) -> Result<RestoreReport> {
-    let _ = (job.options, source, run_script, on_progress, cancel);
-    // Keeps the skeleton an `async fn` (clippy::unused_async) until the body lands.
-    std::future::ready(()).await;
-    unimplemented!("m8: backup")
+    let outcome = restore_run(job, source, run_script, on_progress, cancel).await;
+    match outcome.error {
+        Some(e) => Err(e),
+        None => Ok(outcome.report),
+    }
 }
 
+/// What [`restore_run`] did: the report (also after a failure or cancel) and the error that
+/// stopped it.
+#[derive(Debug, Clone)]
+pub struct RestoreOutcome {
+    pub report: RestoreReport,
+    /// `None` when the restore finished; `Error::Cancelled` when it was cancelled.
+    pub error: Option<Error>,
+}
+
+/// [`restore`] with the report kept when it fails (the services send it with the `failed` and
+/// `cancelled` events).
+pub async fn restore_run(
+    job: RestoreJob<'_>,
+    source: &std::path::Path,
+    run_script: &ScriptRunner,
+    on_progress: &(dyn Fn(&RestoreProgress) + Send + Sync),
+    cancel: CancellationToken,
+) -> RestoreOutcome {
+    let mut run = Restore {
+        job,
+        source: source.to_path_buf(),
+        run_script,
+        on_progress,
+        cancel,
+        started: Instant::now(),
+        progress: RestoreProgress::default(),
+        last_report: None,
+        objects: Vec::new(),
+        warnings: Vec::new(),
+        wrote: false,
+        container: job.options.container.display_name(),
+        replaced: BTreeSet::new(),
+        emptied: Vec::new(),
+    };
+    let error = run.run().await.err();
+    let error = match error {
+        Some(_) if run.cancel.is_cancelled() => Some(Error::Cancelled),
+        other => other,
+    };
+    let left_behind = run.left_behind(error.as_ref());
+    let rows = run.objects.iter().map(|o| o.rows).sum();
+    RestoreOutcome {
+        report: RestoreReport {
+            objects: run.objects,
+            rows,
+            left_behind,
+            warnings: run.warnings,
+            elapsed_ms: elapsed_ms(run.started),
+        },
+        error,
+    }
+}
+
+/// Progress events at most this often while rows load.
+const PROGRESS_EVERY: Duration = Duration::from_millis(250);
+
+/// What the blocking open step read.
+struct Opened {
+    manifest: Manifest,
+    /// The selected objects in creation order, with their definitions.
+    selected: Vec<(ManifestObject, ObjectDef)>,
+}
+
+/// One object of the restore, as planned.
+struct Planned {
+    /// Position in `Restore::objects`.
+    slot: usize,
+    manifest: ManifestObject,
+    /// The definition moved to the target container.
+    def: ObjectDef,
+    /// The object exists in the target now.
+    existing: Option<ObjectRef>,
+    /// Created (or dropped and created) by this restore.
+    create: bool,
+}
+
+struct Restore<'a> {
+    job: RestoreJob<'a>,
+    source: PathBuf,
+    run_script: &'a ScriptRunner,
+    on_progress: &'a (dyn Fn(&RestoreProgress) + Send + Sync),
+    cancel: CancellationToken,
+    started: Instant,
+    progress: RestoreProgress,
+    last_report: Option<Instant>,
+    objects: Vec<RestoredObject>,
+    warnings: Vec<String>,
+    /// Something was written to the target.
+    wrote: bool,
+    container: String,
+    /// Slots of objects that existed and are dropped and created again.
+    replaced: BTreeSet<usize>,
+    /// Tables emptied before the load.
+    emptied: Vec<String>,
+}
+
+fn check(cancel: &CancellationToken) -> Result<()> {
+    if cancel.is_cancelled() {
+        Err(Error::Cancelled)
+    } else {
+        Ok(())
+    }
+}
+
+impl Restore<'_> {
+    fn report(&mut self, force: bool) {
+        let now = Instant::now();
+        if !force && self.last_report.is_some_and(|t| now - t < PROGRESS_EVERY) {
+            return;
+        }
+        self.last_report = Some(now);
+        self.progress.elapsed_ms = elapsed_ms(self.started);
+        (self.on_progress)(&self.progress);
+    }
+
+    fn phase(&mut self, phase: &str) {
+        phase.clone_into(&mut self.progress.phase);
+        self.progress.current = None;
+        self.report(true);
+    }
+
+    async fn run(&mut self) -> Result<()> {
+        let options = self.job.options;
+        if options.is_destructive() && !options.confirm_destructive {
+            return Err(Error::invalid_input(
+                "this restore drops or empties existing objects; confirm it first",
+            ));
+        }
+        if !matches!(
+            options.container.kind,
+            ObjectKind::Database | ObjectKind::Schema
+        ) {
+            return Err(Error::invalid_input(format!(
+                "a restore goes into a database or a schema, not into a {}",
+                options.container.kind
+            )));
+        }
+        let engine = self.job.target.engine();
+        let opened = self.open(engine).await?;
+        self.progress.rows = 0;
+        let manifest = opened.manifest;
+        let with_structure = options.content != RestoreContent::DataOnly;
+        let with_data = options.content != RestoreContent::StructureOnly
+            && manifest.content == BackupContent::StructureAndData;
+        if options.content != RestoreContent::StructureOnly
+            && manifest.content == BackupContent::StructureOnly
+        {
+            self.warnings
+                .push("the backup holds no table rows; only the structure was restored".into());
+        }
+
+        // Plan: move every definition to the target container, find what exists there.
+        let from = Location::of_container(&manifest.source.container);
+        let to = Location::of_container(&options.container);
+        let moved = from != to;
+        let mut planned = Vec::with_capacity(opened.selected.len());
+        let mut lister = Lister::default();
+        self.phase("structure");
+        for (mo, mut def) in opened.selected {
+            check(&self.cancel)?;
+            relocate_def(&mut def, &from, &to);
+            if moved && self.job.dialects.ddl(engine, def.kind()).is_ok() {
+                retarget_text(engine, &mut def, &from, &to);
+            }
+            let object = def.object_ref();
+            let existing = lister
+                .find(
+                    self.job.dialects,
+                    self.job.target,
+                    &options.container,
+                    &object,
+                    &self.cancel,
+                )
+                .await?;
+            self.objects.push(RestoredObject {
+                index: mo.index,
+                object,
+                status: RestoredStatus::NotRun,
+                rows: 0,
+                error: None,
+            });
+            planned.push(Planned {
+                slot: self.objects.len() - 1,
+                manifest: mo,
+                def,
+                existing,
+                create: false,
+            });
+        }
+        self.progress.objects_total = u32::try_from(planned.len()).unwrap_or(u32::MAX);
+        self.progress.rows_total = if with_data {
+            planned
+                .iter()
+                .filter_map(|p| p.manifest.data.as_ref())
+                .map(|d| d.rows)
+                .sum()
+        } else {
+            0
+        };
+
+        let (pre, post) = if with_structure {
+            self.plan_structure(engine, &mut planned).await?
+        } else {
+            self.plan_data_only(&planned)?;
+            (Script::new(), Script::new())
+        };
+
+        // Structure before the rows.
+        if !pre.is_empty() {
+            check(&self.cancel)?;
+            let slots: Vec<usize> = planned
+                .iter()
+                .filter(|p| p.create && !runs_after_data(p.def.kind()))
+                .map(|p| p.slot)
+                .collect();
+            self.script(pre, &slots).await?;
+        }
+        for p in planned.iter().filter(|p| !p.create) {
+            if self.objects[p.slot].status == RestoredStatus::NotRun && with_structure {
+                self.objects[p.slot].status = RestoredStatus::Kept;
+            }
+        }
+
+        // Rows, table by table in creation order (parents first).
+        if with_data {
+            self.phase("data");
+            let tables: Vec<TableDef> = planned
+                .iter()
+                .filter_map(|p| match &p.def {
+                    ObjectDef::Table(t) => Some(t.clone()),
+                    _ => None,
+                })
+                .collect();
+            let cycles: Vec<ObjectRef> = table_dependencies(&tables)
+                .order()
+                .cycles
+                .into_iter()
+                .flatten()
+                .collect();
+            let to_empty: Vec<TableDef> = planned
+                .iter()
+                .filter(|p| !p.create && options.truncate_before_load && p.manifest.data.is_some())
+                .filter_map(|p| match &p.def {
+                    ObjectDef::Table(t) => Some(t.clone()),
+                    _ => None,
+                })
+                .collect();
+            if !to_empty.is_empty() {
+                check(&self.cancel)?;
+                self.empty_tables(&to_empty).await?;
+            }
+            for p in &planned {
+                let ObjectDef::Table(table) = &p.def else {
+                    continue;
+                };
+                if p.manifest.data.is_none() {
+                    continue;
+                }
+                check(&self.cancel)?;
+                // Tables this restore created get their foreign keys to later tables after the
+                // load; existing tables on a cycle load with the checks off where possible.
+                let checks_off = !p.create && cycles.contains(&table.obj);
+                self.progress.current = Some(table.obj.clone());
+                self.report(true);
+                match self.load_table(p, table, checks_off).await {
+                    Ok(rows) => {
+                        let o = &mut self.objects[p.slot];
+                        o.rows = rows;
+                        if !p.create {
+                            o.status = RestoredStatus::Loaded;
+                        }
+                    }
+                    Err(e) => {
+                        let o = &mut self.objects[p.slot];
+                        o.status = RestoredStatus::Failed;
+                        o.error = Some(message(&e));
+                        return Err(e);
+                    }
+                }
+                self.progress.objects_done += 1;
+                self.report(true);
+            }
+        }
+
+        // Structure after the rows: foreign keys to later tables, materialized views, triggers.
+        if !post.is_empty() {
+            self.phase("structure");
+            check(&self.cancel)?;
+            let slots: Vec<usize> = planned
+                .iter()
+                .filter(|p| p.create && runs_after_data(p.def.kind()))
+                .map(|p| p.slot)
+                .collect();
+            self.script(post, &slots).await?;
+        }
+        self.progress.current = None;
+        self.progress.objects_done = self.progress.objects_total;
+        self.report(true);
+        Ok(())
+    }
+
+    /// Opens the archive on a blocking thread: manifest, engine check, selection,
+    /// verification, definitions. Nothing is written before this succeeds.
+    async fn open(&mut self, engine: Engine) -> Result<Opened> {
+        let options = self.job.options.clone();
+        let path = self.source.clone();
+        let cancel = self.cancel.clone();
+        let checked = Arc::new(AtomicU64::new(0));
+        let counter = Arc::clone(&checked);
+        if options.verify_first {
+            self.phase("verify");
+        }
+        let mut task = tokio::task::spawn_blocking(move || {
+            open_archive(&path, &options, engine, &cancel, &counter)
+        });
+        let mut tick = tokio::time::interval(PROGRESS_EVERY);
+        loop {
+            tokio::select! {
+                joined = &mut task => {
+                    return joined.map_err(|_| Error::internal("reading the backup stopped unexpectedly"))?;
+                }
+                _ = tick.tick() => {
+                    // Verification progress: bytes checked, shown as rows of the phase.
+                    self.progress.rows = checked.load(Ordering::Relaxed);
+                    self.report(false);
+                }
+            }
+        }
+    }
+
+    /// Plans the structure scripts: drops of replaced objects and creates before the rows,
+    /// deferred foreign keys, materialized views and triggers after them.
+    async fn plan_structure(
+        &mut self,
+        engine: Engine,
+        planned: &mut [Planned],
+    ) -> Result<(Script, Script)> {
+        let options = self.job.options;
+        let dialects = self.job.dialects;
+        let target = self.job.target;
+        let version = target.server_version().clone();
+        let ctx = DdlContext::new(&version);
+
+        // Existing objects: replaced, kept when equal, refused when different.
+        let mut differ = Vec::new();
+        for p in planned.iter_mut() {
+            match &p.existing {
+                None => p.create = true,
+                Some(_) if options.drop_existing => {
+                    p.create = true;
+                    self.replaced.insert(p.slot);
+                }
+                Some(existing) => {
+                    check(&self.cancel)?;
+                    let current = dialects
+                        .fetcher(engine, p.def.kind())?
+                        .load(target, existing, self.cancel.clone())
+                        .await?;
+                    let equal = dialects
+                        .comparator(engine, p.def.kind())
+                        .is_ok_and(|c| c.diff(&current, &p.def).is_empty());
+                    if !equal {
+                        differ.push(existing.display_name());
+                    }
+                }
+            }
+        }
+        if !differ.is_empty() {
+            return Err(Error::invalid_input(format!(
+                "these objects exist in {} and differ from the backup: {}; restore with drop \
+                 existing to replace them",
+                self.container,
+                differ.join(", ")
+            )));
+        }
+
+        // Generators first, so a missing one stops the restore before anything is written.
+        for p in planned.iter().filter(|p| p.create) {
+            if dialects.ddl(engine, p.def.kind()).is_err() {
+                return Err(Error::unsupported(format!(
+                    "Oxbase cannot create {} objects on {engine} yet ({}); leave it out of the \
+                     restore",
+                    p.def.kind(),
+                    p.def.object_ref().display_name()
+                )));
+            }
+        }
+
+        let mut pre = Script::new();
+        let mut post = Script::new();
+        // Drops of replaced objects, dependents first.
+        for p in planned.iter().rev() {
+            let (true, Some(existing)) = (p.create, &p.existing) else {
+                continue;
+            };
+            let generator = dialects.ddl(engine, p.def.kind())?;
+            let current = match p.def.kind() {
+                ObjectKind::Table => match dialects
+                    .fetcher(engine, ObjectKind::Table)?
+                    .load(target, existing, self.cancel.clone())
+                    .await?
+                {
+                    ObjectDef::Table(t) => Some(t),
+                    _ => None,
+                },
+                _ => None,
+            };
+            let drop_ctx = match &current {
+                Some(t) => ctx.with_table(t),
+                None => ctx,
+            };
+            pre.append(generator.drop_object(existing, &drop_ctx)?);
+        }
+
+        // Tables being created, in order: their foreign keys to tables created later wait
+        // until after the rows (cycles, and loads in parent-first order).
+        let created_tables: Vec<ObjectRef> = planned
+            .iter()
+            .filter(|p| p.create && p.def.kind() == ObjectKind::Table)
+            .map(|p| p.def.object_ref())
+            .collect();
+        let mut deferred: Vec<(TableDef, Vec<oxbase_types::ForeignKeyDef>)> = Vec::new();
+        for p in planned.iter().filter(|p| p.create) {
+            let generator = dialects.ddl(engine, p.def.kind())?;
+            match &p.def {
+                ObjectDef::Table(t) => {
+                    let position = created_tables
+                        .iter()
+                        .position(|r| *r == t.obj)
+                        .unwrap_or(usize::MAX);
+                    let mut now = t.clone();
+                    let (later, keep): (Vec<_>, Vec<_>) =
+                        t.foreign_keys.iter().cloned().partition(|fk| {
+                            created_tables
+                                .iter()
+                                .position(|r| same_table(&fk.ref_table, r))
+                                .is_some_and(|q| q > position)
+                        });
+                    now.foreign_keys = keep;
+                    pre.append(generator.create(&ObjectDef::Table(now.clone()), &ctx)?);
+                    if !later.is_empty() {
+                        deferred.push((now, later));
+                    }
+                }
+                def if runs_after_data(def.kind()) => {}
+                def => {
+                    pre.append(generator.create(def, &ctx)?);
+                }
+            }
+        }
+        if !deferred.is_empty() {
+            let generator = dialects.ddl(engine, ObjectKind::ForeignKey)?;
+            for (mut table, fks) in deferred {
+                for fk in fks {
+                    let script = generator.create(
+                        &ObjectDef::ForeignKey {
+                            table: table.obj.clone(),
+                            foreign_key: fk.clone(),
+                        },
+                        &ctx.with_table(&table),
+                    )?;
+                    post.append(script);
+                    table.foreign_keys.push(fk);
+                }
+            }
+        }
+        for p in planned
+            .iter()
+            .filter(|p| p.create && runs_after_data(p.def.kind()))
+        {
+            let generator = dialects.ddl(engine, p.def.kind())?;
+            post.append(generator.create(&p.def, &ctx)?);
+        }
+        Ok((pre, post))
+    }
+
+    /// Data only: every selected table must exist in the target.
+    fn plan_data_only(&self, planned: &[Planned]) -> Result<()> {
+        let missing: Vec<String> = planned
+            .iter()
+            .filter(|p| p.def.kind() == ObjectKind::Table && p.existing.is_none())
+            .map(|p| p.def.object_ref().display_name())
+            .collect();
+        if missing.is_empty() {
+            Ok(())
+        } else {
+            Err(Error::invalid_input(format!(
+                "these tables do not exist in {}: {}; restore their structure too",
+                self.container,
+                missing.join(", ")
+            )))
+        }
+    }
+
+    /// Runs one structure script; marks `slots` created / replaced, or failed.
+    async fn script(&mut self, script: Script, slots: &[usize]) -> Result<()> {
+        let run = (self.run_script)(script);
+        let result = until_cancelled(&self.cancel, run).await;
+        match result {
+            Ok(_) => {
+                self.wrote = true;
+                for &slot in slots {
+                    self.objects[slot].status = if self.replaced.contains(&slot) {
+                        RestoredStatus::Replaced
+                    } else {
+                        RestoredStatus::Created
+                    };
+                }
+                Ok(())
+            }
+            Err(e) => {
+                // The script may have run in part (engines whose DDL commits per statement).
+                self.wrote = true;
+                for &slot in slots {
+                    self.objects[slot].status = RestoredStatus::Failed;
+                    self.objects[slot].error = Some(message(&e));
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Empties `tables` (in creation order) with `DELETE`, children first, in one transaction.
+    async fn empty_tables(&mut self, tables: &[TableDef]) -> Result<()> {
+        let connection = self.job.target;
+        let quoting = self.job.dialects.quoting(connection.engine())?;
+        let tx = until_cancelled(&self.cancel, connection.begin()).await?;
+        let session = LoadSession::new(connection, Some(tx.as_ref()));
+        let mut failed = None;
+        for table in tables.iter().rev() {
+            let mut w = SqlWriter::new(quoting.as_ref());
+            w.push("DELETE FROM ").qualified(&table.obj);
+            let statement = w.finish();
+            if let Err(e) = session.run(&statement, self.cancel.clone()).await {
+                failed = Some(e);
+                break;
+            }
+        }
+        if let Some(e) = failed {
+            if let Ok(Err(rollback)) =
+                tokio::time::timeout(Duration::from_secs(5), tx.rollback()).await
+            {
+                self.warnings.push(format!(
+                    "rolling back the emptying of the tables failed: {rollback}"
+                ));
+            }
+            return Err(e);
+        }
+        tx.commit().await?;
+        self.wrote = true;
+        self.emptied = tables.iter().map(|t| t.obj.display_name()).collect();
+        Ok(())
+    }
+
+    /// Loads one table's rows (module docs, step 3); returns the rows loaded.
+    async fn load_table(&mut self, p: &Planned, table: &TableDef, checks_off: bool) -> Result<u64> {
+        let dialects = self.job.dialects;
+        let connection = self.job.target;
+        let engine = connection.engine();
+        let version = connection.server_version().clone();
+        let data = p.manifest.data.as_ref().ok_or_else(|| {
+            Error::internal(format!(
+                "{} has no rows in the backup",
+                table.obj.display_name()
+            ))
+        })?;
+        let columns = data
+            .columns
+            .iter()
+            .map(|name| {
+                table
+                    .column(name)
+                    .map(|c| LoadColumn {
+                        name: c.name.clone(),
+                        data_type: c.data_type.clone(),
+                        native_type: c.native_type.clone(),
+                        nullable: c.nullable,
+                    })
+                    .ok_or_else(|| {
+                        Error::invalid_input(format!(
+                            "the backup's rows of {} name a column '{name}' its definition does \
+                             not have",
+                            table.obj.display_name()
+                        ))
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let target = LoadTarget {
+            table: &table.obj,
+            columns: &columns,
+            version: &version,
+        };
+        let loader = dialects.bulk_loader(engine)?;
+        let plain = LoadSession::new(connection, None);
+        until_cancelled(
+            &self.cancel,
+            loader.prepare(plain, &target, self.cancel.clone()),
+        )
+        .await?;
+        let result = self
+            .load_rows(loader.as_ref(), &target, p.manifest.index, checks_off)
+            .await;
+        let finish = loader.finish(plain, &target, CancellationToken::new());
+        match tokio::time::timeout(Duration::from_secs(5), finish).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => self.warnings.push(format!(
+                "ending the load of {} failed: {e}",
+                table.obj.display_name()
+            )),
+            Err(_) => self.warnings.push(format!(
+                "ending the load of {} took too long",
+                table.obj.display_name()
+            )),
+        }
+        if checks_off && let Some(statements) = loader.foreign_key_checks(&table.obj, true) {
+            for sql in statements {
+                if let Err(e) = plain
+                    .run(
+                        &BoundStatement::new(sql, Vec::new()),
+                        CancellationToken::new(),
+                    )
+                    .await
+                {
+                    self.warnings.push(format!(
+                        "switching foreign-key checks back on for {} failed: {e}",
+                        table.obj.display_name()
+                    ));
+                }
+            }
+        }
+        let rows = result?;
+        // Identity and auto-increment counters follow the loaded values.
+        let generated: Vec<_> = table
+            .columns
+            .iter()
+            .filter(|c| c.auto_increment && data.columns.contains(&c.name))
+            .cloned()
+            .collect();
+        if !generated.is_empty() {
+            for sql in loader.identity_resync(&table.obj, &generated) {
+                plain
+                    .run(&BoundStatement::new(sql, Vec::new()), self.cancel.clone())
+                    .await?;
+            }
+        }
+        Ok(rows)
+    }
+
+    /// The table's transaction: optional `DELETE`, the batches, commit (or roll back).
+    async fn load_rows(
+        &mut self,
+        loader: &dyn BulkLoader,
+        target: &LoadTarget<'_>,
+        index: u32,
+        checks_off: bool,
+    ) -> Result<u64> {
+        let connection = self.job.target;
+        let plain = LoadSession::new(connection, None);
+        if checks_off && let Some(statements) = loader.foreign_key_checks(target.table, false) {
+            for sql in statements {
+                plain
+                    .run(&BoundStatement::new(sql, Vec::new()), self.cancel.clone())
+                    .await?;
+            }
+        }
+        let tx = if loader.transactional() {
+            Some(until_cancelled(&self.cancel, connection.begin()).await?)
+        } else {
+            None
+        };
+        let result = self
+            .load_batches(loader, target, tx.as_deref(), index)
+            .await;
+        match (result, tx) {
+            (Ok(rows), Some(tx)) => {
+                tx.commit().await?;
+                self.wrote = true;
+                Ok(rows)
+            }
+            (Ok(rows), None) => {
+                self.wrote = true;
+                Ok(rows)
+            }
+            (Err(e), Some(tx)) => {
+                if let Ok(Err(rollback)) =
+                    tokio::time::timeout(Duration::from_secs(5), tx.rollback()).await
+                {
+                    self.warnings.push(format!(
+                        "rolling back the load of {} failed: {rollback}",
+                        target.table.display_name()
+                    ));
+                }
+                Err(e)
+            }
+            (Err(e), None) => {
+                self.wrote = true;
+                Err(e)
+            }
+        }
+    }
+
+    async fn load_batches(
+        &mut self,
+        loader: &dyn BulkLoader,
+        target: &LoadTarget<'_>,
+        tx: Option<&dyn Tx>,
+        index: u32,
+    ) -> Result<u64> {
+        let connection = self.job.target;
+        let session = LoadSession::new(connection, tx);
+        let (sender, mut receiver) = mpsc::channel::<Result<RecordBatch>>(2);
+        let path = self.source.clone();
+        // Ends on its own once `receiver` is dropped.
+        let _reader = tokio::task::spawn_blocking(move || read_table(&path, index, &sender));
+        let per_call = self
+            .job
+            .options
+            .batch_rows
+            .unwrap_or_else(|| loader.limits(target.version).rows_per_call)
+            .max(1);
+        let mut rows = 0_u64;
+        loop {
+            let next = tokio::select! {
+                biased;
+                () = self.cancel.cancelled() => return Err(Error::Cancelled),
+                next = receiver.recv() => next,
+            };
+            let batch = match next {
+                None => return Ok(rows),
+                Some(item) => item?,
+            };
+            target.check_batch(&batch)?;
+            let mut offset = 0;
+            while offset < batch.num_rows() {
+                let len = per_call.min(batch.num_rows() - offset);
+                let chunk = batch.slice(offset, len);
+                rows += loader
+                    .load(session, target, &chunk, self.cancel.clone())
+                    .await?;
+                offset += len;
+                self.progress.rows += u64::try_from(len).unwrap_or(u64::MAX);
+                self.report(false);
+            }
+        }
+    }
+
+    /// In words: what the target holds now (module docs, step 4).
+    fn left_behind(&self, error: Option<&Error>) -> String {
+        if !self.wrote {
+            return format!("nothing was written to {}", self.container);
+        }
+        let mut parts = Vec::new();
+        if !self.emptied.is_empty() {
+            parts.push(format!("emptied {}", self.emptied.join(", ")));
+        }
+        let created: Vec<String> = self
+            .objects
+            .iter()
+            .filter(|o| matches!(o.status, RestoredStatus::Created | RestoredStatus::Replaced))
+            .map(|o| o.object.display_name())
+            .collect();
+        if !created.is_empty() {
+            parts.push(format!(
+                "{} holds the restored objects {}",
+                self.container,
+                created.join(", ")
+            ));
+        }
+        let loaded: Vec<String> = self
+            .objects
+            .iter()
+            .filter(|o| o.rows > 0 && o.status != RestoredStatus::Failed)
+            .map(|o| format!("{} ({} rows)", o.object.display_name(), o.rows))
+            .collect();
+        if !loaded.is_empty() {
+            parts.push(format!("rows were loaded into {}", loaded.join(", ")));
+        }
+        if let Some(failed) = self
+            .objects
+            .iter()
+            .find(|o| o.status == RestoredStatus::Failed)
+        {
+            parts.push(format!(
+                "the step of {} failed and its transaction was rolled back where the engine \
+                 allows it (MySQL and MariaDB keep DDL that ran)",
+                failed.object.display_name()
+            ));
+        } else if error.is_some_and(Error::is_cancelled) {
+            parts.push(
+                "the restore was cancelled; the step that was running was rolled back".into(),
+            );
+        }
+        let not_run = self
+            .objects
+            .iter()
+            .filter(|o| o.status == RestoredStatus::NotRun)
+            .count();
+        if error.is_some() && not_run > 0 {
+            parts.push(format!("{not_run} objects were not restored"));
+        }
+        parts.join("; ")
+    }
+}
+
+/// Kinds created after the rows: materialized views (they read the tables) and triggers (a
+/// trigger must not fire on restored rows).
+fn runs_after_data(kind: ObjectKind) -> bool {
+    matches!(kind, ObjectKind::MatView | ObjectKind::Trigger)
+}
+
+fn message(e: &Error) -> String {
+    match e {
+        Error::Cancelled => "cancelled".to_owned(),
+        other => other.to_string(),
+    }
+}
+
+/// The blocking part of the open step (`Restore::open`).
+fn open_archive(
+    path: &Path,
+    options: &RestoreOptions,
+    engine: Engine,
+    cancel: &CancellationToken,
+    checked: &AtomicU64,
+) -> Result<Opened> {
+    let mut reader = ArchiveReader::open(path)?;
+    let manifest = reader.manifest().clone();
+    if manifest.engine != engine {
+        return Err(Error::invalid_input(format!(
+            "the backup is from {}, the target is {engine}",
+            manifest.engine
+        )));
+    }
+    let all: BTreeSet<u32> = manifest.objects.iter().map(|o| o.index).collect();
+    let selected: BTreeSet<u32> = if options.objects.is_empty() {
+        all
+    } else {
+        if let Some(unknown) = options.objects.iter().find(|i| !all.contains(i)) {
+            return Err(Error::invalid_input(format!(
+                "the backup has no object {unknown}"
+            )));
+        }
+        options.objects.iter().copied().collect()
+    };
+    if options.verify_first {
+        let with_data = options.content != RestoreContent::StructureOnly;
+        let report = reader.verify_objects(
+            &selected,
+            with_data,
+            &mut |bytes| checked.store(bytes, Ordering::Relaxed),
+            &|| cancel.is_cancelled(),
+        )?;
+        if !report.ok {
+            return Err(Error::invalid_input(format!(
+                "the backup failed verification, nothing was restored: {}",
+                report.problem_lines().join("; ")
+            )));
+        }
+    }
+    let mut out = Vec::with_capacity(selected.len());
+    for index in &manifest.order {
+        if !selected.contains(index) {
+            continue;
+        }
+        check(cancel)?;
+        let object = manifest
+            .object(*index)
+            .cloned()
+            .ok_or_else(|| Error::invalid_input(format!("the backup has no object {index}")))?;
+        let def = reader.definition(*index)?;
+        if def.kind() != object.kind {
+            return Err(Error::invalid_input(format!(
+                "the backup's object {index} is a {}, its definition a {}",
+                object.kind,
+                def.kind()
+            )));
+        }
+        out.push((object, def));
+    }
+    Ok(Opened {
+        manifest,
+        selected: out,
+    })
+}
+
+/// The reader thread of one table: batches into `sender` until the entry ends, an error, or
+/// the receiver goes away.
+fn read_table(path: &Path, index: u32, sender: &mpsc::Sender<Result<RecordBatch>>) {
+    let mut reader = match ArchiveReader::open(path) {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = sender.blocking_send(Err(e));
+            return;
+        }
+    };
+    let rows = match reader.table_rows(index) {
+        Ok(rows) => rows,
+        Err(e) => {
+            let _ = sender.blocking_send(Err(e));
+            return;
+        }
+    };
+    for item in rows {
+        let stop = item.is_err();
+        if sender.blocking_send(item).is_err() || stop {
+            return;
+        }
+    }
+}
+
+/// Finds objects in the target container, listing each (kind, parent) once.
+#[derive(Default)]
+struct Lister {
+    listed: HashMap<(ObjectKind, ObjectRef), Vec<ObjectRef>>,
+}
+
+impl Lister {
+    /// The target's object with `object`'s kind and name (and signature where both have one).
+    async fn find(
+        &mut self,
+        dialects: &DialectRegistry,
+        connection: &dyn Connection,
+        container: &ObjectRef,
+        object: &ObjectRef,
+        cancel: &CancellationToken,
+    ) -> Result<Option<ObjectRef>> {
+        let parent = if object.kind.is_table_child() {
+            let Some(owner) = object.owner() else {
+                return Ok(None);
+            };
+            // The owner must exist before its children are listed.
+            match self
+                .find_under(dialects, connection, container.clone(), &owner, cancel)
+                .await?
+            {
+                Some(owner) => owner,
+                None => return Ok(None),
+            }
+        } else {
+            container.clone()
+        };
+        self.find_under(dialects, connection, parent, object, cancel)
+            .await
+    }
+
+    /// The object of `object`'s kind and name directly under `parent`.
+    async fn find_under(
+        &mut self,
+        dialects: &DialectRegistry,
+        connection: &dyn Connection,
+        parent: ObjectRef,
+        object: &ObjectRef,
+        cancel: &CancellationToken,
+    ) -> Result<Option<ObjectRef>> {
+        let key = (object.kind, parent);
+        if !self.listed.contains_key(&key) {
+            let fetcher = dialects.fetcher(connection.engine(), object.kind)?;
+            let refs = fetcher
+                .list(connection, &key.1, cancel.clone())
+                .await?
+                .into_iter()
+                .map(|s| s.obj)
+                .collect();
+            self.listed.insert(key.clone(), refs);
+        }
+        Ok(self.listed.get(&key).and_then(|refs| {
+            refs.iter()
+                .find(|r| {
+                    r.name == object.name
+                        && (r.signature.is_none()
+                            || object.signature.is_none()
+                            || r.signature == object.signature)
+                })
+                .cloned()
+        }))
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
