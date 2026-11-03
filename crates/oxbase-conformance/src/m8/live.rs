@@ -250,7 +250,7 @@ async fn run_async(
     let mut envs: Vec<Option<Arc<Env>>> = Vec::new();
     for &e in engines {
         let started = Instant::now();
-        let prepared = prepare(&ctx, fixtures, e).await;
+        let prepared = Box::pin(prepare(&ctx, fixtures, e)).await;
         let elapsed = Some(millis(started.elapsed()));
         let (status, detail, env) = match prepared {
             Ok((env, detail)) => (CellStatus::Pass, detail, Some(Arc::new(env))),
@@ -501,14 +501,17 @@ async fn prepare(
     e: &ResolvedEngine,
 ) -> Result<(Env, String), Prepared> {
     let mut opened = Opened::default();
-    let out = tokio::time::timeout(SEED_LIMIT, build(ctx, fixtures, e, &mut opened))
-        .await
-        .unwrap_or_else(|_| {
-            Err(Prepared::Failed(format!(
-                "did not finish within {} s",
-                SEED_LIMIT.as_secs()
-            )))
-        });
+    let out = Box::pin(tokio::time::timeout(
+        SEED_LIMIT,
+        build(ctx, fixtures, e, &mut opened),
+    ))
+    .await
+    .unwrap_or_else(|_| {
+        Err(Prepared::Failed(format!(
+            "did not finish within {} s",
+            SEED_LIMIT.as_secs()
+        )))
+    });
     match out {
         Ok((env, detail)) => {
             // The seeding session (its `USE` changed its default database) is not kept.
@@ -1049,24 +1052,18 @@ async fn compare_data_tables(env: &Env, a: Side<'_>, b: Side<'_>) -> Vec<String>
         )
         .await,
     );
-    let q = |c: &str| seed::quote(env.engine, c);
-    for aggregate in [
-        ("COUNT(*)", None),
-        ("SUM", Some("id")),
-        ("SUM", Some("val")),
+    for expr in [
+        "COUNT(*)".to_owned(),
+        format!("SUM({})", seed::quote(env.engine, "id")),
+        format!("SUM({})", seed::quote(env.engine, "val")),
     ] {
-        let expr = match aggregate {
-            (f, Some(col)) => format!("{f}({})", q(col)),
-            (f, None) => f.to_owned(),
-        };
         let mut got = Vec::new();
         for side in [a, b] {
             let sql = format!("SELECT {expr} FROM {}", env.q(side.container, "m8_big"));
             got.push(scalar(side.session.connection().as_ref(), &sql).await);
         }
-        match (&got[0], &got[1]) {
-            (Ok(x), Ok(y)) if x == y => {}
-            (x, y) => problems.push(format!("m8_big {expr}: {x:?} vs {y:?}")),
+        if got[0].is_err() || got[0] != got[1] {
+            problems.push(format!("m8_big {expr}: {:?} vs {:?}", got[0], got[1]));
         }
     }
     problems
