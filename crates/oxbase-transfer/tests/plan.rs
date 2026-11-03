@@ -354,10 +354,10 @@ async fn query_sources_take_their_columns_from_the_result() {
     )
     .await
     .unwrap();
-    let plan = &prepared.plan;
-    assert!(plan.runnable, "{:?}", plan.blocked);
-    assert_eq!(plan.tables[0].source, None);
-    let types: Vec<&DataType> = plan.tables[0]
+    let planned = &prepared.plan;
+    assert!(planned.runnable, "{:?}", planned.blocked);
+    assert_eq!(planned.tables[0].source, None);
+    let types: Vec<&DataType> = planned.tables[0]
         .columns
         .iter()
         .map(|c| &c.source_type)

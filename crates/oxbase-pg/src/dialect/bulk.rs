@@ -488,8 +488,8 @@ mod tests {
         assert_eq!(
             PgBulkLoader.identity_resync(&table, &[id]),
             vec![
-                "SELECT setval(pg_get_serial_sequence('\"db\".\"s\".\"T\"', 'Id'), max(\"Id\")) \
-                 FROM \"db\".\"s\".\"T\""
+                "SELECT setval(pg_get_serial_sequence('\"s\".\"T\"', 'Id'), max(\"Id\")) FROM \
+                 \"s\".\"T\""
                     .to_owned()
             ]
         );
