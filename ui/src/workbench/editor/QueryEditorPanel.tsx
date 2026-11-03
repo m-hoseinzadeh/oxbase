@@ -18,10 +18,12 @@ import {
   Square,
   TextCursorInput,
   TextSelect,
+  TriangleAlert,
   WandSparkles,
 } from "lucide-react";
 import { useCallback, useEffect, useReducer, useRef, useState } from "react";
 import {
+  isConfirmationRequired,
   isTerminalEvent,
   queryCancel,
   queryCloseEditor,
@@ -30,6 +32,7 @@ import {
   treeChildren,
 } from "../../api";
 import { ICON_SM } from "../../components/icons";
+import { Modal } from "../../components/Modal";
 import { toCommandError } from "../../connections/api";
 import { useConnections } from "../../connections/store";
 import { ENGINE_INFO } from "../../connections/types";
@@ -44,7 +47,7 @@ import { hasInsight } from "./insight/controller";
 import { SchemaCacheIndicator } from "./insight/SchemaCacheIndicator";
 import { SnippetManager } from "./insight/SnippetManager";
 import { useSchemaCache } from "./insight/useSchemaCache";
-import { languageFor, messagesNoteFor, type SqlLanguage } from "./language";
+import { type EditorLanguage, languageFor, messagesNoteFor } from "./language";
 import { Splitter } from "./Splitter";
 import {
   type EditorCommand,
@@ -101,6 +104,8 @@ export function QueryEditorPanel({
   const [hint, setHint] = useState<string | null>(null);
   const [split, setSplit] = useState(0.45);
   const [snippetsOpen, setSnippetsOpen] = useState(false);
+  /** A run the core refused until the user confirms (mongo shell `drop()`, Redis `FLUSHDB`). */
+  const [confirm, setConfirm] = useState<{ script: string; message: string } | null>(null);
   const editorRef = useRef<SqlEditorHandle | null>(null);
   const runId = useRef<string | null>(null);
   const runSeq = useRef(0);
@@ -176,7 +181,7 @@ export function QueryEditorPanel({
     setDatabase(null);
   }
 
-  async function execute(script: string) {
+  async function execute(script: string, confirmDestructive = false) {
     if (!session || active) return;
     if (!script.trim()) {
       setHint("Nothing to run.");
@@ -214,14 +219,22 @@ export function QueryEditorPanel({
             cache.noteRunFinished();
           }
         },
-        database ? { database } : undefined,
+        database || confirmDestructive
+          ? {
+              ...(database ? { database } : {}),
+              ...(confirmDestructive ? { confirmDestructive: true } : {}),
+            }
+          : undefined,
       );
       if (seq !== runSeq.current) return;
       runId.current = id;
       dispatch({ type: "runId", runId: id });
       if (cancelWanted.current) void queryCancel(id).catch(() => {});
     } catch (error) {
-      if (seq === runSeq.current) dispatch({ type: "startFailed", error: toCommandError(error) });
+      if (seq !== runSeq.current) return;
+      const err = toCommandError(error);
+      dispatch({ type: "startFailed", error: err });
+      if (isConfirmationRequired(err)) setConfirm({ script, message: err.message });
     }
   }
 
@@ -313,7 +326,7 @@ export function QueryEditorPanel({
   }
 
   const engine = session?.engine;
-  const language: SqlLanguage = languageFor(engine);
+  const language: EditorLanguage = languageFor(engine);
   const selectedDatabase = database ?? databases.current ?? "";
   const insightOn = hasInsight(engine);
   // The cache of the editor's connection and database (the session's own one when unset).
@@ -558,6 +571,38 @@ export function QueryEditorPanel({
           <ResultsArea run={run} messagesNote={messagesNoteFor(engine)} onExport={exportResult} />
         </div>
       </div>
+      {confirm ? (
+        <Modal
+          title="Run anyway?"
+          onClose={() => setConfirm(null)}
+          footer={
+            <>
+              <button type="button" className="button" onClick={() => setConfirm(null)}>
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="button button--danger"
+                data-testid="confirm-action"
+                data-autofocus
+                onClick={() => {
+                  const script = confirm.script;
+                  setConfirm(null);
+                  void execute(script, true);
+                }}
+              >
+                Run anyway
+              </button>
+            </>
+          }
+        >
+          <p className="confirm__text">
+            <TriangleAlert {...ICON_SM} className="confirm__icon" />
+            This can change or remove data:{" "}
+            {confirm.message.replace(/^confirmation required:\s*/i, "")}
+          </p>
+        </Modal>
+      ) : null}
       {snippetsOpen ? (
         <SnippetManager
           engine={insightOn ? (engine ?? null) : null}

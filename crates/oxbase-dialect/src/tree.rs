@@ -33,6 +33,18 @@
 //! | MatView | folders: Column, Index | - | - | - |
 //!
 //! Routines, sequences and the other leaves have no children.
+//!
+//! M7 layouts (`docs/m7-contracts.md` §3):
+//!
+//! | Node kind | MongoDB (`Catalog`) | Redis (`Session`) |
+//! |---|---|---|
+//! | root | Database | Database (`0` .. `databases - 1`; a cluster has only `0`), folder: User (ACL users) |
+//! | Database | folders: Table ("Collections"), View, User, Role | Schema ("namespace", direct), Key (direct) |
+//! | Schema | - | Schema (direct), Key (direct) |
+//! | Table | folder: Index | - |
+//!
+//! Engines rename a kind in their tree with [`TreeLayout::with_label`] (MongoDB shows tables as
+//! "Collections"); services use [`TreeLayout::folder_label`] for folder nodes.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -87,6 +99,8 @@ pub struct TreeLayout {
     root: Vec<ChildGroup>,
     /// Groups under a node of the key's kind. Kinds without an entry have no children.
     children: BTreeMap<ObjectKind, Vec<ChildGroup>>,
+    /// M7: the engine's own names for a kind, (singular, plural).
+    labels: BTreeMap<ObjectKind, (&'static str, &'static str)>,
 }
 
 impl TreeLayout {
@@ -96,7 +110,37 @@ impl TreeLayout {
             scope,
             root: Vec::new(),
             children: BTreeMap::new(),
+            labels: BTreeMap::new(),
         }
+    }
+
+    /// Builder (M7): the engine calls objects of `kind` `singular` / `plural` ("Collection" /
+    /// "Collections" for MongoDB tables, "Namespace" / "Namespaces" for Redis key prefixes).
+    #[must_use]
+    pub fn with_label(
+        mut self,
+        kind: ObjectKind,
+        singular: &'static str,
+        plural: &'static str,
+    ) -> Self {
+        self.labels.insert(kind, (singular, plural));
+        self
+    }
+
+    /// The name of one object of `kind` on this engine: the engine's label, else
+    /// [`ObjectKind::display_name`].
+    pub fn kind_label(&self, kind: ObjectKind) -> &'static str {
+        self.labels
+            .get(&kind)
+            .map_or(kind.display_name(), |&(singular, _)| singular)
+    }
+
+    /// The label of a folder of `kind` on this engine: the engine's plural label, else
+    /// [`ObjectKind::plural_display_name`].
+    pub fn folder_label(&self, kind: ObjectKind) -> &'static str {
+        self.labels
+            .get(&kind)
+            .map_or(kind.plural_display_name(), |&(_, plural)| plural)
     }
 
     /// Builder: the groups under the connection node, in display order.
@@ -169,5 +213,17 @@ mod tests {
         );
         assert!(ChildGroup::folder(K::Table).folder);
         assert!(!ChildGroup::direct(K::Schema).folder);
+    }
+
+    #[test]
+    fn engines_can_rename_kinds() {
+        let layout = TreeLayout::new(DatabaseScope::Catalog)
+            .with_root(&[ChildGroup::direct(K::Database)])
+            .with_children(K::Database, &[ChildGroup::folder(K::Table)])
+            .with_label(K::Table, "Collection", "Collections");
+        assert_eq!(layout.folder_label(K::Table), "Collections");
+        assert_eq!(layout.kind_label(K::Table), "Collection");
+        assert_eq!(layout.folder_label(K::View), "Views");
+        assert_eq!(layout.kind_label(K::Key), "Key");
     }
 }

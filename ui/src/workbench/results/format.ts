@@ -14,6 +14,53 @@ const EXTENSION_NAME = "ARROW:extension:name";
 const MAX_CELL_TEXT = 2000;
 /** Bytes of a binary value shown as hex. */
 const MAX_HEX_BYTES = 64;
+/** Field metadata of `Binary` columns that hold user bytes (Redis keys and values). */
+const META_ENCODING = "oxbase.encoding";
+/** Field metadata of the column holding each row's whole document (MongoDB `$document`). */
+const META_ROLE = "oxbase.role";
+/** Bytes of user data decoded for a cell (the overlay shows them; the rest is cut). */
+const MAX_TEXT_BYTES = 64 * 1024;
+
+const UTF8 = new TextDecoder("utf-8", { fatal: true });
+
+/**
+ * User bytes as text: UTF-8 as is, other bytes escaped like `redis-cli` (`\xff`), so a value
+ * that is text reads as text and binary stays visible byte for byte.
+ */
+export function bytesText(bytes: Uint8Array): string {
+  const shown = bytes.length > MAX_TEXT_BYTES ? bytes.subarray(0, MAX_TEXT_BYTES) : bytes;
+  const suffix = bytes.length > shown.length ? `… (${bytes.length} bytes)` : "";
+  try {
+    return UTF8.decode(shown) + suffix;
+  } catch {
+    let out = "";
+    for (const b of shown) {
+      if (b === 0x5c) out += "\\\\";
+      else if (b === 0x22) out += '\\"';
+      else if (b === 0x0a) out += "\\n";
+      else if (b === 0x0d) out += "\\r";
+      else if (b === 0x09) out += "\\t";
+      else if (b >= 0x20 && b <= 0x7e) out += String.fromCharCode(b);
+      else out += `\\x${b.toString(16).padStart(2, "0")}`;
+    }
+    return out + suffix;
+  }
+}
+
+/** Whether a column is the hidden whole-document column (`oxbase.role = document`). */
+export function isDocumentColumn(column: ColumnInfo | undefined): boolean {
+  return column?.metadata?.[META_ROLE] === "document";
+}
+
+/**
+ * The columns a grid shows: a result's trailing document column (MongoDB `$document`, always
+ * last) is left out, so the shown columns keep their indexes in the Arrow page.
+ */
+export function visibleColumns(columns: ColumnInfo[]): ColumnInfo[] {
+  let end = columns.length;
+  while (end > 0 && isDocumentColumn(columns[end - 1])) end -= 1;
+  return end === columns.length ? columns : columns.slice(0, end);
+}
 
 export interface FormattedCell {
   /** Full text of the value ("" for NULL). */
@@ -251,9 +298,11 @@ export function formatCell(vector: Vector, index: number, column?: ColumnInfo): 
       break;
     }
     case Type.Binary:
-    case Type.LargeBinary:
-      text = hexText(vector.get(index) as Uint8Array);
+    case Type.LargeBinary: {
+      const bytes = vector.get(index) as Uint8Array;
+      text = column?.metadata?.[META_ENCODING] === "binary" ? bytesText(bytes) : hexText(bytes);
       break;
+    }
     case Type.Bool:
       text = vector.get(index) ? "true" : "false";
       break;
@@ -270,12 +319,13 @@ export function cellDisplayText(text: string): string {
 }
 
 /**
- * The column's native type when the driver reported one (`oxbase.<engine>.type` or
- * `oxbase.native_type`, the MySQL and SQL Server key), else Arrow's.
+ * The column's native type when the driver reported one (`oxbase.<engine>.type`,
+ * `oxbase.native_type`, the MySQL, SQL Server and Redis key, or `oxbase.bson_type`, MongoDB's),
+ * else Arrow's.
  */
 export function columnTypeLabel(column: ColumnInfo): string {
   for (const [key, value] of Object.entries(column.metadata ?? {})) {
-    if (/^oxbase\.([a-z0-9_]+\.type|native_type)$/.test(key)) return value;
+    if (/^oxbase\.([a-z0-9_]+\.type|native_type|bson_type)$/.test(key)) return value;
   }
   return column.dataType;
 }

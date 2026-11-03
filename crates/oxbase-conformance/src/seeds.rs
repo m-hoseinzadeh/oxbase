@@ -11,10 +11,21 @@
 //!
 //! Since M4 an engine with an `[m4.<engine>]` table (SQL Server) adds the groups of
 //! [`m4_groups`]: the kinds its tree layout has beyond the M2 shape (types, view children).
+//!
+//! Since M7 MongoDB and Redis get their groups from `[m7.mongodb]` / `[m7.redis]`
+//! ([`m7_mongo_groups`], [`m7_redis_groups`]), following the refs of `docs/m7-contracts.md` §3:
+//! MongoDB collections, views and roles under their database, indexes under their collection,
+//! the seed user under `admin`; Redis databases under the root, namespaces (`Schema`, the full
+//! prefix with its separator) under their database or enclosing namespace, keys under their
+//! namespace, ACL users under the root.
+
+use std::collections::BTreeMap;
 
 use oxbase_types::{ObjectKind, ObjectRef};
 
-use crate::fixtures::{M2EngineSeed, M2Fixture, M4EngineSeed, M4Fixture};
+use crate::fixtures::{
+    M2EngineSeed, M2Fixture, M4EngineSeed, M4Fixture, M7MongoSeed, M7RedisSeed, MONGO_USER_DATABASE,
+};
 
 /// Columns of the parent seed table (`[m2] tables[0]`), in ordinal order.
 pub const PARENT_COLUMNS: [&str; 3] = ["id", "code", "note"];
@@ -157,6 +168,136 @@ pub fn m4_never_listed(m4: &M4Fixture, kind: ObjectKind) -> Vec<String> {
         ObjectKind::Trigger => m4.ddl_trigger.iter().cloned().collect(),
         _ => Vec::new(),
     }
+}
+
+/// The seed collection an index belongs to: the longest of `collections` that `index` starts
+/// with, followed by `_` (`m7_docs_name_idx` belongs to `m7_docs`).
+pub fn index_collection<'a>(collections: &'a [String], index: &str) -> Option<&'a str> {
+    collections
+        .iter()
+        .filter(|c| {
+            index
+                .strip_prefix(c.as_str())
+                .is_some_and(|rest| rest.len() > 1 && rest.starts_with('_'))
+        })
+        .max_by_key(|c| c.len())
+        .map(String::as_str)
+}
+
+/// The list calls that check `kind` against the `[m7.mongodb]` seed (empty when it seeds
+/// nothing of that kind or names no database).
+pub fn m7_mongo_groups(seed: &M7MongoSeed, kind: ObjectKind) -> Vec<SeedGroup> {
+    let Some(db) = seed.database.as_deref().filter(|d| !d.is_empty()) else {
+        return Vec::new();
+    };
+    let database = ObjectRef::database(db);
+    let one = |name: &Option<String>| -> Vec<String> { name.iter().cloned().collect() };
+    let groups: Vec<Option<SeedGroup>> = match kind {
+        ObjectKind::Database => vec![SeedGroup::new(ObjectRef::root(), vec![db.to_owned()])],
+        ObjectKind::Table => vec![SeedGroup::new(database, seed.collections.clone())],
+        ObjectKind::View => vec![SeedGroup::new(database, one(&seed.view))],
+        ObjectKind::Role => vec![SeedGroup::new(database, one(&seed.role))],
+        ObjectKind::User => vec![SeedGroup::new(
+            ObjectRef::database(MONGO_USER_DATABASE),
+            one(&seed.user),
+        )],
+        ObjectKind::Index => {
+            let mut by_collection: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+            for index in &seed.indexes {
+                if let Some(c) = index_collection(&seed.collections, index) {
+                    by_collection.entry(c).or_default().push(index.clone());
+                }
+            }
+            seed.collections
+                .iter()
+                .filter_map(|c| {
+                    let names = by_collection.remove(c.as_str())?;
+                    SeedGroup::new(database.child(ObjectKind::Table, c.clone()), names)
+                })
+                .map(Some)
+                .collect()
+        }
+        _ => Vec::new(),
+    };
+    groups.into_iter().flatten().collect()
+}
+
+/// The namespaces of `key` from the outermost: every prefix that ends with `separator` and is
+/// followed by more of the key (`m7:ns:a:1` → `m7:`, `m7:ns:`, `m7:ns:a:`). None for an empty
+/// separator (the profile option turns namespaces off).
+pub fn redis_namespaces<'a>(key: &'a str, separator: &str) -> Vec<&'a str> {
+    if separator.is_empty() {
+        return Vec::new();
+    }
+    key.match_indices(separator)
+        .map(|(at, _)| at + separator.len())
+        .filter(|&end| end < key.len())
+        .map(|end| &key[..end])
+        .collect()
+}
+
+/// The ref of the namespace node `chain.last()` (or the database itself for an empty chain):
+/// each namespace is a `Schema` child of the one before it.
+fn namespace_ref(database: &ObjectRef, chain: &[&str]) -> ObjectRef {
+    chain.iter().fold(database.clone(), |parent, ns| {
+        parent.child(ObjectKind::Schema, (*ns).to_owned())
+    })
+}
+
+/// The list calls that check `kind` against the `[m7.redis]` seed: databases (the seed's and,
+/// with `db1_key`, database `1`), the namespaces and keys of `keys` (the optional RedisJSON key
+/// left out), and the ACL user. Empty when it seeds nothing of that kind.
+pub fn m7_redis_groups(seed: &M7RedisSeed, kind: ObjectKind) -> Vec<SeedGroup> {
+    let db = seed
+        .database
+        .as_deref()
+        .filter(|d| !d.is_empty())
+        .unwrap_or("0");
+    let database = ObjectRef::database(db);
+    let separator = seed.namespace_separator.as_deref().unwrap_or(":");
+    // Parent namespace chain -> names listed under it (BTreeMap: a stable group order).
+    let mut under: BTreeMap<Vec<&str>, Vec<String>> = BTreeMap::new();
+    match kind {
+        ObjectKind::Database => {
+            let mut names = vec![db.to_owned()];
+            if seed.db1_key.is_some() && db != "1" {
+                names.push("1".to_owned());
+            }
+            return SeedGroup::new(ObjectRef::root(), names)
+                .into_iter()
+                .collect();
+        }
+        ObjectKind::User => {
+            return SeedGroup::new(ObjectRef::root(), seed.acl_user.iter().cloned().collect())
+                .into_iter()
+                .collect();
+        }
+        ObjectKind::Key => {
+            for key in &seed.keys {
+                let chain = redis_namespaces(key, separator);
+                let names = under.entry(chain).or_default();
+                if !names.contains(key) {
+                    names.push(key.clone());
+                }
+            }
+        }
+        ObjectKind::Schema => {
+            for key in &seed.keys {
+                let chain = redis_namespaces(key, separator);
+                for (depth, ns) in chain.iter().enumerate() {
+                    let names = under.entry(chain[..depth].to_vec()).or_default();
+                    if !names.iter().any(|n| n == ns) {
+                        names.push((*ns).to_owned());
+                    }
+                }
+            }
+        }
+        _ => return Vec::new(),
+    }
+    under
+        .into_iter()
+        .filter_map(|(chain, names)| SeedGroup::new(namespace_ref(&database, &chain), names))
+        .collect()
 }
 
 fn owned_names(names: &[&str]) -> Vec<String> {
@@ -410,6 +551,183 @@ mod tests {
         // No indexed view named: no view children.
         assert_eq!(
             m4_groups(&m4, &seed, ObjectKind::Index),
+            Vec::<SeedGroup>::new()
+        );
+    }
+
+    fn m7(fx: &Fixtures, engine: Engine, kind: ObjectKind) -> Vec<(String, Vec<String>)> {
+        let groups = match engine {
+            Engine::MongoDb => m7_mongo_groups(fx.m7_mongo(engine).unwrap(), kind),
+            _ => m7_redis_groups(fx.m7_redis(engine).unwrap(), kind),
+        };
+        groups
+            .into_iter()
+            .map(|g| (g.parent.to_string(), g.names))
+            .collect()
+    }
+
+    #[test]
+    fn mongodb_seed_groups_follow_the_m7_tree() {
+        let fx = repo();
+        let g = |k| m7(&fx, Engine::MongoDb, k);
+        assert_eq!(
+            g(ObjectKind::Database),
+            [("database:".to_owned(), v(&["oxbase_test"]))]
+        );
+        assert_eq!(
+            g(ObjectKind::Table),
+            [(
+                "database:oxbase_test".to_owned(),
+                v(&["m7_docs", "m7_big", "m7_edit"])
+            )]
+        );
+        assert_eq!(
+            g(ObjectKind::View),
+            [("database:oxbase_test".to_owned(), v(&["m7_view"]))]
+        );
+        assert_eq!(
+            g(ObjectKind::Index),
+            [
+                (
+                    "table:oxbase_test.m7_docs".to_owned(),
+                    v(&[
+                        "m7_docs_name_idx",
+                        "m7_docs_tags_idx",
+                        "m7_docs_at_ttl",
+                        "m7_docs_meta_city_uq"
+                    ])
+                ),
+                ("table:oxbase_test.m7_big".to_owned(), v(&["m7_big_g_idx"])),
+            ]
+        );
+        assert_eq!(
+            g(ObjectKind::User),
+            [("database:admin".to_owned(), v(&["m7_reader"]))]
+        );
+        assert_eq!(
+            g(ObjectKind::Role),
+            [("database:oxbase_test".to_owned(), v(&["m7_role"]))]
+        );
+        assert_eq!(g(ObjectKind::Column), NONE);
+        // Index refs are children of their collection.
+        let groups = m7_mongo_groups(fx.m7_mongo(Engine::MongoDb).unwrap(), ObjectKind::Index);
+        let ix = groups[0]
+            .parent
+            .child(ObjectKind::Index, "m7_docs_name_idx");
+        assert_eq!(ix.parent.as_deref(), Some("m7_docs"));
+        assert_eq!(ix.catalog.as_deref(), Some("oxbase_test"));
+        // Only the engine's own seed.
+        assert!(fx.m7_mongo(Engine::Redis).is_none());
+        assert!(fx.m7_redis(Engine::MongoDb).is_none());
+    }
+
+    #[test]
+    fn redis_seed_groups_follow_the_namespace_tree() {
+        let fx = repo();
+        let g = |k| m7(&fx, Engine::Redis, k);
+        assert_eq!(
+            g(ObjectKind::Database),
+            [("database:".to_owned(), v(&["0", "1"]))]
+        );
+        assert_eq!(
+            g(ObjectKind::User),
+            [("database:".to_owned(), v(&["m7_reader"]))]
+        );
+        assert_eq!(
+            g(ObjectKind::Schema),
+            [
+                ("database:0".to_owned(), v(&["m7:"])),
+                (
+                    "schema:0.m7:".to_owned(),
+                    v(&["m7:big:", "m7:ns:", "m7:edit:"])
+                ),
+                (
+                    "schema:0.m7:.m7:ns:".to_owned(),
+                    v(&["m7:ns:a:", "m7:ns:b:"])
+                ),
+            ]
+        );
+        let keys = g(ObjectKind::Key);
+        assert_eq!(
+            keys,
+            [
+                (
+                    "schema:0.m7:".to_owned(),
+                    v(&[
+                        "m7:string",
+                        "m7:binary",
+                        "m7:hash",
+                        "m7:list",
+                        "m7:set",
+                        "m7:zset",
+                        "m7:stream",
+                        "m7:ttl"
+                    ])
+                ),
+                (
+                    "schema:0.m7:.m7:big:".to_owned(),
+                    v(&["m7:big:list", "m7:big:zset"])
+                ),
+                ("schema:0.m7:.m7:edit:".to_owned(), v(&["m7:edit:seed"])),
+                ("schema:0.m7:.m7:ns:".to_owned(), v(&["m7:ns:leaf"])),
+                (
+                    "schema:0.m7:ns:.m7:ns:a:".to_owned(),
+                    v(&["m7:ns:a:1", "m7:ns:a:2"])
+                ),
+                ("schema:0.m7:ns:.m7:ns:b:".to_owned(), v(&["m7:ns:b:1"])),
+            ]
+        );
+        // Every seed key is in exactly one group; the optional RedisJSON key in none.
+        let seed = fx.m7_redis(Engine::Redis).unwrap();
+        let listed: usize = keys.iter().map(|(_, names)| names.len()).sum();
+        assert_eq!(listed, seed.keys.len());
+        assert!(keys.iter().all(|(_, n)| !n.contains(&"m7:json".to_owned())));
+        // A key ref under a namespace: catalog = the database, schema = the namespace.
+        let groups = m7_redis_groups(seed, ObjectKind::Key);
+        let leaf = groups[3].parent.child(ObjectKind::Key, "m7:ns:leaf");
+        assert_eq!(leaf.catalog.as_deref(), Some("0"));
+        assert_eq!(leaf.schema.as_deref(), Some("m7:ns:"));
+        assert_eq!(g(ObjectKind::Table), NONE);
+    }
+
+    #[test]
+    fn redis_namespaces_and_index_owners() {
+        assert_eq!(
+            redis_namespaces("m7:ns:a:1", ":"),
+            ["m7:", "m7:ns:", "m7:ns:a:"]
+        );
+        assert_eq!(redis_namespaces("plain", ":"), Vec::<&str>::new());
+        // A trailing separator is part of the key's own name, not a namespace of it.
+        assert_eq!(redis_namespaces("a:", ":"), Vec::<&str>::new());
+        assert_eq!(redis_namespaces("a::b", "::"), ["a::"]);
+        assert_eq!(redis_namespaces("m7:x", ""), Vec::<&str>::new());
+        let colls = v(&["m7_docs", "m7_docs_x", "m7_big"]);
+        assert_eq!(index_collection(&colls, "m7_docs_x_idx"), Some("m7_docs_x"));
+        assert_eq!(
+            index_collection(&colls, "m7_docs_name_idx"),
+            Some("m7_docs")
+        );
+        assert_eq!(index_collection(&colls, "m7_docs_"), None);
+        assert_eq!(index_collection(&colls, "other_idx"), None);
+        // An empty separator: every key sits directly in the database.
+        let seed = M7RedisSeed {
+            keys: v(&["a:1", "b"]),
+            namespace_separator: Some(String::new()),
+            ..M7RedisSeed::default()
+        };
+        assert_eq!(
+            m7_redis_groups(&seed, ObjectKind::Key)
+                .into_iter()
+                .map(|g| (g.parent.to_string(), g.names))
+                .collect::<Vec<_>>(),
+            [("database:0".to_owned(), v(&["a:1", "b"]))]
+        );
+        assert_eq!(
+            m7_redis_groups(&seed, ObjectKind::Schema),
+            Vec::<SeedGroup>::new()
+        );
+        assert_eq!(
+            m7_mongo_groups(&M7MongoSeed::default(), ObjectKind::Table),
             Vec::<SeedGroup>::new()
         );
     }

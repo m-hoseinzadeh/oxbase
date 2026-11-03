@@ -38,9 +38,13 @@
 //!
 //! # Execution
 //!
-//! 1. Split the script with `oxbase_sql::split` (dialect from the session's engine); emit
+//! 1. Split the script with the editor's [`StatementSource`] (M7: `oxbase_sql::split` for a
+//!    SQL engine, the engine's registered `ScriptLanguage` for MongoDB and Redis); emit
 //!    [`RunEvent::Started`] with every statement's [`StatementSpan`]. An empty script finishes
-//!    right away.
+//!    right away. Before the run starts, every statement passes the language's guard
+//!    (`ScriptLanguage::guard`): a blocked one fails the call with `InvalidInput`, one that
+//!    needs confirmation fails it with `InvalidInput` starting with
+//!    `oxbase_dialect::CONFIRMATION_REQUIRED` unless [`RunOptions::confirm_destructive`].
 //! 2. For each statement in order: [`RunEvent::StatementStarted`], then
 //!    `Connection::execute(statement.text, &[], token)` under `SessionHandle::exclusive`, and
 //!    for every item of the result stream:
@@ -69,6 +73,13 @@
 //!
 //! History: one `HistoryService::record` per statement that started (status ok, error or
 //! cancelled), unless [`RunOptions::record_history`] is off.
+//!
+//! # Result sources (M7)
+//!
+//! [`QueryService::run_source`] runs an `oxbase_driver::ResultSource` (a MongoDB find request,
+//! a Redis key scan or value read) as a run of one statement whose text is a description of
+//! the source: same editor rules, events, stores, paging, cancel and close; the source's
+//! `open` takes the place of `Connection::execute`.
 //!
 //! # Events and backpressure
 //!
@@ -105,15 +116,16 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, watch};
 use uuid::Uuid;
 
-use oxbase_dialect::{DatabaseScope, DialectRegistry};
-use oxbase_driver::{Notice, NoticeSeverity, ResultItem, ResultStream};
-use oxbase_sql::{SqlDialect, StatementKind};
+use oxbase_dialect::{CONFIRMATION_REQUIRED, DatabaseScope, DialectRegistry, StatementGuard};
+use oxbase_driver::{Notice, NoticeSeverity, ResultItem, ResultSource, ResultStream};
+use oxbase_sql::StatementKind;
 use oxbase_store::HistoryStatus;
 use oxbase_types::{BoundStatement, Engine, Error, ErrorCategory, Result, Value};
 
 use crate::history::{HistoryRecord, HistoryService};
 use crate::results::{AppendOutcome, ByteBudget, ResultStore, RunDir};
 use crate::schema_cache::SchemaEvents;
+use crate::script::StatementSource;
 use crate::{CancellationToken, ConnectionManager, SessionHandle, SessionId};
 
 #[cfg(test)]
@@ -217,6 +229,11 @@ pub struct RunOptions {
     pub record_history: bool,
     /// Keep the editor's earlier runs open instead of closing them (default `false`).
     pub keep_previous: bool,
+    /// M7: run statements the editor language marks as needing confirmation (Redis
+    /// `FLUSHDB`, mongo-shell `dropDatabase()`); the UI sets it after asking (default
+    /// `false`, then not serialized; see the module docs).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub confirm_destructive: bool,
 }
 
 impl Default for RunOptions {
@@ -227,6 +244,7 @@ impl Default for RunOptions {
             stop_on_error: true,
             record_history: true,
             keep_previous: false,
+            confirm_destructive: false,
         }
     }
 }
@@ -669,7 +687,8 @@ impl QueryService {
         script: &str,
         options: RunOptions,
     ) -> Result<RunHandle> {
-        self.start(&target, script.to_owned(), None, options).await
+        self.start(&target, script.to_owned(), None, None, options)
+            .await
     }
 
     /// Starts a run of exactly one statement with bound parameters. Same editor rules, events,
@@ -684,7 +703,29 @@ impl QueryService {
         options: RunOptions,
     ) -> Result<RunHandle> {
         let BoundStatement { sql, params } = statement;
-        self.start(&target, sql, Some(params), options).await
+        self.start(&target, sql, Some(params), None, options).await
+    }
+
+    /// M7: starts a run of `source` (see the module docs): one statement whose text is
+    /// `description` (shown by the UI and recorded in the history unless
+    /// `options.record_history` is off), produced by `source.open` on the editor's session
+    /// instead of `Connection::execute`. Same editor rules, events, paging, cancel and close as
+    /// [`QueryService::run`].
+    pub async fn run_source(
+        &self,
+        target: RunTarget,
+        description: String,
+        source: Arc<dyn ResultSource>,
+        options: RunOptions,
+    ) -> Result<RunHandle> {
+        self.start(
+            &target,
+            description,
+            Some(Vec::new()),
+            Some(source),
+            options,
+        )
+        .await
     }
 
     /// The session run `run` executed on (its editor's session), for edits that must run on
@@ -722,12 +763,13 @@ impl QueryService {
     }
 
     /// [`QueryService::run`] of `script`, or with `params` [`QueryService::run_bound`] of the
-    /// single statement `script`.
+    /// single statement `script`, or with `reader` [`QueryService::run_source`].
     async fn start(
         &self,
         target: &RunTarget,
         script: String,
         params: Option<Vec<Value>>,
+        reader: Option<Arc<dyn ResultSource>>,
         options: RunOptions,
     ) -> Result<RunHandle> {
         target.editor.validate()?;
@@ -736,9 +778,10 @@ impl QueryService {
             .get(target.session)
             .ok_or_else(|| Error::not_found(format!("no open session {}", target.session)))?;
         let engine = base.summary().engine;
-        let dialect = SqlDialect::for_engine(engine).ok_or_else(|| {
-            Error::unsupported(format!("{} has no SQL editor", engine.display_name()))
-        })?;
+        let source = StatementSource::for_engine(&self.dialects, engine)?;
+        if params.is_none() {
+            check_guards(&source, &script, options.confirm_destructive)?;
+        }
         let run_id = RunId::new();
 
         // Reserve the editor.
@@ -867,9 +910,10 @@ impl QueryService {
             replaced_unclean: replaced,
             profile_id: base.summary().profile_id,
             session: Mutex::new(session),
-            dialect,
+            source,
             script,
             params,
+            reader,
             options,
             dir,
             memory: Arc::new(ByteBudget::new(self.config.memory_budget_bytes)),
@@ -1104,25 +1148,76 @@ impl QueryService {
 
     /// The statement under the cursor for "run current statement": `utf16_offset` is the
     /// editor's offset in UTF-16 code units (Monaco `getOffsetAt`). `None` when the text has no
-    /// statement; `Unsupported` for engines without SQL.
+    /// statement; `Unsupported` for engines without SQL (see
+    /// [`QueryService::statement_at_with`] for every engine).
     pub fn statement_at(
         engine: Engine,
         text: &str,
         utf16_offset: usize,
     ) -> Result<Option<StatementSpan>> {
-        let dialect = SqlDialect::for_engine(engine).ok_or_else(|| {
+        let dialect = oxbase_sql::SqlDialect::for_engine(engine).ok_or_else(|| {
             Error::unsupported(format!("{} has no SQL editor", engine.display_name()))
         })?;
-        let byte = oxbase_sql::byte_offset_from_utf16(text, utf16_offset);
-        let statements = oxbase_sql::split(dialect, text);
-        Ok(oxbase_sql::pick_statement(&statements, byte).map(|picked| {
-            let index = statements
-                .iter()
-                .position(|s| s.range == picked.range)
-                .unwrap_or_default();
-            StatementSpan::new(index, picked)
-        }))
+        Ok(pick_span(
+            &StatementSource::Sql(dialect),
+            text,
+            utf16_offset,
+        ))
     }
+
+    /// M7: [`QueryService::statement_at`] for every engine with an editor: the SQL engines and
+    /// the engines that registered a `ScriptLanguage` in `dialects` (MongoDB, Redis).
+    pub fn statement_at_with(
+        dialects: &DialectRegistry,
+        engine: Engine,
+        text: &str,
+        utf16_offset: usize,
+    ) -> Result<Option<StatementSpan>> {
+        let source = StatementSource::for_engine(dialects, engine)?;
+        Ok(pick_span(&source, text, utf16_offset))
+    }
+}
+
+/// The span of the statement of `text` that owns `utf16_offset` (see `oxbase_sql::pick_statement`).
+fn pick_span(source: &StatementSource, text: &str, utf16_offset: usize) -> Option<StatementSpan> {
+    let byte = oxbase_sql::byte_offset_from_utf16(text, utf16_offset);
+    let statements = source.split(text);
+    oxbase_sql::pick_statement(&statements, byte).map(|picked| {
+        let index = statements
+            .iter()
+            .position(|s| s.range == picked.range)
+            .unwrap_or_default();
+        StatementSpan::new(index, picked)
+    })
+}
+
+/// Checks every statement of `script` against the language's guard before a run starts (see
+/// the module docs): blocked statements fail with `InvalidInput`, statements that need
+/// confirmation fail with `InvalidInput` starting with [`CONFIRMATION_REQUIRED`] unless
+/// `confirmed`.
+fn check_guards(source: &StatementSource, script: &str, confirmed: bool) -> Result<()> {
+    if source.sql_dialect().is_some() {
+        return Ok(());
+    }
+    for (i, statement) in source.split(script).iter().enumerate() {
+        match source.guard(statement) {
+            StatementGuard::Allowed => {}
+            StatementGuard::Blocked(why) => {
+                return Err(Error::invalid_input(format!(
+                    "statement {} cannot run from the editor: {why}",
+                    i + 1
+                )));
+            }
+            StatementGuard::Confirm(_) if confirmed => {}
+            StatementGuard::Confirm(what) => {
+                return Err(Error::invalid_input(format!(
+                    "{CONFIRMATION_REQUIRED}statement {}: {what}",
+                    i + 1
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 impl fmt::Debug for QueryService {
@@ -1170,10 +1265,13 @@ struct RunContext {
     /// The database the statements run in, for history.
     database: Option<String>,
     profile_id: Uuid,
-    dialect: SqlDialect,
+    /// M7: how the script is split and redacted (SQL dialect or the engine's language).
+    source: StatementSource,
     script: String,
     /// M3 `run_bound`: the script is one statement with these bound parameters (not split).
     params: Option<Vec<Value>>,
+    /// M7 `run_source`: the one statement is produced by this source, not executed as text.
+    reader: Option<Arc<dyn ResultSource>>,
     options: RunOptions,
     dir: Arc<RunDir>,
     memory: Arc<ByteBudget>,
@@ -1243,9 +1341,9 @@ async fn supervise(context: RunContext) {
 async fn execute(context: RunContext) {
     let started = Instant::now();
     let statements = if context.params.is_some() {
-        vec![whole_statement(context.dialect, &context.script)]
+        vec![context.source.whole(&context.script)]
     } else {
-        split_script(context.dialect, &context.script)
+        context.source.split(&context.script)
     };
     let spans: Vec<StatementSpan> = statements
         .iter()
@@ -1360,10 +1458,13 @@ impl RunContext {
         let Some(events) = &self.schema_events else {
             return;
         };
+        let Some(dialect) = self.source.sql_dialect() else {
+            return;
+        };
         events.statement_succeeded(
             self.session().id(),
             self.database.clone(),
-            self.dialect,
+            dialect,
             statement,
         );
     }
@@ -1479,10 +1580,25 @@ impl RunContext {
                 guard = session.exclusive() => guard,
             };
             let params = self.params.as_deref().unwrap_or_default();
+            let opened = async {
+                match &self.reader {
+                    Some(reader) => {
+                        reader
+                            .open(session.connection().as_ref(), statement_token.clone())
+                            .await
+                    }
+                    None => {
+                        session
+                            .connection()
+                            .execute(sql, params, statement_token.clone())
+                            .await
+                    }
+                }
+            };
             let executed = tokio::select! {
                 biased;
                 () = token.cancelled() => return Outcome::Cancelled { rows_returned: None },
-                executed = session.connection().execute(sql, params, statement_token.clone()) => executed,
+                executed = opened => executed,
             };
             match executed {
                 // The session was found closed before the statement started, after an earlier
@@ -1761,7 +1877,7 @@ impl RunContext {
         let record = HistoryRecord {
             profile_id: self.profile_id,
             database: self.database.clone(),
-            dialect: self.dialect,
+            source: self.source.clone(),
             sql: sql.to_owned(),
             started_at,
             duration,
@@ -1798,27 +1914,6 @@ async fn close_session(manager: &ConnectionManager, id: SessionId) {
         Ok(()) => {}
         Err(e) if e.category() == ErrorCategory::NotFound => {}
         Err(e) => tracing::debug!(error = %e, "closing an editor session failed"),
-    }
-}
-
-/// The statements of `script`.
-fn split_script(dialect: SqlDialect, script: &str) -> Vec<oxbase_sql::Statement> {
-    oxbase_sql::split(dialect, script)
-}
-
-/// `sql` as one statement spanning the whole text (a bound statement is never split). Its kind
-/// is the splitter's hint for the first statement it finds.
-fn whole_statement(dialect: SqlDialect, sql: &str) -> oxbase_sql::Statement {
-    let kind = oxbase_sql::split(dialect, sql)
-        .first()
-        .map_or(StatementKind::Other, |s| s.kind);
-    oxbase_sql::Statement {
-        range: 0..sql.len(),
-        segment_end: sql.len(),
-        start: oxbase_sql::position_at(sql, 0),
-        end: oxbase_sql::position_at(sql, sql.len()),
-        text: sql.to_owned(),
-        kind,
     }
 }
 

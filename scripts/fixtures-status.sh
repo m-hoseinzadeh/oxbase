@@ -17,17 +17,17 @@ else
 fi
 rows="$(oxbase_compose ps --all --format '{{.Service}}|{{.State}}|{{.Health}}|{{.Ports}}')"
 
-printf '%-10s %-10s %-10s %s\n' SERVICE STATE HEALTH PORTS
+printf '%-15s %-10s %-10s %s\n' SERVICE STATE HEALTH PORTS
 all_ok=0
 for svc in $expected; do
     line="$(printf '%s\n' "$rows" | awk -F'|' -v s="$svc" '$1 == s' | head -n 1)"
     if [ -z "$line" ]; then
-        printf '%-10s %-10s %-10s %s\n' "$svc" "absent" "-" "-"
+        printf '%-15s %-10s %-10s %s\n' "$svc" "absent" "-" "-"
         all_ok=1
         continue
     fi
     IFS='|' read -r _ state health ports <<<"$line"
-    printf '%-10s %-10s %-10s %s\n' "$svc" "$state" "${health:--}" "$ports"
+    printf '%-15s %-10s %-10s %s\n' "$svc" "$state" "${health:--}" "$ports"
     if [ "$state" != "running" ] || [ "$health" != "healthy" ]; then
         all_ok=1
     fi

@@ -29,6 +29,12 @@
 //! `OXBASE_CONFORMANCE_REQUIRE_M4=1` (the M4 exit check, set by the integrator once the SQL
 //! Server dialect cells are registered) extends both requirements to SQL Server, so all five SQL
 //! engines must pass, and refuses every skip option ([`guard`]).
+//!
+//! `OXBASE_CONFORMANCE_REQUIRE_M7=1` (the M7 exit check, set by the integrator once the MongoDB
+//! and Redis dialect cells are registered) implies the M4 guard and adds MongoDB and Redis: all
+//! seven engines must pass every applicable connection check and `fetch_list` cell ([`guard`]).
+//! Without it MongoDB and Redis must still pass their connection checks (both drivers are
+//! merged); their `fetch_list` cells may stay pending until their dialect cells are registered.
 
 use oxbase_conformance::adapter::{self, Engine};
 use oxbase_conformance::fixtures::Fixtures;
@@ -45,8 +51,12 @@ use oxbase_conformance::{fetch, fixtures, guard, report, roundtrip, runner, seed
 #[ignore = "needs the Docker fixtures (scripts/fixtures-up.sh); run with --include-ignored"]
 fn harness_runs_against_all_engines_and_m1_connection_checks_pass() {
     let opts = runner::RunOptions::from_env();
-    let require_m4 = guard::require_from_env();
-    if require_m4 {
+    let require_m7 = guard::require_m7_from_env();
+    // The 7-engine guard includes the 5-engine one.
+    let require_m4 = guard::require_from_env() || require_m7;
+    if require_m7 {
+        guard::check_run_m7(&opts).unwrap_or_else(|e| panic!("{e}"));
+    } else if require_m4 {
         guard::check_run(&opts).unwrap_or_else(|e| panic!("{e}"));
     }
     let path = fixtures::fixtures_path();
@@ -101,6 +111,7 @@ fn harness_runs_against_all_engines_and_m1_connection_checks_pass() {
         require_m2: std::env::var(fetch::REQUIRE_M2_ENV)
             .is_ok_and(|v| matches!(v.trim(), "1" | "true" | "yes" | "on")),
         require_m4,
+        require_m7,
     };
     let problems = fetch::gate(&report.cells, &fx, &resolved, &registry, gate);
     assert!(
@@ -136,13 +147,21 @@ fn harness_runs_against_all_engines_and_m1_connection_checks_pass() {
         guard::REQUIRE_ENV,
         problems.join("\n  ")
     );
-    // Without the guard, preview everything it would refuse: its own problems plus the
-    // fetch_list and roundtrip / capabilities gates run as if it were on (pending SQL Server
-    // cells included), so "nothing open" really means the guard can be turned on.
-    let mut open = problems;
-    if !require_m4 {
-        let fetch_m4 = fetch::GateOptions {
-            require_m4: true,
+    let problems_m7 = guard::gate_m7(&report, &resolved);
+    assert!(
+        !require_m7 || problems_m7.is_empty(),
+        "7-engine guard ({}):\n  {}",
+        guard::REQUIRE_M7_ENV,
+        problems_m7.join("\n  ")
+    );
+    // Without the 7-engine guard, preview everything it would refuse: its own problems (the
+    // 5-engine ones included) plus the fetch_list and roundtrip / capabilities gates run as if
+    // it were on (pending SQL Server, MongoDB and Redis cells included), so "nothing open"
+    // really means the guard can be turned on.
+    let mut open = problems_m7;
+    if !require_m7 {
+        let fetch_m7 = fetch::GateOptions {
+            require_m7: true,
             ..gate
         };
         open.extend(fetch::gate(
@@ -150,7 +169,7 @@ fn harness_runs_against_all_engines_and_m1_connection_checks_pass() {
             &fx,
             &resolved,
             &registry,
-            fetch_m4,
+            fetch_m7,
         ));
         let rt_m4 = roundtrip::GateOptions {
             require_m3: true,
@@ -166,10 +185,11 @@ fn harness_runs_against_all_engines_and_m1_connection_checks_pass() {
         ));
     }
     println!(
-        "5-engine guard ({}: {require_m4}): {}",
+        "7-engine guard ({}: {require_m7}; {}: {require_m4}): {}",
+        guard::REQUIRE_M7_ENV,
         guard::REQUIRE_ENV,
         if open.is_empty() {
-            "nothing open (every M4 engine passes; the guard can be turned on)".to_owned()
+            "nothing open (every engine passes; the guard can be turned on)".to_owned()
         } else {
             format!(
                 "{} open (failed, skipped or pending under the guard): {}",
@@ -179,19 +199,14 @@ fn harness_runs_against_all_engines_and_m1_connection_checks_pass() {
         }
     );
 
+    // Every engine has a driver since M7 (MongoDB and Redis included): every applicable
+    // connection check passes.
     for c in &report.connections {
-        // Engines with a driver (M1, plus SQL Server since M4) must pass; the others are pending.
-        let m1 = matches!(
-            c.engine_kind,
-            Engine::Postgres | Engine::MySql | Engine::MariaDb | Engine::Sqlite | Engine::MsSql
-        );
         let ok = match c.status {
-            CellStatus::Pass => m1,
-            CellStatus::Pending => !m1,
-            CellStatus::NotApplicable => true,
+            CellStatus::Pass | CellStatus::NotApplicable => true,
             // Only with OXBASE_CONFORMANCE_ALLOW_MISSING / SKIP_CONNECT.
             CellStatus::Skipped => opts.allow_missing || opts.skip_connect,
-            CellStatus::Fail => false,
+            CellStatus::Pending | CellStatus::Fail => false,
         };
         assert!(
             ok,

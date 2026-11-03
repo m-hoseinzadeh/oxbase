@@ -268,11 +268,15 @@ pub fn cancel_request(state: State<'_, ConnectionsState>, request_id: &str) -> b
 pub async fn close_connection(
     state: State<'_, ConnectionsState>,
     workbench: State<'_, WorkbenchState>,
+    nosql: State<'_, crate::nosql::NoSqlState>,
     session_id: SessionId,
 ) -> std::result::Result<(), CommandError> {
     let manager = Arc::clone(&state.manager);
     let tree = Arc::clone(workbench.tree());
+    let pubsub = Arc::clone(nosql.pubsub());
     isolated(Vec::new(), async move {
+        // M7: subscriptions run on their own connections; end them with the session.
+        pubsub.close_session(session_id).await;
         let closed = manager.close(session_id).await;
         // The children are closed with the base; this only forgets them. Its error never hides
         // the close result.

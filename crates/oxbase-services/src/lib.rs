@@ -110,6 +110,22 @@
 //! - [`snippets::SnippetService`] lists built-in and user snippets and saves / deletes the
 //!   user's.
 //!
+//! # M7: MongoDB and Redis
+//!
+//! Contracts in `docs/m7-contracts.md`:
+//!
+//! - [`script::StatementSource`]: the query service splits, guards and redacts an editor's
+//!   script with `oxbase_sql` on SQL engines and with the engine's registered
+//!   `ScriptLanguage` (mongo shell, Redis console) otherwise, so both run through the M2 run
+//!   path; [`query::QueryService::run_source`] runs a dialect-built `ResultSource` (a find
+//!   request, a key scan, a value read) like a statement.
+//! - [`documents::DocumentService`]: find / aggregate runs, one document per row for the tree
+//!   and JSON views, optimistic document edits (the engine's `DocumentStore`).
+//! - [`keys::KeyService`]: `SCAN` runs for the key browser, key info, chunked typed value
+//!   reads and atomic key edits (the engine's `KeyValueStore`).
+//! - [`pubsub::PubSubService`]: subscriptions on dedicated connections with a bounded, lossy
+//!   event buffer, and publish (the engine's `PubSub`).
+//!
 //! **Sessions.** A session opened with [`ConnectionManager::open`] is a *base* session: the
 //! object tree reads metadata through it. Query editors never run on a base session; each
 //! editor gets a *child* session ([`ConnectionManager::open_child`]) with the same resolved
@@ -142,16 +158,20 @@ use oxbase_types::{Engine, Error, KnownHostsPolicy, Result, Secret, ServerVersio
 pub mod convert;
 pub mod designer;
 mod dialects;
+pub mod documents;
 mod drivers;
 pub mod edit;
 pub mod export;
 pub mod history;
 pub mod import;
 pub mod insight;
+pub mod keys;
 pub mod profiles;
+pub mod pubsub;
 pub mod query;
 pub mod results;
 pub mod schema_cache;
+pub mod script;
 pub mod snippets;
 pub mod tree;
 

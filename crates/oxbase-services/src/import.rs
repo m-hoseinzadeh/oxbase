@@ -675,6 +675,25 @@ impl ImportService {
 
         let mode = request.target.mode;
         let creates = matches!(mode, TargetMode::Create | TargetMode::Replace);
+        let loader = self.dialects.bulk_loader(engine)?;
+        // M7: a loader without transactions (MongoDB) writes each call for good. Emptying or
+        // replacing the target first could not be undone, so those modes are not offered;
+        // create mode makes the target with the loader (`BulkLoader::create_target`).
+        let transactional = loader.transactional();
+        if !transactional
+            && matches!(
+                mode,
+                TargetMode::Truncate | TargetMode::DeleteAll | TargetMode::Replace
+            )
+        {
+            return Err(Error::unsupported(format!(
+                "{} imports without a transaction, so an import cannot empty or replace {}; \
+                 append to it or create a new one",
+                engine.display_name(),
+                table.display_name()
+            )));
+        }
+        let loader_creates = creates && !transactional;
         let mut warnings = Vec::new();
         let def = match mode {
             TargetMode::Create if existing.is_some() => {
@@ -702,13 +721,16 @@ impl ImportService {
         let (columns, planned) = map_columns(request, &def)?;
         check_required(&def, &columns)?;
 
-        let ddl = self.target_ddl(engine, &version, mode, table, &def, existing.is_some())?;
+        let ddl = if loader_creates {
+            TargetDdl::default()
+        } else {
+            self.target_ddl(engine, &version, mode, table, &def, existing.is_some())?
+        };
         warnings.extend(ddl.warnings.iter().cloned());
         let ddl_in_tx = ddl
             .steps
             .iter()
             .all(|s| s.transactional && s.phase == StepPhase::Main);
-        let loader = self.dialects.bulk_loader(engine)?;
         let method = loader.method(&version);
         let load_columns: Vec<LoadColumn> = columns.iter().map(|(_, _, c)| c.clone()).collect();
         let sources: Vec<DataType> = columns.iter().map(|(_, t, _)| t.clone()).collect();
@@ -754,13 +776,21 @@ impl ImportService {
             );
         }
         let transactional_storage = match (&existing, creates) {
+            _ if !transactional => false,
             (Some(def), false) => match self.dialects.dml_writer(engine) {
                 Ok(writer) => writer.transactional(def),
                 Err(_) => true,
             },
             _ => true,
         };
-        if !transactional_storage {
+        if !transactional {
+            warnings.push(format!(
+                "{} imports without a transaction: rows written before a failure or a cancel \
+                 stay in {}",
+                engine.display_name(),
+                table.display_name()
+            ));
+        } else if !transactional_storage {
             warnings.push(
                 "the table's storage does not support transactions: rows inserted before a \
                  failure or a cancel stay in the table"
@@ -790,6 +820,8 @@ impl ImportService {
             total_bytes,
             existed,
             transactional_storage,
+            transactional,
+            loader_creates,
         })
     }
 
@@ -899,6 +931,11 @@ struct Prepared {
     existed: bool,
     /// A rollback undoes inserted rows (`DmlWriter::transactional`).
     transactional_storage: bool,
+    /// M7: the loader works inside a transaction (`BulkLoader::transactional`); without one
+    /// the run opens none and every load call is written for good.
+    transactional: bool,
+    /// M7: create mode makes the target with `BulkLoader::create_target` (no DDL).
+    loader_creates: bool,
 }
 
 /// The value formats a reader uses (text parsing in conversions).

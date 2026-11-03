@@ -1,7 +1,8 @@
 //! Picks the core implementations the desktop app runs with: drivers, dialects, the secret
 //! store, the profile repository, the SSH tunnel provider, (M2) the tree, query and history
 //! services, (M3) the edit and designer services, (M5) the import and export services and
-//! the file-handle registry, and (M6) the schema-cache, insight and snippet services.
+//! the file-handle registry, (M6) the schema-cache, insight and snippet services, and (M7) the
+//! document, key and pub/sub services.
 //! Construction only; no behaviour.
 
 use std::path::Path;
@@ -9,11 +10,14 @@ use std::sync::Arc;
 
 use oxbase_net::ssh::RusshTunnelProvider;
 use oxbase_services::designer::DesignerService;
+use oxbase_services::documents::DocumentService;
 use oxbase_services::edit::EditService;
 use oxbase_services::export::{ExportConfig, ExportService};
 use oxbase_services::history::HistoryService;
 use oxbase_services::import::{ImportConfig, ImportService};
 use oxbase_services::insight::{InsightConfig, InsightService};
+use oxbase_services::keys::KeyService;
+use oxbase_services::pubsub::PubSubService;
 use oxbase_services::query::{QueryConfig, QueryService};
 use oxbase_services::schema_cache::{SchemaCacheConfig, SchemaCacheService, SchemaEvents};
 use oxbase_services::snippets::SnippetService;
@@ -31,6 +35,7 @@ use crate::data::DataState;
 use crate::designer::DesignerState;
 use crate::files::FilesState;
 use crate::insight::InsightState;
+use crate::nosql::NoSqlState;
 use crate::transfer::TransferState;
 use crate::workbench::WorkbenchState;
 
@@ -49,6 +54,8 @@ pub struct AppStates {
     pub files: FilesState,
     /// M6: code insight, schema caches and snippets.
     pub insight: InsightState,
+    /// M7: documents, keys and pub/sub (MongoDB, Redis).
+    pub nosql: NoSqlState,
 }
 
 /// The repositories kept in the app database.
@@ -197,6 +204,15 @@ pub fn app_state_with_repositories(
         events,
         SchemaCacheConfig::default(),
     ));
+    // M7: documents (MongoDB), keys and pub/sub (Redis), through the shared registry.
+    let nosql = NoSqlState::new(
+        Arc::new(DocumentService::new(Arc::clone(&query), Arc::clone(&tree))),
+        Arc::new(KeyService::new(Arc::clone(&query), Arc::clone(&tree))),
+        Arc::new(PubSubService::new(
+            Arc::clone(&manager),
+            Arc::clone(&dialects),
+        )),
+    );
     let insight = Arc::new(InsightService::new(
         dialects,
         caches,
@@ -211,6 +227,7 @@ pub fn app_state_with_repositories(
         transfer: TransferState::new(import, export),
         files: FilesState::new(),
         insight: InsightState::new(insight),
+        nosql,
     }
 }
 
@@ -259,6 +276,8 @@ mod tests {
             states.insight.service().dialects(),
             states.designer.service().dialects()
         ));
+        // M7: no subscription is open.
+        assert_eq!(states.nosql.pubsub().open_count(), 0);
     }
 
     #[test]
@@ -270,7 +289,9 @@ mod tests {
                 Engine::MySql,
                 Engine::MariaDb,
                 Engine::Sqlite,
-                Engine::MsSql
+                Engine::MsSql,
+                Engine::MongoDb,
+                Engine::Redis
             ]
         );
     }

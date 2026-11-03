@@ -26,12 +26,15 @@
 //                             missing file hook or a failure of that step is a skip (warning)
 //   OXBASE_E2E_REQUIRE_M6     1: the M6 code-insight step must pass; without it any failure of
 //                             that step (core insight or schema cache not built yet) is a skip
+//   OXBASE_E2E_REQUIRE_M7     1: the M7 MongoDB and Redis steps must pass; without it a missing
+//                             fixture or any failure of those steps is a skip (warning)
 //   OXBASE_E2E_INSIGHT_P95_LIMIT_MS  p95 bound of 50 `insight_complete` calls through IPC
 //                             (default 150, docs/m6-contracts.md §5)
 //   GITHUB_STEP_SUMMARY       if set, a Markdown summary is appended to it
 
 import { createReadStream } from "node:fs";
 import { appendFile, copyFile, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import net from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Keys, sleep, WebDriver } from "./webdriver.mjs";
@@ -51,6 +54,7 @@ const config = {
   requireEdit: /^(1|true|yes)$/i.test(env.OXBASE_E2E_REQUIRE_EDIT || ""),
   requireM5: /^(1|true|yes)$/i.test(env.OXBASE_E2E_REQUIRE_M5 || ""),
   requireM6: /^(1|true|yes)$/i.test(env.OXBASE_E2E_REQUIRE_M6 || ""),
+  requireM7: /^(1|true|yes)$/i.test(env.OXBASE_E2E_REQUIRE_M7 || ""),
   insightP95LimitMs: Number(env.OXBASE_E2E_INSIGHT_P95_LIMIT_MS || 150),
   insightSamples: 50,
   rows: 1_000_000,
@@ -212,6 +216,7 @@ const report = {
   requireEdit: config.requireEdit,
   requireM5: config.requireM5,
   requireM6: config.requireM6,
+  requireM7: config.requireM7,
   query: null,
   pageLatency: null,
   scroll: [],
@@ -219,6 +224,7 @@ const report = {
   edit: null,
   m5: null,
   m6: null,
+  m7: null,
   steps: results,
   pageErrors: [],
 };
@@ -245,6 +251,7 @@ class Fatal extends Error {}
 const EDIT_GATE = { required: config.requireEdit, env: "OXBASE_E2E_REQUIRE_EDIT" };
 const M5_GATE = { required: config.requireM5, env: "OXBASE_E2E_REQUIRE_M5" };
 const M6_GATE = { required: config.requireM6, env: "OXBASE_E2E_REQUIRE_M6" };
+const M7_GATE = { required: config.requireM7, env: "OXBASE_E2E_REQUIRE_M7" };
 
 async function step(name, fn, gate = EDIT_GATE) {
   const started = Date.now();
@@ -1671,6 +1678,675 @@ async function insightChecks() {
   );
 }
 
+// ---------------------------------------------------------------------------------------------
+// M7: MongoDB and Redis (docs/m7-contracts.md §11, ui/e2e/README.md step 11)
+
+/** M7 state: which fixtures got a profile, their names and passwords. */
+const m7 = { mongo: null, redis: null };
+
+/** `[engines.<name>]` of tests/fixtures.toml (flat `key = "text"` / `key = number` only). */
+async function fixtureEngine(name) {
+  const text = await readFile(path.resolve(here, "../../tests/fixtures.toml"), "utf8");
+  const start = text.indexOf(`[engines.${name}]`);
+  if (start < 0) return null;
+  const out = {};
+  for (const line of text.slice(start).split("\n").slice(1)) {
+    if (/^\s*\[/.test(line)) break;
+    const m = /^\s*([a-z_]+)\s*=\s*(?:"([^"]*)"|(\d+))\s*(?:#.*)?$/.exec(line);
+    if (m) out[m[1]] = m[2] ?? Number(m[3]);
+  }
+  return out;
+}
+
+/** Whether something listens on `host:port` (the fixture container is up). */
+function reachable(host, port, ms = 2_000) {
+  return new Promise((resolve) => {
+    const socket = net.createConnection({ host, port });
+    const timer = setTimeout(() => {
+      socket.destroy();
+      resolve(false);
+    }, ms);
+    socket.on("connect", () => {
+      clearTimeout(timer);
+      socket.end();
+      resolve(true);
+    });
+    socket.on("error", () => {
+      clearTimeout(timer);
+      resolve(false);
+    });
+  });
+}
+
+/** Calls one command through the webview's IPC; rejects with the command's error. */
+async function ipc(cmd, args) {
+  const out = await wd.executeAsync(
+    `const [cmd, args, done] = arguments;
+     window.__TAURI_INTERNALS__.invoke(cmd, args).then(
+       (value) => done({ value: value === undefined ? null : value }),
+       (e) => done({ error: String((e && e.message) || (e && e.category) || e) }));`,
+    cmd,
+    args,
+  );
+  if (!out || "error" in out) throw new Error(`${cmd}: ${out?.error}`);
+  return out.value;
+}
+
+/** The open session of the profile named `name`. */
+async function sessionOf(name) {
+  const sessions = await ipc("list_open_connections", {});
+  const found = sessions.find((s) => s.profile_name === name);
+  if (!found) throw new Error(`no open session for "${name}"`);
+  return found;
+}
+
+/**
+ * Runs `script` on session `sessionId` through IPC (`query_run` + `query_page`, like
+ * `sqlViaIpc`) and returns the first result's rows as strings.
+ */
+let scriptRuns = 0;
+async function scriptViaIpc(sessionId, script) {
+  await loadArrow();
+  scriptRuns += 1;
+  const result = await wd.executeAsync(
+    `const [sessionId, script, editorId, done] = arguments;
+     (async () => {
+       const T = window.__TAURI_INTERNALS__;
+       const failures = [];
+       let hasResult = false;
+       let finish;
+       const ended = new Promise((resolve) => { finish = resolve; });
+       const callback = T.transformCallback((raw) => {
+         const m = raw && typeof raw === "object" && "message" in raw ? raw.message : raw;
+         if (!m || typeof m !== "object") return;
+         if (m.type === "resultSet" && m.resultIndex === 0) hasResult = true;
+         if (m.type === "statementFailed") failures.push(m.error && m.error.message || "statement failed");
+         if (m.type === "finished" || m.type === "failed" || m.type === "cancelled") finish(m);
+       });
+       try {
+         const runId = await T.invoke("query_run", { sessionId, editorId, script, options: null,
+           onEvent: "__CHANNEL__:" + callback });
+         const end = await Promise.race([ended,
+           new Promise((_, reject) => setTimeout(() => reject(new Error("no end event in 30 s")), 30000))]);
+         if (end.type !== "finished" || failures.length) {
+           return { error: end.type + (end.error ? ": " + end.error.message : "") +
+             (failures.length ? ": " + failures.join("; ") : "") };
+         }
+         if (!hasResult) return { rows: [] };
+         const raw = await T.invoke("query_page", { runId, resultIndex: 0, offset: 0, limit: 100 });
+         const bytes = raw instanceof ArrayBuffer ? new Uint8Array(raw)
+           : raw instanceof Uint8Array ? raw : Uint8Array.from(raw);
+         const table = window.Arrow.tableFromIPC(bytes);
+         const dec = new TextDecoder();
+         const rows = [];
+         for (let r = 0; r < table.numRows; r += 1) {
+           const row = [];
+           for (let c = 0; c < table.numCols; c += 1) {
+             const v = table.getChildAt(c).get(r);
+             row.push(v === null || v === undefined ? null : v instanceof Uint8Array ? dec.decode(v) : String(v));
+           }
+           rows.push(row);
+         }
+         return { rows };
+       } finally {
+         await T.invoke("query_close_editor", { editorId }).catch(() => {});
+       }
+     })().then(done, (e) => done({ error: String(e && e.message || e) }));`,
+    sessionId,
+    script,
+    `e2e-script-${scriptRuns}`,
+  );
+  if (!result || !Array.isArray(result.rows)) {
+    throw new Error(`${script.split(/\s/)[0]} through IPC failed: ${result?.error}`);
+  }
+  return result.rows;
+}
+
+/** Replaces the text of the Monaco editor inside `host` (the editor's own testid element). */
+async function setMonacoText(host, text) {
+  const area = await waitFor(
+    "the editor's text area (Monaco)",
+    () => wd.executeElement("return arguments[0].querySelector('textarea');", host),
+    { timeoutMs: 60_000 },
+  );
+  await wd.click(host).catch(() => {});
+  const flat = (t) => (t ?? "").replace(/\s+/g, "");
+  const shownText = () =>
+    wd.execute(
+      "const v = arguments[0].querySelector('.view-lines');" +
+        "return v ? v.textContent.replace(/\\u00a0/g, ' ') : null;",
+      host,
+    );
+  let shown = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    // Empty the editor first: Monaco works out what an input event inserted by comparing the
+    // text area before and after, and a replacement that shares a suffix with the selected
+    // text (a document edited in place) can keep that suffix. Inserting into an empty editor
+    // has nothing to compare against.
+    await wd.execute("arguments[0].focus();", area);
+    await wd.chord(Keys.control, "a");
+    await wd.sendKeys(area, Keys.backspace);
+    await sleep(100);
+    await wd.execute(
+      "arguments[0].focus(); document.execCommand('insertText', false, arguments[1]);",
+      area,
+      text,
+    );
+    await sleep(250);
+    shown = await shownText();
+    if (flat(shown) === flat(text)) return;
+  }
+  throw new Error(`the editor shows ${JSON.stringify(shown)}, not ${JSON.stringify(text)}`);
+}
+
+/** Replaces the value of a React-controlled input or textarea by typing. */
+async function typeInto(input, text) {
+  await wd.execute("arguments[0].focus(); arguments[0].select && arguments[0].select();", input);
+  await wd.chord(Keys.control, "a");
+  await wd.sendKeys(input, Keys.backspace);
+  if (text) await wd.sendKeys(input, text);
+  const value = await wd.execute("return arguments[0].value;", input);
+  if (value !== text)
+    throw new Error(`the field shows ${JSON.stringify(value)}, not ${JSON.stringify(text)}`);
+}
+
+/** The first element matching `css` inside `root` (or the document), or null. */
+function within(root, css) {
+  return wd.executeElement(
+    "const [root, css] = arguments; return (root || document).querySelector(css);",
+    root,
+    css,
+  );
+}
+
+/** Text of the first element matching `css` inside `root`. */
+function textIn(root, css) {
+  return wd.execute(
+    "const [root, css] = arguments; const e = (root || document).querySelector(css);" +
+      "return e ? e.textContent.replace(/\\u00a0/g, ' ').trim() : null;",
+    root,
+    css,
+  );
+}
+
+/** Opens the tree row's context menu and picks `label`. */
+async function treeMenu(row, label) {
+  await wd.execute(
+    "const r = arguments[0]; r.click(); const b = r.getBoundingClientRect();" +
+      "r.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true," +
+      "  clientX: b.left + 24, clientY: b.top + b.height / 2 }));",
+    row,
+  );
+  const item = await waitFor(`the "${label}" menu item`, () =>
+    wd.executeElement(
+      "for (const i of document.querySelectorAll('[role=menu] [role=menuitem]'))" +
+        "  if (i.textContent.includes(arguments[0])) return i;" +
+        "return null;",
+      label,
+    ),
+  );
+  await wd.click(item);
+}
+
+/** Connects the saved profile `name` through the Connections panel (prompted password). */
+async function connectProfile(name, password) {
+  const before = parseCount((await hookText("openConnections")) ?? "0") ?? 0;
+  const option = await waitFor(`the saved connection "${name}"`, () =>
+    wd.executeElement(
+      "const list = window.__e2e.locate(window.__e2e.hooks.connectionList);" +
+        "if (!list) return null;" +
+        "for (const o of list.querySelectorAll('[role=option], [data-testid=connection-item]')) {" +
+        "  if (o.textContent.includes(arguments[0])) return o; }" +
+        "return null;",
+      name,
+    ),
+  );
+  await wd.click(option);
+  const button = await waitFor("the Connect button", async () => {
+    const el = await locate("connectButton");
+    return el && (await wd.execute("return !arguments[0].disabled;", el)) ? el : null;
+  });
+  await wd.click(button);
+  const prompt = await waitFor("the password prompt", async () => {
+    const el = await locate("passwordPrompt");
+    if (!el) return null;
+    return wd.executeElement(
+      "const e = arguments[0]; return e.tagName === 'INPUT' ? e : e.querySelector('input[type=password]');",
+      el,
+    );
+  });
+  await wd.sendKeys(prompt, password);
+  await wd.sendKeys(prompt, Keys.enter);
+  await waitFor(
+    `"${name}" to connect`,
+    async () => {
+      const count = parseCount((await hookText("openConnections")) ?? "0") ?? 0;
+      if (count > before) return true;
+      const error = await wd.execute(
+        "const a = document.querySelector('.panel--connections [role=alert]');" +
+          "return a ? a.textContent : null;",
+      );
+      if (error) throw new Fatal(`connect failed: ${error}`);
+      return null;
+    },
+    { timeoutMs: 30_000 },
+  );
+}
+
+/** The profile of a fixture (prompted password, so no keychain is needed). */
+function fixtureProfile(name, engine, fixture, options) {
+  return {
+    schema_version: 1,
+    id: "00000000-0000-0000-0000-000000000000",
+    name,
+    engine,
+    address: { kind: "network", host: fixture.host, port: fixture.port },
+    ...(fixture.database !== undefined ? { database: String(fixture.database) } : {}),
+    ...(fixture.user ? { user: fixture.user } : {}),
+    password: { source: "prompt" },
+    tls: { mode: "disable" },
+    ...(options ? { options } : {}),
+  };
+}
+
+async function m7Setup() {
+  report.m7 = {};
+  const mongo = await fixtureEngine("mongodb");
+  const redis = await fixtureEngine("redis");
+  const up = async (f) => Boolean(f?.host && f.port && (await reachable(f.host, f.port)));
+  const mongoUp = await up(mongo);
+  const redisUp = await up(redis);
+  report.m7.fixtures = { mongodb: mongoUp, redis: redisUp };
+  if (!mongoUp && !redisUp) {
+    throw new SkipStep(
+      "neither the MongoDB nor the Redis fixture is reachable (scripts/e2e-fixtures.sh starts " +
+        "PostgreSQL only until the M7 integration adds them)",
+    );
+  }
+  try {
+    if (mongoUp) {
+      const name = "E2E MongoDB";
+      await ipc("save_profile", {
+        profile: fixtureProfile(name, "mongodb", mongo, {
+          ...(mongo.auth_source ? { auth_source: mongo.auth_source } : {}),
+        }),
+        secrets: {},
+      });
+      m7.mongo = { name, password: mongo.password };
+    }
+    if (redisUp) {
+      const name = "E2E Redis";
+      await ipc("save_profile", { profile: fixtureProfile(name, "redis", redis), secrets: {} });
+      m7.redis = { name, password: redis.password };
+    }
+    // The Connections panel lists profiles when it mounts: reload the window (the core keeps its
+    // sessions) and install the probes again.
+    await wd.execute("location.reload();");
+    await sleep(500);
+    await waitFor(
+      "the reloaded document",
+      () => wd.execute("return document.readyState === 'complete' && !window.__e2e;"),
+      { timeoutMs: 60_000 },
+    ).catch(() => {});
+    await wd.execute(INSTALL_PROBES, HOOKS);
+    await waitFor("the status bar after the reload", async () =>
+      (await hookText("statusBar"))?.includes("oxbase core"),
+    );
+    if (m7.mongo) await connectProfile(m7.mongo.name, m7.mongo.password);
+    if (m7.redis) await connectProfile(m7.redis.name, m7.redis.password);
+  } catch (error) {
+    if (config.requireM7 || error instanceof SkipStep) throw error;
+    m7.mongo = null;
+    m7.redis = null;
+    throw new SkipStep(`M7 connections not working in this build yet: ${error.message}`);
+  }
+  return `profiles: ${[m7.mongo?.name, m7.redis?.name].filter(Boolean).join(", ")}`;
+}
+
+/** Until the M7 streams are integrated a failure is a skip; OXBASE_E2E_REQUIRE_M7=1 fails. */
+async function m7Tolerant(fn) {
+  try {
+    return await fn();
+  } catch (error) {
+    // Close a dialog the failed step left open, so the next step's clicks reach the page.
+    await closeOpenDialogs().catch(() => {});
+    if (config.requireM7 || error instanceof SkipStep) throw error;
+    throw new SkipStep(`not working in this build yet: ${error.message}`);
+  }
+}
+
+/** Presses Escape until no `[role=dialog]` is open (at most three times). */
+async function closeOpenDialogs() {
+  for (let i = 0; i < 3; i++) {
+    if (!(await wd.execute("return !!document.querySelector('[role=dialog]');"))) return;
+    await wd.performActions([
+      {
+        type: "key",
+        id: "keyboard",
+        actions: [
+          { type: "keyDown", value: Keys.escape },
+          { type: "keyUp", value: Keys.escape },
+        ],
+      },
+    ]);
+    await wd.releaseActions();
+    await sleep(200);
+  }
+}
+
+/** The collection tab of `db.name`. */
+function collectionTab(db, name) {
+  return wd.executeElement(
+    "for (const v of document.querySelectorAll('[data-testid=collection-tab]'))" +
+      "  if (v.getAttribute('aria-label') === 'Collection ' + arguments[0]) return v;" +
+      "return null;",
+    `${db}.${name}`,
+  );
+}
+
+/** Waits for a collection tab's status to show a count (`12 documents`); returns it. */
+async function collectionCount(tab, what) {
+  return waitFor(
+    what,
+    async () => {
+      const status = (await textIn(tab, "[data-testid=collection-status]")) ?? "";
+      if (status.startsWith("Failed")) throw new Fatal(`collection: ${status}`);
+      if (status.includes("…") || status.startsWith("Loading")) return null;
+      return parseCount(status) !== null ? parseCount(status) : null;
+    },
+    { timeoutMs: 30_000 },
+  );
+}
+
+async function mongoSteps() {
+  const name = m7.mongo.name;
+  const out = {};
+  report.m7.mongo = out;
+  const db = "oxbase_test";
+  // Browse: oxbase_test -> Collections -> m7_docs opens in the collection tab with 12 documents.
+  const docsRow = await treeRow([name, db, "Collections"], "m7_docs");
+  if (!docsRow) throw new Error(`${db}.m7_docs is not in the object tree`);
+  await openTableData(docsRow);
+  const docs = await waitFor("the collection tab of m7_docs", () => collectionTab(db, "m7_docs"), {
+    timeoutMs: 15_000,
+  });
+  out.m7Docs = await collectionCount(docs, "the documents of m7_docs");
+  if (out.m7Docs !== 12) throw new Error(`m7_docs shows ${out.m7Docs} documents, not 12`);
+  const headers = await wd.execute(
+    "const t = arguments[0].querySelector('table[role=grid]');" +
+      "return t ? Array.from(t.querySelectorAll('thead th')).map((h) => h.textContent.trim()) : [];",
+    docs,
+  );
+  if (headers.some((h) => h.startsWith("$document"))) {
+    throw new Error("the grid shows the hidden $document column");
+  }
+  await gallery("04-mongo-collection");
+
+  // Edit: a document of its own in m7_edit, found with the builder's filter, edited in the
+  // document dialog, read back through IPC, then deleted.
+  const session = await sessionOf(name);
+  const collection = { kind: "table", catalog: db, name: "m7_edit" };
+  const id = `e2e-t${runToken()}`;
+  const inserted = await ipc("document_apply", {
+    sessionId: session.id,
+    collection,
+    edits: [{ type: "insert", document: JSON.stringify({ _id: id, n: 1, note: "webview smoke" }) }],
+    requestId: null,
+  });
+  if (inserted.outcomes?.[0]?.status !== "applied") {
+    throw new Error(`could not insert the test document: ${JSON.stringify(inserted)}`);
+  }
+  try {
+    const editRow = await treeRow([name, db, "Collections"], "m7_edit");
+    if (!editRow) throw new Error(`${db}.m7_edit is not in the object tree`);
+    await openTableData(editRow);
+    const tab = await waitFor("the collection tab of m7_edit", () => collectionTab(db, "m7_edit"));
+    await collectionCount(tab, "the documents of m7_edit");
+    const filter = await within(tab, "[data-testid=find-filter]");
+    if (!filter) throw new Error("no filter field in the find builder");
+    await setMonacoText(filter, JSON.stringify({ _id: id }));
+    await wd.click(await within(tab, "[data-testid=collection-run]"));
+    await waitFor("the filtered run to show 1 document", async () => {
+      const status = (await textIn(tab, "[data-testid=collection-status]")) ?? "";
+      if (status.startsWith("Failed")) throw new Fatal(status);
+      return status === "1 document";
+    });
+    // Select the row: focusing the grid's accessibility cell selects it (see editCell).
+    const edit = await within(tab, "[data-testid=document-edit]");
+    await waitFor(
+      "the document row to be selected",
+      async () => {
+        if (await wd.execute("return !arguments[0].disabled;", edit)) return true;
+        const cell = await wd.executeElement(
+          "const t = arguments[0].querySelector('table[role=grid]');" +
+            "return t ? t.querySelector('tbody td') : null;",
+          tab,
+        );
+        if (cell)
+          await wd.execute("arguments[0].focus(); arguments[0].click();", cell).catch(() => {});
+        return null;
+      },
+      { timeoutMs: 20_000, intervalMs: 1_000 },
+    );
+    await wd.click(edit);
+    const editor = await waitFor("the document editor", () =>
+      wd.executeElement(
+        "return document.querySelector('[role=dialog] [data-testid=document-editor]');",
+      ),
+    );
+    await setMonacoText(
+      editor,
+      JSON.stringify({ _id: id, n: 2, note: "edited by the webview smoke" }),
+    );
+    await wd.click(await within(null, "[role=dialog] [data-testid=document-save]"));
+    await waitFor(
+      "the document to be saved",
+      async () => {
+        const error = await textIn(tab, "[data-testid=document-error]");
+        if (error) throw new Fatal(`save failed: ${error}`);
+        return wd.execute("return !document.querySelector('[role=dialog]');");
+      },
+      { timeoutMs: 20_000 },
+    );
+    const stored = await ipc("document_get", {
+      sessionId: session.id,
+      collection,
+      id: JSON.stringify(id),
+      requestId: null,
+    });
+    const doc = stored ? JSON.parse(stored) : null;
+    const n = doc?.n?.$numberInt ?? doc?.n;
+    if (String(n) !== "2") throw new Error(`after saving, the document is ${stored}`);
+    out.edited = id;
+  } finally {
+    await ipc("document_apply", {
+      sessionId: session.id,
+      collection,
+      edits: [{ type: "delete", id: JSON.stringify(id) }],
+      requestId: null,
+    }).catch((error) => log(`could not delete the test document ${id}: ${error.message}`));
+  }
+
+  // Query: the shell (New query on the database row opens it) counts m7_docs.
+  const dbRow = await treeRow([name], db);
+  if (!dbRow) throw new Error(`${db} is not in the object tree`);
+  await wd.execute("arguments[0].click();", dbRow);
+  await wd.click(
+    await wd.executeElement(
+      'return document.querySelector(\'[role=toolbar][aria-label="Object tree actions"] button[aria-label="New query"]\');',
+    ),
+  );
+  const shell = await waitFor("the shell tab", () =>
+    wd.executeElement(
+      "const all = Array.from(document.querySelectorAll('section.query-editor')).filter((e) => e.offsetParent !== null);" +
+        "return all.length ? all[all.length - 1] : null;",
+    ),
+  );
+  await setMonacoText(
+    await within(shell, "[data-testid=sql-editor]"),
+    "db.m7_docs.countDocuments({})",
+  );
+  await wd.click(await within(shell, "[data-testid=run-button]"));
+  const state = await waitFor(
+    "the shell run to end",
+    async () => {
+      const s = await wd.execute(
+        "const e = arguments[0].querySelector('[data-testid=run-status]'); return e ? e.getAttribute('data-state') : null;",
+        shell,
+      );
+      return s === "finished" || s === "failed" || s === "cancelled" ? s : null;
+    },
+    { timeoutMs: 30_000 },
+  );
+  if (state !== "finished") {
+    throw new Error(`the shell run ${state}: ${await textIn(shell, "[data-testid=run-status]")}`);
+  }
+  await waitFor(
+    "the count 12 in the shell's result",
+    () =>
+      wd.execute(
+        "const t = arguments[0].querySelector('table[role=grid]');" +
+          "return t ? Array.from(t.querySelectorAll('tbody td')).some((c) => c.textContent.trim() === '12') : false;",
+        shell,
+      ),
+    { timeoutMs: 15_000 },
+  );
+  out.shellCount = 12;
+  return `m7_docs: 12 documents; edited ${out.edited}; shell countDocuments = 12`;
+}
+
+async function redisSteps() {
+  const name = m7.redis.name;
+  const out = {};
+  report.m7.redis = out;
+  const session = await sessionOf(name);
+
+  // Browse: database 0 -> m7: opens the key browser on m7:*; then the m7:ns: namespace.
+  const ns = await treeRow([name, "0"], "m7:");
+  if (!ns) throw new Error('the namespace "m7:" is not in the object tree of database 0');
+  await treeMenu(ns, "Browse these keys");
+  const browser = await waitFor("the key browser", () => within(null, "[data-testid=key-browser]"));
+  const keyCount = async (what) =>
+    waitFor(
+      what,
+      async () => {
+        const status = (await textIn(browser, "[data-testid=key-status]")) ?? "";
+        if (status.startsWith("Failed")) throw new Fatal(`key scan: ${status}`);
+        if (status.includes("…") || status.startsWith("Scanning")) return null;
+        const n = parseCount(status);
+        return n === null ? null : { n };
+      },
+      { timeoutMs: 30_000 },
+    );
+  const scanFor = async (pattern) => {
+    await typeInto(await within(browser, "[data-testid=key-pattern]"), pattern);
+    await wd.click(await within(browser, "[data-testid=key-scan]"));
+    await sleep(300);
+    return (await keyCount(`the scan of ${pattern}`)).n;
+  };
+  out.nsKeys = await scanFor("m7:ns:*");
+  if (!out.nsKeys) throw new Error("no key under m7:ns:");
+
+  // Open m7:hash in the typed editor.
+  out.hashKeys = await scanFor("m7:hash");
+  const openKey = async (key) => {
+    const row = await waitFor(`the key ${key} in the list`, () =>
+      wd.executeElement(
+        "for (const r of arguments[0].querySelectorAll('[data-testid=key-row]'))" +
+          "  if (r.querySelector('.key-list__name')?.textContent === arguments[1]) return r;" +
+          "return null;",
+        browser,
+        key,
+      ),
+    );
+    await wd.execute("arguments[0].click();", row);
+    return waitFor(`the value editor of ${key}`, () =>
+      wd.executeElement(
+        "const e = arguments[0].querySelector('[data-testid=key-editor]');" +
+          "return e && e.getAttribute('aria-label') === 'Key ' + arguments[1] ? e : null;",
+        browser,
+        key,
+      ),
+    );
+  };
+  const hash = await openKey("m7:hash");
+  out.hashValue = await waitFor("the fields of m7:hash", async () => {
+    const meta = (await textIn(hash, "[data-testid=key-meta]")) ?? "";
+    const count = (await textIn(hash, "[data-testid=value-count]")) ?? "";
+    return meta.includes("Hash") && parseCount(count) > 0 && !count.includes("…") ? count : null;
+  });
+  await gallery("05-redis-key-browser");
+
+  // Edit: a string key of its own, changed in the string editor and read back with GET.
+  const key = `m7:edit:t${runToken()}:s`;
+  const address = { database: "0", key: { encoding: "utf8", text: key } };
+  const created = await ipc("key_apply", {
+    sessionId: session.id,
+    request: {
+      address,
+      create: true,
+      edits: [{ type: "setString", value: { encoding: "utf8", text: "before" } }],
+    },
+    requestId: null,
+  });
+  if (!created.committed) throw new Error(`could not create ${key}: ${JSON.stringify(created)}`);
+  try {
+    await scanFor(key);
+    const editor = await openKey(key);
+    const value = await waitFor("the string value", async () => {
+      const area = await within(editor, "[data-testid=string-value]");
+      return area && (await wd.execute("return arguments[0].value;", area)) === "before"
+        ? area
+        : null;
+    });
+    await typeInto(value, "after");
+    await wd.click(await within(editor, "[data-testid=string-save]"));
+    await waitFor("the key to be saved", async () => {
+      const error = await textIn(editor, "[data-testid=key-error]");
+      if (error) throw new Fatal(`save failed: ${error}`);
+      const rows = await scriptViaIpc(session.id, `GET ${key}`);
+      return rows.some((r) => r.includes("after"));
+    });
+    out.edited = key;
+  } finally {
+    await ipc("key_apply", {
+      sessionId: session.id,
+      request: { address, edits: [{ type: "delete" }], confirmDestructive: true },
+      requestId: null,
+    }).catch((error) => log(`could not delete ${key}: ${error.message}`));
+  }
+
+  // Query: the console runs HGETALL m7:hash and shows the reply.
+  const root = await treeRow([], name);
+  if (!root) throw new Error(`the connection "${name}" is not in the object tree`);
+  await treeMenu(root, "Console");
+  const consoleTab = await waitFor("the console", async () =>
+    wd.executeElement(
+      "const all = Array.from(document.querySelectorAll('[data-testid=redis-console]')).filter((e) => e.offsetParent !== null);" +
+        "return all.length ? all[all.length - 1] : null;",
+    ),
+  );
+  const input = await within(consoleTab, "[data-testid=console-input]");
+  await typeInto(input, "HGETALL m7:hash");
+  await wd.sendKeys(input, Keys.enter);
+  out.console = await waitFor(
+    "the reply of HGETALL m7:hash",
+    async () => {
+      const text = (await textIn(consoleTab, "[data-testid=console-output]")) ?? "";
+      if (text.includes("(error)"))
+        throw new Fatal(`the console shows an error: ${text.slice(-300)}`);
+      const reply = await within(consoleTab, "[data-testid=resp-table], [data-testid=resp-lines]");
+      if (!reply) return null;
+      const shown = (await textIn(consoleTab, "[data-testid=console-output]")) ?? "";
+      const want = ["f1", "v1", "f2", "v2", "f3", "grüße"];
+      if (!want.every((w) => shown.includes(w))) return null;
+      return shown.slice(-200);
+    },
+    { timeoutMs: 20_000 },
+  );
+  return `m7:ns: ${out.nsKeys} keys; m7:hash ${out.hashValue}; edited ${out.edited}; HGETALL shown`;
+}
+
 function markdownSummary() {
   const lines = ["## Webview smoke (Linux)", ""];
   lines.push("| Step | Result | Time | Detail |", "|---|---|---|---|");
@@ -1749,6 +2425,12 @@ function markdownSummary() {
         ` (limit ${m.ipc.limitMs}), core p95 ${m.ipc.coreMs.p95} ms, cache ${m.cache}.`,
     );
   }
+  if (report.m7) {
+    const m = report.m7;
+    lines.push(
+      `M7: MongoDB ${m.mongo ? JSON.stringify(m.mongo) : "not run"}; Redis ${m.redis ? JSON.stringify(m.redis) : "not run"}.`,
+    );
+  }
   if (report.cancel) {
     lines.push(
       `Cancel: "Cancelled" ${report.cancel.ms} ms after Stop (limit ${config.cancelLimitMs} ms), ` +
@@ -1778,6 +2460,18 @@ async function main() {
       M5_GATE,
     );
     await step("Completion lists a fixture table (M6 code insight)", insightStep, M6_GATE);
+  }
+
+  if (ok) {
+    // M7 (docs/m7-contracts.md §11): profiles for the MongoDB and Redis fixtures, then browse,
+    // edit and query on both. Tolerant (skips) until OXBASE_E2E_REQUIRE_M7=1.
+    const ready = await step("Add the MongoDB and Redis fixture profiles (M7)", m7Setup, M7_GATE);
+    if (ready && m7.mongo) {
+      await step("Browse, edit and query MongoDB (M7)", () => m7Tolerant(mongoSteps), M7_GATE);
+    }
+    if (ready && m7.redis) {
+      await step("Browse, edit and query Redis (M7)", () => m7Tolerant(redisSteps), M7_GATE);
+    }
   }
 
   const failed = results.some((r) => r.status === "failed");

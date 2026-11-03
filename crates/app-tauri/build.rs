@@ -59,6 +59,19 @@ const COMMANDS: &[&str] = &[
     "snippet_list",
     "snippet_save",
     "snippet_delete",
+    // M7 MongoDB and Redis (src/nosql.rs).
+    "document_find",
+    "document_aggregate",
+    "document_at",
+    "document_get",
+    "document_apply",
+    "key_scan_open",
+    "key_info",
+    "key_value_open",
+    "key_apply",
+    "pubsub_subscribe",
+    "pubsub_unsubscribe",
+    "pubsub_publish",
 ];
 
 fn main() {

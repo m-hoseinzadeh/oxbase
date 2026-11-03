@@ -297,6 +297,12 @@ export interface RunOptions {
   stopOnError?: boolean;
   recordHistory?: boolean;
   keepPrevious?: boolean;
+  /**
+   * M7: run statements the editor language marks as needing confirmation (Redis `FLUSHDB`,
+   * mongo-shell `dropDatabase()`). Without it such a run is refused with an `invalid_input`
+   * error whose message starts with `CONFIRMATION_REQUIRED` (see `./nosql`).
+   */
+  confirmDestructive?: boolean;
 }
 
 /** A statement of the script. Lines and columns are 1-based, columns in UTF-16 units. */

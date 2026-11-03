@@ -37,6 +37,14 @@
 //! [`SqlLanguage`] data (module [`language`]: keywords, reserved words, built-in functions,
 //! data types, identifier characters), both registered next to the other engine-wide roles.
 //!
+//! M7 adds the roles of the engines without SQL (`docs/m7-contracts.md`): the per-engine
+//! editor language [`ScriptLanguage`] (module [`script`]: split, redact and guard mongo-shell
+//! and Redis console statements, so the query service runs them like SQL), the document role
+//! [`DocumentStore`] (module [`document`]: find / aggregate as Arrow pages, optimistic document
+//! edits), the key-value role [`KeyValueStore`] (module [`keyvalue`]: `SCAN`-based key browsing,
+//! typed value reads, atomic key edits) and [`PubSub`] (module [`pubsub`]). Tree layouts may
+//! rename kinds ([`TreeLayout::with_label`]: MongoDB tables are "Collections").
+//!
 //! How engine crates register their cells: see [`DialectRegistry`] (*Registration*). The
 //! contracts are in `docs/m2-contracts.md`, `docs/m3-contracts.md`, `docs/m4-contracts.md` and
 //! `docs/m5-contracts.md` and `docs/m6-contracts.md`.
@@ -47,10 +55,14 @@ pub mod catalog;
 pub mod compare;
 mod ddl;
 mod dml;
+pub mod document;
 pub mod dump;
+pub mod keyvalue;
 pub mod language;
+pub mod pubsub;
 mod quoting;
 mod registry;
+pub mod script;
 pub mod sql;
 mod tree;
 
@@ -68,12 +80,16 @@ pub use capability::{DesignerCapabilities, Support};
 pub use catalog::{CatalogReader, CatalogScope, RelationName};
 pub use ddl::DdlContext;
 pub use dml::{DmlPlan, DmlTarget, write_column_list, write_key_predicate};
+pub use document::DocumentStore;
 pub use dump::{DumpLiteral, DumpSession, IdentityInsert};
+pub use keyvalue::KeyValueStore;
 pub use language::{FunctionInfo, FunctionKind, SqlLanguage, TypeInfo, TypeParams};
+pub use pubsub::{PubSub, PubSubEvent, SubscribeRequest, Subscription};
 pub use quoting::{AnsiQuoting, BacktickQuoting, BracketQuoting, LexRules, PgQuoting, Quoting};
 pub use registry::{
     CellRole, CellStatus, CoverageMatrix, DESIGNER_KINDS, DialectRegistry, EngineRole, MissingCell,
 };
+pub use script::{CONFIRMATION_REQUIRED, ScriptLanguage, StatementGuard};
 pub use tree::{ChildGroup, DatabaseScope, TreeLayout};
 
 /// Reads objects of one kind from a live connection. One implementation per (engine, kind).

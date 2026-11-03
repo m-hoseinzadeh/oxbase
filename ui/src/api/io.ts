@@ -244,7 +244,9 @@ export type BulkMethod =
   | "copy_binary"
   | "multi_row_insert"
   | "prepared_insert"
-  | "tds_bulk_load";
+  | "tds_bulk_load"
+  // M7: MongoDB insertMany batches.
+  | "document_insert";
 
 export interface PlannedColumn {
   source: number;

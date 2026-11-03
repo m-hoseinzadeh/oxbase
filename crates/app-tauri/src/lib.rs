@@ -30,6 +30,12 @@
 //!   `schema_cache_status`, `snippet_list`, `snippet_save` and `snippet_delete`. Contract:
 //!   `docs/m6-contracts.md` §7.
 //!
+//! * MongoDB and Redis (M7, `src/nosql.rs`): `document_find`, `document_aggregate`,
+//!   `document_at`, `document_get`, `document_apply`, `key_scan_open`, `key_info`,
+//!   `key_value_open`, `key_apply`, `pubsub_subscribe` (events through a `Channel`),
+//!   `pubsub_unsubscribe` and `pubsub_publish`. The mongo shell and the Redis console run
+//!   through `query_run` and `statement_at`. Contract: `docs/m7-contracts.md` §8.
+//!
 //! Every fallible command rejects with [`error::CommandError`], serialized as
 //! `{ "category": "<snake_case ErrorCategory>", "message": "..." }`.
 //!
@@ -44,6 +50,7 @@ mod designer;
 mod error;
 mod files;
 mod insight;
+mod nosql;
 mod profiles;
 mod transfer;
 mod workbench;
@@ -107,6 +114,7 @@ pub fn run() {
             app.manage(states.transfer);
             app.manage(states.files);
             app.manage(states.insight);
+            app.manage(states.nosql);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -160,6 +168,18 @@ pub fn run() {
             insight::snippet_list,
             insight::snippet_save,
             insight::snippet_delete,
+            nosql::document_find,
+            nosql::document_aggregate,
+            nosql::document_at,
+            nosql::document_get,
+            nosql::document_apply,
+            nosql::key_scan_open,
+            nosql::key_info,
+            nosql::key_value_open,
+            nosql::key_apply,
+            nosql::pubsub_subscribe,
+            nosql::pubsub_unsubscribe,
+            nosql::pubsub_publish,
         ])
         .build(tauri::generate_context!())
         .expect("error while building the oxbase desktop shell");

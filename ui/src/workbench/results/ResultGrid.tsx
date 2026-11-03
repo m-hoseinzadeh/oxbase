@@ -37,7 +37,13 @@ import {
 import type { ColumnInfo } from "../../api";
 import { normalizeColor, subscribeTheme } from "../theme-bridge";
 import { type CopyNotify, cellsForSelection, NULL_COPY_TEXT } from "./copy";
-import { cellDisplayText, columnTypeLabel, formatCell, initialColumnWidth } from "./format";
+import {
+  cellDisplayText,
+  columnTypeLabel,
+  formatCell,
+  initialColumnWidth,
+  visibleColumns,
+} from "./format";
 import { dataCellOf } from "./gridCoords";
 import type { ResultPager } from "./pager";
 import { fromGridSelection, type GridRowSelection, toGridSelection } from "./rowSelection";
@@ -212,6 +218,7 @@ const OverlayEditor: ProvideEditorComponent<GridCell> = ({ initialValue, onFinis
 
 export interface ResultGridProps {
   pager: ResultPager;
+  /** The result's columns; a trailing whole-document column (`$document`) is not shown. */
   columns: ColumnInfo[];
   /** Rows stored so far; grows while the result streams. */
   rowCount: number;
@@ -236,13 +243,15 @@ const NO_SELECTION: GridSelection = {
 
 export function ResultGrid({
   pager,
-  columns,
+  columns: resultColumns,
   rowCount,
   onNotice,
   edit,
   onSelectRows,
   selectedRows,
 }: ResultGridProps) {
+  // The document column is always last, so the shown columns keep their page indexes.
+  const columns = useMemo(() => visibleColumns(resultColumns), [resultColumns]);
   const gridRef = useRef<DataEditorRef>(null);
   const portalRef = useRef<HTMLDivElement>(null);
   const region = useRef<Rectangle>({ x: 0, y: 0, width: 0, height: 0 });

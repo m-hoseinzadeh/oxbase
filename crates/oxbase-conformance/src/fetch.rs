@@ -28,6 +28,10 @@
 //! Server engines are seeded by their Docker init scripts (`[m2.<engine>] init_sql`). SQLite
 //! has no container: the harness applies its `init_sql` to a fresh scratch file and attaches a
 //! second file as `attached_as` holding `attached_table`, as `[m2.sqlite]` describes.
+//!
+//! Since M7 MongoDB and Redis run the same cells against their `[m7]` seed (02-m7.js,
+//! seed-m7.redis; groups from [`seeds::m7_mongo_groups`] / [`seeds::m7_redis_groups`]) once their
+//! dialect cells are registered; until then their cells stay pending.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -42,8 +46,8 @@ use oxbase_types::{Engine, ObjectDef, ObjectKind, ObjectRef, ObjectSummary, Valu
 use crate::adapter;
 use crate::connect::{Ctx, millis};
 use crate::fixtures::{Fixtures, M2EngineSeed, ResolvedEngine, in_workspace};
-use crate::guard::{self, M4_ENGINES};
-use crate::matrix::{Cell, CellStatus, Check, driver_milestone};
+use crate::guard::{self, M4_ENGINES, M7_ENGINES};
+use crate::matrix::{Cell, CellStatus, Check};
 use crate::seeds::{self, SeedGroup};
 
 /// Upper bound for one cell (waiting for the session, then every list and load of one kind).
@@ -90,12 +94,9 @@ pub struct FetchOutcome {
     pub elapsed_ms: Option<u64>,
 }
 
-/// The kinds whose `fetch_list` cell can run on `engine`: the engine has a driver, the kind
-/// applies, and a [`Fetcher`] is registered for it.
+/// The kinds whose `fetch_list` cell can run on `engine`: the kind applies and a [`Fetcher`]
+/// is registered for it.
 pub fn runnable_kinds(registry: &DialectRegistry, engine: Engine) -> Vec<ObjectKind> {
-    if driver_milestone(engine).is_some() {
-        return Vec::new();
-    }
     ObjectKind::ALL
         .into_iter()
         .filter(|&k| adapter::applies(registry, engine, k) && registry.fetcher(engine, k).is_ok())
@@ -104,12 +105,19 @@ pub fn runnable_kinds(registry: &DialectRegistry, engine: Engine) -> Vec<ObjectK
 
 /// The seed groups of `kind` for the fixture `e` (empty when the fixtures seed nothing): the
 /// `[m2]` groups, then the `[m4]` ones of an engine with an `[m4.<engine>]` table, every group
-/// of such an engine also carrying the `[m4]` names no list of `kind` may return.
+/// of such an engine also carrying the `[m4]` names no list of `kind` may return, then the
+/// `[m7]` ones of MongoDB and Redis.
 pub fn groups_for(fixtures: &Fixtures, e: &ResolvedEngine, kind: ObjectKind) -> Vec<SeedGroup> {
     let mut groups = fixtures
         .m2_seed(&e.name, e.engine)
         .map(|(m2, seed)| seeds::seed_groups(m2, seed, kind))
         .unwrap_or_default();
+    if let Some(seed) = fixtures.m7_mongo(e.engine) {
+        groups.extend(seeds::m7_mongo_groups(seed, kind));
+    }
+    if let Some(seed) = fixtures.m7_redis(e.engine) {
+        groups.extend(seeds::m7_redis_groups(seed, kind));
+    }
     if let Some((m4, seed)) = fixtures.m4_seed(&e.name, e.engine) {
         groups.extend(seeds::m4_groups(m4, &seed, kind));
         let never = seeds::m4_never_listed(m4, kind);
@@ -600,14 +608,20 @@ pub struct GateOptions {
     /// The same for every [`M4_ENGINES`] fixture, SQL Server included (the 5-engine guard,
     /// `OXBASE_CONFORMANCE_REQUIRE_M4=1`, [`crate::guard`]).
     pub require_m4: bool,
+    /// The same for every [`M7_ENGINES`] fixture, MongoDB and Redis included (the 7-engine
+    /// guard, `OXBASE_CONFORMANCE_REQUIRE_M7=1`); their seed is the `[m7]` one.
+    pub require_m7: bool,
 }
 
 impl GateOptions {
     /// The engines that must have a layout and a seed, and the variable that asked for it.
     fn required(self) -> Option<(&'static [Engine], &'static str)> {
+        let m7: &'static [Engine] = &M7_ENGINES;
         let m4: &'static [Engine] = &M4_ENGINES;
         let m2: &'static [Engine] = &M2_ENGINES;
-        if self.require_m4 {
+        if self.require_m7 {
+            Some((m7, guard::REQUIRE_M7_ENV))
+        } else if self.require_m4 {
             Some((m4, guard::REQUIRE_ENV))
         } else if self.require_m2 {
             Some((m2, REQUIRE_M2_ENV))
@@ -627,7 +641,8 @@ pub const REQUIRE_M2_ENV: &str = "OXBASE_CONFORMANCE_REQUIRE_M2_FETCH";
 /// - every kind of a registered [`TreeLayout`] passes or is n/a: pending means the Fetcher or
 ///   the seed object is missing;
 /// - an engine with a registered layout has at least one passing cell;
-/// - with [`GateOptions::require_m2`], every [`M2_ENGINES`] fixture has a layout and a seed.
+/// - with [`GateOptions::require_m2`], every [`M2_ENGINES`] fixture has a layout and a seed
+///   (likewise [`M4_ENGINES`] with `require_m4` and [`M7_ENGINES`] with `require_m7`).
 ///
 /// [`TreeLayout`]: oxbase_dialect::TreeLayout
 pub fn gate(
@@ -683,10 +698,11 @@ pub fn gate(
                     e.name, e.engine
                 ));
             }
-            if fixtures.m2_seed(&e.name, e.engine).is_none() {
+            if !fixtures.has_tree_seed(&e.name, e.engine) {
                 problems.push(format!(
-                    "{}: tests/fixtures.toml has no [m2.{}] ({env} is set)",
-                    e.name, e.name
+                    "{}: tests/fixtures.toml has no [m2.{}] (SQL engines) or [m7.{}] (MongoDB, \
+                     Redis) seed ({env} is set)",
+                    e.name, e.name, e.engine
                 ));
             }
         }
@@ -1085,7 +1101,7 @@ mod tests {
     const NO_KINDS: Vec<ObjectKind> = Vec::new();
 
     #[test]
-    fn engines_without_a_driver_or_fetchers_run_nothing() {
+    fn engines_without_fetchers_run_nothing() {
         let reg = adapter::provisional_registry();
         for engine in Engine::ALL {
             assert_eq!(runnable_kinds(&reg, engine), NO_KINDS, "{engine}");
@@ -1101,8 +1117,8 @@ mod tests {
             ObjectKind::View,
             Arc::new(Fake::new(Vec::new())),
         );
-        // Redis has no driver before M7.
-        assert_eq!(runnable_kinds(&reg, Engine::Redis), NO_KINDS);
+        // Every engine has a driver since M7: a registered fetcher is enough.
+        assert_eq!(runnable_kinds(&reg, Engine::Redis), [ObjectKind::Key]);
         assert_eq!(runnable_kinds(&reg, Engine::Sqlite), [ObjectKind::View]);
     }
 
@@ -1437,6 +1453,69 @@ objects = [\"t_parent\", \"t_child\", \"m2_view\", \"t_trg\"]
               (OXBASE_CONFORMANCE_REQUIRE_M4 is set)"
             ]
         );
+    }
+
+    #[test]
+    fn gate_requires_a_layout_and_the_m7_seed_for_mongodb_and_redis_when_guarded() {
+        let fx = Fixtures::parse(
+            "schema_version = 1
+[engines.mongodb]
+kind = \"mongodb\"
+port = 15417
+[engines.redis]
+kind = \"redis\"
+port = 15479
+[m7.mongodb]
+database = \"oxbase_test\"
+collections = [\"m7_docs\"]
+",
+            "m7",
+        )
+        .unwrap();
+        let engines = fx.resolve().unwrap();
+        let reg = adapter::provisional_registry();
+        let mut cells = plan_engine_in(&reg, "mongodb", Engine::MongoDb);
+        cells.extend(plan_engine_in(&reg, "redis", Engine::Redis));
+        let opts = GateOptions::default();
+        // Unregistered cells stay pending, which is fine without the guard.
+        assert_eq!(
+            gate(&cells, &fx, &engines, &reg, opts),
+            Vec::<String>::new()
+        );
+        // Under the M4 guard MongoDB and Redis are not required.
+        let m4 = GateOptions {
+            require_m4: true,
+            ..opts
+        };
+        assert_eq!(gate(&cells, &fx, &engines, &reg, m4), Vec::<String>::new());
+        let p = gate(
+            &cells,
+            &fx,
+            &engines,
+            &reg,
+            GateOptions {
+                require_m7: true,
+                ..opts
+            },
+        );
+        assert_eq!(
+            p,
+            [
+                "mongodb: mongodb registers no tree layout in oxbase_services::default_dialects \
+                 (OXBASE_CONFORMANCE_REQUIRE_M7 is set)",
+                "redis: redis registers no tree layout in oxbase_services::default_dialects \
+                 (OXBASE_CONFORMANCE_REQUIRE_M7 is set)",
+                "redis: tests/fixtures.toml has no [m2.redis] (SQL engines) or [m7.redis] \
+                 (MongoDB, Redis) seed (OXBASE_CONFORMANCE_REQUIRE_M7 is set)",
+            ]
+        );
+        // The [m7] seeds become the cells' groups.
+        let mongo = &engines[0];
+        assert_eq!(mongo.engine, Engine::MongoDb);
+        let tables = groups_for(&fx, mongo, ObjectKind::Table);
+        assert_eq!(tables.len(), 1);
+        assert_eq!(tables[0].names, ["m7_docs"]);
+        assert_eq!(groups_for(&fx, &engines[1], ObjectKind::Key), Vec::new());
     }
 
     #[test]

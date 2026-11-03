@@ -100,6 +100,37 @@ import / export step (step 9) once the integrator turns it on.
       `format-button`, `snippets-button`, `schema-cache-status` (`data-state` = `ready`,
       `stale`, `missing`, `building`, `failed`, ...) and `schema-cache-refresh`.
 
+11. **MongoDB and Redis (M7)** (docs/m7-contracts.md §11):
+    - **Setup.** The test reads `[engines.mongodb]` and `[engines.redis]` from
+      `tests/fixtures.toml` and checks that each fixture port answers. For each one that does it
+      saves a profile through IPC (`save_profile`, password _prompt_, TLS off: "E2E MongoDB"
+      with `auth_source`, "E2E Redis"), reloads the window (the Connections panel lists profiles
+      when it mounts; the core keeps its sessions) and connects through the Connections panel
+      and its password prompt. `scripts/e2e-fixtures.sh` starts both (with PostgreSQL); an
+      unreachable fixture is a skip unless `OXBASE_E2E_REQUIRE_M7=1`.
+    - **MongoDB.** The tree path `oxbase_test` → `Collections` → `m7_docs` opens the collection
+      tab (`data-testid=collection-tab`, labelled "Collection oxbase_test.m7_docs"), whose status
+      (`collection-status`) must reach 12 documents and whose grid must not show `$document`.
+      Screenshots `ui-04-mongo-collection-{dark,light}`. It inserts a document of its own
+      (`_id` `e2e-t<token>`) into `m7_edit` through `document_apply`, opens `m7_edit`, types the
+      filter `{"_id": ...}` into the builder (`find-filter`) and runs it (`collection-run`),
+      selects the row, edits it in the document dialog (`document-edit`, `document-editor`,
+      `document-save`) to `n: 2`, reads it back with `document_get` and deletes it (also after
+      a failure). Then **New query** on the database row opens the mongo shell; it runs
+      `db.m7_docs.countDocuments({})`, which must finish and show `12`.
+    - **Redis.** The context menu of the tree's `m7:` namespace (database 0) opens the key
+      browser (`key-browser`) on `m7:*`; scanning `m7:ns:*` (`key-pattern`, `key-scan`,
+      `key-status`) must find keys; `m7:hash` opens in the typed editor (`key-editor`,
+      `key-meta` says Hash, `value-count` has rows). Screenshots
+      `ui-05-redis-key-browser-{dark,light}`. It creates `m7:edit:t<token>:s` = `before`
+      through `key_apply`, opens it, changes the string editor (`string-value`, `string-save`)
+      to `after`, checks it with `GET` through IPC and deletes the key. The connection's
+      **Console** runs `HGETALL m7:hash` (`console-input`); the reply (`resp-table` or
+      `resp-lines`) must show without `(error)`.
+    - Without `OXBASE_E2E_REQUIRE_M7=1`, a missing fixture or any failure of these steps is a
+      skip with a warning. The webview job sets it (M7 integration), so there a skip or a
+      failure fails the run.
+
 ### The M5 file hook (app stream)
 
 What the test expects from the app, in **debug builds only** (`#[cfg(debug_assertions)]`, so a

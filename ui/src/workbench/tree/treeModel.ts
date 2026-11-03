@@ -2,7 +2,7 @@
  * The object tree's view model: which nodes are expanded, what their children are (loaded lazily
  * with `tree_children`), and the flat list of rows the panel renders and navigates.
  */
-import type { ObjectRef, TreeNode, TreeNodeRef, Value } from "../../api";
+import type { BinaryText, Extras, ObjectRef, TreeNode, TreeNodeRef, Value } from "../../api";
 import type { Engine, SessionSummary } from "../../connections/types";
 
 /** A node's id in the panel: its session plus the core's node key. */
@@ -37,6 +37,8 @@ export type Row =
       engine?: Engine;
       system: boolean;
       comment?: string;
+      /** The object's listing extras (M7: a Redis key's `key_type`, `ttl_ms`, `key_hex`). */
+      extras?: Extras;
       parentId: string | null;
       posInSet: number;
       setSize: number;
@@ -75,7 +77,46 @@ export function nodeDetail(node: TreeNode): string {
   if (summary.row_estimate !== undefined && summary.ref.kind !== "column") {
     parts.push(`~${compactCount(summary.row_estimate)} rows`);
   }
+  // M7: Redis keys and namespaces, MongoDB collections.
+  const keyType = textExtra(summary.extras?.key_type);
+  if (keyType) parts.push(keyType);
+  const ttl = summary.extras?.ttl_ms;
+  if (ttl && (ttl.type === "int" || ttl.type === "u_int") && ttl.value >= 0) {
+    parts.push(`TTL ${ttlLabel(ttl.value)}`);
+  }
+  const keys = summary.extras?.key_count;
+  if (keys && (keys.type === "int" || keys.type === "u_int")) {
+    parts.push(`${compactCount(keys.value)} ${keys.value === 1 ? "key" : "keys"}`);
+  }
+  const docs = summary.extras?.document_count;
+  if (
+    docs &&
+    (docs.type === "int" || docs.type === "u_int") &&
+    summary.row_estimate === undefined
+  ) {
+    parts.push(`${compactCount(docs.value)} docs`);
+  }
+  const truncated = summary.extras?.truncated;
+  if (truncated?.type === "bool" && truncated.value) parts.push("more in the key browser");
   return parts.join(" · ");
+}
+
+function ttlLabel(ms: number): string {
+  const s = Math.round(ms / 1000);
+  if (s < 60) return `${s} s`;
+  if (s < 3600) return `${Math.round(s / 60)} min`;
+  if (s < 86_400) return `${Math.round(s / 3600)} h`;
+  return `${Math.round(s / 86_400)} d`;
+}
+
+/**
+ * The key of a Redis key node as bytes: its `key_hex` extra when the name is not UTF-8 (the
+ * label then shows `\xHH` escapes), else its name.
+ */
+export function keyBytesOf(object: ObjectRef, extras: Extras | undefined): BinaryText {
+  const hex = extras?.key_hex;
+  if (hex?.type === "text" && hex.value !== "") return { encoding: "hex", hex: hex.value };
+  return { encoding: "utf8", text: object.name };
 }
 
 export function iconOf(ref: TreeNodeRef): string {
@@ -131,6 +172,7 @@ export function flattenTree(sessions: SessionSummary[], state: TreeState): Row[]
       const id = nodeId(sessionId, node.key);
       const expanded = node.expandable && state.expanded.has(id);
       const comment = node.summary?.comment;
+      const extras = node.summary?.extras;
       rows.push({
         type: "node",
         id,
@@ -144,6 +186,7 @@ export function flattenTree(sessions: SessionSummary[], state: TreeState): Row[]
         icon: iconOf(node.node),
         system: node.summary?.system ?? false,
         ...(comment ? { comment } : {}),
+        ...(extras ? { extras } : {}),
         parentId,
         posInSet: index + 1,
         setSize: children.nodes.length,

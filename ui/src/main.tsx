@@ -7,6 +7,7 @@ import "./workbench/workbench.css";
 import "./workbench/m3.css";
 import "./workbench/transfer/transfer.css";
 import "./workbench/editor/insight/insight.css";
+import "./workbench/nosql/nosql.css";
 
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";

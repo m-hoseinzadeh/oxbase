@@ -3,17 +3,24 @@
  * objects below it. Children are listed on demand (`tree_children`) when a node is first
  * expanded; a collapsed node's pending request is cancelled. Keyboard: arrows move and
  * expand/collapse, Home/End jump, Enter toggles (or retries a failed load), F5 refreshes.
+ *
+ * M7: a MongoDB collection opens in a collection tab and "New query" opens the mongo shell; a
+ * Redis key opens in the key browser, and Redis rows offer the key browser, the console and
+ * Pub/Sub. SQL-only actions (design, new table, export) are not offered for them.
  */
 import {
   ChevronRight,
   CircleAlert,
   FileInput,
   FileOutput,
+  KeyRound,
   Loader2,
   PencilRuler,
+  Radio,
   RefreshCw,
   RotateCw,
   SquarePen,
+  SquareTerminal,
   Table2,
   TableProperties,
   Unplug,
@@ -24,7 +31,17 @@ import { ContextMenu, type MenuItem } from "../../components/ContextMenu";
 import { ICON, ICON_LG, ICON_SM } from "../../components/icons";
 import { cancelRequest, newRequestId, toCommandError } from "../../connections/api";
 import { useConnections } from "../../connections/store";
-import { openQueryEditor, openTableData, openTableDesigner } from "../layout";
+import {
+  openCollection,
+  openConsole,
+  openKeyBrowser,
+  openPubSub,
+  openQueryEditor,
+  openTableData,
+  openTableDesigner,
+} from "../layout";
+import { type EngineFamily, engineFamily } from "../nosql/engines";
+import { prefixPattern } from "../nosql/keys/keyModel";
 import { openExport, openImport } from "../transfer/store";
 import { TreeIcon } from "./TreeIcon";
 import {
@@ -32,6 +49,7 @@ import {
   cachedDescendants,
   databaseOf,
   flattenTree,
+  keyBytesOf,
   type Row,
 } from "./treeModel";
 
@@ -86,6 +104,18 @@ export function importTarget(row: Row | null): ObjectRef | null | undefined {
   return kind === "database" || kind === "schema" || kind === "table" ? ref.object : undefined;
 }
 
+/** The Redis key a row stands for, if it is a key node. */
+function keyObject(row: Row | null): ObjectRef | null {
+  if (row?.type !== "node" || row.ref.type !== "object") return null;
+  return row.ref.object.kind === "key" ? row.ref.object : null;
+}
+
+/** The namespace prefix (`m7:ns:`) of a Redis namespace row. */
+function namespaceOf(row: Row): string | undefined {
+  if (row.type !== "node" || row.ref.type !== "object") return undefined;
+  return row.ref.object.kind === "schema" ? row.ref.object.name : undefined;
+}
+
 function isNavigable(row: Row): boolean {
   return row.type === "node" || row.type === "error";
 }
@@ -104,6 +134,15 @@ export function ObjectTreePanel() {
 
   const rows = flattenTree(sessions, { expanded, children });
   const selectedRow = rows.find((r) => r.id === selected) ?? null;
+  const familyOf = (row: Row | null): EngineFamily =>
+    engineFamily(
+      row?.type === "node" ? sessions.find((s) => s.id === row.sessionId)?.engine : undefined,
+    );
+  /** Where a new table goes (SQL engines only). */
+  const tableTargetOf = (row: Row | null) => (familyOf(row) === "sql" ? newTableTarget(row) : null);
+  /** Where an import goes (not into a key-value store). */
+  const importTargetOf = (row: Row | null) =>
+    familyOf(row) === "keyvalue" ? undefined : importTarget(row);
 
   const cancelPending = useCallback((id: string) => {
     const requestId = pending.current.get(id);
@@ -221,46 +260,84 @@ export function ObjectTreePanel() {
     dropChildren([...children.keys()]);
   }
 
-  function newQuery() {
-    const row = selectedRow;
+  /** A query editor for the row's database: the mongo shell, the Redis console or SQL. */
+  function queryFor(row: Row | null) {
     const sessionId = row?.type === "node" ? row.sessionId : sessions[0]?.id;
     const database = row?.type === "node" ? databaseOf(row.ref) : undefined;
+    const family = row?.type === "node" ? familyOf(row) : engineFamily(sessions[0]?.engine);
+    if (family === "keyvalue" && sessionId) {
+      openConsole({ sessionId, ...(database ? { database } : {}) });
+      return;
+    }
     openQueryEditor({
       ...(sessionId ? { sessionId } : {}),
       ...(database ? { database } : {}),
+      ...(family === "document" ? { title: `Shell${database ? ` ${database}` : ""}` } : {}),
     });
   }
 
+  function newQuery() {
+    queryFor(selectedRow);
+  }
+
+  function openKeys(row: Row, withKey: boolean) {
+    if (row.type !== "node") return;
+    const database = databaseOf(row.ref);
+    const key = keyObject(row);
+    const namespace = namespaceOf(row);
+    openKeyBrowser({
+      sessionId: row.sessionId,
+      ...(database ? { database } : {}),
+      ...(namespace ? { pattern: prefixPattern(namespace) } : {}),
+      ...(withKey && key ? { openKey: keyBytesOf(key, row.extras) } : {}),
+    });
+  }
+
+  /** Whether Enter / double-click / Open has something to open for the row. */
+  function canOpen(row: Row | null): boolean {
+    return dataObject(row) !== null || keyObject(row) !== null;
+  }
+
   function openData(row: Row | null = selectedRow) {
+    if (row?.type !== "node") return;
+    if (keyObject(row)) {
+      openKeys(row, true);
+      return;
+    }
     const object = dataObject(row);
-    if (row?.type === "node" && object) openTableData({ sessionId: row.sessionId, table: object });
+    if (!object) return;
+    if (familyOf(row) === "document") {
+      openCollection({ sessionId: row.sessionId, collection: object });
+    } else {
+      openTableData({ sessionId: row.sessionId, table: object });
+    }
   }
 
   function design() {
     const row = selectedRow;
     const object = dataObject(row);
-    if (row?.type === "node" && object?.kind === "table") {
+    if (row?.type === "node" && object?.kind === "table" && familyOf(row) === "sql") {
       openTableDesigner({ sessionId: row.sessionId, table: object });
     }
   }
 
   function newTable() {
     const row = selectedRow;
-    const target = newTableTarget(row);
+    const target = tableTargetOf(row);
     if (row?.type === "node" && target) {
       openTableDesigner({ sessionId: row.sessionId, table: target, isNew: true });
     }
   }
 
   function importInto(row: Row | null = selectedRow) {
-    const target = importTarget(row);
+    const target = importTargetOf(row);
     if (row?.type !== "node" || target === undefined) return;
     openImport({ sessionId: row.sessionId, ...(target ? { target } : {}) });
   }
 
   function exportRows(row: Row | null = selectedRow) {
     const object = dataObject(row);
-    if (row?.type !== "node" || !object) return;
+    if (row?.type !== "node" || !object || familyOf(row) !== "sql") return;
     const engine = sessions.find((s) => s.id === row.sessionId)?.engine;
     const what = object.kind === "table" ? "Table" : "View";
     openExport({
@@ -274,11 +351,13 @@ export function ObjectTreePanel() {
 
   function menuItems(row: Row): MenuItem[] {
     if (row.type !== "node") return [];
+    const family = familyOf(row);
+    if (family === "keyvalue") return keyValueItems(row);
     const items: MenuItem[] = [];
     const object = dataObject(row);
     if (object) {
       items.push({ label: "Open", icon: Table2, onSelect: () => openData(row) });
-      if (object.kind === "table") {
+      if (object.kind === "table" && family === "sql") {
         items.push({
           label: "Design",
           icon: PencilRuler,
@@ -286,7 +365,7 @@ export function ObjectTreePanel() {
         });
       }
     }
-    const tableTarget = newTableTarget(row);
+    const tableTarget = tableTargetOf(row);
     if (tableTarget) {
       items.push({
         label: "New table",
@@ -297,15 +376,12 @@ export function ObjectTreePanel() {
       });
     }
     items.push({
-      label: "New query",
-      icon: SquarePen,
+      label: family === "document" ? "Mongo shell" : "New query",
+      icon: family === "document" ? SquareTerminal : SquarePen,
       separatorBefore: !tableTarget,
-      onSelect: () => {
-        const database = databaseOf(row.ref);
-        openQueryEditor({ sessionId: row.sessionId, ...(database ? { database } : {}) });
-      },
+      onSelect: () => queryFor(row),
     });
-    if (importTarget(row) !== undefined) {
+    if (importTargetOf(row) !== undefined) {
       items.push({
         label: object ? "Import into this table…" : "Import data…",
         icon: FileInput,
@@ -313,14 +389,49 @@ export function ObjectTreePanel() {
         onSelect: () => importInto(row),
       });
     }
-    if (object) {
+    if (object && family === "sql") {
       items.push({
         label: "Export…",
         icon: FileOutput,
-        separatorBefore: importTarget(row) === undefined,
+        separatorBefore: importTargetOf(row) === undefined,
         onSelect: () => exportRows(row),
       });
     }
+    items.push({
+      label: "Refresh",
+      icon: RefreshCw,
+      shortcut: "F5",
+      separatorBefore: true,
+      onSelect: refresh,
+    });
+    return items;
+  }
+
+  /** Redis rows: the key (or the key browser here), the console and Pub/Sub. */
+  function keyValueItems(row: Row): MenuItem[] {
+    if (row.type !== "node") return [];
+    const items: MenuItem[] = [];
+    const database = databaseOf(row.ref);
+    if (keyObject(row)) {
+      items.push({ label: "Open key", icon: KeyRound, onSelect: () => openKeys(row, true) });
+    } else if (row.ref.type !== "object" || row.ref.object.kind !== "user") {
+      items.push({
+        label: namespaceOf(row) ? "Browse these keys" : "Key browser",
+        icon: KeyRound,
+        onSelect: () => openKeys(row, false),
+      });
+    }
+    items.push({
+      label: "Console",
+      icon: SquareTerminal,
+      separatorBefore: true,
+      onSelect: () => openConsole({ sessionId: row.sessionId, ...(database ? { database } : {}) }),
+    });
+    items.push({
+      label: "Pub/Sub",
+      icon: Radio,
+      onSelect: () => openPubSub({ sessionId: row.sessionId }),
+    });
     items.push({
       label: "Refresh",
       icon: RefreshCw,
@@ -372,7 +483,7 @@ export function ObjectTreePanel() {
         else if (row?.parentId) target = items.find((r) => r.id === row.parentId);
         break;
       case "Enter":
-        if (row && dataObject(row)) openData(row);
+        if (row && canOpen(row)) openData(row);
         else if (row?.type === "node") setOpen(row, !row.expanded);
         else if (row?.type === "error") dropChildren([row.parentId]);
         break;
@@ -426,7 +537,7 @@ export function ObjectTreePanel() {
           type="button"
           className="icon-button"
           onClick={() => openData()}
-          disabled={!dataObject(selectedRow)}
+          disabled={!canOpen(selectedRow)}
           aria-label="Open"
           title="Open the rows (Enter or double-click)"
         >
@@ -436,7 +547,7 @@ export function ObjectTreePanel() {
           type="button"
           className="icon-button"
           onClick={design}
-          disabled={dataObject(selectedRow)?.kind !== "table"}
+          disabled={dataObject(selectedRow)?.kind !== "table" || familyOf(selectedRow) !== "sql"}
           aria-label="Design"
           title="Design the selected table"
         >
@@ -446,7 +557,7 @@ export function ObjectTreePanel() {
           type="button"
           className="icon-button"
           onClick={newTable}
-          disabled={newTableTarget(selectedRow) === null}
+          disabled={tableTargetOf(selectedRow) === null}
           aria-label="New table"
           title="New table in the selected database or schema"
         >
@@ -456,7 +567,7 @@ export function ObjectTreePanel() {
           type="button"
           className="icon-button"
           onClick={() => importInto()}
-          disabled={importTarget(selectedRow) === undefined}
+          disabled={importTargetOf(selectedRow) === undefined}
           aria-label="Import"
           title="Import a file into the selected database, schema or table"
         >
@@ -552,7 +663,7 @@ export function ObjectTreePanel() {
                   treeRef.current?.focus();
                 }}
                 onDoubleClick={() => {
-                  if (dataObject(row)) openData(row);
+                  if (canOpen(row)) openData(row);
                   else setOpen(row, !row.expanded);
                 }}
                 onContextMenu={(e) => {

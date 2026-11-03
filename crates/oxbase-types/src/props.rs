@@ -143,6 +143,23 @@ pub const CURRENT: PropId = PropId::from_static("current");
 /// Total size on disk in bytes, when cheap to know (int).
 pub const SIZE_BYTES: PropId = PropId::from_static("size_bytes");
 
+// --- M7: document and key-value listings (`docs/m7-contracts.md` §3) ---
+
+/// Key summary: the value type, [`crate::KeyType::as_str`] (text: `string`, `hash`, ...).
+pub const KEY_TYPE: PropId = PropId::from_static("key_type");
+/// Key summary: milliseconds until the key expires (int); absent when it never expires.
+pub const TTL_MS: PropId = PropId::from_static("ttl_ms");
+/// Database or key-namespace summary: keys under it (int). With [`TRUNCATED`] a lower bound.
+pub const KEY_COUNT: PropId = PropId::from_static("key_count");
+/// Listing (bool): the fetcher stopped at its limit, so the children shown are not all of them
+/// (Redis namespaces and keys in the tree; the key browser shows the rest).
+pub const TRUNCATED: PropId = PropId::from_static("truncated");
+/// Key summary: the key's bytes as lowercase hex (text), only when they are not valid UTF-8
+/// (the ref's `name` then shows them escaped, `\xHH`).
+pub const KEY_HEX: PropId = PropId::from_static("key_hex");
+/// Collection / view summary: number of documents from the collection statistics (int).
+pub const DOCUMENT_COUNT: PropId = PropId::from_static("document_count");
+
 /// Typed map of database-specific properties, ordered by id so output is deterministic.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(transparent)]

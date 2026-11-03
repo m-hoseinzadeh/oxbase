@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::adapter::{Engine, ObjectKind};
 use crate::connect::{ConnCell, ConnCheck};
 use crate::fixtures::in_workspace;
-use crate::matrix::{Cell, CellStatus, Check, driver_milestone};
+use crate::matrix::{Cell, CellStatus, Check};
 use crate::probe::{ProbeOutcome, Target};
 
 /// Bumped when the JSON layout changes incompatibly.
@@ -370,13 +370,20 @@ impl Report {
     }
 
     /// The M3 table: engine x designer kind, each cell `roundtrip` then `capabilities` glyph,
-    /// followed by one line per cell (what ran, or why it is pending) for the engines that have
-    /// a driver.
+    /// followed by one line per cell (what ran, or why it is pending) for the engines with an
+    /// applicable designer cell (MongoDB and Redis have none once their cells are registered).
     fn render_roundtrip(&self, out: &mut String) {
         let engines: Vec<&EngineStatus> = self
             .engines
             .iter()
-            .filter(|e| driver_milestone(e.kind).is_none())
+            .filter(|e| {
+                self.cells.iter().any(|c| {
+                    c.engine == e.name
+                        && c.check == Check::Roundtrip
+                        && DESIGNER_KINDS.contains(&c.object_kind)
+                        && c.status != CellStatus::NotApplicable
+                })
+            })
             .collect();
         if engines.is_empty() {
             return;
@@ -610,7 +617,7 @@ mod tests {
             ),
             "{text}"
         );
-        // Redis has no driver before M7: no M3 rows.
+        // Redis has no designer kind: no M3 rows.
         assert!(!text.contains("  redis table roundtrip"), "{text}");
     }
 
@@ -690,12 +697,11 @@ mod tests {
         let text = report.render();
         assert_eq!(
             line_starting(&text, "ENGINE    connect"),
-            "ENGINE    connect       tls           ssh           tls_over_ssh  cancel        \
-             stream_200k"
+            "ENGINE    connect  tls      ssh      tls_over_ssh  cancel   stream_200k"
         );
         assert!(
             text.lines()
-                .any(|l| l.starts_with("redis ") && l.contains("pending (M7)")),
+                .any(|l| l.starts_with("redis ") && l.contains("pending")),
             "{text}"
         );
         assert!(text.contains("  postgres cancel pass: ok"), "{text}");

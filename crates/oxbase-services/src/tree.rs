@@ -15,7 +15,8 @@
 //! *direct* group is listed right away with the kind's fetcher. Groups whose kind the server
 //! version does not support (`DialectRegistry::supports_kind`) are left out. Objects with
 //! `system = true` are left out unless [`TreeOptions::show_system`]. Labels: the object's
-//! [`ObjectRef::display_name`], the folder's [`ObjectKind::plural_display_name`]. A node is
+//! [`ObjectRef::display_name`], the folder's `TreeLayout::folder_label` (the engine's own
+//! name, M7, else [`ObjectKind::plural_display_name`]). A node is
 //! `expandable` when its kind has groups in the layout (folders always are).
 //!
 //! # Which session reads a node
@@ -95,6 +96,14 @@ impl TreeNode {
             expandable: true,
             summary: None,
         }
+    }
+
+    /// M7: the same node with another label (the engine's name for a folder, such as
+    /// "Collections"; `TreeLayout::folder_label`).
+    #[must_use]
+    pub fn with_label(mut self, label: impl Into<String>) -> Self {
+        self.label = label.into();
+        self
     }
 
     /// An object node from a fetcher's listing row.
@@ -194,7 +203,10 @@ impl TreeService {
                 continue;
             }
             if group.folder {
-                out.push(TreeNode::folder(parent.clone(), group.kind));
+                out.push(
+                    TreeNode::folder(parent.clone(), group.kind)
+                        .with_label(layout.folder_label(group.kind)),
+                );
             } else {
                 out.extend(
                     self.list_objects(&base, &layout, &parent, group.kind, options, cancel)

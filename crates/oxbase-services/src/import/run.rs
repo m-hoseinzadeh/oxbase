@@ -601,6 +601,29 @@ impl<'a> Pipeline<'a> {
             self.ddl_committed();
         }
 
+        // 2b. M7: a loader without transactions creates its target itself (create mode).
+        if p.loader_creates {
+            let (loader, connection, target) = (self.loader, self.connection, self.target);
+            let cancel = token.clone();
+            let create = async move {
+                loader
+                    .create_target(LoadSession::new(connection, None), &target, cancel)
+                    .await
+                    .transpose()
+            };
+            match cancellable(&token, clock, create).await {
+                Ok(Some(())) => self.ddl_committed(),
+                Ok(None) => {
+                    return Err(Error::unsupported(format!(
+                        "{} cannot create {} for an import",
+                        p.engine.display_name(),
+                        p.plan.table.display_name()
+                    )));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
         // 3. Session settings of the loader.
         cancellable(
             &token,
@@ -644,6 +667,10 @@ impl<'a> Pipeline<'a> {
     }
 
     async fn begin(&mut self) -> Result<()> {
+        if !self.job.prepared.transactional {
+            // M7: the loader writes without a transaction (each call is for good).
+            return Ok(());
+        }
         let begin = self.connection.begin();
         self.tx = Some(cancellable(&self.job.token, self.clock, begin).await?);
         Ok(())
@@ -843,6 +870,10 @@ impl<'a> Pipeline<'a> {
                 }
             })?;
         self.st.rows_inserted += u64::try_from(chunk.num_rows()).unwrap_or(u64::MAX);
+        if !self.job.prepared.transactional {
+            // Written for good: nothing can roll it back (M7, `BulkLoader::transactional`).
+            self.st.rows_committed = self.st.rows_inserted;
+        }
         if let Some(every) = self.commit_every
             && self.st.rows_inserted / every > self.st.rows_committed / every
         {

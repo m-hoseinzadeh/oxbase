@@ -55,6 +55,47 @@ impl Endpoint {
     pub fn socket_addr(&self) -> Option<SocketAddr> {
         self.ip().map(|ip| SocketAddr::new(ip, self.port))
     }
+
+    /// M7: parses `host`, `host:port`, `[ipv6]` or `[ipv6]:port` (surrounding whitespace
+    /// ignored); `default_port` when no port is given. `InvalidInput` for an empty host, a bad
+    /// port or an unbracketed IPv6 literal with a port.
+    pub fn parse(text: &str, default_port: u16) -> Result<Self> {
+        let text = text.trim();
+        let bad = || Error::invalid_input(format!("'{text}' is not a host or host:port"));
+        let (host, port) = if let Some(rest) = text.strip_prefix('[') {
+            let (host, after) = rest.split_once(']').ok_or_else(bad)?;
+            let port = match after {
+                "" => None,
+                p => Some(p.strip_prefix(':').ok_or_else(bad)?),
+            };
+            (host, port)
+        } else if text.matches(':').count() > 1 {
+            // A bare IPv6 literal without a port.
+            (text, None)
+        } else {
+            match text.split_once(':') {
+                Some((host, port)) => (host, Some(port)),
+                None => (text, None),
+            }
+        };
+        if host.is_empty() || host.contains(char::is_whitespace) {
+            return Err(bad());
+        }
+        let port = match port {
+            None => default_port,
+            Some(p) => p.parse::<u16>().ok().filter(|p| *p > 0).ok_or_else(bad)?,
+        };
+        Ok(Self::new(host, port))
+    }
+
+    /// M7: a comma-separated list of [`Endpoint::parse`] entries (seed lists of MongoDB replica
+    /// sets and Redis cluster / sentinel nodes). Empty entries are skipped.
+    pub fn parse_list(text: &str, default_port: u16) -> Result<Vec<Self>> {
+        text.split(',')
+            .filter(|entry| !entry.trim().is_empty())
+            .map(|entry| Self::parse(entry, default_port))
+            .collect()
+    }
 }
 
 impl From<SocketAddr> for Endpoint {
@@ -342,6 +383,41 @@ impl SshOptions {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn endpoints_parse_from_text() {
+        assert_eq!(
+            Endpoint::parse(" mongo1:27018 ", 27017).unwrap(),
+            Endpoint::new("mongo1", 27018)
+        );
+        assert_eq!(
+            Endpoint::parse("redis", 6379).unwrap(),
+            Endpoint::new("redis", 6379)
+        );
+        assert_eq!(
+            Endpoint::parse("[::1]:7000", 6379).unwrap(),
+            Endpoint::new("::1", 7000)
+        );
+        assert_eq!(
+            Endpoint::parse("[::1]", 1).unwrap(),
+            Endpoint::new("::1", 1)
+        );
+        assert_eq!(Endpoint::parse("::1", 2).unwrap(), Endpoint::new("::1", 2));
+        for bad in [
+            "", ":80", "h:0", "h:x", "h:70000", "[::1", "[::1]x", "a b:1",
+        ] {
+            assert!(Endpoint::parse(bad, 1).is_err(), "{bad}");
+        }
+        assert_eq!(
+            Endpoint::parse_list("a:1, b ,,[::1]:3", 9).unwrap(),
+            [
+                Endpoint::new("a", 1),
+                Endpoint::new("b", 9),
+                Endpoint::new("::1", 3)
+            ]
+        );
+        assert!(Endpoint::parse_list("a:1,:2", 9).is_err());
+    }
+
     use super::*;
 
     #[test]

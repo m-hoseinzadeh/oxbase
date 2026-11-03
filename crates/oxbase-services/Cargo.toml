@@ -28,6 +28,10 @@ oxbase-sqlite.workspace = true
 # M4: SQL Server. Registered in `default_drivers` / `default_dialects` once the driver and the
 # dialect streams uncomment their lines there.
 oxbase-mssql.workspace = true
+# M7: MongoDB and Redis. Registered in `default_drivers` / `default_dialects` at M7 integration,
+# when their lines there are uncommented (docs/m7-contracts.md §1).
+oxbase-mongo.workspace = true
+oxbase-redis.workspace = true
 chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true
