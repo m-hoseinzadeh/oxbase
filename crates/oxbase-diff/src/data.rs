@@ -1262,7 +1262,7 @@ mod tests {
 
     fn row(key: &[Value], rest: &[Value]) -> Row {
         let values: Vec<Value> = key.iter().chain(rest).cloned().collect();
-        let canon: Vec<String> = values.iter().map(|v| super::canon(v, None)).collect();
+        let canon: Vec<String> = values.iter().map(|v| canon(v, None)).collect();
         Row {
             key: key_form(&canon[..key.len()]),
             values,

@@ -621,6 +621,8 @@ async fn data_sync(key: &'static str) {
             big.chunks_skipped
         );
         assert!(big.warnings.is_empty(), "{key}: {:?}", big.warnings);
+        // Digests also work over decimals, bytes, zoned timestamps and Unicode text.
+        assert!(data.warnings.is_empty(), "{key}: {:?}", data.warnings);
     }
     assert_eq!(counts(composite), [0, 1, 0], "{key}: m8_composite");
     assert!(

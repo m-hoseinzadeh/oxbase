@@ -6,12 +6,13 @@
 //! SELECT COUNT(*),
 //!        CONCAT(COALESCE(SUM(CRC32(r)), 0), ':',
 //!               COALESCE(BIT_XOR(CAST(CONV(SUBSTRING(MD5(r), 1, 16), 16, 10) AS UNSIGNED)), 0))
-//!   FROM (SELECT CONCAT_WS(',', QUOTE(`c1`), QUOTE(`c2`)) AS r
+//!   FROM (SELECT CONCAT_WS(',', IFNULL(MD5(`c1`), 'n'), IFNULL(MD5(`c2`), 'n')) AS r
 //!           FROM `db`.`t` WHERE <range>) AS x
 //! ```
 //!
-//! `QUOTE` writes NULL as the bare word `NULL` and every value as a quoted, escaped string, so
-//! NULL, the empty string and the text `'NULL'` all differ. The per-row hashes are combined
+//! Each value is hashed on its own (`MD5` of its bytes: binary columns never meet a text
+//! character set) and NULL is `n`, which no MD5 text equals, so NULL and the empty string
+//! differ. The per-row hashes are combined
 //! with a sum and an XOR (no `GROUP_CONCAT`, whose length is capped by
 //! `group_concat_max_len`); both sides of a sync run on the same engine, so the digest only
 //! has to be stable there.
@@ -47,7 +48,7 @@ impl ChunkHasher for MySqlChunkHasher {
             if pos > 0 {
                 w.push(", ");
             }
-            w.push("QUOTE(").ident(&column.name).push(")");
+            w.push("IFNULL(MD5(").ident(&column.name).push("), 'n')");
         }
         w.push(") AS `oxbase_row` FROM ")
             .qualified(table)
@@ -86,8 +87,9 @@ mod tests {
             st.sql,
             "SELECT COUNT(*), CONCAT(COALESCE(SUM(CRC32(`oxbase_row`)), 0), ':', \
              COALESCE(BIT_XOR(CAST(CONV(SUBSTRING(MD5(`oxbase_row`), 1, 16), 16, 10) AS \
-             UNSIGNED)), 0)) FROM (SELECT CONCAT_WS(',', QUOTE(`id`), QUOTE(`na``me`)) AS \
-             `oxbase_row` FROM `db`.`t` WHERE (`id` > ?)) AS `oxbase_chunk`"
+             UNSIGNED)), 0)) FROM (SELECT CONCAT_WS(',', IFNULL(MD5(`id`), 'n'), \
+             IFNULL(MD5(`na``me`), 'n')) AS `oxbase_row` FROM `db`.`t` WHERE (`id` > ?)) AS \
+             `oxbase_chunk`"
         );
         assert_eq!(st.params, [Value::Int(10)]);
         assert!(

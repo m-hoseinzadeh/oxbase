@@ -112,9 +112,7 @@ impl DiffStore {
                 .tempdir_in(parent),
             None => tempfile::Builder::new().prefix("oxbase-diff-").tempdir(),
         }
-        .map_err(|e| {
-            oxbase_types::Error::internal(format!("cannot create a temporary directory: {e}"))
-        })?;
+        .map_err(|e| Error::internal(format!("cannot create a temporary directory: {e}")))?;
         Ok(Self {
             dir,
             slots: BTreeMap::new(),
@@ -232,7 +230,7 @@ impl DiffStore {
             paths: paths.into_iter(),
             reader: None,
             pending: None,
-            batch_rows: batch_rows.max(1),
+            slice_rows: batch_rows.max(1),
         }))
     }
 }
@@ -243,7 +241,7 @@ struct Rows {
     reader: Option<StreamReader<BufReader<File>>>,
     /// A batch being handed out in slices, and the next offset.
     pending: Option<(RecordBatch, usize)>,
-    batch_rows: usize,
+    slice_rows: usize,
 }
 
 impl Rows {
@@ -281,7 +279,7 @@ impl Iterator for Rows {
             if let Some((batch, offset)) = self.pending.take() {
                 let left = batch.num_rows() - offset;
                 if left > 0 {
-                    let take = left.min(self.batch_rows);
+                    let take = left.min(self.slice_rows);
                     let slice = batch.slice(offset, take);
                     if offset + take < batch.num_rows() {
                         self.pending = Some((batch, offset + take));
@@ -335,8 +333,8 @@ mod tests {
 
     #[test]
     fn round_trip_of_100k_rows_in_write_order() {
-        use arrow_array::Int64Array;
         use arrow_array::cast::AsArray;
+        use arrow_array::{Array, Int64Array};
         let mut store = DiffStore::new(None).unwrap();
         // Written in chunks like a compare does, read back in other batch sizes.
         for chunk in 0..100 {
