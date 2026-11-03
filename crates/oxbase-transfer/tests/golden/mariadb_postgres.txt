@@ -1,0 +1,31 @@
+# MariaDB -> PostgreSQL
+boolean                  -> boolean                              exact
+int8                     -> int16                                widened     PostgreSQL has no 1-byte integer: stored as smallint
+int16                    -> int16                                exact
+int32                    -> int32                                exact
+int64                    -> int64                                exact
+int32 unsigned           -> int64                                widened     PostgreSQL has no unsigned integers: stored as bigint
+int64 unsigned           -> decimal(20,0)                        widened     PostgreSQL has no unsigned integers: stored as numeric(20,0)
+float32                  -> float32                              exact
+float64                  -> float64                              exact
+decimal(18,4)            -> decimal(18,4)                        exact
+decimal(38,10)           -> decimal(38,10)                       exact
+decimal                  -> decimal(65,30)                       exact
+char(10)                 -> char(10)                             exact
+varchar(255)             -> varchar(255)                         exact
+varchar                  -> text                                 exact
+text                     -> text                                 exact
+binary(16)               -> varbinary                            widened     bytea has no fixed length: the bytes are kept as they are
+varbinary                -> varbinary                            exact
+date                     -> date                                 exact
+time(6)                  -> time(6)                              exact
+timestamp(6)             -> timestamp(6)                         exact
+timestamptz(6)           -> timestamp(6)                         exact
+interval                 -> varchar(64)                          exact
+uuid                     -> uuid                                 exact
+json                     -> json                                 exact
+jsonb                    -> jsonb                                exact
+int32[]                  -> json                                 exact
+text[]                   -> json                                 exact
+enum(small, medium, large) -> text                                 widened     PostgreSQL enums are types of their own: the labels are stored as text
+geometry                 -> geometry                             unsupported PostgreSQL has no built-in type 'geometry'

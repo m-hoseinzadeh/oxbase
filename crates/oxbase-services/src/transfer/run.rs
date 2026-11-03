@@ -428,7 +428,7 @@ impl Job {
                 let mut report = not_run(index, table.target.clone());
                 report.status = TableStatus::Failed;
                 report.error = Some(e.to_string());
-                report.left_behind = "the copy could not start".to_owned();
+                "the copy could not start".clone_into(&mut report.left_behind);
                 report
             }
         };

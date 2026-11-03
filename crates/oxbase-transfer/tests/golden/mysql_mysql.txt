@@ -1,0 +1,31 @@
+# MySQL -> MySQL
+boolean                  -> boolean                              exact
+int8                     -> int8                                 exact
+int16                    -> int16                                exact
+int32                    -> int32                                exact
+int64                    -> int64                                exact
+int32 unsigned           -> int32 unsigned                       exact
+int64 unsigned           -> int64 unsigned                       exact
+float32                  -> float32                              exact
+float64                  -> float64                              exact
+decimal(18,4)            -> decimal(18,4)                        exact
+decimal(38,10)           -> decimal(38,10)                       exact
+decimal                  -> decimal(65,30)                       exact
+char(10)                 -> char(10)                             exact
+varchar(255)             -> varchar(255)                         exact
+varchar                  -> text                                 exact
+text                     -> text                                 exact
+binary(16)               -> binary(16)                           exact
+varbinary                -> varbinary                            exact
+date                     -> date                                 exact
+time(6)                  -> time(6)                              exact
+timestamp(6)             -> timestamp(6)                         exact
+timestamptz(6)           -> timestamp(6)                         exact
+interval                 -> varchar(64)                          exact
+uuid                     -> char(36)                             exact
+json                     -> json                                 exact
+jsonb                    -> jsonb                                exact
+int32[]                  -> json                                 exact
+text[]                   -> json                                 exact
+enum(small, medium, large) -> enum(small, medium, large)           exact
+geometry                 -> geometry [geometry]                  exact
