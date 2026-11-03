@@ -370,6 +370,15 @@ fn seed(engine: Engine, c: &str, source: bool) -> Vec<String> {
                 push(format!(
                     "CREATE FUNCTION {c}.add_one(n integer) RETURNS integer LANGUAGE sql IMMUTABLE AS 'SELECT n + 1'"
                 ));
+                push(format!(
+                    "CREATE MATERIALIZED VIEW {c}.customer_names AS SELECT id, name FROM {c}.customers"
+                ));
+                push(format!(
+                    "COMMENT ON VIEW {c}.active_customers IS 'Customers with an email'"
+                ));
+                push(format!(
+                    "COMMENT ON SEQUENCE {c}.invoice_seq IS 'Invoice numbers'"
+                ));
             } else {
                 push(format!(
                     "CREATE TABLE {c}.customers (id integer PRIMARY KEY, name varchar(100) NOT NULL)"
@@ -567,6 +576,91 @@ fn seed(engine: Engine, c: &str, source: bool) -> Vec<String> {
     out
 }
 
+/// More objects of each kind on top of [`seed`]: a procedure, a materialized view and a
+/// disabled trigger to create or replace, comments, sequences to alter, and a view, a function,
+/// a sequence and a trigger that exist only in the target (dropped with drops).
+fn extra_seed(engine: Engine, c: &str, source: bool) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    match engine {
+        Engine::Postgres => {
+            let total = if source { "total" } else { "total + 0" };
+            out.push(format!(
+                "CREATE PROCEDURE {c}.touch_order(p_id integer) LANGUAGE plpgsql AS $$ BEGIN UPDATE {c}.orders SET total = {total} WHERE id = p_id; END $$"
+            ));
+            if source {
+                out.push(format!(
+                    "CREATE TRIGGER orders_audit_upd AFTER UPDATE ON {c}.orders FOR EACH ROW EXECUTE FUNCTION {c}.audit_order()"
+                ));
+                out.push(format!(
+                    "ALTER TABLE {c}.orders DISABLE TRIGGER orders_audit_upd"
+                ));
+            } else {
+                out.push(format!("CREATE VIEW {c}.old_view AS SELECT 1 AS one"));
+                out.push(format!(
+                    "CREATE FUNCTION {c}.old_fn() RETURNS integer LANGUAGE sql AS 'SELECT 1'"
+                ));
+                out.push(format!("CREATE SEQUENCE {c}.old_seq"));
+                out.push(format!(
+                    "CREATE TRIGGER old_trg AFTER DELETE ON {c}.customers FOR EACH ROW EXECUTE FUNCTION {c}.audit_order()"
+                ));
+            }
+        }
+        Engine::MySql | Engine::MariaDb => {
+            if engine == Engine::MariaDb {
+                let by = if source { 5 } else { 1 };
+                out.push(format!(
+                    "CREATE SEQUENCE `{c}`.ticket_seq INCREMENT BY {by}"
+                ));
+            }
+            if !source {
+                out.push(format!("CREATE VIEW `{c}`.old_view AS SELECT 1 AS one"));
+                out.push(format!(
+                    "CREATE FUNCTION `{c}`.old_fn() RETURNS INT DETERMINISTIC RETURN 1"
+                ));
+                out.push(format!(
+                    "CREATE TRIGGER `{c}`.old_trg AFTER DELETE ON `{c}`.customers FOR EACH ROW SET @x = 1"
+                ));
+                if engine == Engine::MariaDb {
+                    out.push(format!("CREATE SEQUENCE `{c}`.old_seq"));
+                }
+            }
+        }
+        Engine::MsSql => {
+            let by = if source { 5 } else { 1 };
+            out.push(format!(
+                "CREATE SEQUENCE [{c}].ticket_seq AS int START WITH 1 INCREMENT BY {by}"
+            ));
+            if source {
+                out.push(format!(
+                    "EXEC sys.sp_addextendedproperty @name = N'MS_Description', @value = N'Customers with an email', @level0type = N'SCHEMA', @level0name = N'{c}', @level1type = N'VIEW', @level1name = N'active_customers'"
+                ));
+                out.push(format!(
+                    "DISABLE TRIGGER [{c}].orders_audit ON [{c}].orders"
+                ));
+            } else {
+                out.push(format!("CREATE VIEW [{c}].old_view AS SELECT 1 AS one"));
+                out.push(format!(
+                    "CREATE FUNCTION [{c}].old_fn() RETURNS int AS BEGIN RETURN 1 END"
+                ));
+                out.push(format!("CREATE SEQUENCE [{c}].old_seq AS int START WITH 1"));
+                out.push(format!(
+                    "CREATE TRIGGER [{c}].old_trg ON [{c}].customers AFTER DELETE AS SET NOCOUNT ON"
+                ));
+            }
+        }
+        _ => {
+            if !source {
+                out.push("CREATE VIEW old_view AS SELECT 1 AS one".to_owned());
+                out.push(
+                    "CREATE TRIGGER old_trg AFTER DELETE ON customers BEGIN SELECT 1; END"
+                        .to_owned(),
+                );
+            }
+        }
+    }
+    out
+}
+
 /// Drops a scratch container (best effort).
 fn drop_container(engine: Engine, c: &str) -> Vec<String> {
     match engine {
@@ -622,22 +716,33 @@ fn expected(engine: Engine) -> Vec<(String, DiffStatus)> {
     .map(|(id, s)| (id.to_owned(), s))
     .collect();
     let mut add = |id: &str, s: DiffStatus| out.push((id.to_owned(), s));
+    // Only in the target on every engine (extra_seed).
+    add("view:old_view", DiffStatus::OnlyInTarget);
+    add("trigger:customers.old_trg", DiffStatus::OnlyInTarget);
     match engine {
         Engine::Postgres => {
             add("sequence:invoice_seq", DiffStatus::OnlyInSource);
             add("sequence:ticket_seq", DiffStatus::Different);
+            add("sequence:old_seq", DiffStatus::OnlyInTarget);
+            add("mat_view:customer_names", DiffStatus::OnlyInSource);
             add(
                 "function:order_total(p_id integer)",
                 DiffStatus::OnlyInSource,
             );
             add("function:add_one(n integer)", DiffStatus::Different);
             add("function:audit_order()", DiffStatus::Same);
+            add("function:old_fn()", DiffStatus::OnlyInTarget);
+            add("procedure:touch_order(p_id integer)", DiffStatus::Different);
+            add("trigger:orders.orders_audit_upd", DiffStatus::OnlyInSource);
         }
         Engine::MySql | Engine::MariaDb | Engine::MsSql => {
             add("function:order_total", DiffStatus::OnlyInSource);
+            add("function:old_fn", DiffStatus::OnlyInTarget);
             add("procedure:touch_order", DiffStatus::Different);
             if engine != Engine::MySql {
                 add("sequence:invoice_seq", DiffStatus::OnlyInSource);
+                add("sequence:ticket_seq", DiffStatus::Different);
+                add("sequence:old_seq", DiffStatus::OnlyInTarget);
             }
         }
         _ => {}
@@ -695,6 +800,8 @@ async fn scratch_steps(live: &Live, names: &[String; 4], sessions: &[SessionHand
     let key = live.key;
     for (i, name) in names.iter().enumerate() {
         live.run(&sessions[i], &seed(engine, name, i % 2 == 0))
+            .await;
+        live.run(&sessions[i], &extra_seed(engine, name, i % 2 == 0))
             .await;
     }
     let source = live.container(&names[0]);
@@ -764,21 +871,29 @@ async fn scratch_steps(live: &Live, names: &[String; 4], sessions: &[SessionHand
     let recompare = live.apply_all(&second, "every item with drops").await;
     assert!(recompare.diff.is_in_sync(true), "{key}");
 
-    // Without drops: legacy_notes and order_lines stay, and only they are reported.
+    // Without drops: the objects only in the target stay, and only they are reported.
     let source = live.container(&names[2]);
     let target = live.container(&names[3]);
     let third = live
         .compare((&sessions[2], &source), (&sessions[3], &target), false)
         .await;
     let recompare = live.apply_all(&third, "without drops").await;
-    let left: Vec<&str> = recompare
+    let mut left: Vec<&str> = recompare
         .diff
         .items
         .iter()
         .filter(|i| i.status != DiffStatus::Same)
         .map(|i| i.id.as_str())
         .collect();
-    assert_eq!(left, ["table:legacy_notes", "table:order_lines"], "{key}");
+    left.sort_unstable();
+    let only_in_target = expected(engine);
+    let mut kept: Vec<&str> = only_in_target
+        .iter()
+        .filter(|(_, s)| *s == DiffStatus::OnlyInTarget)
+        .map(|(id, _)| id.as_str())
+        .collect();
+    kept.sort_unstable();
+    assert_eq!(left, kept, "{key}");
     assert!(recompare.diff.is_in_sync(false), "{key}");
 }
 
