@@ -5,6 +5,8 @@ import { refreshSessions, resetConnectionsStore } from "../../connections/store"
 import type { SessionSummary } from "../../connections/types";
 import { tauriCore } from "../../test/tauriMock";
 import { setDockviewApi } from "../layout";
+import { SyncHost } from "../sync/SyncHost";
+import { resetSyncStore } from "../sync/store";
 import { resetTransferStore } from "../transfer/store";
 import { TransferHost } from "../transfer/TransferHost";
 import { ObjectTreePanel } from "./ObjectTreePanel";
@@ -297,6 +299,7 @@ describe("ObjectTreePanel import and export", () => {
   });
   afterEach(() => {
     resetTransferStore();
+    resetSyncStore();
     resetConnectionsStore();
   });
 
@@ -326,6 +329,7 @@ describe("ObjectTreePanel import and export", () => {
       "New query",
       "Import into this table…",
       "Export…",
+      "Transfer…",
       "Refresh",
     ]);
     expect(within(menu).getByRole("menuitem", { name: "Open" })).toHaveFocus();
@@ -337,6 +341,36 @@ describe("ObjectTreePanel import and export", () => {
     const dialog = screen.getByRole("dialog", { name: "Export data" });
     expect(within(dialog).getByTestId("export-source")).toHaveTextContent("Table app.users");
     expect(within(dialog).getByLabelText("Filter (SQL condition)")).toBeInTheDocument();
+  });
+
+  it("offers transfer, sync and backup on a database and transfer on a table", async () => {
+    render(<SyncHost />);
+    await showTables();
+    fireEvent.contextMenu(item(/app/), { clientX: 40, clientY: 50 });
+    const menu = screen.getByRole("menu", { name: "app actions" });
+    const labels = within(menu)
+      .getAllByRole("menuitem")
+      .map((m) => m.querySelector(".context-menu__label")?.textContent);
+    expect(labels).toEqual(
+      expect.arrayContaining([
+        "Data transfer…",
+        "Structure sync…",
+        "Data sync…",
+        "Back up…",
+        "Restore into…",
+      ]),
+    );
+    fireEvent.click(within(menu).getByRole("menuitem", { name: "Back up…" }));
+    const backup = screen.getByRole("dialog", { name: "Back up" });
+    await waitFor(() =>
+      expect(within(backup).getByLabelText("Back up database")).toHaveValue("app"),
+    );
+    fireEvent.click(within(backup).getByRole("button", { name: "Cancel" }));
+
+    fireEvent.contextMenu(item(/users/), { clientX: 40, clientY: 50 });
+    fireEvent.click(screen.getByRole("menuitem", { name: "Transfer…" }));
+    const wizard = screen.getByRole("dialog", { name: "Data transfer" });
+    expect(await within(wizard).findByRole("checkbox", { name: /app\.users/ })).toBeChecked();
   });
 
   it("imports into a database from its menu (keyboard) and from the toolbar", async () => {

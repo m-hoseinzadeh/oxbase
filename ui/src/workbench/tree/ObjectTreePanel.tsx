@@ -9,16 +9,21 @@
  * Pub/Sub. SQL-only actions (design, new table, export) are not offered for them.
  */
 import {
+  Archive,
+  ArchiveRestore,
+  ArrowLeftRight,
   ChevronRight,
   CircleAlert,
   FileInput,
   FileOutput,
   KeyRound,
+  ListTree,
   Loader2,
   PencilRuler,
   Radio,
   RefreshCw,
   RotateCw,
+  Rows3,
   SquarePen,
   SquareTerminal,
   Table2,
@@ -34,14 +39,17 @@ import { useConnections } from "../../connections/store";
 import {
   openCollection,
   openConsole,
+  openDataSync,
   openKeyBrowser,
   openPubSub,
   openQueryEditor,
+  openStructureSync,
   openTableData,
   openTableDesigner,
 } from "../layout";
 import { type EngineFamily, engineFamily } from "../nosql/engines";
 import { prefixPattern } from "../nosql/keys/keyModel";
+import { openBackup, openRestore, openTransfer } from "../sync/store";
 import { openExport, openImport } from "../transfer/store";
 import { TreeIcon } from "./TreeIcon";
 import {
@@ -114,6 +122,25 @@ function keyObject(row: Row | null): ObjectRef | null {
 function namespaceOf(row: Row): string | undefined {
   if (row.type !== "node" || row.ref.type !== "object") return undefined;
   return row.ref.object.kind === "schema" ? row.ref.object.name : undefined;
+}
+
+/** The database or schema a row stands for (M8 transfer, sync, backup), if it is one. */
+export function containerOf(row: Row | null): ObjectRef | null {
+  if (row?.type !== "node" || row.ref.type !== "object") return null;
+  const kind = row.ref.object.kind;
+  return kind === "database" || kind === "schema" ? row.ref.object : null;
+}
+
+/** The database or schema a table or view lives in. */
+export function parentContainer(object: ObjectRef): ObjectRef | null {
+  if (object.schema) {
+    return {
+      kind: "schema",
+      ...(object.catalog ? { catalog: object.catalog } : {}),
+      name: object.schema,
+    };
+  }
+  return object.catalog ? { kind: "database", name: object.catalog } : null;
 }
 
 function isNavigable(row: Row): boolean {
@@ -396,6 +423,45 @@ export function ObjectTreePanel() {
         separatorBefore: importTargetOf(row) === undefined,
         onSelect: () => exportRows(row),
       });
+      const parent = parentContainer(object);
+      items.push({
+        label: "Transfer…",
+        icon: ArrowLeftRight,
+        onSelect: () =>
+          openTransfer({
+            source: { sessionId: row.sessionId, ...(parent ? { container: parent } : {}) },
+            objects: [object],
+          }),
+      });
+    }
+    const container = family === "sql" ? containerOf(row) : null;
+    if (container) {
+      const side = { sessionId: row.sessionId, container };
+      items.push(
+        {
+          label: "Data transfer…",
+          icon: ArrowLeftRight,
+          separatorBefore: true,
+          onSelect: () => openTransfer({ source: side }),
+        },
+        {
+          label: "Structure sync…",
+          icon: ListTree,
+          onSelect: () => openStructureSync({ source: side }),
+        },
+        { label: "Data sync…", icon: Rows3, onSelect: () => openDataSync({ source: side }) },
+        {
+          label: "Back up…",
+          icon: Archive,
+          separatorBefore: true,
+          onSelect: () => openBackup({ source: side }),
+        },
+        {
+          label: "Restore into…",
+          icon: ArchiveRestore,
+          onSelect: () => openRestore({ target: side }),
+        },
+      );
     }
     items.push({
       label: "Refresh",
