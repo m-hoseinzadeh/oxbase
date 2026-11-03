@@ -253,7 +253,7 @@ impl Spell {
             1 => format!("日本 {i}"),
             _ => format!("😀 {i}"),
         };
-        let amount = if i % 4 == 0 {
+        let amount = if i.is_multiple_of(4) {
             "-1234567890123456789012345678.0123456789"
         } else {
             "1234567890123456789012345678.0123456789"
@@ -263,7 +263,7 @@ impl Spell {
         } else {
             amount.to_owned()
         };
-        let payload = if i % 2 == 0 {
+        let payload = if i.is_multiple_of(2) {
             (self.bytes_lit)("00ff10")
         } else {
             "NULL".to_owned()
