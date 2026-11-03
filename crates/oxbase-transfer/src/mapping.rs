@@ -908,7 +908,10 @@ pub fn pair_report(ctx: &MappingContext<'_>) -> PairReport {
     let rows = representative_types()
         .into_iter()
         .map(|logical| {
-            let held = ctx.source_mapper.map(&logical, ctx.source_version);
+            let mut held = ctx.source_mapper.map(&logical, ctx.source_version);
+            // A `varchar(n)` column holds `n` in the source's own unit (SQL Server's mapper
+            // would double it to make room for another engine's characters).
+            keep_text_length(&logical, &mut held);
             let mapping = if held.fidelity == Fidelity::Unsupported {
                 TypeMapping::unsupported(
                     logical.clone(),
