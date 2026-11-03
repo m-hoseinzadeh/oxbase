@@ -105,7 +105,8 @@ function neighbourPanel(api: DockviewApi): string | undefined {
       p.id.startsWith("collection-") ||
       p.id.startsWith("keys-") ||
       p.id.startsWith("console-") ||
-      p.id.startsWith("pubsub-"),
+      p.id.startsWith("pubsub-") ||
+      p.id.startsWith("sync-"),
   )?.id;
 }
 
@@ -325,4 +326,42 @@ export function openPubSub(init: PubSubPanelParams): void {
     params: init,
     ...(neighbour ? { position: { referencePanel: neighbour, direction: "within" } } : {}),
   });
+}
+
+// --- M8: structure sync and data sync tabs ------------------------------------------------
+
+/** A connection and, when known, a database or schema of it. */
+export interface SyncSideParams {
+  sessionId: string;
+  container?: ObjectRef;
+}
+
+/** `params` of a structure sync or data sync tab. */
+export interface SyncPanelParams {
+  source?: SyncSideParams;
+  target?: SyncSideParams;
+}
+
+function openSync(component: "structureSync" | "dataSync", title: string, init: SyncPanelParams) {
+  const api = dockview;
+  if (!api) return;
+  counter += 1;
+  const neighbour = neighbourPanel(api);
+  api.addPanel({
+    id: `sync-${component}-${Date.now().toString(36)}-${counter}`,
+    component,
+    title,
+    params: init,
+    ...(neighbour ? { position: { referencePanel: neighbour, direction: "within" } } : {}),
+  });
+}
+
+/** Opens a new structure sync tab (compare two databases or schemas, script, apply). */
+export function openStructureSync(init: SyncPanelParams = {}): void {
+  openSync("structureSync", "Structure sync", init);
+}
+
+/** Opens a new data sync tab (compare the rows of table pairs, script, apply). */
+export function openDataSync(init: SyncPanelParams = {}): void {
+  openSync("dataSync", "Data sync", init);
 }
