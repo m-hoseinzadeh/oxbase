@@ -124,7 +124,8 @@ export function DataSyncPanel({ params }: { params: SyncPanelParams }) {
   const applying =
     apply.status === "starting" || apply.status === "running" || apply.status === "recomparing";
   const busy = comparing || applying;
-  const compareId = ended(compare.status) ? compare.compareId : null;
+  // Scripts and applies work on a complete compare only.
+  const compareId = compare.status === "finished" ? compare.compareId : null;
   const results = Object.values(compare.results).sort((a, b) => a.pair - b.pair);
   const totals = dataTotals(results);
   const active = activePair === null ? null : (compare.results[activePair] ?? null);
