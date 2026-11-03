@@ -182,6 +182,12 @@ BEGIN
 END;
 GO
 
+-- Two orders; the orders_audit trigger writes their two order_audit rows.
+INSERT INTO m8_src.orders (customer_id, created_at, total) VALUES
+    (1, '2026-01-05T10:00:00', 19.00),
+    (2, '2026-01-06T11:30:00', 120.00);
+GO
+
 -- --- structure: target --------------------------------------------------------------------
 
 CREATE TABLE m8_tgt.customers (
@@ -245,6 +251,11 @@ INSERT INTO m8_tgt.customers (name, email, fax) VALUES
 INSERT INTO m8_tgt.products (name, sku, price, stock) VALUES
     (N'Widget', N'W-1', 9.50, 10),
     (N'Gadget', N'G-1', 120.00, 0);
+-- The same orders and audit rows (no trigger here); a sync adds orders_customer_fk over them.
+INSERT INTO m8_tgt.orders (customer_id, created_at, total) VALUES
+    (1, '2026-01-05T10:00:00', 19.00),
+    (2, '2026-01-06T11:30:00', 120.00);
+INSERT INTO m8_tgt.order_audit (order_id, action) VALUES (1, N'insert'), (2, N'insert');
 GO
 
 CREATE VIEW m8_tgt.active_customers AS
@@ -327,13 +338,18 @@ SELECT i,
        DATEADD(day, i - 1, CAST('2026-01-01T10:00:00+05:30' AS datetimeoffset(7))),
        CASE i WHEN 9 THEN NULL WHEN 10 THEN N'y' ELSE N'note ' + CAST(i AS nvarchar(20)) END
 FROM g;
+-- Values that need quoting in a script: a quote, a backslash, `;` and `--` (id 3 differs, so
+-- its UPDATE writes this name) and a quote, double quotes and N'...' (id 19 is inserted).
+UPDATE m8_src.m8_data SET name = N'O''Brien \ x;--' WHERE id = 3;
+UPDATE m8_src.m8_data SET note = N'it''s "q"; -- N''x''' WHERE id = 19;
 
--- Target: ids 1..18, 3 / 5 / 7 changed, 9 and 10 swap their NULL notes, 21 / 22 only here.
--- Expected: inserts 2, updates 5, deletes 2.
+-- Target: ids 1..18, 3 / 2 / 4 changed (name / amount / instant; 2 and 4 are edge rows: a
+-- 38-digit amount with a Japanese name, an astral emoji name), 9 and 10 swap their NULL
+-- notes, 21 / 22 only here. Expected: inserts 2, updates 5, deletes 2.
 INSERT INTO m8_tgt.m8_data SELECT * FROM m8_src.m8_data WHERE id <= 18;
 UPDATE m8_tgt.m8_data SET name = N'name-3 changed' WHERE id = 3;
-UPDATE m8_tgt.m8_data SET amount = 999.0000000001 WHERE id = 5;
-UPDATE m8_tgt.m8_data SET happened_at = DATEADD(hour, 1, happened_at) WHERE id = 7;
+UPDATE m8_tgt.m8_data SET amount = 999.0000000001 WHERE id = 2;
+UPDATE m8_tgt.m8_data SET happened_at = DATEADD(hour, 1, happened_at) WHERE id = 4;
 UPDATE m8_tgt.m8_data SET note = N'x' WHERE id = 9;
 UPDATE m8_tgt.m8_data SET note = NULL WHERE id = 10;
 INSERT INTO m8_tgt.m8_data (id, name, amount, payload, happened_at, note) VALUES

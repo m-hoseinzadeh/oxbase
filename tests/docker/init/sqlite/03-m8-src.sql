@@ -70,6 +70,10 @@ INSERT INTO customers (id, name, email, phone) VALUES
 INSERT INTO products (id, name, sku, price, stock) VALUES
     (1, 'Widget', 'W-1', 9.50, 10),
     (2, 'Gadget', 'G-1', 120.00, 0);
+-- Two orders; the orders_audit trigger writes their two order_audit rows.
+INSERT INTO orders (customer_id, created_at, total) VALUES
+    (1, '2026-01-05 10:00:00', 19.00),
+    (2, '2026-01-06 11:30:00', 120.00);
 
 -- --- data pairs (identical structure on both sides) --------------------------------------
 -- happened_at is ISO text with the +05:30 offset; amount has NUMERIC affinity (both files
@@ -118,6 +122,10 @@ SELECT i,
        '2026-01-' || printf('%02d', i) || 'T10:00:00+05:30',
        CASE i WHEN 9 THEN NULL WHEN 10 THEN 'y' ELSE 'note ' || i END
 FROM g;
+-- Values that need quoting in a script: a quote, a backslash, `;` and `--` (id 3 differs, so
+-- its UPDATE writes this name) and a quote, double quotes and N'...' (id 19 is inserted).
+UPDATE m8_data SET name = 'O''Brien \ x;--' WHERE id = 3;
+UPDATE m8_data SET note = 'it''s "q"; -- N''x''' WHERE id = 19;
 
 WITH RECURSIVE g (i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM g WHERE i < 100000)
 INSERT INTO m8_big (id, val, label) SELECT i, i % 1000, 'row-' || i FROM g;

@@ -37,6 +37,10 @@ arrow-array.workspace = true
 # M8 (src/m8): seed scripts split into statements, and values read back as display text.
 oxbase-sql.workspace = true
 arrow-cast.workspace = true
+# M8 (src/m8/values.rs): date-time texts read back from the engines are parsed to compare them.
+chrono.workspace = true
+# M8 backup cell: every entry of a backup archive is scanned for the fixture password.
+zip.workspace = true
 
 [dev-dependencies]
 pretty_assertions.workspace = true

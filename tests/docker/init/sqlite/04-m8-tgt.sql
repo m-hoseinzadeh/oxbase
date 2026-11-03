@@ -60,6 +60,12 @@ INSERT INTO customers (id, name, email, fax) VALUES
 INSERT INTO products (id, name, sku, price, stock) VALUES
     (1, 'Widget', 'W-1', 9.50, 10),
     (2, 'Gadget', 'G-1', 120.00, 0);
+-- The same orders and audit rows as 03-m8-src.sql (no trigger here); a sync adds
+-- orders_customer_fk over them.
+INSERT INTO orders (customer_id, created_at, total) VALUES
+    (1, '2026-01-05 10:00:00', 19.00),
+    (2, '2026-01-06 11:30:00', 120.00);
+INSERT INTO order_audit (order_id, action) VALUES (1, 'insert'), (2, 'insert');
 
 -- --- data pairs (identical structure on both sides) --------------------------------------
 
@@ -106,6 +112,10 @@ SELECT i,
        '2026-01-' || printf('%02d', i) || 'T10:00:00+05:30',
        CASE i WHEN 9 THEN NULL WHEN 10 THEN 'y' ELSE 'note ' || i END
 FROM g;
+-- Values that need quoting in a script: a quote, a backslash, `;` and `--` (id 3 differs, so
+-- its UPDATE writes this name) and a quote, double quotes and N'...' (id 19 is inserted).
+UPDATE m8_data SET name = 'O''Brien \ x;--' WHERE id = 3;
+UPDATE m8_data SET note = 'it''s "q"; -- N''x''' WHERE id = 19;
 
 WITH RECURSIVE g (i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM g WHERE i < 100000)
 INSERT INTO m8_big (id, val, label) SELECT i, i % 1000, 'row-' || i FROM g;
@@ -115,12 +125,13 @@ INSERT INTO m8_composite (tenant, code, qty) VALUES
 
 INSERT INTO m8_nokey (a, b) VALUES (1, 'one'), (2, 'two');
 
--- m8_data: 19 / 20 missing, 3 / 5 / 7 changed, 9 and 10 swap their NULL notes, 21 / 22 only
--- here (expected: inserts 2, updates 5, deletes 2).
+-- m8_data: 19 / 20 missing, 3 / 2 / 4 changed (name / amount / instant; 2 and 4 are edge
+-- rows), 9 and 10 swap their NULL notes, 21 / 22 only here (expected: inserts 2, updates 5,
+-- deletes 2).
 DELETE FROM m8_data WHERE id IN (19, 20);
 UPDATE m8_data SET name = 'name-3 changed' WHERE id = 3;
-UPDATE m8_data SET amount = 999.0000000001 WHERE id = 5;
-UPDATE m8_data SET happened_at = '2026-01-07T11:00:00+05:30' WHERE id = 7;
+UPDATE m8_data SET amount = 999.0000000001 WHERE id = 2;
+UPDATE m8_data SET happened_at = '2026-01-04T11:00:00+05:30' WHERE id = 4;
 UPDATE m8_data SET note = 'x' WHERE id = 9;
 UPDATE m8_data SET note = NULL WHERE id = 10;
 INSERT INTO m8_data (id, name, amount, payload, happened_at, note) VALUES

@@ -12,25 +12,47 @@
 //!   the Docker init (`m8_src`, ...) exists. Every other cell runs on these copies, so a re-run
 //!   (or another stream's live test that synced `m8_tgt`) cannot change what it sees.
 //! - `sync_structure`: compare source / target with drops on (`StructureSyncService`); every
-//!   `[m8] structure_items` id (minus the engine's `skip_items`) is reported as differing; apply
-//!   every item (destructive confirmed); the script commits, the apply's re-compare is in sync,
-//!   and a fresh compare reports zero differences.
+//!   `[m8] structure_items` id (minus the engine's `skip_items`) is reported with its designed
+//!   status (only in source, only in target, different); the preview is destructive and atomic
+//!   exactly where the engine runs DDL in transactions (not MySQL / MariaDB); an apply without
+//!   confirmation is refused; apply every item (destructive confirmed); the script commits, the
+//!   apply's re-compare is in sync, a fresh compare reports zero differences, and the target's
+//!   seeded customers, products, orders and order_audit rows read back unchanged.
 //! - `sync_data`: compare the `[m8] data_tables` (`DataSyncService`); counts equal
-//!   `[m8] data_expected`, the key-less table is refused; apply inserts, updates and deletes
-//!   (confirmed); the apply reports in sync and a fresh compare has no differences.
-//! - `backup`: back up the source container (`BackupService`), list and verify the archive,
-//!   restore it into the empty restore container; every object restores, every table holds the
-//!   source's row count, a structure compare source / restore is in sync and a data compare of
-//!   the keyed data tables is in sync.
+//!   `[m8] data_expected`, the key-less table is refused; an apply with deletes but without
+//!   confirmation is refused; apply inserts, updates and deletes (confirmed); the apply reports
+//!   in sync, a fresh compare has no differences, and `m8_data`, `m8_composite` and `m8_big`
+//!   read back on both sides compare equal value by value ([`values`]). The designed rows
+//!   carry text that needs quoting (`'`, `\`, `;`, `--`) and edge values (a 38-digit amount,
+//!   an astral emoji).
+//! - `backup`: back up the source container (`BackupService`), list and verify the archive; a
+//!   truncated and a damaged copy must not verify; the archive (raw and every entry) holds no
+//!   password or host; restore it into the empty restore container; every object restores,
+//!   every table (`order_audit` too: a trigger firing during the load would duplicate it)
+//!   holds the source's row count, the data tables and orders read back equal, a structure
+//!   compare source / restore is in sync and a data compare of the keyed data tables is in
+//!   sync.
 //!
 //! The transfer matrix (`transfer`, one cell per ordered pair of different engines): copy the
 //! source copy's `m8_data` into the target engine's transfer container (`TransferService`):
-//! the plan must be runnable (or name a precise reason per blocked column), the run must
-//! finish, and the target table must hold the same ids, names and notes. Non-exact column
-//! mappings are listed with their reasons (the lossiness). PostgreSQL → MySQL is the M8 exit
-//! check and must pass: it also copies the `[m8.transfer]` set (tables listed child first),
-//! whose plan fidelities and `information_schema.COLUMNS.COLUMN_TYPE` must equal
-//! `[m8.transfer.expected_mysql]`, with the rows and the foreign keys.
+//! the run must finish, and every column read back must equal the source where the plan says
+//! `exact` (decimals exactly, instants in UTC, bytes as hex; [`values`]); differences in
+//! non-exact columns are listed with the plan's fidelity, and every non-exact mapping with its
+//! reason (the lossiness). A plan that cannot run is `n/a` only when it blocks on columns the
+//! mapper marks unsupported with a reason; otherwise the cell fails. PostgreSQL → MySQL is the
+//! M8 exit check and must pass: it also copies the `[m8.transfer]` set (tables listed child
+//! first), whose plan fidelities and `information_schema.COLUMNS.COLUMN_TYPE` must equal
+//! `[m8.transfer.expected_mysql]`, whose `m8_types` values read back equal under that table's
+//! rules, with every table's rows, `m8_parent` loaded before `m8_child`, and the foreign keys
+//! (`m8_tree` references itself).
+//!
+//! # Sessions and cancellation
+//!
+//! On server engines the seed runs on its own session (closed after); the source, target,
+//! restore and transfer roles each get their own session of the fixture profile, so a service
+//! that reads or writes the wrong side shows. A cell that runs out of time is aborted and every
+//! run of the four services on its sessions is cancelled; a run whose terminal event does not
+//! come is cancelled by id.
 //!
 //! # Pending
 //!
@@ -51,6 +73,7 @@
 
 pub mod seed;
 pub mod skeleton;
+pub mod values;
 
 mod live;
 

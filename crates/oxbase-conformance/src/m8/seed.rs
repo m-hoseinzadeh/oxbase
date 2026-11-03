@@ -204,14 +204,25 @@ pub fn qualified(engine: Engine, container: &str, table: &str) -> String {
     }
 }
 
-/// Creates the empty container `name` (not for SQLite).
-pub fn create_container(engine: Engine, name: &str) -> String {
+/// The default collation the seeds give their MySQL / MariaDB databases (MariaDB 11.8 would
+/// otherwise default to `utf8mb4_uca1400_ai_ci`, unlike the seed pair and `m8_restore`).
+pub fn seed_collation(engine: Engine) -> Option<&'static str> {
     match engine {
-        Engine::MySql | Engine::MariaDb => format!(
-            "CREATE DATABASE {} DEFAULT CHARACTER SET utf8mb4",
+        Engine::MySql => Some("utf8mb4_0900_ai_ci"),
+        Engine::MariaDb => Some("utf8mb4_unicode_ci"),
+        _ => None,
+    }
+}
+
+/// Creates the empty container `name` (not for SQLite); MySQL / MariaDB databases get the
+/// seed's character set and collation.
+pub fn create_container(engine: Engine, name: &str) -> String {
+    match seed_collation(engine) {
+        Some(collation) => format!(
+            "CREATE DATABASE {} DEFAULT CHARACTER SET utf8mb4 COLLATE {collation}",
             quote(engine, name)
         ),
-        _ => format!("CREATE SCHEMA {}", quote(engine, name)),
+        None => format!("CREATE SCHEMA {}", quote(engine, name)),
     }
 }
 
@@ -384,6 +395,11 @@ mod tests {
             Vec::<String>::new()
         );
         assert!(list_containers(Engine::MySql, "m8_t_").is_some());
+        assert_eq!(
+            create_container(Engine::MariaDb, "x"),
+            "CREATE DATABASE `x` DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
+        );
+        assert_eq!(create_container(Engine::MsSql, "x"), "CREATE SCHEMA [x]");
         assert!(list_containers(Engine::Sqlite, "m8_t_").is_none());
     }
 
@@ -469,11 +485,11 @@ mod tests {
             assert!(text.is_ascii(), "{file} must stay ASCII");
             let stmts = statements(Engine::Sqlite, &text);
             assert!(stmts.len() > 10, "{file}: {} statements", stmts.len());
-            // The trigger body is one statement.
+            // The trigger body stays inside its CREATE TRIGGER statement.
             assert!(
                 stmts
                     .iter()
-                    .all(|s| !s.trim_start().starts_with("INSERT INTO order_audit")),
+                    .all(|s| !s.contains("NEW.id") || s.contains("CREATE TRIGGER")),
                 "{file}: the trigger body was split"
             );
         }
