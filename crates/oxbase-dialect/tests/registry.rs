@@ -799,10 +799,9 @@ fn missing_m8_roles_lists_what_sync_and_transfer_need() {
     let loader = reg.bulk_loader(Engine::Postgres).unwrap();
     let table = ObjectRef::table(None, Some("s"), "t");
     assert!(loader.foreign_key_checks(&table, false).is_none());
-    assert!(
-        loader
-            .identity_resync(&table, &[ColumnDef::new("id", DataType::INT64)])
-            .is_empty()
+    assert_eq!(
+        loader.identity_resync(&table, &[ColumnDef::new("id", DataType::INT64)]),
+        Vec::<String>::new()
     );
     assert!(oxbase_dialect::SYNC_KINDS.contains(&ObjectKind::Trigger));
     assert_eq!(oxbase_dialect::M8_ENGINES.len(), 5);

@@ -358,6 +358,6 @@ mod tests {
         .unwrap();
         assert_eq!(minimal.options.mode, TableMode::Truncate);
         assert_eq!(minimal.options.batch_rows, 10_000);
-        assert!(minimal.overrides.is_empty());
+        assert_eq!(minimal.overrides, Vec::<ColumnOverride>::new());
     }
 }

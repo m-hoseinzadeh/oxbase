@@ -186,7 +186,7 @@ mod tests {
         assert!(!runs.is_running(gone));
         drop(first);
         drop(second);
-        assert!(runs.is_empty());
+        assert_eq!(runs.len(), 0);
         assert_eq!(runs.cancel_session(a), 0);
         assert_eq!(
             serde_json::to_string(&gone).unwrap(),

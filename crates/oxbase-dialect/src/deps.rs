@@ -244,7 +244,7 @@ mod tests {
                 "tree"
             ]
         );
-        assert!(graph.order().cycles.is_empty());
+        assert_eq!(graph.order().cycles, Vec::<Vec<ObjectRef>>::new());
         assert_eq!(
             graph
                 .dependencies(&t("order_items"))
@@ -254,7 +254,7 @@ mod tests {
             ["orders", "products"]
         );
         // A self-reference is no dependency.
-        assert!(graph.dependencies(&t("tree")).is_empty());
+        assert_eq!(graph.dependencies(&t("tree")), Vec::<&ObjectRef>::new());
     }
 
     #[test]
@@ -290,7 +290,10 @@ mod tests {
         assert_eq!(order.order.len(), 50_001);
         assert_eq!(order.order[0].name, "n50000");
         assert_eq!(order.order[50_000].name, "n0");
-        assert!(DependencyGraph::new().order().order.is_empty());
+        assert_eq!(
+            DependencyGraph::new().order().order,
+            Vec::<ObjectRef>::new()
+        );
     }
 
     #[test]

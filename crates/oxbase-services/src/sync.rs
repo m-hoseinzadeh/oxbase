@@ -511,7 +511,8 @@ mod tests {
 
         let apply: StructureApplyRequest =
             serde_json::from_value(serde_json::json!({"compareId": OperationId::new()})).unwrap();
-        assert!(apply.selection.is_empty() && !apply.confirm_destructive);
+        assert_eq!(apply.selection, Vec::<String>::new());
+        assert!(!apply.confirm_destructive);
 
         let started = DataCompareEvent::Started {
             compare_id: OperationId::new(),
