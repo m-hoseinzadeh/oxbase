@@ -580,7 +580,7 @@ mod tests {
             diff: diff.clone(),
         };
         let failed = failed_recompare(&kept, &Error::Cancelled);
-        assert!(failed.diff.items.is_empty());
+        assert_eq!(failed.diff.items, Vec::<DiffItem>::new());
         assert_eq!(failed.diff.warnings.len(), 1);
         assert_eq!(failed.counts, DiffCounts::default());
     }

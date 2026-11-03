@@ -1246,31 +1246,31 @@ async fn edge_steps(live: &Live, tok: &str, names: &[String; 4], admin: &Session
 #[tokio::test]
 #[ignore = "needs the Docker fixtures"]
 async fn postgres_sync_edges() {
-    edge_cycle("postgres", Engine::Postgres).await;
+    Box::pin(edge_cycle("postgres", Engine::Postgres)).await;
 }
 
 #[tokio::test]
 #[ignore = "needs the Docker fixtures"]
 async fn mysql_sync_edges() {
-    edge_cycle("mysql", Engine::MySql).await;
+    Box::pin(edge_cycle("mysql", Engine::MySql)).await;
 }
 
 #[tokio::test]
 #[ignore = "needs the Docker fixtures"]
 async fn mariadb_sync_edges() {
-    edge_cycle("mariadb", Engine::MariaDb).await;
+    Box::pin(edge_cycle("mariadb", Engine::MariaDb)).await;
 }
 
 #[tokio::test]
 #[ignore = "needs the Docker fixtures"]
 async fn mssql_sync_edges() {
-    edge_cycle("mssql", Engine::MsSql).await;
+    Box::pin(edge_cycle("mssql", Engine::MsSql)).await;
 }
 
 #[tokio::test]
 #[ignore = "runs against SQLite files (with the live tests)"]
 async fn sqlite_sync_edges() {
-    edge_cycle("sqlite", Engine::Sqlite).await;
+    Box::pin(edge_cycle("sqlite", Engine::Sqlite)).await;
 }
 
 // --- the [m8] fixture pair --------------------------------------------------------------------

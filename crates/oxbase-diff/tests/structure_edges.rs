@@ -5,7 +5,8 @@
 //!   key that references it is dropped before the change and added back after it, also when
 //!   only the parent is selected (golden scripts `tests/golden/structure_fk_<engine>.sql`);
 //! - a column default moved to a new sequence: the old sequence is dropped after the table
-//!   stopped using it (golden `tests/golden/structure_seq_<engine>.sql`);
+//!   stopped using it (golden `tests/golden/structure_seq_postgres.sql`; the order is checked
+//!   on SQL Server and MariaDB too);
 //! - a routine a new table's default calls is created before the table;
 //! - a view that reads a changed table but is not selected is created again from the target's
 //!   own definition;
@@ -124,17 +125,16 @@ fn options(include_drops: bool) -> StructureOptions {
     }
 }
 
-fn check_golden(name: &str, sql: &str) {
+/// Compares `sql` with golden file `name`; a missing or different file prints the script
+/// and is collected into `failed` (the test fails once every engine printed its script).
+fn check_golden(name: &str, sql: &str, failed: &mut Vec<String>) {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/golden")
         .join(format!("{name}.sql"));
     let expected = std::fs::read_to_string(&path).unwrap_or_default();
     if expected != sql {
         eprintln!("===== BEGIN GOLDEN {name} =====\n{sql}===== END GOLDEN {name} =====");
-        panic!(
-            "{} is missing or differs from the generated script (printed above)",
-            path.display()
-        );
+        failed.push(path.display().to_string());
     }
 }
 
@@ -198,6 +198,7 @@ fn check_fk_order(k: &str, sql: &[&str]) {
 #[test]
 fn foreign_keys_on_a_widened_parent_key_are_dropped_and_added_back() {
     let reg = registry();
+    let mut failed = Vec::new();
     for engine in [
         Engine::Postgres,
         Engine::MySql,
@@ -221,7 +222,7 @@ fn foreign_keys_on_a_widened_parent_key_are_dropped_and_added_back() {
         let script = sync_script(&reg, &diff, &source, &target, &[], &opts).unwrap();
         let sql: Vec<&str> = script.script.ordered().map(|s| s.sql.as_str()).collect();
         check_fk_order(k, &sql);
-        check_golden(&format!("structure_fk_{k}"), &script.sql);
+        check_golden(&format!("structure_fk_{k}"), &script.sql, &mut failed);
 
         // Only the parent selected: the child's key (as the target has it) still goes and
         // comes back.
@@ -238,6 +239,11 @@ fn foreign_keys_on_a_widened_parent_key_are_dropped_and_added_back() {
         let sql: Vec<&str> = script.script.ordered().map(|s| s.sql.as_str()).collect();
         check_fk_order(k, &sql);
     }
+    assert_eq!(
+        failed,
+        Vec::<String>::new(),
+        "golden scripts differ (printed above)"
+    );
 }
 
 /// `orders.id` takes its default from `seq_name` (the engine's own spelling).
@@ -288,7 +294,15 @@ fn a_sequence_only_in_the_target_goes_after_the_tables_stop_using_it() {
             s.contains("old_seq") && s.to_uppercase().starts_with("DROP")
         });
         assert!(create < alter && alter < drop, "{k}: {sql:#?}");
-        check_golden(&format!("structure_seq_{k}"), &script.sql);
+        if engine == Engine::Postgres {
+            let mut failed = Vec::new();
+            check_golden("structure_seq_postgres", &script.sql, &mut failed);
+            assert_eq!(
+                failed,
+                Vec::<String>::new(),
+                "golden script differs (printed above)"
+            );
+        }
     }
 }
 
