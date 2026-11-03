@@ -57,6 +57,8 @@ use crate::schema_cache::SchemaEvents;
 use crate::tree::TreeService;
 use crate::{CancellationToken, ConnectionManager, SessionId};
 
+mod structure;
+
 /// Compare results kept per service (module docs).
 pub const KEPT_COMPARES: usize = 8;
 
@@ -131,6 +133,8 @@ pub struct StructureSyncService {
     dialects: Arc<DialectRegistry>,
     runs: RunRegistry,
     schema_events: Option<SchemaEvents>,
+    /// Kept compare results (module docs).
+    kept: structure::Kept,
 }
 
 impl StructureSyncService {
@@ -145,6 +149,7 @@ impl StructureSyncService {
             dialects,
             runs: RunRegistry::new(),
             schema_events: None,
+            kept: structure::Kept::default(),
         }
     }
 
@@ -178,16 +183,12 @@ impl StructureSyncService {
         request: &StructureCompareRequest,
         cancel: CancellationToken,
     ) -> Result<StructureCompareResult> {
-        let _ = (&self.schema_events, request, cancel);
-        // Keeps the skeleton an `async fn` (clippy::unused_async) until the body lands.
-        std::future::ready(()).await;
-        unimplemented!("m8: structure-sync")
+        structure::compare(self, request, cancel).await
     }
 
     /// The script of the selected items of a kept compare. Changes nothing.
     pub fn script(&self, request: &StructureScriptRequest) -> Result<SyncScript> {
-        let _ = (&self.runs, request);
-        unimplemented!("m8: structure-sync")
+        structure::script(self, request)
     }
 
     /// Applies the selected items (module docs, *Structure apply*).
@@ -196,16 +197,12 @@ impl StructureSyncService {
         request: &StructureApplyRequest,
         cancel: CancellationToken,
     ) -> Result<StructureApplyReport> {
-        let _ = (&self.runs, request, cancel);
-        // Keeps the skeleton an `async fn` (clippy::unused_async) until the body lands.
-        std::future::ready(()).await;
-        unimplemented!("m8: structure-sync")
+        structure::apply(self, request, cancel).await
     }
 
     /// Drops a kept compare; `false` when it is unknown.
     pub fn forget(&self, compare_id: OperationId) -> bool {
-        let _ = (&self.runs, compare_id);
-        unimplemented!("m8: structure-sync")
+        self.kept.remove(compare_id)
     }
 
     /// Cancels every compare and apply that uses `session` (closing it).

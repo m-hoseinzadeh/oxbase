@@ -70,6 +70,8 @@ mod native;
 mod routine;
 mod rows;
 mod sequence;
+// M8: structure sync DDL for views, routines, triggers and MariaDB sequences.
+mod sync_ddl;
 mod table;
 mod trigger;
 mod view;
@@ -77,8 +79,8 @@ mod view;
 use std::sync::Arc;
 
 use oxbase_dialect::{
-    BacktickQuoting, Capabilities, ChildGroup, DESIGNER_KINDS, DatabaseScope, DesignerCapabilities,
-    DialectRegistry, TreeLayout,
+    BacktickQuoting, Capabilities, ChildGroup, DESIGNER_KINDS, DatabaseScope, DefinitionComparator,
+    DesignerCapabilities, DialectRegistry, TreeLayout,
 };
 use oxbase_driver::{CancellationToken, Connection};
 use oxbase_types::{
@@ -176,6 +178,22 @@ pub fn register(reg: &mut DialectRegistry) {
         reg.register_capabilities(engine, Arc::new(MySqlCapabilities::new(engine)));
         reg.register_quoting(engine, Arc::new(BacktickQuoting));
         reg.mark_not_applicable_except(engine, applicable_kinds(engine));
+
+        // M8: structure sync DDL and comparison of views, routines, triggers and MariaDB
+        // sequences (sync_ddl.rs).
+        let sync = Arc::new(sync_ddl::MySqlSyncDdl { mariadb });
+        let mut sync_kinds = sync_ddl::KINDS.to_vec();
+        if mariadb {
+            sync_kinds.push(ObjectKind::Sequence);
+        }
+        for kind in sync_kinds {
+            reg.register_ddl(engine, kind, sync.clone());
+            reg.register_comparator(
+                engine,
+                kind,
+                Arc::new(DefinitionComparator(sync_ddl::MySqlSyncRules)),
+            );
+        }
     }
 }
 

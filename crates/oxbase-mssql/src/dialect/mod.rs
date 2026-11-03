@@ -44,11 +44,14 @@ mod dml;
 mod fetch;
 // M6: keywords, functions and types for code insight.
 mod language;
+// M8: structure sync DDL for views, sequences, routines and triggers.
+mod sync_ddl;
 
 use std::sync::Arc;
 
 use oxbase_dialect::{
-    BracketQuoting, ChildGroup, DESIGNER_KINDS, DatabaseScope, DialectRegistry, TreeLayout,
+    BracketQuoting, ChildGroup, DESIGNER_KINDS, DatabaseScope, DefinitionComparator,
+    DialectRegistry, TreeLayout,
 };
 use oxbase_types::{Engine, ObjectKind};
 
@@ -102,6 +105,18 @@ pub fn register(reg: &mut DialectRegistry) {
     // M6: language data for code insight (language.rs).
     reg.register_language(engine, language::LANGUAGE);
     reg.mark_not_applicable_except(engine, &APPLICABLE);
+
+    // M8: structure sync DDL and comparison of views, sequences, routines and triggers
+    // (sync_ddl.rs).
+    let sync = Arc::new(sync_ddl::MsSqlSyncDdl);
+    for kind in sync_ddl::KINDS {
+        reg.register_ddl(engine, kind, sync.clone());
+        reg.register_comparator(
+            engine,
+            kind,
+            Arc::new(DefinitionComparator(sync_ddl::MsSqlSyncRules)),
+        );
+    }
 }
 
 /// The SQL Server object tree (see the module docs).
