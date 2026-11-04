@@ -79,7 +79,7 @@ skipped and the installers stay unsigned.
 ### 5. Test run
 
 Set `SIGNPATH_SIGNING_POLICY_SLUG` to `test-signing` and run **Bundle** manually (Actions →
-Bundle → Run workflow). The run confirms the artifact configuration (the path of `Oxbase.exe`
+Bundle → Run workflow). The run confirms the artifact configuration (the path of `app-tauri.exe`
 inside the `.msi`, the version format Tauri writes); fix `installers.xml` in SignPath if a
 restriction does not match, and run again. Then set the variable back to `release-signing` (or
 delete it).

@@ -9,8 +9,9 @@
   version are enforced on every signed file, as SignPath Foundation requires; `version` comes
   from the workflow (scripts/release-check.mjs, the version in Cargo.toml).
 
-  Check with a test-signing run first (docs/code-signing.md, step 5): the path of the .exe
-  inside the .msi and the version format Tauri writes are confirmed there.
+  The app is installed as `app-tauri.exe` (the MSI's File table; the Cargo binary name). Check with
+  a test-signing run first (docs/code-signing.md, step 5): the path of that .exe inside the .msi
+  and the version format Tauri writes into its metadata are confirmed there.
 -->
 <artifact-configuration xmlns="http://signpath.io/artifact-configuration/v1">
   <parameters>
@@ -18,7 +19,7 @@
   </parameters>
   <zip-file>
     <msi-file path="Oxbase_${version}_x64_en-US.msi">
-      <pe-file path="**/Oxbase.exe" product-name="Oxbase" product-version="${version}">
+      <pe-file path="**/app-tauri.exe" product-name="Oxbase" product-version="${version}">
         <authenticode-sign />
       </pe-file>
       <authenticode-sign />
