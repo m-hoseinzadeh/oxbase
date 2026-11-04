@@ -34,7 +34,7 @@ import {
   useRef,
   useState,
 } from "react";
-import type { ColumnInfo } from "../../api";
+import type { ColumnInfo, Engine } from "../../api";
 import { normalizeColor, subscribeTheme } from "../theme-bridge";
 import { type CopyNotify, cellsForSelection, NULL_COPY_TEXT } from "./copy";
 import {
@@ -47,6 +47,7 @@ import {
 import { dataCellOf } from "./gridCoords";
 import type { ResultPager } from "./pager";
 import { fromGridSelection, type GridRowSelection, toGridSelection } from "./rowSelection";
+import { ValuePanel } from "./ValuePanel";
 
 /** Rows assumed visible before the grid reports its real viewport. */
 const MIN_VIEWPORT_ROWS = 60;
@@ -234,6 +235,15 @@ export interface ResultGridProps {
    * the current row into view.
    */
   selectedRows?: GridRowSelection | undefined;
+  /**
+   * The value panel (the selected cell's whole value, ./ValuePanel) is open. Leave it unset and
+   * the grid keeps the state itself; either way activating a read-only cell (double-click,
+   * Enter, Space) opens it, and its close button closes it.
+   */
+  valuePanel?: boolean | undefined;
+  onValuePanelChange?: ((open: boolean) => void) | undefined;
+  /** The connection's engine, for the value panel's SQL beautifier. */
+  engine?: Engine | null | undefined;
 }
 
 const NO_SELECTION: GridSelection = {
@@ -249,6 +259,9 @@ export function ResultGrid({
   edit,
   onSelectRows,
   selectedRows,
+  valuePanel,
+  onValuePanelChange,
+  engine,
 }: ResultGridProps) {
   // The document column is always last, so the shown columns keep their page indexes.
   const columns = useMemo(() => visibleColumns(resultColumns), [resultColumns]);
@@ -263,6 +276,17 @@ export function ResultGrid({
   const colours = useEditColours();
   const editRef = useRef(edit);
   editRef.current = edit;
+  const [ownValuePanel, setOwnValuePanel] = useState(false);
+  const valueOpen = valuePanel ?? ownValuePanel;
+  const setValueOpen = useCallback(
+    (open: boolean) => {
+      if (valuePanel === undefined) setOwnValuePanel(open);
+      onValuePanelChange?.(open);
+    },
+    [valuePanel, onValuePanelChange],
+  );
+  // The value panel re-reads its cell when rows arrive (a page loaded after the selection).
+  const [, setLoads] = useState(0);
 
   useEffect(() => {
     pager.setRowCount(rowCount);
@@ -275,6 +299,7 @@ export function ResultGrid({
         const r = region.current;
         const from = Math.max(first, r.y);
         const to = Math.min(last, r.y + Math.max(r.height, MIN_VIEWPORT_ROWS) - 1);
+        setLoads((n) => n + 1);
         if (to < from) return;
         const cells: { cell: Item }[] = [];
         for (let row = from; row <= to; row += 1) {
@@ -325,7 +350,9 @@ export function ResultGrid({
         kind: GridCellKind.Text,
         data: value.text,
         displayData: cellDisplayText(value.text),
-        allowOverlay: true,
+        // Read-only cells open the value panel instead of Glide's small text overlay; the
+        // editable grid turns the overlay (its editor) back on below.
+        allowOverlay: false,
         readonly: true,
         ...(value.numeric ? { contentAlign: "right" as const } : {}),
       };
@@ -461,44 +488,87 @@ export function ResultGrid({
     if (region.current.height === 0) pager.setVisible(0, MIN_VIEWPORT_ROWS - 1);
   }, [pager]);
 
+  /** The whole value of a data cell: text, `null` (NULL) or `undefined` (not loaded). */
+  const valueAt = useCallback(
+    (col: number, row: number): string | null | undefined => {
+      const override = edit?.override(row, col);
+      if (override) return override.placeholder ?? override.text;
+      const ref = pager.cell(row, col);
+      if (!ref) return undefined;
+      const value = formatCell(ref.vector, ref.index, columns[col]);
+      return value.isNull ? null : value.text;
+    },
+    [edit, pager, columns],
+  );
+
+  const onCellActivated = useCallback(
+    ([col, row]: Item) => {
+      if (edit?.canEdit(row, col)) return;
+      setValueOpen(true);
+    },
+    [edit, setValueOpen],
+  );
+
+  const currentCell = selection.current?.cell;
+  const panelColumn = currentCell ? (columns[currentCell[0]] ?? null) : null;
+  const panelValue =
+    currentCell && panelColumn ? valueAt(currentCell[0], currentCell[1]) : undefined;
+
   const columnSummary = columns.map((c) => `${c.name} (${columnTypeLabel(c)})`).join(", ");
 
   return (
-    <div className="result-grid" data-testid="result-grid">
-      <OverlayTarget.Provider value={overlay}>
-        <DataEditor
-          ref={gridRef}
-          columns={gridColumns}
-          rows={rowCount + (edit?.extraRows ?? 0)}
-          getCellContent={getCellContent}
-          drawHeader={drawHeader}
-          onVisibleRegionChanged={onVisibleRegionChanged}
-          onColumnResize={(_column, newSize, index) =>
-            setWidths((current) => ({ ...current, [index]: newSize }))
-          }
-          getCellsForSelection={getCellsForSelection}
-          gridSelection={selection}
-          onGridSelectionChange={onGridSelectionChange}
-          {...(edit
-            ? {
-                provideEditor,
-                onDelete: () => false,
-                onPaste: false,
-              }
-            : {})}
-          rowMarkers="number"
-          rowHeight={ROW_HEIGHT}
-          headerHeight={HEADER_HEIGHT}
-          smoothScrollX
-          smoothScrollY
-          theme={theme}
-          width="100%"
-          height="100%"
-          portalElementRef={portalRef as RefObject<HTMLElement>}
+    <div
+      className={`result-grid${valueOpen ? " result-grid--with-value" : ""}`}
+      data-testid="result-grid"
+    >
+      <div className="result-grid__main">
+        <OverlayTarget.Provider value={overlay}>
+          <DataEditor
+            ref={gridRef}
+            columns={gridColumns}
+            rows={rowCount + (edit?.extraRows ?? 0)}
+            getCellContent={getCellContent}
+            drawHeader={drawHeader}
+            onVisibleRegionChanged={onVisibleRegionChanged}
+            onColumnResize={(_column, newSize, index) =>
+              setWidths((current) => ({ ...current, [index]: newSize }))
+            }
+            getCellsForSelection={getCellsForSelection}
+            onCellActivated={onCellActivated}
+            gridSelection={selection}
+            onGridSelectionChange={onGridSelectionChange}
+            {...(edit
+              ? {
+                  provideEditor,
+                  onDelete: () => false,
+                  onPaste: false,
+                }
+              : {})}
+            rowMarkers="number"
+            rowHeight={ROW_HEIGHT}
+            headerHeight={HEADER_HEIGHT}
+            smoothScrollX
+            smoothScrollY
+            theme={theme}
+            width="100%"
+            height="100%"
+            portalElementRef={portalRef as RefObject<HTMLElement>}
+          />
+        </OverlayTarget.Provider>
+        <div ref={portalRef} className="result-grid__portal" />
+        <span className="visually-hidden">Columns: {columnSummary}</span>
+      </div>
+      {valueOpen ? (
+        <ValuePanel
+          column={panelColumn}
+          value={panelValue}
+          engine={engine}
+          onClose={() => {
+            setValueOpen(false);
+            gridRef.current?.focus();
+          }}
         />
-      </OverlayTarget.Provider>
-      <div ref={portalRef} className="result-grid__portal" />
-      <span className="visually-hidden">Columns: {columnSummary}</span>
+      ) : null}
     </div>
   );
 }

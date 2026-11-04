@@ -67,6 +67,8 @@ export interface SqlEditorProps {
   onChange?: ((text: string) => void) | undefined;
   /** A small field editor: no line numbers, gutter or folding (the builder's JSON fields). */
   compact?: boolean | undefined;
+  /** Wrap long lines at the editor's width (the value panel). */
+  wordWrap?: boolean | undefined;
 }
 
 const MonacoSqlEditor = lazy(() => import("./MonacoSqlEditor"));

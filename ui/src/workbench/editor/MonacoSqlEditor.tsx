@@ -18,6 +18,7 @@ export default function MonacoSqlEditor({
   insight,
   onChange,
   compact,
+  wordWrap,
 }: SqlEditorProps) {
   const host = useRef<HTMLDivElement>(null);
   const editor = useRef<monaco.editor.IStandaloneCodeEditor | null>(null);
@@ -31,6 +32,7 @@ export default function MonacoSqlEditor({
     language,
     readOnly: readOnly ?? false,
     compact: compact ?? false,
+    wordWrap: wordWrap ?? false,
   });
   // Insight reads the latest target (engine, connection, database) on every request.
   const insightProps = useRef(insight);
@@ -60,6 +62,7 @@ export default function MonacoSqlEditor({
       ariaLabel: ariaLabel ?? "SQL editor",
       readOnly: initial.current.readOnly,
       domReadOnly: initial.current.readOnly,
+      wordWrap: initial.current.wordWrap ? "on" : "off",
       ...(initial.current.compact
         ? {
             lineNumbers: "off" as const,
@@ -188,6 +191,10 @@ export default function MonacoSqlEditor({
     const model = editor.current?.getModel();
     if (model) monaco.editor.setModelLanguage(model, language);
   }, [language]);
+
+  useEffect(() => {
+    editor.current?.updateOptions({ wordWrap: wordWrap ? "on" : "off" });
+  }, [wordWrap]);
 
   // A controlled viewer follows `value`.
   useEffect(() => {

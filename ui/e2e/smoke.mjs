@@ -399,6 +399,39 @@ async function screenshot(name) {
 }
 
 /**
+ * Design review of the value panel (results/ValuePanel.tsx): opens it with the results' Value
+ * button, selects a cell with a real click on the grid, screenshots both themes, closes it.
+ * Logs what it saw; never fails the run.
+ */
+async function valuePanelGallery() {
+  try {
+    const toggle = await wd.execute("return document.querySelector('.results__value-toggle');");
+    const canvas = await wd.execute(
+      "return document.querySelector('[data-testid=result-grid] canvas');",
+    );
+    if (!toggle || !canvas) {
+      log("value panel: no Value button or grid canvas");
+      return;
+    }
+    await wd.click(toggle);
+    await sleep(300);
+    await wd.click(canvas);
+    await sleep(500);
+    const seen = await wd.execute(
+      "const p = document.querySelector('[data-testid=value-panel]'); if (!p) return null;" +
+        " return (p.querySelector('.value-panel__name')?.textContent ?? '') + ' | ' +" +
+        " (p.querySelector('.value-panel__stats, .value-panel__empty')?.textContent ?? '');",
+    );
+    log(seen === null ? "value panel: did not open" : `value panel: ${seen}`);
+    if (seen !== null) await gallery("02-value-panel");
+    await wd.click(toggle);
+    await sleep(200);
+  } catch (error) {
+    log(`value panel: ${error.message}`);
+  }
+}
+
+/**
  * Design review of the themed dropdown list (components/Select.tsx): opens the first select
  * matching `selector` in `root` with a real click, screenshots both themes with the list open,
  * then closes it with Escape. Logs what it saw; never fails the run.
@@ -2991,6 +3024,7 @@ async function main() {
   if (ok) ok = await step("Arrow page decodes in the webview (first cell is 1)", firstCell);
   if (ok) ok = await step("Scroll the grid (pages load at each position)", scrollGrid);
   if (ok) await gallery("02-query-results");
+  if (ok) await valuePanelGallery();
   if (ok) ok = await step("Page latency through IPC + Arrow decode", measurePages);
   if (ok) ok = await step("Cancel a running large query", cancelRun);
   if (ok) ok = await step("Edit a table cell (M3 table data UI)", editCell);
