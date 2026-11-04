@@ -668,17 +668,35 @@ fn option_value<'a>(params: &'a ConnectParams, key: &str) -> Option<&'a str> {
     params.options.get(key).map(String::as_str)
 }
 
-fn apply_options(cfg: &mut Config, params: &ConnectParams) -> Result<()> {
-    // Output formats the text decoder expects (users may still change them in the session), and
-    // standard string literals, which the SQL lexer (`check_expression`) and the generated DDL
-    // assume. User options come last, so a profile may still override them.
-    let mut startup =
-        String::from("-c DateStyle=ISO -c bytea_output=hex -c standard_conforming_strings=on");
+/// The session settings the driver relies on: the date output format the text decoder reads
+/// (users may still change it in the session), and standard string literals, which the SQL
+/// lexer (`check_expression`) and the generated DDL assume. They go in the startup packet's
+/// `options`, so they hold from the first statement. PgBouncer tracks both by default, so they
+/// pass through it and survive transaction pooling.
+///
+/// `bytea_output` is not among them: PgBouncer 1.20+ refuses an untracked parameter in
+/// `options` ("unsupported startup parameter in options: bytea_output"), the server default is
+/// already `hex`, and [`crate::values::parse_bytea`] reads the escape format too.
+const SESSION_DEFAULTS: [(&str, &str); 2] =
+    [("DateStyle", "ISO"), ("standard_conforming_strings", "on")];
+
+/// Sets the startup `options` (with `defaults`: [`SESSION_DEFAULTS`], then the profile's own
+/// `options`, which come last so a profile may still override them) and the other options.
+fn apply_options(cfg: &mut Config, params: &ConnectParams, defaults: bool) -> Result<()> {
+    let mut startup: Vec<String> = if defaults {
+        SESSION_DEFAULTS
+            .iter()
+            .map(|(name, value)| format!("-c {name}={value}"))
+            .collect()
+    } else {
+        Vec::new()
+    };
     if let Some(extra) = option_value(params, "options").filter(|o| !o.trim().is_empty()) {
-        startup.push(' ');
-        startup.push_str(extra);
+        startup.push(extra.to_owned());
     }
-    cfg.options(startup);
+    if !startup.is_empty() {
+        cfg.options(startup.join(" "));
+    }
     for (key, value) in &params.options {
         match key.as_str() {
             "options" | "sslnegotiation" => {}
@@ -711,6 +729,23 @@ fn apply_options(cfg: &mut Config, params: &ConnectParams) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Whether a connection pooler refused the startup `options`: PgBouncer before 1.20 refuses
+/// the parameter itself ("unsupported startup parameter: options"), later versions an untracked
+/// parameter in it ("unsupported startup parameter in options: <name>").
+fn startup_options_refused(err: &tokio_postgres::Error) -> bool {
+    err.as_db_error()
+        .is_some_and(|db| db.message().starts_with("unsupported startup parameter"))
+}
+
+/// The `SET` statements of [`SESSION_DEFAULTS`], for a session opened without them.
+fn session_defaults_sql() -> String {
+    SESSION_DEFAULTS
+        .iter()
+        .map(|(name, value)| format!("SET {name} = {value}"))
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 fn connect_error(err: &tokio_postgres::Error, server: &Endpoint, dial: &Endpoint) -> Error {
@@ -797,21 +832,40 @@ impl PgConnection {
         let negotiation = ssl_negotiation(option_value(params, "sslnegotiation"), mode)?;
         cfg.ssl_mode(ssl_mode(mode));
         cfg.ssl_negotiation(negotiation);
-        apply_options(&mut cfg, params)?;
+        let base = cfg.clone();
+        apply_options(&mut cfg, params, true)?;
 
         let tls = PgTls::new(&effective, negotiation == SslNegotiation::Direct)?;
-        let (session_tls, tls_used) = tls.tracked();
+        let (session_tls, mut tls_used) = tls.tracked();
         let limit = params.connect_timeout.unwrap_or(DEFAULT_CONNECT_TIMEOUT);
-        let (client, mut connection) =
-            match tokio::time::timeout(limit, cfg.connect(session_tls)).await {
-                Err(_) => {
-                    return Err(Error::timeout(format!(
-                        "connecting to PostgreSQL at {server} took longer than {limit:?}"
-                    )));
-                }
-                Ok(Err(e)) => return Err(connect_error(&e, &server, &dial)),
-                Ok(Ok(pair)) => pair,
-            };
+        let mut attempt = tokio::time::timeout(limit, cfg.connect(session_tls)).await;
+        // A pooler that refuses the startup `options` (see `startup_options_refused`): connect
+        // again without the driver's defaults and set them with `SET` once connected. A
+        // profile's own `options` are still sent, so a refusal of those stays an error.
+        let mut set_defaults = false;
+        if let Ok(Err(e)) = &attempt
+            && startup_options_refused(e)
+        {
+            tracing::info!(
+                error = %from_pg(e),
+                "the server refused the startup options; connecting without the driver's defaults"
+            );
+            let mut retry = base;
+            apply_options(&mut retry, params, false)?;
+            let (session_tls, used) = tls.tracked();
+            tls_used = used;
+            attempt = tokio::time::timeout(limit, retry.connect(session_tls)).await;
+            set_defaults = true;
+        }
+        let (client, mut connection) = match attempt {
+            Err(_) => {
+                return Err(Error::timeout(format!(
+                    "connecting to PostgreSQL at {server} took longer than {limit:?}"
+                )));
+            }
+            Ok(Err(e)) => return Err(connect_error(&e, &server, &dial)),
+            Ok(Ok(pair)) => pair,
+        };
 
         let version = connection
             .parameter("server_version")
@@ -836,6 +890,15 @@ impl PgConnection {
                 }
             }
         });
+
+        if set_defaults {
+            let sql = session_defaults_sql();
+            match tokio::time::timeout(limit, client.simple_query(&sql)).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => tracing::warn!(error = %from_pg(&e), "{sql} failed"),
+                Err(_) => tracing::warn!("{sql} timed out"),
+            }
+        }
 
         // The database the server actually opened (a pooler alias such as pgbouncer's
         // `[databases] app = dbname=real` connects to `real`); the requested name is the fallback.

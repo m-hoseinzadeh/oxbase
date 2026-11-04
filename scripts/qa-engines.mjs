@@ -61,7 +61,7 @@ const ENGINES = ["postgres", "mysql", "mariadb", "sqlite", "mssql", "mongodb", "
 const SQL_ENGINES = ["postgres", "mysql", "mariadb", "sqlite", "mssql"];
 // Compose services of a single-database stage (the SSH bastion for the tunnel tests).
 const STAGE_SERVICES = {
-  postgres: ["postgres", "ssh"],
+  postgres: ["postgres", "pgbouncer", "pgbouncer-legacy", "ssh"],
   mysql: ["mysql", "ssh"],
   mariadb: ["mariadb", "ssh"],
   sqlite: [],
@@ -284,8 +284,8 @@ const FIXTURE_PORTS = /:(15[4-5]\d\d)\b/;
 
 function servicesOf(engines) {
   if (engines.length === 1) return STAGE_SERVICES[engines[0]];
-  // Cross-engine stages need the databases only (no tunnel tests there).
-  return engines.flatMap((e) => STAGE_SERVICES[e].filter((s) => s !== "ssh"));
+  // Cross-engine stages need the databases only (no tunnel or pooler tests there).
+  return engines.flatMap((e) => STAGE_SERVICES[e].filter((s) => s !== "ssh" && !s.startsWith("pgbouncer")));
 }
 
 function dockerExec(container, argv, env = {}) {
