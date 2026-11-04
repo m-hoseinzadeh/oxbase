@@ -90,8 +90,9 @@ fn text(v: &Value) -> &str {
 }
 
 /// What every session through a pooler must do: the decoder's settings are in place, values
-/// decode in the text protocol, and bound parameters run.
-async fn check_session(key: &str, conn: &dyn Connection) {
+/// decode in the text protocol, and bound parameters run. With `session_pooling`, statements
+/// run one after another share a server connection, so a session `SET` holds for the next one.
+async fn check_session(key: &str, conn: &dyn Connection, session_pooling: bool) {
     // Text protocol (no parameters): dates need DateStyle ISO.
     let out = run(
         conn,
@@ -115,21 +116,22 @@ async fn check_session(key: &str, conn: &dyn Connection) {
     );
     assert_eq!(text(&v[3]), "on", "{key}: standard_conforming_strings");
 
-    // The driver no longer pins bytea_output: the escape format decodes too. One script, so the
-    // SET and the SELECT share a server connection even in transaction pooling.
-    let out = run(
-        conn,
-        "SET bytea_output = escape; SELECT '\\x00ff10'::bytea AS b; RESET bytea_output",
-        &[],
-    )
-    .await;
-    let set = out
-        .result_sets
-        .iter()
-        .find(|s| !s.batches.is_empty())
-        .expect("the SELECT's result set");
-    let b = cell_value(set.batches[0].column(0).as_ref(), 0).expect("cell");
-    assert_eq!(b, Value::Bytes(vec![0, 255, 16]), "{key}: escape format");
+    // The driver no longer pins bytea_output: the escape format decodes too. Typed columns
+    // need one statement per call (a script's results are text), and the SET must hold for the
+    // SELECT, so only where statements share a server connection.
+    if session_pooling {
+        run(conn, "SET bytea_output = escape", &[]).await;
+        let out = run(
+            conn,
+            "SELECT '\\x00ff10'::bytea AS b, current_setting('bytea_output') AS bo",
+            &[],
+        )
+        .await;
+        let v = row(&out);
+        assert_eq!(text(&v[1]), "escape", "{key}: bytea_output");
+        assert_eq!(v[0], Value::Bytes(vec![0, 255, 16]), "{key}: escape format");
+        run(conn, "RESET bytea_output", &[]).await;
+    }
 
     // Extended protocol (bound parameters), several times: prepared statements through the
     // pooler.
@@ -152,7 +154,7 @@ async fn a_current_pgbouncer_in_transaction_pooling_accepts_the_driver_defaults(
     let key = "pgbouncer";
     let p = params(key);
     let conn = connect(key, &p).await;
-    check_session(key, conn.as_ref()).await;
+    check_session(key, conn.as_ref(), false).await;
     conn.close().await.unwrap();
 
     // The fixture is the case that broke: an untracked parameter in the startup options is
@@ -186,6 +188,6 @@ async fn a_pgbouncer_that_refuses_startup_options_gets_the_defaults_by_set() {
 
     // Without them, the driver's own defaults are retried without `options` and set with SET.
     let conn = connect(key, &p).await;
-    check_session(key, conn.as_ref()).await;
+    check_session(key, conn.as_ref(), true).await;
     conn.close().await.unwrap();
 }
