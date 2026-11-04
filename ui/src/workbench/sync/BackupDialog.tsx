@@ -16,6 +16,7 @@ import {
 } from "../../api";
 import { ICON, ICON_SM } from "../../components/icons";
 import { Modal } from "../../components/Modal";
+import { Select } from "../../components/Select";
 import { newRequestId, toCommandError } from "../../connections/api";
 import { useConnections } from "../../connections/store";
 import { formatMs } from "../format";
@@ -203,14 +204,14 @@ export function BackupDialog({ init, onClose }: { init: BackupInit; onClose: () 
         <div className="field-row">
           <div className="field">
             <label htmlFor={`${id}-content`}>Content</label>
-            <select
+            <Select
               id={`${id}-content`}
               value={content}
               onChange={(e) => setContent(e.target.value as BackupContent)}
             >
               <option value="structure_and_data">Structure and data</option>
               <option value="structure_only">Structure only</option>
-            </select>
+            </Select>
           </div>
           <label className="checkbox sync-inline-check">
             <input type="checkbox" checked={zstd} onChange={(e) => setZstd(e.target.checked)} />

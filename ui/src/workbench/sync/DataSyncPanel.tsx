@@ -32,6 +32,7 @@ import {
 } from "../../api";
 import { ICON, ICON_LG, ICON_SM } from "../../components/icons";
 import { Modal } from "../../components/Modal";
+import { Select } from "../../components/Select";
 import { newRequestId, toCommandError } from "../../connections/api";
 import { useConnections } from "../../connections/store";
 import { ENGINE_INFO } from "../../connections/types";
@@ -394,7 +395,7 @@ export function DataSyncPanel({ params }: { params: SyncPanelParams }) {
                   {qualifiedName(p.source)}
                 </th>
                 <td>
-                  <select
+                  <Select
                     aria-label={`Target of ${p.source.name}`}
                     value={p.target?.name ?? ""}
                     disabled={busy}
@@ -409,7 +410,7 @@ export function DataSyncPanel({ params }: { params: SyncPanelParams }) {
                         {qualifiedName(t)}
                       </option>
                     ))}
-                  </select>
+                  </Select>
                   {p.caseFolded ? (
                     <span
                       className="badge badge--warning sync-badge"

@@ -399,6 +399,55 @@ async function screenshot(name) {
 }
 
 /**
+ * Design review of the themed dropdown list (components/Select.tsx): opens the first select
+ * matching `selector` in `root` with a real click, screenshots both themes with the list open,
+ * then closes it with Escape. Logs what it saw; never fails the run.
+ */
+async function selectListGallery(root, selector, name) {
+  try {
+    const select = await wd.execute(
+      "return arguments[0].querySelector(arguments[1]);",
+      root,
+      selector,
+    );
+    if (!select) {
+      log(`select list: no select matches ${selector}`);
+      return;
+    }
+    await wd.click(select);
+    await sleep(300);
+    const items = await wd.execute(
+      "const l = document.querySelector('.select-list[role=listbox]'); return l ? l.querySelectorAll('[role=option]').length : -1;",
+    );
+    log(
+      items < 0
+        ? "select list: the themed list did not open"
+        : `select list: open with ${items} option(s)`,
+    );
+    if (items >= 0) {
+      for (const label of ["Dark theme", "Light theme"]) {
+        // Theme buttons would close the list (a click elsewhere), so switch by attribute and
+        // re-open the list for each theme.
+        await wd.execute(
+          `document.documentElement.dataset.theme = ${JSON.stringify(label.startsWith("Dark") ? "dark" : "light")};`,
+        );
+        await sleep(300);
+        await screenshot(`ui-${name}-${label.startsWith("Dark") ? "dark" : "light"}`);
+      }
+      await wd.execute(
+        "const l = document.querySelector('.select-list[role=listbox]'); if (l) l.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));",
+      );
+      await wd.execute(
+        "const b = document.querySelector('button[aria-label=\"Dark theme\"]'); if (b) b.click();",
+      );
+      await sleep(200);
+    }
+  } catch (error) {
+    log(`select list: ${error.message}`);
+  }
+}
+
+/**
  * Screenshots for design review: the current screen in the dark theme, then in the light theme
  * (switched with the status bar's theme buttons, so Monaco and the grid re-theme too), then back
  * to dark. Never fails the run.
@@ -2682,6 +2731,7 @@ async function m8TransferStep() {
       { timeoutMs: 60_000 },
     );
     await gallery("08-transfer-mapping");
+    await selectListGallery(dialog, "[data-testid=mapping-row] select", "08-select-list");
     await clickWhenEnabled(dialog, "[data-testid=transfer-next]", "Next (mapping)");
     await clickWhenEnabled(dialog, "[data-testid=transfer-next]", "Next (options)");
     await waitFor("the dry-run DDL", () => within(dialog, "[data-testid=transfer-ddl]"), {

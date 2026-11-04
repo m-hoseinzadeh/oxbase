@@ -32,6 +32,7 @@ import {
 } from "../../../api";
 import { ICON, ICON_SM } from "../../../components/icons";
 import { Modal } from "../../../components/Modal";
+import { Select } from "../../../components/Select";
 import { toCommandError } from "../../../connections/api";
 import { ResultPager } from "../../results/pager";
 import { timedQueryPage } from "../../results/perf";
@@ -768,13 +769,13 @@ function ElementForm({
       {type === "list" && isNew ? (
         <label className="element-form__field">
           <span>Add at</span>
-          <select
+          <Select
             value={draft.end}
             onChange={(e) => onChange({ ...draft, end: e.target.value as "head" | "tail" })}
           >
             <option value="tail">End (RPUSH)</option>
             <option value="head">Start (LPUSH)</option>
-          </select>
+          </Select>
         </label>
       ) : null}
       <div className="element-form__actions">

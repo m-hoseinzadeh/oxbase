@@ -8,6 +8,7 @@ import { TriangleAlert } from "lucide-react";
 import { type KeyboardEvent, useEffect, useRef } from "react";
 import type { CellInput, DataType, InputKind } from "../../api";
 import { ICON_SM } from "../../components/icons";
+import { Select } from "../../components/Select";
 import {
   formatJson,
   isXmlType,
@@ -56,7 +57,7 @@ export function TypedInput({
         ? "false"
         : "";
     return (
-      <select
+      <Select
         {...common}
         className="value-input value-input--boolean"
         value={value}
@@ -65,12 +66,12 @@ export function TypedInput({
         {value === "" ? <option value="">Choose…</option> : null}
         <option value="true">true</option>
         <option value="false">false</option>
-      </select>
+      </Select>
     );
   }
   if (kind.type === "enum" && kind.labels.length > 0) {
     return (
-      <select
+      <Select
         {...common}
         className="value-input value-input--enum"
         value={text}
@@ -82,7 +83,7 @@ export function TypedInput({
             {l}
           </option>
         ))}
-      </select>
+      </Select>
     );
   }
   if ((kind.type === "json" || isXmlType(dataType)) && !compact) {

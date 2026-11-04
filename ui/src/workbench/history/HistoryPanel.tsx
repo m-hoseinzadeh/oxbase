@@ -37,6 +37,7 @@ import {
 } from "../../api";
 import { ICON_LG, ICON_SM } from "../../components/icons";
 import { Modal } from "../../components/Modal";
+import { Select } from "../../components/Select";
 import { toCommandError } from "../../connections/api";
 import { useConnections } from "../../connections/store";
 import { onHistoryChanged } from "../events";
@@ -307,7 +308,7 @@ export function HistoryPanel() {
             onChange={(e) => setSearch(e.target.value)}
           />
         </span>
-        <select
+        <Select
           aria-label="Connection filter"
           className="history__filter"
           value={profileId}
@@ -319,7 +320,7 @@ export function HistoryPanel() {
               {p.name}
             </option>
           ))}
-        </select>
+        </Select>
         <span className="toolbar__separator" aria-hidden="true" />
         <button
           type="button"

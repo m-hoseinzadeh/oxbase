@@ -28,6 +28,7 @@ import {
 } from "../../api";
 import { ICON, ICON_SM } from "../../components/icons";
 import { Modal } from "../../components/Modal";
+import { Select } from "../../components/Select";
 import { cancelRequest, newRequestId, toCommandError } from "../../connections/api";
 import { useConnections } from "../../connections/store";
 import { ENGINE_INFO } from "../../connections/types";
@@ -389,7 +390,7 @@ export function RestoreDialog({ init, onClose }: { init: RestoreInit; onClose: (
         ) : null}
         <div className="field">
           <label htmlFor={`${id}-content`}>Restore</label>
-          <select
+          <Select
             id={`${id}-content`}
             value={effectiveContent}
             disabled={running}
@@ -402,7 +403,7 @@ export function RestoreDialog({ init, onClose }: { init: RestoreInit; onClose: (
             <option value="data_only" disabled={m.content === "structure_only"}>
               Data only (into existing tables)
             </option>
-          </select>
+          </Select>
         </div>
         <label className="checkbox">
           <input

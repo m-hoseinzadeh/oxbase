@@ -30,6 +30,7 @@ import {
   treeChildren,
 } from "../../../api";
 import { ICON, ICON_LG, ICON_SM } from "../../../components/icons";
+import { Select } from "../../../components/Select";
 import { toCommandError } from "../../../connections/api";
 import { useConnections } from "../../../connections/store";
 import type { KeyBrowserParams } from "../../layout";
@@ -334,7 +335,7 @@ export function KeyBrowserPanel({
       <div className="toolbar table-data__toolbar" role="toolbar" aria-label="Key browser actions">
         <label className="query-editor__picker" title="Logical database">
           <span className="visually-hidden">Database</span>
-          <select
+          <Select
             aria-label="Database"
             value={database}
             disabled={active}
@@ -349,7 +350,7 @@ export function KeyBrowserPanel({
                 db{db}
               </option>
             ))}
-          </select>
+          </Select>
         </label>
         <form
           className="key-browser__filter"
@@ -369,7 +370,7 @@ export function KeyBrowserPanel({
             value={pattern}
             onChange={(e) => setPattern(e.target.value)}
           />
-          <select
+          <Select
             aria-label="Key type"
             value={type}
             onChange={(e) => {
@@ -384,7 +385,7 @@ export function KeyBrowserPanel({
                 {KEY_TYPE_LABEL[t]}
               </option>
             ))}
-          </select>
+          </Select>
           <button
             type="submit"
             className="button button--primary"
