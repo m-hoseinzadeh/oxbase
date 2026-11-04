@@ -1,7 +1,7 @@
 //! Conversions between PostgreSQL's text / binary value formats and plain Rust numbers.
 //!
-//! Text parsers expect the server's default output settings (`DateStyle = ISO`,
-//! `bytea_output = hex`, which the driver sets at connect time). A value they cannot read is
+//! Text parsers expect `DateStyle = ISO` (which the driver sets at connect time); `bytea` is read
+//! in both output formats (hex, the server default, and escape). A value they cannot read is
 //! reported as a [`Problem`] so the caller can show it as NULL and warn once per column.
 
 use std::fmt::Write as _;
@@ -33,8 +33,7 @@ impl Problem {
             Self::NaN => "NaN cannot be represented as a decimal and is shown as NULL",
             Self::OutOfRange => "values outside the column type's range are shown as NULL",
             Self::Unparsable => {
-                "values in an unexpected format are shown as NULL (DateStyle must be ISO and \
-                 bytea_output hex)"
+                "values in an unexpected format are shown as NULL (DateStyle must be ISO)"
             }
         }
     }

@@ -116,6 +116,54 @@ services:
         limits:
           memory: 512m
 
+  # PgBouncer in front of `postgres` (tests/docker/pgbouncer/entrypoint.sh): a current release
+  # in transaction pooling, and a release before 1.20 (which refuses startup `options`).
+  pgbouncer:
+    <<: *common
+    image: alpine:3.22
+    container_name: oxbase-fixtures-pgbouncer
+    entrypoint: ["/bin/sh", "/oxbase-pgbouncer/entrypoint.sh"]
+    environment:
+      OXBASE_POOL_MODE: transaction
+    ports:
+      - "127.0.0.1:15461:6432"
+    volumes:
+      - ./pgbouncer:/oxbase-pgbouncer:ro
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 6432"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+      start_period: 60s
+      start_interval: 1s
+    deploy:
+      resources:
+        limits:
+          memory: 64m
+
+  pgbouncer-legacy:
+    <<: *common
+    image: alpine:3.17
+    container_name: oxbase-fixtures-pgbouncer-legacy
+    entrypoint: ["/bin/sh", "/oxbase-pgbouncer/entrypoint.sh"]
+    environment:
+      OXBASE_POOL_MODE: session
+    ports:
+      - "127.0.0.1:15462:6432"
+    volumes:
+      - ./pgbouncer:/oxbase-pgbouncer:ro
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 6432"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+      start_period: 60s
+      start_interval: 1s
+    deploy:
+      resources:
+        limits:
+          memory: 64m
+
   mysql:
     <<: *common
     image: mysql:8.4.13

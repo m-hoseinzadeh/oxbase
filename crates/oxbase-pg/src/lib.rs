@@ -20,10 +20,14 @@
 //! - `channel_binding`: `disable`, `prefer` (default) or `require`.
 //! - `target_session_attrs`: `any`, `read-write` or `read-only`.
 //!
-//! The driver starts sessions with `DateStyle=ISO` and `bytea_output=hex`, the formats its text
-//! decoder reads. A session that changes them later gets NULLs (with a warning notice) for
-//! values it cannot read. It also pins `standard_conforming_strings=on`, which the SQL lexer
-//! assumes; generated DDL writes backslash literals as `E'...'`, so it means the same either way.
+//! The driver starts sessions with `DateStyle=ISO`, the date format its text decoder reads (a
+//! session that changes it later gets NULLs, with a warning notice, for values it cannot read),
+//! and `standard_conforming_strings=on`, which the SQL lexer assumes; generated DDL writes
+//! backslash literals as `E'...'`, so it means the same either way. Both go in the startup
+//! `options`; PgBouncer tracks both by default. A pooler that refuses startup `options`
+//! altogether (PgBouncer before 1.20) gets a second attempt without them, followed by `SET`s.
+//! `bytea` is read in both the hex and the escape output format, so `bytea_output` is left to
+//! the server (whose default is `hex`); PgBouncer 1.20+ refuses it in `options`.
 //!
 //! # Results
 //!
