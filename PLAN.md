@@ -139,6 +139,8 @@ The server holds the results. A query run keeps a spilled result store (Arrow IP
 
 Every milestone ships as a working app on all three platforms through CI. The "Done when" column is the exit check.
 
+Releases (decided 2026-11-04): **1.0.0 is the core client, M0 to M8.** M9 to M13 (jobs, ER modeling, BI, AI, hardening) are planned across 2.0.0 to 3.0.0 and later.
+
 | # | Milestone | Done when |
 |---|---|---|
 | M0 | Workspace, Tauri shell, CI matrix (Linux/macOS/Windows), Docker fixtures for all 7 engines, conformance harness | Signed dev builds on all 3 OSes; harness runs empty against all engines |
