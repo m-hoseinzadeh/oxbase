@@ -5,7 +5,10 @@ React + TypeScript UI. v1 targets PostgreSQL, MySQL, MariaDB, SQLite, SQL Server
 Redis on Linux, macOS and Windows. The core is headless, so every feature also works from
 `oxbase-cli` and from tests. See [PLAN.md](PLAN.md) for the architecture and milestones.
 
-## What works (M8)
+## What works (1.0)
+
+Oxbase 1.0 is the core client: milestones M0 to M8 of [PLAN.md](PLAN.md). Jobs, ER modeling, BI,
+AI and the hardening milestone (M9 to M13) are planned for later major versions.
 
 On PostgreSQL, MySQL, MariaDB, SQLite and SQL Server (M1 connections: plain, TLS, SSH,
 keychain secrets; SQL Server since M4):
@@ -245,7 +248,7 @@ RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps --locked
 cargo build -p app-tauri --locked          # proves the Tauri shell links
                                            # (verified via `pnpm --dir ../../ui tauri build --debug --no-bundle`
                                            #  from crates/app-tauri, which runs the UI build first)
-cargo run -p oxbase-cli -- --version          # prints "oxbase 0.8.1"
+cargo run -p oxbase-cli -- --version          # prints "oxbase 1.0.0"
 cargo deny check                              # licenses, advisories, bans, sources
 cargo tree -i openssl-sys; cargo tree -i aws-lc-sys   # both must find nothing (rustls + ring only)
 scripts/keychain-tests.sh                     # real OS keychain tests (see Conformance harness)
