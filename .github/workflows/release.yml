@@ -188,12 +188,19 @@ jobs:
           VERSION: ${{ needs.prepare.outputs.version }}
           SIGNED: ${{ needs.prepare.outputs.require_signing }}
           SHA: ${{ needs.prepare.outputs.sha }}
+          # SignPath signs the Windows installers once its project is configured (bundle.yml).
+          WINDOWS_SIGNPATH: ${{ vars.SIGNPATH_PROJECT_SLUG != '' }}
         run: |
           set -euo pipefail
           {
             echo "Oxbase $VERSION, built from commit ${SHA:0:7}."
             echo
-            if [ "$SIGNED" != "true" ]; then
+            if [ "$SIGNED" != "true" ] && [ "$WINDOWS_SIGNPATH" = "true" ]; then
+              echo "> The Windows installers are code-signed (publisher: SignPath Foundation). The macOS"
+              echo "> app is not signed yet: macOS blocks it until you right-click it and choose **Open**"
+              echo "> (or run \`xattr -dr com.apple.quarantine /Applications/Oxbase.app\`)."
+              echo
+            elif [ "$SIGNED" != "true" ]; then
               echo "> **Unsigned build.** These installers are not code-signed yet. macOS blocks the app"
               echo "> until you right-click it and choose **Open** (or run"
               echo "> \`xattr -dr com.apple.quarantine /Applications/Oxbase.app\`), and Windows SmartScreen"
@@ -228,7 +235,9 @@ jobs:
             echo '```'
             echo
             echo "This proves where a file was built, not who wrote the code; it does not replace OS code"
-            echo "signing (macOS and Windows still warn about unsigned installers)."
+            echo "signing."
+            echo
+            echo "[Code signing policy](https://github.com/$GITHUB_REPOSITORY#code-signing-policy)"
           } > notes.md
           cat notes.md
 

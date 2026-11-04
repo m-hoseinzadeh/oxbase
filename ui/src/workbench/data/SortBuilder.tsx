@@ -4,6 +4,7 @@
  */
 import { ArrowUpDown, ChevronDown, ChevronUp, Plus, X } from "lucide-react";
 import { ICON_SM } from "../../components/icons";
+import { Select } from "../../components/Select";
 import { type FilterColumn, move, newSortKey, type SortDraftKey } from "./filterModel";
 
 export interface SortBuilderProps {
@@ -33,7 +34,7 @@ export function SortBuilder({ keys, columns, onChange, nullsNative, disabled }: 
         {keys.map((key, index) => (
           <li key={key.id} className="sort__key">
             <span className="sort__index">{index + 1}</span>
-            <select
+            <Select
               aria-label={`Sort column ${index + 1}`}
               value={key.column}
               disabled={disabled}
@@ -45,8 +46,8 @@ export function SortBuilder({ keys, columns, onChange, nullsNative, disabled }: 
                   {c.name}
                 </option>
               ))}
-            </select>
-            <select
+            </Select>
+            <Select
               aria-label={`Direction ${index + 1}`}
               value={key.descending ? "desc" : "asc"}
               disabled={disabled}
@@ -54,8 +55,8 @@ export function SortBuilder({ keys, columns, onChange, nullsNative, disabled }: 
             >
               <option value="asc">Ascending</option>
               <option value="desc">Descending</option>
-            </select>
-            <select
+            </Select>
+            <Select
               aria-label={`NULLs ${index + 1}`}
               value={key.nulls}
               disabled={disabled}
@@ -65,7 +66,7 @@ export function SortBuilder({ keys, columns, onChange, nullsNative, disabled }: 
               <option value="default">NULLs: default</option>
               <option value="first">NULLs first</option>
               <option value="last">NULLs last</option>
-            </select>
+            </Select>
             <button
               type="button"
               className="icon-button icon-button--small"

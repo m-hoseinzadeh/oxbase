@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <!-- Oxbase app icon: the in-app mark (ui/src/App.tsx .app__mark: Lucide "database" on the
+       accent tile, docs/design-system.md). Regenerate every bundle icon from this file with
+       `cd ui && pnpm tauri icon ../crates/app-tauri/icons/app-icon.svg -o ../crates/app-tauri/icons`. -->
+  <rect x="56" y="56" width="912" height="912" rx="200" fill="#22c55e"/>
+  <g transform="translate(224 224) scale(24)" fill="none" stroke="#052e16" stroke-width="2.25"
+     stroke-linecap="round" stroke-linejoin="round">
+    <ellipse cx="12" cy="5" rx="9" ry="3"/>
+    <path d="M3 5V19A9 3 0 0 0 21 19V5"/>
+    <path d="M3 12A9 3 0 0 0 21 12"/>
+  </g>
+</svg>

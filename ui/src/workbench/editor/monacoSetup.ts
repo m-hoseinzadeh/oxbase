@@ -13,6 +13,8 @@ import "monaco-editor/languages/definitions/mysql/register";
 import "monaco-editor/languages/definitions/sql/register";
 import "monaco-editor/languages/definitions/javascript/register";
 import "monaco-editor/languages/definitions/redis/register";
+// The value panel (results/ValuePanel.tsx) highlights XML values.
+import "monaco-editor/languages/definitions/xml/register";
 import EditorWorker from "monaco-editor/editor/editor.worker?worker";
 
 globalThis.MonacoEnvironment = {

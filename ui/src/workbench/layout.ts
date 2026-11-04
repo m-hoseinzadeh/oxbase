@@ -28,6 +28,11 @@ export function setDockviewApi(api: DockviewApi | null): void {
   dockview = api;
 }
 
+/** The id of the active tab (dockview panel), if any. */
+export function activePanelId(): string | null {
+  return dockview?.activePanel?.id ?? null;
+}
+
 /** A fresh editor id (1 to 200 bytes, unique for this app run). */
 export function newEditorId(): string {
   counter += 1;

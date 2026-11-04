@@ -7,6 +7,7 @@ import { CircleAlert, LoaderCircle, RotateCw } from "lucide-react";
 import { useEffect, useId, useState } from "react";
 import type { ObjectRef } from "../../api";
 import { ICON_SM } from "../../components/icons";
+import { Select } from "../../components/Select";
 import { newRequestId, toCommandError } from "../../connections/api";
 import { ENGINE_INFO, type SessionSummary } from "../../connections/types";
 import { listDatabases, listSchemas } from "./catalog";
@@ -155,7 +156,7 @@ export function ContainerPicker({
     <div className="sync-side" data-testid={testId}>
       <div className="field">
         <label htmlFor={`${id}-session`}>{label} connection</label>
-        <select
+        <Select
           id={`${id}-session`}
           value={sessionId}
           disabled={disabled}
@@ -169,12 +170,12 @@ export function ContainerPicker({
               {s.profile_name} ({ENGINE_INFO[s.engine].label})
             </option>
           ))}
-        </select>
+        </Select>
         {sessions.length === 0 && emptyHint ? <p className="field__hint">{emptyHint}</p> : null}
       </div>
       <div className="field">
         <label htmlFor={`${id}-database`}>{label} database</label>
-        <select
+        <Select
           id={`${id}-database`}
           value={databaseRef ? value.database : ""}
           disabled={disabled || databases?.status !== "ok"}
@@ -194,12 +195,12 @@ export function ContainerPicker({
                 </option>
               ))
             : null}
-        </select>
+        </Select>
       </div>
       {hasSchemas || (databaseRef && schemas?.status === "loading") ? (
         <div className="field">
           <label htmlFor={`${id}-schema`}>{label} schema</label>
-          <select
+          <Select
             id={`${id}-schema`}
             value={container ? value.schema : ""}
             disabled={disabled || schemas?.status !== "ok"}
@@ -217,7 +218,7 @@ export function ContainerPicker({
                   </option>
                 ))
               : null}
-          </select>
+          </Select>
         </div>
       ) : null}
       {databases?.status === "loading" || schemas?.status === "loading" ? (

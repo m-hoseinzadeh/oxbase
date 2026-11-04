@@ -2,6 +2,7 @@
 import { useState } from "react";
 import { type KeyEdit, type KeyInfo, type KeyType, keyApply, utf8 } from "../../../api";
 import { Modal } from "../../../components/Modal";
+import { Select } from "../../../components/Select";
 import { toCommandError } from "../../../connections/api";
 import {
   createEdit,
@@ -129,7 +130,7 @@ export function NewKeyDialog({
         </div>
         <div className="field">
           <label htmlFor="new-key-type">Type</label>
-          <select
+          <Select
             id="new-key-type"
             value={type}
             onChange={(e) => setType(e.target.value as NewType)}
@@ -139,7 +140,7 @@ export function NewKeyDialog({
                 {KEY_TYPE_LABEL[t]}
               </option>
             ))}
-          </select>
+          </Select>
         </div>
       </div>
       {VALUE_FIELDS[type].map((f) => (

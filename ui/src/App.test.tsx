@@ -1,4 +1,4 @@
-import { render, screen, within } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { App } from "./App";
 import { tauriCore } from "./test/tauriMock";
@@ -32,5 +32,22 @@ describe("App layout", () => {
     expect(screen.getByText("No open connections")).toBeInTheDocument();
     const toolbar = screen.getByRole("toolbar", { name: "Workbench" });
     expect(within(toolbar).getByRole("button", { name: "New query" })).toBeEnabled();
+  });
+
+  it("closes a tab with a middle click, and only with the middle button", async () => {
+    render(<App />);
+    const tab = (await screen.findByText("Welcome")).closest(".dv-default-tab") as HTMLElement;
+    expect(tab).not.toBeNull();
+    fireEvent.pointerDown(tab, { button: 2 });
+    fireEvent.pointerUp(tab, { button: 2 });
+    expect(screen.getByRole("heading", { name: "Welcome to Oxbase" })).toBeInTheDocument();
+    const middle = new MouseEvent("mousedown", { bubbles: true, cancelable: true, button: 1 });
+    fireEvent(tab, middle);
+    expect(middle.defaultPrevented).toBe(true); // no auto-scroll
+    fireEvent.pointerDown(tab, { button: 1 });
+    fireEvent.pointerUp(tab, { button: 1 });
+    await waitFor(() =>
+      expect(screen.queryByRole("heading", { name: "Welcome to Oxbase" })).toBeNull(),
+    );
   });
 });

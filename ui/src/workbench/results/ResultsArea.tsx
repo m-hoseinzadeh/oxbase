@@ -13,6 +13,7 @@ import {
   LoaderCircle,
   type LucideIcon,
   MessageSquareText,
+  PanelRight,
   Play,
   Rows3,
   Table2,
@@ -20,6 +21,7 @@ import {
   TriangleAlert,
 } from "lucide-react";
 import { type KeyboardEvent, useEffect, useRef, useState } from "react";
+import type { Engine } from "../../api";
 import { ICON_LG, ICON_SM } from "../../components/icons";
 import { formatMs } from "../format";
 import { ResultPager } from "./pager";
@@ -152,9 +154,13 @@ export interface ResultsAreaProps {
   messagesNote?: string | null | undefined;
   /** Exports every row of a result (offered once the run has ended). */
   onExport?: ((result: ResultInfo) => void) | undefined;
+  /** The connection's engine (the value panel's SQL beautifier). */
+  engine?: Engine | null | undefined;
 }
 
-export function ResultsArea({ run, messagesNote = null, onExport }: ResultsAreaProps) {
+export function ResultsArea({ run, messagesNote = null, onExport, engine }: ResultsAreaProps) {
+  // The value panel stays open across result tabs and runs.
+  const [valuePanel, setValuePanel] = useState(false);
   // The tab the user picked, for the run it was picked in (a new run starts on its first result).
   const [picked, setPicked] = useState<{ runId: string | null; tab: TabId } | null>(null);
   const pagers = useRef(new Map<number, ResultPager>());
@@ -323,6 +329,16 @@ export function ResultsArea({ run, messagesNote = null, onExport }: ResultsAreaP
                   {shownNotice}
                 </span>
               ) : null}
+              <button
+                type="button"
+                className="button button--small button--ghost results__value-toggle"
+                aria-pressed={valuePanel}
+                title="Show the selected cell's whole value (or double-click a cell)"
+                onClick={() => setValuePanel((open) => !open)}
+              >
+                <PanelRight {...ICON_SM} />
+                Value
+              </button>
               {onExport ? (
                 <button
                   type="button"
@@ -347,6 +363,9 @@ export function ResultsArea({ run, messagesNote = null, onExport }: ResultsAreaP
                 columns={activeResult.columns}
                 rowCount={activeResult.rowCount}
                 onNotice={(text) => setNotice({ key: gridKey, text })}
+                valuePanel={valuePanel}
+                onValuePanelChange={setValuePanel}
+                engine={engine}
               />
             </div>
           </>

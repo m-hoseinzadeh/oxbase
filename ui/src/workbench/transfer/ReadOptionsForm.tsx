@@ -4,6 +4,7 @@
  */
 import { useId } from "react";
 import type { ReadOptions, SourcePreview, TextEncoding, ValueFormats } from "../../api";
+import { Select } from "../../components/Select";
 
 type CsvOptions = Extract<ReadOptions, { format: "csv" }>;
 type JsonOptions = Extract<ReadOptions, { format: "json" }>;
@@ -51,7 +52,7 @@ function CsvForm({
       <div className="field">
         <label htmlFor={`${id}-delimiter`}>Delimiter</label>
         <div className="transfer-form__inline">
-          <select
+          <Select
             id={`${id}-delimiter`}
             value={known ? delimiter : "other"}
             disabled={disabled}
@@ -65,7 +66,7 @@ function CsvForm({
               </option>
             ))}
             <option value="other">Other…</option>
-          </select>
+          </Select>
           {known ? null : (
             <input
               type="text"
@@ -81,7 +82,7 @@ function CsvForm({
       </div>
       <div className="field">
         <label htmlFor={`${id}-quote`}>Quote</label>
-        <select
+        <Select
           id={`${id}-quote`}
           value={options.quote === null ? "none" : (options.quote ?? '"')}
           disabled={disabled}
@@ -92,11 +93,11 @@ function CsvForm({
           <option value={'"'}>Double quote ( " )</option>
           <option value="'">Single quote ( ' )</option>
           <option value="none">None</option>
-        </select>
+        </Select>
       </div>
       <div className="field">
         <label htmlFor={`${id}-encoding`}>Encoding</label>
-        <select
+        <Select
           id={`${id}-encoding`}
           value={options.encoding ?? "auto"}
           disabled={disabled}
@@ -107,7 +108,7 @@ function CsvForm({
               {e.label}
             </option>
           ))}
-        </select>
+        </Select>
       </div>
       <div className="field">
         <label htmlFor={`${id}-skip`}>Skip lines at the start</label>
@@ -124,7 +125,7 @@ function CsvForm({
       </div>
       <div className="field">
         <label htmlFor={`${id}-decimal`}>Decimal separator</label>
-        <select
+        <Select
           id={`${id}-decimal`}
           value={decimalComma ? "," : "."}
           disabled={disabled}
@@ -139,7 +140,7 @@ function CsvForm({
         >
           <option value=".">Point ( 1.5 )</option>
           <option value=",">Comma ( 1,5 )</option>
-        </select>
+        </Select>
       </div>
       <div className="field">
         <label htmlFor={`${id}-null`}>Other text read as NULL</label>
@@ -199,7 +200,7 @@ function JsonForm({
     <div className="transfer-form">
       <div className="field">
         <label htmlFor={`${id}-layout`}>Layout</label>
-        <select
+        <Select
           id={`${id}-layout`}
           value={options.layout ?? "auto"}
           disabled={disabled}
@@ -210,11 +211,11 @@ function JsonForm({
           <option value="auto">Detect</option>
           <option value="array">One array of objects</option>
           <option value="lines">One object per line (NDJSON)</option>
-        </select>
+        </Select>
       </div>
       <div className="field">
         <label htmlFor={`${id}-encoding`}>Encoding</label>
-        <select
+        <Select
           id={`${id}-encoding`}
           value={options.encoding ?? "auto"}
           disabled={disabled}
@@ -225,7 +226,7 @@ function JsonForm({
               {e.label}
             </option>
           ))}
-        </select>
+        </Select>
       </div>
     </div>
   );
@@ -248,7 +249,7 @@ function XlsxForm({
     <div className="transfer-form">
       <div className="field">
         <label htmlFor={`${id}-sheet`}>Sheet</label>
-        <select
+        <Select
           id={`${id}-sheet`}
           value={sheet}
           disabled={disabled || sheets.length === 0}
@@ -263,7 +264,7 @@ function XlsxForm({
               {s}
             </option>
           ))}
-        </select>
+        </Select>
       </div>
       <div className="field">
         <label htmlFor={`${id}-header`}>Header row</label>

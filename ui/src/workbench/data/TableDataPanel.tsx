@@ -24,6 +24,7 @@ import {
   LoaderCircle,
   Lock,
   type LucideIcon,
+  PanelRight,
   PencilRuler,
   Plus,
   RefreshCw,
@@ -78,6 +79,7 @@ import {
   singleRow,
 } from "../results/rowSelection";
 import { IDLE_RUN, isActive, rowCountLabel, runReducer } from "../results/runState";
+import { registerShortcuts, type ShortcutHandler } from "../shortcuts";
 import { openExport } from "../transfer/store";
 import { CellEditor } from "./CellEditor";
 import {
@@ -157,6 +159,7 @@ function plural(n: number, one: string, many: string): string {
 
 export function TableDataPanel({ editorId, sessionId, table }: TableDataParams) {
   const engine = useConnections().sessions.find((s) => s.id === sessionId)?.engine;
+  const [valuePanel, setValuePanel] = useState(false);
   const [caps, setCaps] = useState<EngineCapabilities | null>(null);
   const [run, dispatch] = useReducer(runReducer, IDLE_RUN);
   const [draft, setDraft] = useState<FilterDraft>(emptyDraft);
@@ -343,6 +346,19 @@ export function TableDataPanel({ editorId, sessionId, table }: TableDataParams) 
   function refresh() {
     guardPending(() => void open(query), "Refreshing");
   }
+
+  // F5 / Ctrl+R reload the rows (../shortcuts), through the same pending-changes guard.
+  const shortcut = useRef<ShortcutHandler>(() => false);
+  shortcut.current = (command) => {
+    if (command !== "run") return false;
+    // While rows load, the key is used up, like the disabled button.
+    if (!active) refresh();
+    return true;
+  };
+  useEffect(
+    () => registerShortcuts(`data-${editorId}`, (command) => shortcut.current(command)),
+    [editorId],
+  );
 
   /** Exports every row of the table with the applied filter and sort (not only the grid's). */
   function exportTable() {
@@ -705,7 +721,7 @@ export function TableDataPanel({ editorId, sessionId, table }: TableDataParams) 
           className="button button--ghost"
           onClick={refresh}
           disabled={active}
-          title="Reload the rows"
+          title="Reload the rows (F5)"
         >
           <RefreshCw {...ICON} />
           Refresh
@@ -832,6 +848,18 @@ export function TableDataPanel({ editorId, sessionId, table }: TableDataParams) 
             </button>
           ))}
         </div>
+        {view === "grid" ? (
+          <button
+            type="button"
+            className="button button--ghost"
+            aria-pressed={valuePanel}
+            title="Show the selected cell's whole value"
+            onClick={() => setValuePanel((open) => !open)}
+          >
+            <PanelRight {...ICON} />
+            Value
+          </button>
+        ) : null}
         <span
           className="query-editor__status table-data__status"
           role="status"
@@ -999,6 +1027,9 @@ export function TableDataPanel({ editorId, sessionId, table }: TableDataParams) 
               edit={editing}
               onSelectRows={setSelection}
               selectedRows={selection}
+              valuePanel={valuePanel}
+              onValuePanelChange={setValuePanel}
+              engine={engine ?? null}
             />
           </div>
         ) : view === "form" ? (

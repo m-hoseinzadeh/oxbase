@@ -7,6 +7,7 @@ import { CircleAlert, Filter, Minus, Plus, X } from "lucide-react";
 import { type ReactNode, useId } from "react";
 import type { FilterOp } from "../../api";
 import { ICON_SM } from "../../components/icons";
+import { Select } from "../../components/Select";
 import {
   type ConditionNode,
   emptyGroup,
@@ -58,7 +59,7 @@ function ConditionRow({
   return (
     <li className={`filter__item filter__condition${problem ? " filter__item--invalid" : ""}`}>
       {conj}
-      <select
+      <Select
         aria-label="Column"
         className="filter__column"
         value={node.column}
@@ -77,8 +78,8 @@ function ConditionRow({
             {c.name}
           </option>
         ))}
-      </select>
-      <select
+      </Select>
+      <Select
         aria-label="Operator"
         className="filter__op"
         value={node.op}
@@ -90,7 +91,7 @@ function ConditionRow({
             {o.label}
           </option>
         ))}
-      </select>
+      </Select>
       {node.values.map((value, index) => (
         // Values have no identity of their own; their position is their key.
         // biome-ignore lint/suspicious/noArrayIndexKey: positional inputs.

@@ -31,6 +31,7 @@ import {
 } from "../../api";
 import { ICON, ICON_SM } from "../../components/icons";
 import { Modal } from "../../components/Modal";
+import { Select } from "../../components/Select";
 import { toCommandError } from "../../connections/api";
 import { formatMs } from "../format";
 import {
@@ -348,7 +349,7 @@ export function ExportDialog({ init, onClose }: { init: ExportInit; onClose: () 
           <legend>File</legend>
           <div className="field">
             <label htmlFor={`${id}-format`}>Format</label>
-            <select
+            <Select
               id={`${id}-format`}
               value={format}
               disabled={running}
@@ -362,7 +363,7 @@ export function ExportDialog({ init, onClose }: { init: ExportInit; onClose: () 
                   {FORMAT_LABEL[f]}
                 </option>
               ))}
-            </select>
+            </Select>
           </div>
           <WriteOptionsForm
             options={options}

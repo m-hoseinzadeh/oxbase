@@ -103,6 +103,9 @@ jobs:
     env:
       # Secrets cannot be referenced in `if:`; expose only whether they are set.
       HAS_WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE != '' && secrets.WINDOWS_CERTIFICATE_PASSWORD != '' }}
+      # SignPath Foundation signing of the Windows installers (docs/code-signing.md): the API
+      # token secret plus the organization and project variables.
+      HAS_WINDOWS_SIGNPATH: ${{ secrets.SIGNPATH_API_TOKEN != '' && vars.SIGNPATH_ORGANIZATION_ID != '' && vars.SIGNPATH_PROJECT_SLUG != '' }}
       HAS_APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE != '' && secrets.APPLE_CERTIFICATE_PASSWORD != '' }}
       HAS_APPLE_NOTARIZATION: ${{ secrets.APPLE_ID != '' && secrets.APPLE_PASSWORD != '' && secrets.APPLE_TEAM_ID != '' }}
     steps:
@@ -237,6 +240,97 @@ jobs:
           uploadWorkflowArtifacts: true
           workflowArtifactNamePattern: ${{ inputs.artifact_prefix || 'oxbase-dev' }}-[platform]-[arch]-[bundle]
           retryAttempts: 1
+
+      # ------------------------------------------------------ Windows: SignPath Foundation
+      # docs/code-signing.md. The bundler stamps the app .exe with its bundle type while it builds
+      # each installer, so the .exe cannot be signed before bundling. Instead both installers go
+      # to SignPath in one signing request (one manual approval per release): the .msi is signed
+      # together with the app .exe inside it, the NSIS -setup.exe as a whole. The signed files
+      # replace the unsigned ones in target/ and in the workflow artifacts release.yml publishes.
+
+      - name: SignPath - version
+        id: signpath-version
+        if: runner.os == 'Windows' && env.HAS_WINDOWS_SIGNPATH == 'true'
+        shell: bash
+        run: node scripts/release-check.mjs --dry-run
+
+      - name: SignPath - collect the installers
+        if: runner.os == 'Windows' && env.HAS_WINDOWS_SIGNPATH == 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $in = Join-Path $env:RUNNER_TEMP 'signpath-unsigned'
+          New-Item -ItemType Directory -Force -Path $in | Out-Null
+          $files = @(Get-ChildItem target/release/bundle/msi/*.msi) + @(Get-ChildItem target/release/bundle/nsis/*-setup.exe)
+          if ($files.Count -ne 2) { throw "expected one .msi and one -setup.exe, found $($files.Count)" }
+          $files | ForEach-Object { Copy-Item $_.FullName $in; Write-Host "to sign: $($_.Name)" }
+
+      - name: SignPath - upload the unsigned installers
+        id: signpath-unsigned
+        if: runner.os == 'Windows' && env.HAS_WINDOWS_SIGNPATH == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ inputs.artifact_prefix || 'oxbase-dev' }}-windows-unsigned-installers
+          path: ${{ runner.temp }}/signpath-unsigned
+          retention-days: 1
+          if-no-files-found: error
+
+      # Waits for the manual approval in SignPath (up to an hour): approve the request the job
+      # summary links to.
+      - name: SignPath - sign the installers
+        id: signpath
+        if: runner.os == 'Windows' && env.HAS_WINDOWS_SIGNPATH == 'true'
+        uses: signpath/github-action-submit-signing-request@f6d04783b4569d051e0c80105fe66e82819d0092 # v3.0
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG || 'release-signing' }}
+          artifact-configuration-slug: ${{ vars.SIGNPATH_ARTIFACT_CONFIGURATION_SLUG || 'installers' }}
+          github-artifact-id: ${{ steps.signpath-unsigned.outputs.artifact-id }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 3600
+          output-artifact-directory: ${{ runner.temp }}/signpath-signed
+          parameters: |
+            version: ${{ toJSON(steps.signpath-version.outputs.version) }}
+
+      - name: SignPath - use the signed installers
+        if: runner.os == 'Windows' && env.HAS_WINDOWS_SIGNPATH == 'true'
+        shell: pwsh
+        env:
+          REQUEST_URL: ${{ steps.signpath.outputs.signing-request-web-url }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $out = Join-Path $env:RUNNER_TEMP 'signpath-signed'
+          foreach ($dir in @('target/release/bundle/msi', 'target/release/bundle/nsis')) {
+            foreach ($f in Get-ChildItem $dir -File | Where-Object { $_.Extension -in '.msi', '.exe' }) {
+              $signed = Get-ChildItem -Recurse -File $out | Where-Object Name -eq $f.Name | Select-Object -First 1
+              if (-not $signed) { throw "SignPath returned no $($f.Name)" }
+              Copy-Item $signed.FullName $f.FullName -Force
+              Write-Host "signed: $($f.Name)"
+            }
+          }
+          "Signed by SignPath: [signing request]($env:REQUEST_URL)" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+      # Same names as tauri-action's uploads (workflowArtifactNamePattern), so release.yml
+      # publishes the signed files.
+      - name: SignPath - replace the MSI artifact
+        if: runner.os == 'Windows' && env.HAS_WINDOWS_SIGNPATH == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ inputs.artifact_prefix || 'oxbase-dev' }}-windows-x64-msi
+          path: target/release/bundle/msi/*.msi
+          overwrite: true
+          if-no-files-found: error
+
+      - name: SignPath - replace the NSIS artifact
+        if: runner.os == 'Windows' && env.HAS_WINDOWS_SIGNPATH == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ inputs.artifact_prefix || 'oxbase-dev' }}-windows-x64-nsis
+          path: target/release/bundle/nsis/*-setup.exe
+          overwrite: true
+          if-no-files-found: error
 
       # A green build does not prove the bundles are signed (see the header). Runs without
       # secrets; checks codesign/spctl/stapler on macOS and Authenticode on Windows.

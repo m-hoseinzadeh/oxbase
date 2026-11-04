@@ -855,6 +855,29 @@ It prints one line per job and, for failed jobs, only the error lines of the log
 errors, failed tests, panics, `##[error]`). Exit code 0 means all green. It uses `GITHUB_TOKEN`
 or the github.com credential that `git push` uses, and never pushes to main.
 
+## Code signing policy
+
+Free code signing provided by [SignPath.io](https://about.signpath.io), certificate by
+[SignPath Foundation](https://signpath.org).
+
+**Status:** Oxbase has applied to the SignPath Foundation program. Until it is accepted, the
+Windows installers are not code-signed. The macOS app is not signed either (no Apple Developer
+certificate yet). Every release file has a GitHub build provenance attestation and
+`SHA256SUMS.txt` is signed with Sigstore; the release notes say how to check them.
+
+- **What is signed:** the Windows installers of a release (`.msi`, with the app inside it, and
+  the NSIS `-setup.exe`), built from this repository by GitHub Actions
+  ([bundle.yml](.github/workflows/bundle.yml), [release.yml](.github/workflows/release.yml)).
+  Nothing built anywhere else is signed. Setup: [docs/code-signing.md](docs/code-signing.md).
+- **Committers and reviewers:** [Mohammad Hoseinzadeh](https://github.com/m-hoseinzadeh). Changes
+  from other contributors are reviewed by a committer before they are merged.
+- **Approvers:** [Mohammad Hoseinzadeh](https://github.com/m-hoseinzadeh). Every signing request is
+  approved by hand.
+- **Privacy:** this program will not transfer any information to other networked systems unless
+  specifically requested by the user or the person installing or operating it. Oxbase connects
+  only to the database servers, SSH bastions and other hosts you configure; it has no telemetry
+  and no update checks.
+
 ## License
 
 Oxbase is licensed under the [Apache License, Version 2.0](LICENSE). See [NOTICE](NOTICE).

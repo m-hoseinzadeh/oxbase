@@ -11,6 +11,8 @@
 // Rust versions come from Cargo.lock; npm versions from the installed packages under
 // ui/node_modules, so run it after `pnpm install`.
 //
+// Also: the custom NSIS template must come from the installed @tauri-apps/cli release.
+//
 // Usage: node scripts/ci-check-tauri-versions.mjs [Cargo.lock] [ui dir]
 import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
@@ -67,6 +69,25 @@ if (crates.has('tauri') && checked === 0) {
   console.error('ci-check-tauri-versions: tauri is in Cargo.lock but @tauri-apps/api is not installed in ui/');
   process.exit(1);
 }
+// The custom NSIS template (crates/app-tauri/windows/installer.nsi) is a copy of the bundler's
+// template of one Tauri CLI release; the bundler fills it with that release's placeholders, so a
+// CLI upgrade must re-copy it (its header says how).
+const templatePath = join(repoRoot, 'crates', 'app-tauri', 'windows', 'installer.nsi');
+const cliPkg = join(uiDir, 'node_modules', '@tauri-apps', 'cli', 'package.json');
+if (existsSync(templatePath)) {
+  const from = /tauri-cli-v(\d+\.\d+\.\d+(?:-[0-9A-Za-z.]+)?)/.exec(readFileSync(templatePath, 'utf8'))?.[1];
+  const cli = existsSync(cliPkg) ? JSON.parse(readFileSync(cliPkg, 'utf8')).version : null;
+  const ok = from !== undefined && from === cli;
+  console.log(`${ok ? 'ok      ' : 'MISMATCH'} NSIS template from tauri-cli ${from ?? '?'} <-> @tauri-apps/cli ${cli ?? '(not installed)'}`);
+  if (!ok) {
+    console.error(
+      'ci-check-tauri-versions: crates/app-tauri/windows/installer.nsi was copied from another ' +
+        'Tauri CLI release; copy the new upstream template and re-apply the Oxbase change.',
+    );
+    process.exit(1);
+  }
+}
+
 if (mismatches.length > 0) {
   console.error(
     'ci-check-tauri-versions: Tauri crates and npm packages must share major.minor; ' +

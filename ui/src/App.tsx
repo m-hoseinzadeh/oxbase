@@ -1,7 +1,9 @@
 import {
+  DockviewDefaultTab,
   DockviewReact,
   type DockviewReadyEvent,
   type DockviewTheme,
+  type IDockviewPanelHeaderProps,
   type IDockviewPanelProps,
   themeLight,
 } from "dockview-react";
@@ -17,6 +19,7 @@ import { TableDesignerPanel } from "./workbench/designer/TableDesignerPanel";
 import { QueryEditorPanel } from "./workbench/editor/QueryEditorPanel";
 import { HistoryPanel } from "./workbench/history/HistoryPanel";
 import {
+  activePanelId,
   type CollectionPanelParams,
   type ConsolePanelParams,
   type DesignerPanelParams,
@@ -35,6 +38,7 @@ import { CollectionPanel } from "./workbench/nosql/CollectionPanel";
 import { ConsolePanel } from "./workbench/nosql/console/ConsolePanel";
 import { KeyBrowserPanel } from "./workbench/nosql/keys/KeyBrowserPanel";
 import { PubSubPanel } from "./workbench/nosql/pubsub/PubSubPanel";
+import { installShortcuts } from "./workbench/shortcuts";
 import { DataSyncPanel } from "./workbench/sync/DataSyncPanel";
 import { StructureSyncPanel } from "./workbench/sync/StructureSyncPanel";
 import { SyncHost } from "./workbench/sync/SyncHost";
@@ -146,6 +150,23 @@ const components: Record<string, FunctionComponent<IDockviewPanelProps>> = {
   dataSync: DataSyncTab,
 };
 
+/**
+ * Every tab: dockview's React default tab, which closes on a middle click (press and release
+ * of the middle button) like its close button does. Without `defaultTabComponent` dockview
+ * draws its plain DOM tab, which has no middle-click close. The middle button's press is
+ * cancelled so the webview does not start auto-scrolling.
+ */
+function Tab(props: IDockviewPanelHeaderProps) {
+  return (
+    <DockviewDefaultTab
+      {...props}
+      onMouseDown={(event) => {
+        if (event.button === 1) event.preventDefault();
+      }}
+    />
+  );
+}
+
 // Structural variables come from dockview's light theme; colours are overridden in
 // theme.css with our own CSS variables, which follow the OS light/dark preference.
 const theme: DockviewTheme = { ...themeLight, name: "oxbase" };
@@ -179,6 +200,8 @@ function onReady(event: DockviewReadyEvent) {
 
 export function App() {
   useEffect(() => () => setDockviewApi(null), []);
+  // F5, Ctrl+Enter, ... act on the active tab (./workbench/shortcuts).
+  useEffect(() => installShortcuts(activePanelId), []);
   return (
     <div className="app">
       <header className="app__bar">
@@ -220,7 +243,12 @@ export function App() {
         </div>
       </header>
       <main className="app__workspace">
-        <DockviewReact components={components} onReady={onReady} theme={theme} />
+        <DockviewReact
+          components={components}
+          defaultTabComponent={Tab}
+          onReady={onReady}
+          theme={theme}
+        />
       </main>
       <StatusBar />
       <TransferHost />

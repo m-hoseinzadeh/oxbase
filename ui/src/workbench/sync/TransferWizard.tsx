@@ -31,6 +31,7 @@ import {
 } from "../../api";
 import { ICON, ICON_SM } from "../../components/icons";
 import { Modal } from "../../components/Modal";
+import { Select } from "../../components/Select";
 import { cancelRequest, newRequestId, toCommandError } from "../../connections/api";
 import { useConnections } from "../../connections/store";
 import { languageFor } from "../editor/language";
@@ -526,7 +527,7 @@ export function TransferWizard({ init, onClose }: { init: TransferInit; onClose:
     return (
       <div className="field">
         <label htmlFor={`${id}-mode`}>When a target table exists</label>
-        <select
+        <Select
           id={`${id}-mode`}
           value={options.mode}
           onChange={(e) =>
@@ -538,7 +539,7 @@ export function TransferWizard({ init, onClose }: { init: TransferInit; onClose:
               {MODE_LABEL[m]}
             </option>
           ))}
-        </select>
+        </Select>
         {sameAsSource ? (
           <p className="field__hint">
             The target is the source database or schema: only new tables can be created.
@@ -578,7 +579,7 @@ export function TransferWizard({ init, onClose }: { init: TransferInit; onClose:
     const choices: DataType[] = typeChoices(c.mapping.dataType);
     return (
       <div className="sync-type">
-        <select
+        <Select
           aria-label={`Target type of ${c.source}`}
           value={typeKey(edit.dataType ?? c.mapping.dataType)}
           disabled={c.skipped}
@@ -592,7 +593,7 @@ export function TransferWizard({ init, onClose }: { init: TransferInit; onClose:
               {typeLabel(t)}
             </option>
           ))}
-        </select>
+        </Select>
         <input
           type="text"
           aria-label={`Native target type of ${c.source}`}
@@ -738,28 +739,28 @@ export function TransferWizard({ init, onClose }: { init: TransferInit; onClose:
             </div>
             <div className="field">
               <label htmlFor={`${id}-tx`}>Commit</label>
-              <select
+              <Select
                 id={`${id}-tx`}
                 value={options.transaction}
                 onChange={(e) => set({ transaction: e.target.value as "per_table" | "per_batch" })}
               >
                 <option value="per_table">Once per table (all or nothing)</option>
                 <option value="per_batch">After every batch</option>
-              </select>
+              </Select>
             </div>
           </fieldset>
           <fieldset className="fieldset transfer-group">
             <legend>Rows that do not fit</legend>
             <div className="field">
               <label htmlFor={`${id}-errors`}>On a bad row</label>
-              <select
+              <Select
                 id={`${id}-errors`}
                 value={options.errors}
                 onChange={(e) => set({ errors: e.target.value as "stop" | "continue" })}
               >
                 <option value="stop">Stop the table</option>
                 <option value="continue">Skip the row and report it</option>
-              </select>
+              </Select>
             </div>
             <div className="field">
               <label htmlFor={`${id}-max-errors`}>Rows reported at most</label>
@@ -778,25 +779,25 @@ export function TransferWizard({ init, onClose }: { init: TransferInit; onClose:
             <legend>Keys and identity</legend>
             <div className="field">
               <label htmlFor={`${id}-identity`}>Identity values</label>
-              <select
+              <Select
                 id={`${id}-identity`}
                 value={options.identity}
                 onChange={(e) => set({ identity: e.target.value as "keep" | "generate" })}
               >
                 <option value="keep">Keep the source values</option>
                 <option value="generate">Let the target generate them</option>
-              </select>
+              </Select>
             </div>
             <div className="field">
               <label htmlFor={`${id}-fk`}>Foreign key checks while loading</label>
-              <select
+              <Select
                 id={`${id}-fk`}
                 value={options.fkChecks}
                 onChange={(e) => set({ fkChecks: e.target.value as "keep" | "disable" })}
               >
                 <option value="keep">Keep them on</option>
                 <option value="disable">Turn them off where the engine can</option>
-              </select>
+              </Select>
             </div>
             <label className="checkbox">
               <input

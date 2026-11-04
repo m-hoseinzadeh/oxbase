@@ -33,6 +33,7 @@ import {
 } from "../../api";
 import { ICON_SM } from "../../components/icons";
 import { Modal } from "../../components/Modal";
+import { Select } from "../../components/Select";
 import { toCommandError } from "../../connections/api";
 import { useConnections } from "../../connections/store";
 import { ENGINE_INFO } from "../../connections/types";
@@ -42,6 +43,7 @@ import type { QueryEditorParams } from "../layout";
 import { spanOffsets } from "../positions";
 import { ResultsArea } from "../results/ResultsArea";
 import { IDLE_RUN, isActive, type ResultInfo, runReducer } from "../results/runState";
+import { registerShortcuts, type ShortcutHandler } from "../shortcuts";
 import { openExport } from "../transfer/store";
 import { hasInsight } from "./insight/controller";
 import { SchemaCacheIndicator } from "./insight/SchemaCacheIndicator";
@@ -270,6 +272,26 @@ export function QueryEditorPanel({
     }
   }
 
+  // App-wide shortcuts (../shortcuts): F5 / Ctrl+R run the selection or the whole script,
+  // Ctrl+Enter and Ctrl+Shift+Enter as in the editor, Shift+F5 stops. They read the latest
+  // state through the ref, registered once per tab.
+  const shortcut = useRef<ShortcutHandler>(() => false);
+  shortcut.current = (command) => {
+    if (command === "cancel") {
+      if (!active) return false;
+      cancel();
+      return true;
+    }
+    // A run key while nothing can run (no connection, a query running) is used up, not passed on.
+    if (!session || active) return true;
+    if (command === "run") {
+      if (editorRef.current?.getSelection()) runSelection();
+      else runAll();
+    } else onCommand(command === "runAll" ? "runAll" : "runCurrent");
+    return true;
+  };
+  useEffect(() => registerShortcuts(editorId, (command) => shortcut.current(command)), [editorId]);
+
   function onCommand(command: EditorCommand) {
     if (command === "runAll") runAll();
     else if (editorRef.current?.getSelection()) runSelection();
@@ -412,7 +434,7 @@ export function QueryEditorPanel({
           ) : (
             <Plug {...ICON_SM} className="query-editor__picker-icon" />
           )}
-          <select
+          <Select
             aria-label="Connection"
             value={sessionId ?? ""}
             disabled={active || sessions.length === 0}
@@ -427,7 +449,7 @@ export function QueryEditorPanel({
                 {s.profile_name} ({ENGINE_INFO[s.engine].label})
               </option>
             ))}
-          </select>
+          </Select>
         </label>
         <label className="query-editor__picker" title="Database the query runs in">
           <span className="visually-hidden">Database</span>
@@ -436,7 +458,7 @@ export function QueryEditorPanel({
           ) : (
             <Database {...ICON_SM} className="query-editor__picker-icon" />
           )}
-          <select
+          <Select
             aria-label="Database"
             value={selectedDatabase}
             disabled={active || databases.names.length === 0}
@@ -455,7 +477,7 @@ export function QueryEditorPanel({
                 {name}
               </option>
             ))}
-          </select>
+          </Select>
         </label>
         <span className="toolbar__separator" aria-hidden="true" />
         <button
@@ -464,7 +486,7 @@ export function QueryEditorPanel({
           data-testid="run-button"
           disabled={disabled}
           onClick={runAll}
-          title="Run the whole script (Ctrl+Shift+Enter)"
+          title="Run the selection, else the whole script (F5, Ctrl+R; the whole script: Ctrl+Shift+Enter)"
         >
           <Play {...ICON_SM} fill="currentColor" />
           Run
@@ -495,7 +517,7 @@ export function QueryEditorPanel({
           data-testid="cancel-button"
           disabled={!active}
           onClick={cancel}
-          title="Stop the running query"
+          title="Stop the running query (Shift+F5)"
         >
           <Square {...ICON_SM} fill={active ? "currentColor" : "none"} />
           Stop
@@ -568,7 +590,12 @@ export function QueryEditorPanel({
         </div>
         <Splitter value={split} onChange={setSplit} label="Resize editor and results" />
         <div className="query-editor__results">
-          <ResultsArea run={run} messagesNote={messagesNoteFor(engine)} onExport={exportResult} />
+          <ResultsArea
+            run={run}
+            messagesNote={messagesNoteFor(engine)}
+            onExport={exportResult}
+            engine={engine ?? null}
+          />
         </div>
       </div>
       {confirm ? (

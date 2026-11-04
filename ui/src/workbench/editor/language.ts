@@ -6,9 +6,10 @@ export type SqlLanguage = "pgsql" | "mysql" | "sql";
 
 /**
  * Monaco language id of any editor: SQL, the mongo shell (`javascript`, also used for the
- * Extended JSON editors of the document builder) or the Redis console (`redis`).
+ * Extended JSON editors of the document builder and JSON values), the Redis console (`redis`),
+ * and the value panel's `xml` and `plaintext`.
  */
-export type EditorLanguage = SqlLanguage | "javascript" | "redis";
+export type EditorLanguage = SqlLanguage | "javascript" | "redis" | "xml" | "plaintext";
 
 const LANGUAGE: Partial<Record<Engine, EditorLanguage>> = {
   postgres: "pgsql",

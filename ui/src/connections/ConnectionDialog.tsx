@@ -21,6 +21,7 @@ import {
 } from "react";
 import { ICON, ICON_SM } from "../components/icons";
 import { Modal } from "../components/Modal";
+import { Select } from "../components/Select";
 import {
   cancelRequest,
   type FileFilter,
@@ -674,7 +675,7 @@ export function ConnectionDialog({ profile, onClose, onSaved }: ConnectionDialog
         >
           <div className="field">
             <label htmlFor={fieldId("tlsMode")}>Encryption mode</label>
-            <select
+            <Select
               id={fieldId("tlsMode")}
               aria-describedby={tlsHelpId}
               value={form.tlsMode}
@@ -685,7 +686,7 @@ export function ConnectionDialog({ profile, onClose, onSaved }: ConnectionDialog
                   {m.label}
                 </option>
               ))}
-            </select>
+            </Select>
             <p id={tlsHelpId} className="field__hint" data-testid="tls-help">
               {tlsHelp}
             </p>
@@ -838,7 +839,7 @@ export function ConnectionDialog({ profile, onClose, onSaved }: ConnectionDialog
             </Field>
             <Field field="sshAuth" label="Authentication" errors={errors}>
               {(p) => (
-                <select
+                <Select
                   {...p}
                   value={form.sshAuth}
                   onChange={(e) => set("sshAuth", e.target.value as SshAuthMethod)}
@@ -846,7 +847,7 @@ export function ConnectionDialog({ profile, onClose, onSaved }: ConnectionDialog
                   <option value="password">Password</option>
                   <option value="private_key">Private key file</option>
                   <option value="agent">SSH agent</option>
-                </select>
+                </Select>
               )}
             </Field>
             {form.sshAuth === "password" ? (
@@ -918,7 +919,7 @@ export function ConnectionDialog({ profile, onClose, onSaved }: ConnectionDialog
             ) : null}
             <div className="field">
               <label htmlFor={fieldId("hostKeyPolicy")}>Server key check</label>
-              <select
+              <Select
                 id={fieldId("hostKeyPolicy")}
                 aria-describedby={hostKeyHelpId}
                 value={form.hostKeyPolicy}
@@ -929,7 +930,7 @@ export function ConnectionDialog({ profile, onClose, onSaved }: ConnectionDialog
                     {p.label}
                   </option>
                 ))}
-              </select>
+              </Select>
               <p id={hostKeyHelpId} className="field__hint">
                 {hostKeyHelp}
               </p>
@@ -1065,7 +1066,7 @@ function MongoServerFields({
         </Field>
         <Field field="readPreference" label="Read preference" errors={errors}>
           {(p) => (
-            <select
+            <Select
               {...p}
               value={form.readPreference}
               onChange={(e) => set("readPreference", e.target.value as MongoReadPreference)}
@@ -1075,7 +1076,7 @@ function MongoServerFields({
                   {READ_PREFERENCE_LABEL[r]}
                 </option>
               ))}
-            </select>
+            </Select>
           )}
         </Field>
       </div>
@@ -1108,7 +1109,7 @@ function MongoAuthFields({ form, errors, set, text }: EngineFieldsProps) {
       </Field>
       <Field field="authMechanism" label="Authentication mechanism" errors={errors}>
         {(p) => (
-          <select
+          <Select
             {...p}
             value={form.authMechanism}
             onChange={(e) => set("authMechanism", e.target.value as MongoAuthMechanism | "")}
@@ -1119,7 +1120,7 @@ function MongoAuthFields({ form, errors, set, text }: EngineFieldsProps) {
                 {m === "MONGODB-X509" ? "X.509 client certificate" : m}
               </option>
             ))}
-          </select>
+          </Select>
         )}
       </Field>
     </div>
@@ -1149,7 +1150,7 @@ function RedisServerFields({ form, errors, set, text }: EngineFieldsProps) {
         }
       >
         {(p) => (
-          <select
+          <Select
             {...p}
             value={form.redisMode}
             onChange={(e) => set("redisMode", e.target.value as RedisMode)}
@@ -1159,7 +1160,7 @@ function RedisServerFields({ form, errors, set, text }: EngineFieldsProps) {
                 {REDIS_MODE_LABEL[m]}
               </option>
             ))}
-          </select>
+          </Select>
         )}
       </Field>
       {form.redisMode === "standalone" ? null : (
@@ -1197,14 +1198,14 @@ function RedisServerFields({ form, errors, set, text }: EngineFieldsProps) {
           </Field>
           <Field field="sentinelAuth" label="Sentinel login" errors={errors}>
             {(p) => (
-              <select
+              <Select
                 {...p}
                 value={form.sentinelAuth}
                 onChange={(e) => set("sentinelAuth", e.target.value as "none" | "same")}
               >
                 <option value="none">None</option>
                 <option value="same">Same user and password</option>
-              </select>
+              </Select>
             )}
           </Field>
         </div>
@@ -1212,7 +1213,7 @@ function RedisServerFields({ form, errors, set, text }: EngineFieldsProps) {
       <div className="field-row">
         <Field field="protocol" label="Protocol" errors={errors}>
           {(p) => (
-            <select
+            <Select
               {...p}
               value={form.protocol}
               onChange={(e) => set("protocol", e.target.value as "auto" | "resp2" | "resp3")}
@@ -1220,7 +1221,7 @@ function RedisServerFields({ form, errors, set, text }: EngineFieldsProps) {
               <option value="auto">Automatic (RESP3 when available)</option>
               <option value="resp2">RESP2</option>
               <option value="resp3">RESP3</option>
-            </select>
+            </Select>
           )}
         </Field>
         <Field

@@ -8,6 +8,7 @@ import type {
   TextEncoding,
   WriteOptions,
 } from "../../api";
+import { Select } from "../../components/Select";
 import { ENGINE_INFO } from "../../connections/types";
 import { LEVEL_RANGE, SQL_DUMP_ENGINES } from "./model";
 
@@ -64,7 +65,7 @@ function CsvForm({ o, set, disabled }: { o: Csv; set: (n: Csv) => void; disabled
     <div className="transfer-form">
       <div className="field">
         <label htmlFor={`${id}-delimiter`}>Delimiter</label>
-        <select
+        <Select
           id={`${id}-delimiter`}
           value={o.delimiter ?? ","}
           disabled={disabled}
@@ -74,11 +75,11 @@ function CsvForm({ o, set, disabled }: { o: Csv; set: (n: Csv) => void; disabled
           <option value=";">Semicolon ( ; )</option>
           <option value={"\t"}>Tab</option>
           <option value="|">Pipe ( | )</option>
-        </select>
+        </Select>
       </div>
       <div className="field">
         <label htmlFor={`${id}-quoting`}>Quote values</label>
-        <select
+        <Select
           id={`${id}-quoting`}
           value={o.quoteStyle ?? "necessary"}
           disabled={disabled}
@@ -88,11 +89,11 @@ function CsvForm({ o, set, disabled }: { o: Csv; set: (n: Csv) => void; disabled
           <option value="always">Always</option>
           <option value="non_numeric">All but numbers</option>
           <option value="never">Never</option>
-        </select>
+        </Select>
       </div>
       <div className="field">
         <label htmlFor={`${id}-encoding`}>Encoding</label>
-        <select
+        <Select
           id={`${id}-encoding`}
           value={o.encoding ?? "utf8"}
           disabled={disabled}
@@ -103,11 +104,11 @@ function CsvForm({ o, set, disabled }: { o: Csv; set: (n: Csv) => void; disabled
               {e.label}
             </option>
           ))}
-        </select>
+        </Select>
       </div>
       <div className="field">
         <label htmlFor={`${id}-eol`}>Line ends</label>
-        <select
+        <Select
           id={`${id}-eol`}
           value={o.lineEnding ?? "lf"}
           disabled={disabled}
@@ -115,7 +116,7 @@ function CsvForm({ o, set, disabled }: { o: Csv; set: (n: Csv) => void; disabled
         >
           <option value="lf">LF (Linux, macOS)</option>
           <option value="cr_lf">CR LF (Windows)</option>
-        </select>
+        </Select>
       </div>
       <div className="field">
         <label htmlFor={`${id}-null`}>NULL is written as</label>
@@ -172,7 +173,7 @@ function JsonForm({ o, set, disabled }: { o: Json; set: (n: Json) => void; disab
     <div className="transfer-form">
       <div className="field">
         <label htmlFor={`${id}-layout`}>Layout</label>
-        <select
+        <Select
           id={`${id}-layout`}
           value={o.layout ?? "array"}
           disabled={disabled}
@@ -180,11 +181,11 @@ function JsonForm({ o, set, disabled }: { o: Json; set: (n: Json) => void; disab
         >
           <option value="array">One array of objects</option>
           <option value="lines">One object per line (NDJSON)</option>
-        </select>
+        </Select>
       </div>
       <div className="field">
         <label htmlFor={`${id}-binary`}>Binary values</label>
-        <select
+        <Select
           id={`${id}-binary`}
           value={o.binary ?? "base64"}
           disabled={disabled}
@@ -192,7 +193,7 @@ function JsonForm({ o, set, disabled }: { o: Json; set: (n: Json) => void; disab
         >
           <option value="base64">Base64</option>
           <option value="hex">Hex</option>
-        </select>
+        </Select>
       </div>
       <div className="transfer-form__checks">
         <Check
@@ -262,7 +263,7 @@ function ParquetForm({
     <div className="transfer-form">
       <div className="field">
         <label htmlFor={`${id}-codec`}>Compression</label>
-        <select
+        <Select
           id={`${id}-codec`}
           value={compression.codec}
           disabled={disabled}
@@ -275,7 +276,7 @@ function ParquetForm({
               {c === "none" ? "None" : c === "lz4_raw" ? "LZ4" : c}
             </option>
           ))}
-        </select>
+        </Select>
       </div>
       {range ? (
         <div className="field">
@@ -323,7 +324,7 @@ function DumpForm({
     <div className="transfer-form">
       <div className="field">
         <label htmlFor={`${id}-target`}>SQL for</label>
-        <select
+        <Select
           id={`${id}-target`}
           value={o.target}
           disabled={disabled}
@@ -337,7 +338,7 @@ function DumpForm({
               {ENGINE_INFO[e].label}
             </option>
           ))}
-        </select>
+        </Select>
       </div>
       <div className="field">
         <label htmlFor={`${id}-version`}>Server version</label>

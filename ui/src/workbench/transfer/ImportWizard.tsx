@@ -47,6 +47,7 @@ import {
 } from "../../api";
 import { ICON, ICON_LG, ICON_SM } from "../../components/icons";
 import { Modal } from "../../components/Modal";
+import { Select } from "../../components/Select";
 import { cancelRequest, newRequestId, toCommandError } from "../../connections/api";
 import { useConnections } from "../../connections/store";
 import { ENGINE_INFO } from "../../connections/types";
@@ -708,7 +709,7 @@ export function ImportWizard({ init, onClose }: { init: ImportInit; onClose: () 
         <div className="transfer-step__side">
           <div className="field">
             <label htmlFor={`${id}-format`}>Format</label>
-            <select
+            <Select
               id={`${id}-format`}
               value={formatOf(options)}
               onChange={(e) => changeFormat(e.target.value as ImportFormat)}
@@ -718,7 +719,7 @@ export function ImportWizard({ init, onClose }: { init: ImportInit; onClose: () 
                   {FORMAT_LABEL[f]}
                 </option>
               ))}
-            </select>
+            </Select>
           </div>
           <ReadOptionsForm options={options} preview={previewData} onChange={setOptions} />
         </div>
@@ -765,7 +766,7 @@ export function ImportWizard({ init, onClose }: { init: ImportInit; onClose: () 
         ) : null}
         <div className="field">
           <label htmlFor={`${id}-session`}>Connection</label>
-          <select
+          <Select
             id={`${id}-session`}
             value={target.sessionId}
             onChange={(e) => {
@@ -779,7 +780,7 @@ export function ImportWizard({ init, onClose }: { init: ImportInit; onClose: () 
                 {s.profile_name} ({ENGINE_INFO[s.engine].label})
               </option>
             ))}
-          </select>
+          </Select>
         </div>
         <fieldset className="fieldset">
           <legend className="visually-hidden">Target table</legend>
@@ -832,7 +833,7 @@ export function ImportWizard({ init, onClose }: { init: ImportInit; onClose: () 
         {target.kind === "existing" ? (
           <div className="field">
             <label htmlFor={`${id}-mode`}>Before importing</label>
-            <select
+            <Select
               id={`${id}-mode`}
               value={target.existingMode}
               onChange={(e) =>
@@ -847,7 +848,7 @@ export function ImportWizard({ init, onClose }: { init: ImportInit; onClose: () 
                   {MODE_LABEL[m]}
                 </option>
               ))}
-            </select>
+            </Select>
             {target.existingMode === "replace" ? (
               <p className="field__hint">
                 The table is dropped and created again from the column mapping.
@@ -877,7 +878,7 @@ export function ImportWizard({ init, onClose }: { init: ImportInit; onClose: () 
     const setType = (dataType: MappingRow["dataType"]) => updateRow(r.source, { dataType });
     return (
       <>
-        <select
+        <Select
           aria-label={`Type of ${r.sourceName}`}
           value={typeKey(r.dataType)}
           disabled={r.skip}
@@ -898,7 +899,7 @@ export function ImportWizard({ init, onClose }: { init: ImportInit; onClose: () 
               </option>
             );
           })}
-        </select>
+        </Select>
         {sized && dt.type === "decimal" ? (
           <span className="transfer-size">
             <input
@@ -998,7 +999,7 @@ export function ImportWizard({ init, onClose }: { init: ImportInit; onClose: () 
                           onChange={(e) => updateRow(r.source, { target: e.target.value })}
                         />
                       ) : (
-                        <select
+                        <Select
                           aria-label={`Target column for ${r.sourceName}`}
                           aria-invalid={rowProblems.length > 0}
                           value={r.target}
@@ -1016,7 +1017,7 @@ export function ImportWizard({ init, onClose }: { init: ImportInit; onClose: () 
                               {c.name} ({c.native_type || typeLabel(c.data_type)})
                             </option>
                           ))}
-                        </select>
+                        </Select>
                       )}
                       {rowProblems.map((m) => (
                         <p key={m} className="field__error">
@@ -1087,7 +1088,7 @@ export function ImportWizard({ init, onClose }: { init: ImportInit; onClose: () 
           </fieldset>
           <fieldset className="fieldset transfer-group">
             <legend>Transactions</legend>
-            <select
+            <Select
               aria-label="Transactions"
               value={transaction.type}
               onChange={(e) =>
@@ -1101,7 +1102,7 @@ export function ImportWizard({ init, onClose }: { init: ImportInit; onClose: () 
               <option value="auto">Automatic (one transaction for small files)</option>
               <option value="single">One transaction (all or nothing)</option>
               <option value="batches">Commit every N rows</option>
-            </select>
+            </Select>
             {transaction.type === "batches" ? (
               <label className="checkbox">
                 Rows per commit

@@ -399,6 +399,93 @@ async function screenshot(name) {
 }
 
 /**
+ * Design review of the value panel (results/ValuePanel.tsx): opens it with the results' Value
+ * button, selects a cell with a real click on the grid, screenshots both themes, closes it.
+ * Logs what it saw; never fails the run.
+ */
+async function valuePanelGallery() {
+  try {
+    const toggle = await wd.execute("return document.querySelector('.results__value-toggle');");
+    const canvas = await wd.execute(
+      "return document.querySelector('[data-testid=result-grid] canvas');",
+    );
+    if (!toggle || !canvas) {
+      log("value panel: no Value button or grid canvas");
+      return;
+    }
+    await wd.click(toggle);
+    await sleep(300);
+    await wd.click(canvas);
+    await sleep(500);
+    const seen = await wd.execute(
+      "const p = document.querySelector('[data-testid=value-panel]'); if (!p) return null;" +
+        " return (p.querySelector('.value-panel__name')?.textContent ?? '') + ' | ' +" +
+        " (p.querySelector('.value-panel__stats, .value-panel__empty')?.textContent ?? '');",
+    );
+    log(seen === null ? "value panel: did not open" : `value panel: ${seen}`);
+    if (seen !== null) await gallery("02-value-panel");
+    await wd.click(toggle);
+    await sleep(200);
+  } catch (error) {
+    log(`value panel: ${error.message}`);
+  }
+}
+
+/**
+ * Design review of the themed dropdown list (components/Select.tsx): opens the first select
+ * matching `selector` in `root` with a real click, screenshots both themes with the list open,
+ * then closes it with Escape. Logs what it saw; never fails the run.
+ */
+async function selectListGallery(root, selector, name) {
+  const listed = () =>
+    wd.execute(
+      "const l = document.querySelector('.select-list[role=listbox]'); return l ? l.querySelectorAll('[role=option]').length : -1;",
+    );
+  const close = () =>
+    wd.execute(
+      "const l = document.querySelector('.select-list[role=listbox]'); if (l) l.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));",
+    );
+  const theme = (label) =>
+    wd.execute(
+      `const b = document.querySelector('button[aria-label="${label}"]'); if (b) b.click(); return !!b;`,
+    );
+  try {
+    const select = await wd.execute(
+      "return arguments[0].querySelector(arguments[1]);",
+      root,
+      selector,
+    );
+    if (!select) {
+      log(`select list: no select matches ${selector}`);
+      return;
+    }
+    // The theme buttons are a click outside the list, which closes it: switch, then open it.
+    for (const [label, suffix] of [
+      ["Dark theme", "dark"],
+      ["Light theme", "light"],
+    ]) {
+      if (!(await theme(label))) continue;
+      await sleep(300);
+      await wd.click(select);
+      await sleep(300);
+      const items = await listed();
+      log(
+        items < 0
+          ? `select list (${suffix}): the themed list did not open`
+          : `select list (${suffix}): open with ${items} option(s)`,
+      );
+      if (items >= 0) await screenshot(`ui-${name}-${suffix}`);
+      await close();
+      await sleep(200);
+    }
+    await theme("Dark theme");
+    await sleep(200);
+  } catch (error) {
+    log(`select list: ${error.message}`);
+  }
+}
+
+/**
  * Screenshots for design review: the current screen in the dark theme, then in the light theme
  * (switched with the status bar's theme buttons, so Monaco and the grid re-theme too), then back
  * to dark. Never fails the run.
@@ -2682,6 +2769,7 @@ async function m8TransferStep() {
       { timeoutMs: 60_000 },
     );
     await gallery("08-transfer-mapping");
+    await selectListGallery(dialog, "[data-testid=mapping-row] select", "08-select-list");
     await clickWhenEnabled(dialog, "[data-testid=transfer-next]", "Next (mapping)");
     await clickWhenEnabled(dialog, "[data-testid=transfer-next]", "Next (options)");
     await waitFor("the dry-run DDL", () => within(dialog, "[data-testid=transfer-ddl]"), {
@@ -2936,6 +3024,7 @@ async function main() {
   if (ok) ok = await step("Arrow page decodes in the webview (first cell is 1)", firstCell);
   if (ok) ok = await step("Scroll the grid (pages load at each position)", scrollGrid);
   if (ok) await gallery("02-query-results");
+  if (ok) await valuePanelGallery();
   if (ok) ok = await step("Page latency through IPC + Arrow decode", measurePages);
   if (ok) ok = await step("Cancel a running large query", cancelRun);
   if (ok) ok = await step("Edit a table cell (M3 table data UI)", editCell);
