@@ -13,9 +13,11 @@ import "./workbench/nosql/nosql.css";
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { App } from "./App";
+import { installNativeMenuGuard } from "./workbench/native-menu";
 import { initTheme } from "./workbench/theme-bridge";
 
 initTheme();
+installNativeMenuGuard();
 
 const root = document.getElementById("root");
 if (!root) {

@@ -753,6 +753,18 @@ select[multiple] {
   background-image: none;
 }
 
+/* The dropdown list itself. Engines that draw it from CSS (WebView2 / Chromium) use these;
+   the others draw a native popup in the window's theme (theme-bridge passes the choice on). */
+option,
+optgroup {
+  background-color: var(--color-bg-elevated);
+  color: var(--color-fg);
+}
+
+option:disabled {
+  color: var(--color-fg-faint);
+}
+
 textarea {
   padding: var(--space-1) var(--space-2);
   line-height: var(--line-height-ui);
