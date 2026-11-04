@@ -1,10 +1,14 @@
+import { isTauri } from "@tauri-apps/api/core";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useSyncExternalStore } from "react";
 
 /**
  * The user's theme choice and the theme in effect. The CSS tokens in theme.css switch on
  * `<html data-theme>`; canvas and editor surfaces (Glide grid, Monaco) cannot read CSS
  * variables live, so they subscribe here and re-read the tokens when the theme changes.
- * See docs/design-system.md.
+ * What the OS draws for the webview (native `<select>` popups, the webview's own context
+ * menu, scrollbars on some platforms) follows the native window's theme, so the choice is
+ * passed to Tauri too ("system" lets the window follow the OS). See docs/design-system.md.
  */
 export type ThemePreference = "dark" | "light" | "system";
 export type ResolvedTheme = "dark" | "light";
@@ -42,6 +46,24 @@ function notify() {
 
 function apply() {
   if (typeof document !== "undefined") document.documentElement.dataset.theme = preference;
+  applyNative();
+}
+
+/** The native window's theme: the choice, or `null` (follow the OS) for "system". */
+export function nativeTheme(choice: ThemePreference): "dark" | "light" | null {
+  return choice === "system" ? null : choice;
+}
+
+function applyNative() {
+  // Outside the app (tests, a plain browser) there is no native window.
+  if (!isTauri()) return;
+  try {
+    getCurrentWindow()
+      .setTheme(nativeTheme(preference))
+      .catch((error: unknown) => console.warn("could not set the window theme", error));
+  } catch (error) {
+    console.warn("could not set the window theme", error);
+  }
 }
 
 /** Applies the stored choice to `<html>` and follows OS changes while "system" is chosen. */
@@ -217,6 +239,13 @@ export function applyMonacoTheme(monaco: MonacoThemeApi): void {
       "editorHoverWidget.border": hex(cssToken("--color-border-strong", "#334155"), "#334155"),
       "editorError.foreground": hex(cssToken("--color-danger", "#f87171"), "#f87171"),
       "editorWarning.foreground": hex(cssToken("--color-warning", "#fbbf24"), "#fbbf24"),
+      // The editor's own context menu (Cut / Copy / Paste / Command Palette).
+      "menu.background": hex(cssToken("--color-bg-elevated", "#172036"), "#172036"),
+      "menu.foreground": hex(cssToken("--color-fg", "#e2e8f0"), "#e2e8f0"),
+      "menu.selectionBackground": hex(cssToken("--color-bg-muted", "#1e293b"), "#1e293b"),
+      "menu.selectionForeground": hex(cssToken("--color-fg", "#e2e8f0"), "#e2e8f0"),
+      "menu.separatorBackground": hex(cssToken("--color-border", "#243045"), "#243045"),
+      "menu.border": hex(cssToken("--color-border-strong", "#334155"), "#334155"),
       focusBorder: hex(cssToken("--color-focus", "#38bdf8"), "#38bdf8"),
     },
   });
