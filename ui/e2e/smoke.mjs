@@ -404,6 +404,18 @@ async function screenshot(name) {
  * then closes it with Escape. Logs what it saw; never fails the run.
  */
 async function selectListGallery(root, selector, name) {
+  const listed = () =>
+    wd.execute(
+      "const l = document.querySelector('.select-list[role=listbox]'); return l ? l.querySelectorAll('[role=option]').length : -1;",
+    );
+  const close = () =>
+    wd.execute(
+      "const l = document.querySelector('.select-list[role=listbox]'); if (l) l.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));",
+    );
+  const theme = (label) =>
+    wd.execute(
+      `const b = document.querySelector('button[aria-label="${label}"]'); if (b) b.click(); return !!b;`,
+    );
   try {
     const select = await wd.execute(
       "return arguments[0].querySelector(arguments[1]);",
@@ -414,34 +426,27 @@ async function selectListGallery(root, selector, name) {
       log(`select list: no select matches ${selector}`);
       return;
     }
-    await wd.click(select);
-    await sleep(300);
-    const items = await wd.execute(
-      "const l = document.querySelector('.select-list[role=listbox]'); return l ? l.querySelectorAll('[role=option]').length : -1;",
-    );
-    log(
-      items < 0
-        ? "select list: the themed list did not open"
-        : `select list: open with ${items} option(s)`,
-    );
-    if (items >= 0) {
-      for (const label of ["Dark theme", "Light theme"]) {
-        // Theme buttons would close the list (a click elsewhere), so switch by attribute and
-        // re-open the list for each theme.
-        await wd.execute(
-          `document.documentElement.dataset.theme = ${JSON.stringify(label.startsWith("Dark") ? "dark" : "light")};`,
-        );
-        await sleep(300);
-        await screenshot(`ui-${name}-${label.startsWith("Dark") ? "dark" : "light"}`);
-      }
-      await wd.execute(
-        "const l = document.querySelector('.select-list[role=listbox]'); if (l) l.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));",
+    // The theme buttons are a click outside the list, which closes it: switch, then open it.
+    for (const [label, suffix] of [
+      ["Dark theme", "dark"],
+      ["Light theme", "light"],
+    ]) {
+      if (!(await theme(label))) continue;
+      await sleep(300);
+      await wd.click(select);
+      await sleep(300);
+      const items = await listed();
+      log(
+        items < 0
+          ? `select list (${suffix}): the themed list did not open`
+          : `select list (${suffix}): open with ${items} option(s)`,
       );
-      await wd.execute(
-        "const b = document.querySelector('button[aria-label=\"Dark theme\"]'); if (b) b.click();",
-      );
+      if (items >= 0) await screenshot(`ui-${name}-${suffix}`);
+      await close();
       await sleep(200);
     }
+    await theme("Dark theme");
+    await sleep(200);
   } catch (error) {
     log(`select list: ${error.message}`);
   }
