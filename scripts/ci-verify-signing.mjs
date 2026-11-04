@@ -15,6 +15,9 @@
 //   HAS_APPLE_CERTIFICATE   "true" when APPLE_CERTIFICATE (+ password) is configured
 //   HAS_APPLE_NOTARIZATION  "true" when APPLE_ID, APPLE_PASSWORD and APPLE_TEAM_ID are set
 //   HAS_WINDOWS_CERTIFICATE "true" when WINDOWS_CERTIFICATE is configured
+//   HAS_WINDOWS_SIGNPATH    "true" when SignPath Foundation signs the Windows installers
+//                           (docs/code-signing.md): both installers must be signed; the bare
+//                           app .exe next to bundle/ is not (its signed copy is inside the .msi)
 //   OXBASE_TARGET_DIR          cargo target dir to search (default: <repo>/target)
 //
 // A signature that is present but broken always fails, whatever OXBASE_REQUIRE_SIGNING says.
@@ -38,6 +41,8 @@ const required = flag('OXBASE_REQUIRE_SIGNING');
 const appleCert = flag('HAS_APPLE_CERTIFICATE');
 const appleNotarize = flag('HAS_APPLE_NOTARIZATION');
 const windowsCert = flag('HAS_WINDOWS_CERTIFICATE');
+const windowsSignPath = flag('HAS_WINDOWS_SIGNPATH');
+const windowsSigned = windowsCert || windowsSignPath;
 const platform = process.platform;
 
 const rows = []; // [artifact, check, result]
@@ -82,13 +87,13 @@ function writeSummary(title) {
 if (process.argv.includes('--preflight')) {
   console.log(
     `signing preflight: platform=${platform} required=${required} apple-cert=${appleCert}` +
-      ` apple-notarization=${appleNotarize} windows-cert=${windowsCert}`,
+      ` apple-notarization=${appleNotarize} windows-cert=${windowsCert} windows-signpath=${windowsSignPath}`,
   );
   if (platform === 'darwin') {
     if (!appleCert) missing('macOS', 'secrets', 'APPLE_CERTIFICATE / APPLE_CERTIFICATE_PASSWORD not set (bundle will be ad-hoc signed)');
     if (!appleNotarize) missing('macOS', 'secrets', 'APPLE_ID / APPLE_PASSWORD / APPLE_TEAM_ID not set (bundle will not be notarized)');
   } else if (platform === 'win32') {
-    if (!windowsCert) missing('Windows', 'secrets', 'WINDOWS_CERTIFICATE / WINDOWS_CERTIFICATE_PASSWORD not set (bundle will be unsigned)');
+    if (!windowsSigned) missing('Windows', 'secrets', 'neither WINDOWS_CERTIFICATE / WINDOWS_CERTIFICATE_PASSWORD nor SignPath (SIGNPATH_API_TOKEN, SIGNPATH_ORGANIZATION_ID, SIGNPATH_PROJECT_SLUG) is set (bundle will be unsigned)');
   }
   if (failures === 0) ok(platform, 'secrets', 'preflight passed');
   writeSummary('Signing preflight');
@@ -186,7 +191,7 @@ const PS_CHECK = [
   '} | ConvertTo-Json -Compress',
 ].join('\n');
 
-function verifyWindowsFile(file) {
+function verifyWindowsFile(file, { appBinary = false } = {}) {
   const name = rel(file);
   const r = run('pwsh', ['-NoProfile', '-NonInteractive', '-Command', PS_CHECK], { OXBASE_SIG_FILE: file });
   if (!r.ok) {
@@ -205,7 +210,11 @@ function verifyWindowsFile(file) {
     if (sig.Timestamp) ok(name, 'timestamp', sig.Timestamp);
     else (required ? fail : warn)(name, 'timestamp', 'not timestamped (signature expires with the certificate)');
   } else if (sig.Status === 'NotSigned') {
-    (windowsCert ? fail : missing)(name, 'Authenticode', 'not signed');
+    if (appBinary && windowsSignPath && !windowsCert) {
+      ok(name, 'Authenticode', 'not signed here; SignPath signs its copy inside the .msi and the installers');
+    } else {
+      (windowsSigned ? fail : missing)(name, 'Authenticode', 'not signed');
+    }
   } else {
     fail(name, 'Authenticode', `${sig.Status}: ${sig.Message}`);
   }
@@ -216,11 +225,11 @@ function verifyWindows(dir) {
   if (files.length === 0) fail(rel(dir), 'bundles', 'no .msi or NSIS .exe under bundle/');
   // The app executable itself sits next to bundle/ (named after productName or the crate).
   const profileDir = dirname(dir);
+  for (const f of files) verifyWindowsFile(f);
   for (const exe of ['Oxbase.exe', 'oxbase.exe', 'app-tauri.exe']) {
     const p = join(profileDir, exe);
-    if (existsSync(p)) files.push(p);
+    if (existsSync(p)) verifyWindowsFile(p, { appBinary: true });
   }
-  for (const f of files) verifyWindowsFile(f);
 }
 
 // ------------------------------------------------------------------ Linux
