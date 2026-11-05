@@ -766,11 +766,16 @@ pnpm tauri build                          # release bundles for the current OS
    arrive. **Stop** cancels it and keeps the rows already received.
 5. **History** lists past statements. Search them, **Open in editor**, **Delete**, clear them
    all, or turn history off.
+6. Ctrl+= and Ctrl+- zoom the whole app, Ctrl+0 goes back to 100 % (the level is remembered;
+   the status bar shows it while it is not 100 %).
 
 ### Editing data and designing tables
 
 1. With the fixture, expand `oxbase_test` > `m3` > **Tables** and double-click `m3_edit_pk`.
-   **Filter & sort** narrows and orders the rows (the query is re-run on the server).
+   **Filter & sort** narrows and orders the rows (the query is re-run on the server; Enter
+   applies). The tab loads the first 1,000 rows: the **Rows** control changes that (new tabs
+   start with your last choice), and **Load all rows** fetches the rest. Export always writes
+   every row.
 2. Double-click a cell (or start typing) to edit it, **Add row** / **Duplicate row** /
    **Delete row** to change rows, **Revert row** to drop a row's pending changes. Pending
    changes are coloured; **Apply** writes them all in one transaction, **Discard** drops them.

@@ -369,9 +369,16 @@ export function FilterBuilder({
             value={draft.raw}
             disabled={disabled}
             onChange={(e) => onChange({ ...draft, raw: e.target.value })}
+            onKeyDown={(e) => {
+              // Enter is a new line here; Ctrl+Enter applies the filter like Enter elsewhere.
+              if (e.key !== "Enter" || !(e.ctrlKey || e.metaKey)) return;
+              e.preventDefault();
+              e.currentTarget.form?.requestSubmit();
+            }}
           />
           <p className="field__hint">
             Sent to the database as typed. It must be one condition: no semicolons or comments.
+            Ctrl+Enter applies it.
           </p>
         </div>
       ) : (

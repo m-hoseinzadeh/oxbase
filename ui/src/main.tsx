@@ -15,8 +15,10 @@ import { createRoot } from "react-dom/client";
 import { App } from "./App";
 import { installNativeMenuGuard } from "./workbench/native-menu";
 import { initTheme } from "./workbench/theme-bridge";
+import { initZoom } from "./workbench/zoom";
 
 initTheme();
+initZoom();
 installNativeMenuGuard();
 
 const root = document.getElementById("root");
