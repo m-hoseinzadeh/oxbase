@@ -44,7 +44,8 @@ type Log = Arc<Mutex<Vec<String>>>;
 /// - anything else: `RowsAffected(0)`.
 ///
 /// A stream that sees its statement cancelled logs `cancelled`. Connecting to the database
-/// `hang` never finishes.
+/// `hang` never finishes. `begin` opens a transaction that `commit` / `rollback` end;
+/// `rollback_open_transaction` logs `rollback-check` and ends it.
 struct ScriptDriver {
     log: Log,
     engine: Engine,
@@ -71,6 +72,7 @@ impl Driver for ScriptDriver {
             log: self.log.clone(),
             closed: Arc::new(AtomicBool::new(false)),
             busy_until: Arc::new(Mutex::new(None)),
+            in_transaction: Arc::new(AtomicBool::new(false)),
         }))
     }
 }
@@ -82,6 +84,8 @@ struct ScriptConnection {
     closed: Arc<AtomicBool>,
     /// Set by `slowstop`: `execute` waits until then.
     busy_until: Arc<Mutex<Option<Instant>>>,
+    /// A `begin` not yet ended by `commit` or `rollback`.
+    in_transaction: Arc<AtomicBool>,
 }
 
 /// How long a `slowstop` statement keeps its connection busy after a cancel.
@@ -159,6 +163,11 @@ impl Connection for ScriptConnection {
         let mut words: Vec<&str> = sql.split_whitespace().collect();
         if words.len() > 1 && words[0] == "select" {
             words.remove(0);
+        }
+        match words.first().copied() {
+            Some("begin") => self.in_transaction.store(true, Ordering::SeqCst),
+            Some("commit" | "rollback") => self.in_transaction.store(false, Ordering::SeqCst),
+            _ => {}
         }
         let mut steps = VecDeque::new();
         let mut delay = Duration::ZERO;
@@ -272,6 +281,14 @@ impl Connection for ScriptConnection {
 
     async fn begin(&self) -> Result<Box<dyn Tx>> {
         Err(Error::unsupported("no transactions"))
+    }
+
+    async fn rollback_open_transaction(&self) -> Result<Option<bool>> {
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(Error::connection("closed"));
+        }
+        self.log.lock().unwrap().push("rollback-check".into());
+        Ok(Some(self.in_transaction.swap(false, Ordering::SeqCst)))
     }
 
     async fn close(&self) -> Result<()> {
@@ -1531,4 +1548,130 @@ async fn engines_without_sql_run_their_registered_language() {
         .unwrap();
     assert_eq!(span.index, 1);
     assert!(QueryService::statement_at(Engine::Redis, "PING", 0).is_err());
+}
+
+// ---------------------------------------------------------------------------------------------
+// Per-run sessions (SessionMode::PerRun)
+// ---------------------------------------------------------------------------------------------
+
+async fn per_run_harness() -> Harness {
+    let mut profile = ConnectionProfile::new(
+        "limited",
+        Engine::Postgres,
+        ProfileAddress::Network {
+            host: "script.invalid".into(),
+            port: Some(5432),
+        },
+    );
+    profile.database = Some("db1".into());
+    profile.session_mode = SessionMode::PerRun;
+    Harness::with_profile(profile, |_| {}).await
+}
+
+fn rolled_back(event: &RunEvent) -> bool {
+    matches!(event, RunEvent::Notice { code: Some(code), level: NoticeLevel::Warning, .. } if code == ROLLED_BACK_CODE)
+}
+
+/// Waits until base `base` has no child session left (they close in the background).
+async fn no_children(manager: &ConnectionManager, base: SessionId) {
+    for _ in 0..100 {
+        if manager.children_of(base).is_empty() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("child sessions left: {:?}", manager.children_of(base));
+}
+
+#[tokio::test]
+async fn per_run_sessions_close_after_each_run() {
+    let h = per_run_harness().await;
+    let (_, events) = h.run("a", "update 1", no_history()).await;
+    assert_eq!(shape(&events).last().unwrap(), "finished");
+    assert!(!events.iter().any(rolled_back), "{events:?}");
+    no_children(&h.manager, h.session).await;
+    assert_eq!(h.service.editor_usage(h.session), EditorUsage::default());
+
+    // The next run connects again (base + one per run), on the editor's database.
+    let (run, _) = h.run("a", "rows 3", no_history()).await;
+    no_children(&h.manager, h.session).await;
+    assert_eq!(connects(&h), 3);
+    // Its rows stay readable without a session.
+    let page = h.service.page(run, 0, 0, 10).await.unwrap();
+    assert_eq!(page.num_rows(), 3);
+    assert!(h.log.lock().unwrap().contains(&"rollback-check".to_owned()));
+}
+
+#[tokio::test]
+async fn per_run_rolls_back_an_open_transaction_and_says_so() {
+    let h = per_run_harness().await;
+    let (_, events) = h.run("a", "begin; update 1", no_history()).await;
+    let notice = events
+        .iter()
+        .position(rolled_back)
+        .expect("a rolled-back notice");
+    assert_eq!(
+        notice,
+        events.len() - 2,
+        "the notice comes right before the terminal event"
+    );
+    assert!(events.last().unwrap().is_terminal());
+    no_children(&h.manager, h.session).await;
+
+    // A committed transaction: nothing to roll back, no notice.
+    let (_, events) = h.run("a", "begin; update 1; commit", no_history()).await;
+    assert!(!events.iter().any(rolled_back), "{events:?}");
+    // A failed run gives its session back too.
+    let (_, events) = h.run("a", "begin; fail", no_history()).await;
+    assert!(events.iter().any(rolled_back), "{events:?}");
+    no_children(&h.manager, h.session).await;
+}
+
+#[tokio::test]
+async fn per_tab_sessions_stay_and_are_never_checked() {
+    let h = Harness::new(|_| {}).await;
+    let (_, events) = h.run("a", "begin; update 1", no_history()).await;
+    assert!(!events.iter().any(rolled_back));
+    assert_eq!(h.manager.children_of(h.session).len(), 1);
+    assert_eq!(
+        h.service.editor_usage(h.session),
+        EditorUsage {
+            idle: 1,
+            running: 0
+        }
+    );
+    assert!(!h.log.lock().unwrap().contains(&"rollback-check".to_owned()));
+}
+
+#[tokio::test]
+async fn edits_of_a_per_run_result_get_a_session_of_their_own() {
+    let h = per_run_harness().await;
+    let (run, _) = h.run("a", "rows 2", no_history()).await;
+    no_children(&h.manager, h.session).await;
+    let lease = h
+        .service
+        .edit_session(run, &CancellationToken::new())
+        .await
+        .unwrap();
+    assert!(lease.is_own());
+    assert_eq!(lease.session.summary().database.as_deref(), Some("db1"));
+    assert_eq!(h.manager.children_of(h.session).len(), 1);
+    drop(lease);
+    no_children(&h.manager, h.session).await;
+
+    // Per tab, the run's own session.
+    let h = Harness::new(|_| {}).await;
+    let (run, _) = h.run("a", "rows 2", no_history()).await;
+    let lease = h
+        .service
+        .edit_session(run, &CancellationToken::new())
+        .await
+        .unwrap();
+    assert!(!lease.is_own());
+    drop(lease);
+    assert_eq!(
+        h.manager.children_of(h.session).len(),
+        1,
+        "the tab keeps its session"
+    );
 }

@@ -633,6 +633,42 @@ pub struct SshSettings {
     pub extra: Extra,
 }
 
+/// How long the query tabs of a connection keep their database session.
+///
+/// The object tree always keeps the connection's own session; this is about the tabs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionMode {
+    /// Each tab keeps its session between runs: transactions, `SET`, `USE` and temporary
+    /// tables last until the tab closes.
+    #[default]
+    PerTab,
+    /// Each run (and each grid edit) connects, runs and disconnects: a connection holds one
+    /// session for the tree plus one per running query. A transaction a run leaves open is
+    /// rolled back. For servers with a connection limit.
+    PerRun,
+}
+
+impl SessionMode {
+    /// `true` for the default ([`SessionMode::PerTab`]), which profiles do not write out.
+    pub fn is_per_tab(&self) -> bool {
+        *self == Self::PerTab
+    }
+
+    /// Whether `engine` offers this mode: [`SessionMode::PerRun`] only for the server SQL
+    /// engines (PostgreSQL, MySQL, MariaDB, SQL Server), whose drivers can tell whether a run
+    /// left a transaction open.
+    pub fn supported(self, engine: Engine) -> bool {
+        match self {
+            Self::PerTab => true,
+            Self::PerRun => matches!(
+                engine,
+                Engine::Postgres | Engine::MySql | Engine::MariaDb | Engine::MsSql
+            ),
+        }
+    }
+}
+
 /// A saved connection.
 ///
 /// Secrets are referenced ([`SecretRef`] / [`KeyRef`]), never stored inline. The JSON form is
@@ -664,6 +700,9 @@ pub struct ConnectionProfile {
     /// Engine-specific options passed to the driver. Never put secrets here.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub options: BTreeMap<String, String>,
+    /// How long query tabs keep their session (absent = [`SessionMode::PerTab`]).
+    #[serde(default, skip_serializing_if = "SessionMode::is_per_tab")]
+    pub session_mode: SessionMode,
     #[serde(flatten)]
     pub extra: Extra,
 }
@@ -684,6 +723,7 @@ impl ConnectionProfile {
             ssh: None,
             connect_timeout_secs: None,
             options: BTreeMap::new(),
+            session_mode: SessionMode::PerTab,
             extra: Extra::new(),
         }
     }
@@ -759,6 +799,13 @@ impl ConnectionProfile {
             return Err(Error::invalid_input(
                 "TLS client certificate and key must be given together",
             ));
+        }
+        if !self.session_mode.supported(self.engine) {
+            return Err(Error::invalid_input(format!(
+                "{} keeps a session per tab; connecting for each run is available for \
+                 PostgreSQL, MySQL, MariaDB and SQL Server",
+                self.engine.display_name()
+            )));
         }
         Ok(())
     }
@@ -848,6 +895,33 @@ impl ProfileRepository for MemoryProfileRepository {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn session_mode_is_written_only_when_per_run_and_checked_per_engine() {
+        let mut p = sample();
+        assert_eq!(p.session_mode, SessionMode::PerTab);
+        assert!(!p.to_json().unwrap().contains("session_mode"));
+        p.session_mode = SessionMode::PerRun;
+        let json = p.to_json().unwrap();
+        assert!(json.contains("\"session_mode\": \"per_run\""), "{json}");
+        let back: ConnectionProfile = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.session_mode, SessionMode::PerRun);
+        p.validate().unwrap();
+
+        for engine in [Engine::Sqlite, Engine::MongoDb, Engine::Redis] {
+            assert!(!SessionMode::PerRun.supported(engine), "{engine}");
+            assert!(SessionMode::PerTab.supported(engine), "{engine}");
+        }
+        let mut sqlite = ConnectionProfile::new(
+            "file",
+            Engine::Sqlite,
+            ProfileAddress::File {
+                path: "/tmp/x.db".into(),
+            },
+        );
+        sqlite.session_mode = SessionMode::PerRun;
+        assert!(sqlite.validate().is_err());
+    }
 
     fn sample() -> ConnectionProfile {
         let mut p = ConnectionProfile::new(

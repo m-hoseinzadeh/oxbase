@@ -73,6 +73,29 @@ export interface ConnectionProfile {
   ssh?: SshSettings;
   connect_timeout_secs?: number;
   options?: Record<string, string>;
+  /** How long query tabs keep their session (absent = `per_tab`). */
+  session_mode?: SessionMode;
+}
+
+/**
+ * `oxbase_store::SessionMode`: `per_tab` keeps each query tab's session between runs;
+ * `per_run` connects for each run and each grid edit (PostgreSQL, MySQL, MariaDB, SQL Server).
+ */
+export type SessionMode = "per_tab" | "per_run";
+
+/** One open connection's sessions (`app_tauri::workbench::SessionUsage`). */
+export interface SessionUsage {
+  sessionId: string;
+  profileName: string;
+  sessionMode: SessionMode;
+  /** Every session: the connection's own plus the children. */
+  total: number;
+  /** Query tabs keeping a session between runs. */
+  idleTabs: number;
+  /** Queries running now. */
+  running: number;
+  /** Other databases in the tree, a schema-cache read, a grid edit, an import... */
+  other: number;
 }
 
 /** Secret values typed for one call (`app_tauri::profiles::SecretInput`). */
@@ -110,6 +133,8 @@ export interface SessionSummary {
   database?: string;
   /** M2: the base session of a child session (children are not listed by the core). */
   parent?: string;
+  /** The profile's session mode. */
+  session_mode?: SessionMode;
 }
 
 export type ErrorCategory =

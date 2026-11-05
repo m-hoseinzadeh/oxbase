@@ -1,6 +1,13 @@
 import { describe, expect, it } from "vitest";
 import type { RunEvent, StatementSpan } from "../../api";
-import { IDLE_RUN, MAX_MESSAGES, type RunState, rowCountLabel, runReducer } from "./runState";
+import {
+  IDLE_RUN,
+  MAX_MESSAGES,
+  ROLLED_BACK_CODE,
+  type RunState,
+  rowCountLabel,
+  runReducer,
+} from "./runState";
 
 const SCRIPT = "SELECT * FROM big;\nUPDATE t SET x = 1;";
 
@@ -153,5 +160,30 @@ describe("runReducer", () => {
     expect(state.messages.at(-1)?.text).toBe(`x ${flood - 1}`);
     expect(new Set(state.messages.map((m) => m.id)).size).toBe(MAX_MESSAGES);
     expect(state.errorCount).toBe(1);
+  });
+});
+
+describe("a rolled-back transaction (per-run connections)", () => {
+  it("is flagged and shown as a plain warning, without the core's code", () => {
+    const state = play([
+      { type: "started", runId: "r1", statements: STATEMENTS },
+      { type: "statementStarted", statementIndex: 0 },
+      { type: "statementDone", statementIndex: 0, rowsAffected: 1, elapsedMs: 3 },
+      {
+        type: "notice",
+        level: "warning",
+        message: "The run ended inside a transaction, so it was rolled back.",
+        code: ROLLED_BACK_CODE,
+      },
+      { type: "finished", elapsedMs: 10 },
+    ]);
+    expect(state.rolledBack).toBe(true);
+    const notice = state.messages.find((m) => m.kind === "notice");
+    expect(notice).toMatchObject({
+      level: "warning",
+      text: "The run ended inside a transaction, so it was rolled back.",
+    });
+    // A new run starts clean.
+    expect(runReducer(state, { type: "start", script: "SELECT 1" }).rolledBack).toBe(false);
   });
 });

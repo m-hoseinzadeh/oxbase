@@ -66,7 +66,7 @@ interface DatabaseList {
   current: string | null;
 }
 
-type StatusTone = "idle" | "running" | "finished" | "failed" | "cancelled" | "hint";
+type StatusTone = "idle" | "running" | "finished" | "failed" | "cancelled" | "hint" | "rolledBack";
 
 /** The run status icon in the toolbar (the text says the same; colour is never the only cue). */
 const STATUS_ICON: Record<StatusTone, LucideIcon | null> = {
@@ -76,6 +76,7 @@ const STATUS_ICON: Record<StatusTone, LucideIcon | null> = {
   failed: CircleX,
   cancelled: CircleSlash,
   hint: Info,
+  rolledBack: TriangleAlert,
 };
 
 const NO_DATABASES: DatabaseList = { status: "idle", names: [], current: null };
@@ -412,6 +413,11 @@ export function QueryEditorPanel({
   } else if (run.status === "cancelled") {
     status = "Cancelled";
     statusTone = "cancelled";
+  }
+  // Per-run connections: the transaction the run left open was not kept (see Messages).
+  if (!active && run.rolledBack) {
+    status = `${status} · transaction rolled back`;
+    statusTone = "rolledBack";
   }
   if (hint) statusTone = "hint";
   const StatusIcon = STATUS_ICON[statusTone];

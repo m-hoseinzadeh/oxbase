@@ -35,8 +35,9 @@
 //! 2. **Plan** each edit with the engine's `DmlWriter` (key values of stored rows are read from
 //!    the result store with `convert::cell_value`; rows changed or inserted by an earlier apply
 //!    use the values that apply read back).
-//! 3. **Run** on the run's own session (`QueryService::run_session`, holding
-//!    `SessionHandle::exclusive`), in **one transaction** (`Connection::begin`), in buffer order.
+//! 3. **Run** on the run's own session (`QueryService::edit_session`: per-run connections open a
+//!    session for the apply and close it afterwards; holding `SessionHandle::exclusive`), in
+//!    **one transaction** (`Connection::begin`), in buffer order.
 //!    A write that does not affect exactly one row is a [`EditStatus::Conflict`]
 //!    ("the row was changed or deleted by someone else"). The first failure or conflict rolls
 //!    everything back: that edit gets its status and error, the ones that ran before it
@@ -724,8 +725,10 @@ impl EditService {
             });
         }
 
-        // 3. Run in one transaction on the run's own session.
-        let session = self.query.run_session(run)?;
+        // 3. Run in one transaction on the run's own session (per-run mode: on a session opened
+        //    for the apply; `lease` closes it when the apply ends, after `guard` and `tx`).
+        let lease = self.query.edit_session(run, &cancel).await?;
+        let session = lease.session.clone();
         let guard = until_cancelled(&cancel, async { Ok(session.exclusive().await) }).await?;
         let tx = session.connection().begin().await?;
         let mut executed: Vec<Executed> = Vec::with_capacity(prepared.len());

@@ -48,6 +48,7 @@ import {
   MONGO_READ_PREFERENCES,
   type MongoAuthMechanism,
   type MongoReadPreference,
+  offersPerRun,
   profileFromForm,
   type RedisMode,
   type SshAuthMethod,
@@ -64,6 +65,7 @@ import {
   DIALOG_ENGINES,
   ENGINE_INFO,
   type ErrorCategory,
+  type SessionMode,
   type TlsMode,
 } from "./types";
 
@@ -248,6 +250,20 @@ export function TestResult({ state }: { state: TestState }) {
   }
 }
 
+/** The session modes of the server SQL engines (`ConnectionForm.sessionMode`). */
+const SESSION_MODES: { value: SessionMode; label: string; hint: string }[] = [
+  {
+    value: "per_tab",
+    label: "Keep a session per tab",
+    hint: "Each query tab keeps its own connection, so transactions, SET values and temporary tables last until the tab closes.",
+  },
+  {
+    value: "per_run",
+    label: "Connect for each run",
+    hint: "A tab connects only while a query runs or edits are saved. A transaction left open is rolled back. For servers with a connection limit, such as behind PgBouncer.",
+  },
+];
+
 /** The "New connection" / "Edit connection" dialog. */
 export function ConnectionDialog({ profile, onClose, onSaved }: ConnectionDialogProps) {
   const [form, setForm] = useState<ConnectionForm>(() =>
@@ -264,6 +280,7 @@ export function ConnectionDialog({ profile, onClose, onSaved }: ConnectionDialog
   const tlsHelpId = useId();
   const hostKeyHelpId = useId();
   const sshHintId = useId();
+  const sessionsHintId = useId();
 
   const networked = isNetworked(form.engine);
   const traits = engineTraits(form.engine);
@@ -637,6 +654,41 @@ export function ConnectionDialog({ profile, onClose, onSaved }: ConnectionDialog
                   />
                   Read-only intent (route to a readable secondary replica)
                 </label>
+              ) : null}
+              {offersPerRun(form.engine) ? (
+                <fieldset className="session-modes" aria-describedby={sessionsHintId}>
+                  <legend className="form-section__title form-section__title--spaced">
+                    Sessions
+                  </legend>
+                  {SESSION_MODES.map((m) => (
+                    <label
+                      key={m.value}
+                      className={`option-card option-card--choice${
+                        form.sessionMode === m.value ? " option-card--selected" : ""
+                      }`}
+                    >
+                      <span className="option-card__title">
+                        <input
+                          type="radio"
+                          name="sessionMode"
+                          value={m.value}
+                          checked={form.sessionMode === m.value}
+                          aria-labelledby={`${sessionsHintId}-${m.value}`}
+                          aria-describedby={`${sessionsHintId}-${m.value}-hint`}
+                          onChange={() => set("sessionMode", m.value)}
+                        />
+                        <span id={`${sessionsHintId}-${m.value}`}>{m.label}</span>
+                      </span>
+                      <span id={`${sessionsHintId}-${m.value}-hint`} className="field__hint">
+                        {m.hint}
+                      </span>
+                    </label>
+                  ))}
+                  <p id={sessionsHintId} className="field__hint">
+                    The object tree always keeps one session. A change applies the next time you
+                    connect.
+                  </p>
+                </fieldset>
               ) : null}
             </>
           ) : (

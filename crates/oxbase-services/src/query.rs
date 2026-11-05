@@ -126,7 +126,7 @@ use crate::history::{HistoryRecord, HistoryService};
 use crate::results::{AppendOutcome, ByteBudget, ResultStore, RunDir};
 use crate::schema_cache::SchemaEvents;
 use crate::script::StatementSource;
-use crate::{CancellationToken, ConnectionManager, SessionHandle, SessionId};
+use crate::{CancellationToken, ConnectionManager, SessionHandle, SessionId, SessionMode};
 
 #[cfg(test)]
 mod live_tests;
@@ -141,6 +141,18 @@ const STOP_GRACE: Duration = Duration::from_millis(1000);
 const EDITOR_CONNECT_DEADLINE: Duration = Duration::from_secs(60);
 /// How long `close` waits for a cancelled run to end before forgetting it anyway.
 const CLOSE_WAIT: Duration = Duration::from_secs(3);
+/// How long the per-run release waits for the driver to roll back an open transaction (and say
+/// whether there was one) before it just closes the session (which rolls it back too).
+const ROLLBACK_CHECK_DEADLINE: Duration = Duration::from_secs(5);
+
+/// `code` of the warning [`RunEvent::Notice`] a run sends when it ended inside a transaction on
+/// a connection that connects for each run ([`SessionMode::PerRun`]): the transaction was rolled
+/// back when the run gave its session back.
+pub const ROLLED_BACK_CODE: &str = "oxbase.rolled_back";
+
+const ROLLED_BACK_NOTICE: &str = "The run ended inside a transaction, so it was rolled back: this \
+     connection connects for each run and keeps no session between runs. End the script with \
+     COMMIT to keep its changes.";
 /// Warning sent when a run starts on a new session because the editor's last cancelled
 /// statement had not finished stopping on the old one.
 const REPLACED_UNCLEAN_NOTICE: &str = "the last cancelled statement was still stopping on the \
@@ -590,6 +602,45 @@ struct Editor {
     runs: Vec<RunId>,
 }
 
+/// A session to apply grid edits on ([`QueryService::edit_session`]). With
+/// [`SessionMode::PerRun`] it was opened for the apply and is closed (in the background) when
+/// this is dropped; otherwise it is the run's own session and stays open.
+pub struct EditSession {
+    pub session: SessionHandle,
+    /// Set when the session was opened for the apply: who closes it.
+    owner: Option<Arc<ConnectionManager>>,
+}
+
+impl EditSession {
+    /// `true` when the session was opened for this apply (per-run mode).
+    pub fn is_own(&self) -> bool {
+        self.owner.is_some()
+    }
+}
+
+impl Drop for EditSession {
+    fn drop(&mut self) {
+        let Some(manager) = self.owner.take() else {
+            return;
+        };
+        let id = self.session.id();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move { close_session(&manager, id).await });
+        } else {
+            tracing::debug!("no runtime to close an edit session on");
+        }
+    }
+}
+
+/// The sessions the query editors of one connection hold ([`QueryService::editor_usage`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EditorUsage {
+    /// Editors that keep a session between runs (per-tab mode), not running now.
+    pub idle: usize,
+    /// Editors running a query now (each on its own session).
+    pub running: usize,
+}
+
 /// The session a run gets from `QueryService::editor_session`.
 struct EditorSession {
     session: SessionHandle,
@@ -604,6 +655,11 @@ struct EditorSession {
 struct Run {
     id: RunId,
     editor: EditorId,
+    /// The base session the run's editor belongs to.
+    base: SessionId,
+    engine: Engine,
+    /// The database the run's session was opened on (`None`: the base's), once it is open.
+    database: Mutex<Option<String>>,
     token: CancellationToken,
     state: watch::Sender<RunState>,
     statements: Mutex<Vec<StatementSpan>>,
@@ -757,6 +813,75 @@ impl QueryService {
         Ok(session)
     }
 
+    /// The engine run `run` ran on; `None` when unknown or closed.
+    pub fn run_engine(&self, run: RunId) -> Option<Engine> {
+        self.registry.run(run).map(|found| found.engine)
+    }
+
+    /// The session to apply grid edits of run `run` on, which the caller holds until the
+    /// apply ends (see [`EditSession`]).
+    ///
+    /// - [`SessionMode::PerTab`]: the run's own session ([`QueryService::run_session`]).
+    /// - [`SessionMode::PerRun`]: the run gave its session back when it ended, so a new one is
+    ///   opened on the run's database, and closed when the [`EditSession`] is dropped.
+    ///
+    /// `NotFound` for an unknown or closed run, or when its connection is closed.
+    pub async fn edit_session(
+        &self,
+        run: RunId,
+        cancel: &CancellationToken,
+    ) -> Result<EditSession> {
+        let found = self
+            .registry
+            .run(run)
+            .ok_or_else(|| Error::not_found(format!("no open query run {run}")))?;
+        let base = self
+            .manager
+            .get(found.base)
+            .ok_or_else(|| Error::not_found("this connection is not open"))?;
+        if base.summary().session_mode != SessionMode::PerRun {
+            return Ok(EditSession {
+                session: self.run_session(run)?,
+                owner: None,
+            });
+        }
+        let database = lock(&found.database).clone();
+        let open = self
+            .manager
+            .open_child(found.base, database.as_deref(), cancel.clone());
+        let session = tokio::time::timeout(EDITOR_CONNECT_DEADLINE, open)
+            .await
+            .unwrap_or_else(|_| {
+                Err(Error::timeout(format!(
+                    "opening a session for the edits took longer than {} s",
+                    EDITOR_CONNECT_DEADLINE.as_secs()
+                )))
+            })?;
+        Ok(EditSession {
+            session,
+            owner: Some(Arc::clone(&self.manager)),
+        })
+    }
+
+    /// What the query editors of base session `base` hold: sessions kept by idle editors
+    /// and editors running now (for the session counter).
+    pub fn editor_usage(&self, base: SessionId) -> EditorUsage {
+        let editors = lock(&self.registry.editors);
+        let mut usage = EditorUsage::default();
+        for editor in editors.values().filter(|e| e.base == base) {
+            if editor.busy.is_some() {
+                usage.running += 1;
+            } else if editor
+                .child
+                .as_ref()
+                .is_some_and(|c| c.summary().parent.is_some())
+            {
+                usage.idle += 1;
+            }
+        }
+        usage
+    }
+
     /// Where run `run` is; `None` when unknown or closed.
     pub fn run_state(&self, run: RunId) -> Option<RunState> {
         self.registry.run(run).map(|found| found.state())
@@ -838,6 +963,9 @@ impl QueryService {
         let run = Arc::new(Run {
             id: run_id,
             editor: target.editor.clone(),
+            base: target.session,
+            engine,
+            database: Mutex::new(None),
             token: CancellationToken::new(),
             state: watch::Sender::new(RunState::Running),
             statements: Mutex::new(Vec::new()),
@@ -897,6 +1025,7 @@ impl QueryService {
             editor.database.clone_from(&database);
         }
         *lock(&run.session) = Some(session.clone());
+        (*lock(&run.database)).clone_from(&database);
 
         let (tx, rx) = mpsc::channel(self.config.event_capacity.max(1));
         let context = RunContext {
@@ -1442,6 +1571,9 @@ async fn execute(context: RunContext) {
         ),
         Terminal::Cancelled => (RunState::Cancelled, RunEvent::Cancelled { elapsed_ms }),
     };
+    // Per-run mode: the session goes back (an open transaction is rolled back and announced)
+    // before the terminal event, so the notice is part of the run.
+    context.release_per_run_session().await;
     // State and editor first, so a caller that sees the terminal event can start the next run.
     context.run.state.send_replace(state);
     context
@@ -1541,6 +1673,55 @@ impl RunContext {
         let id = old.id();
         tokio::spawn(async move { close_session(&manager, id).await });
         Ok(new)
+    }
+
+    /// [`SessionMode::PerRun`]: the run gives its session back when it ends. The editor
+    /// forgets it (its next run connects again, on the same database), a transaction the
+    /// script left open is rolled back (announced with a [`ROLLED_BACK_CODE`] warning) and the
+    /// session is closed in the background. A session a stopped statement may still be busy
+    /// on is closed without the rollback check (closing rolls the transaction back too).
+    async fn release_per_run_session(&self) {
+        let session = self.session();
+        if session.summary().session_mode != SessionMode::PerRun
+            || session.summary().parent.is_none()
+        {
+            return;
+        }
+        let id = session.id();
+        let unclean = {
+            let mut editors = lock(&self.registry.editors);
+            match editors.get_mut(&self.run.editor) {
+                Some(editor) if editor.child.as_ref().is_some_and(|c| c.id() == id) => {
+                    editor.child = None;
+                    std::mem::take(&mut editor.unclean)
+                }
+                _ => false,
+            }
+        } || self.reopen_if_closed.load(Ordering::SeqCst);
+        if !unclean && self.manager.get(id).is_some() {
+            let check = async {
+                let _guard = session.exclusive().await;
+                session.connection().rollback_open_transaction().await
+            };
+            match tokio::time::timeout(ROLLBACK_CHECK_DEADLINE, check).await {
+                Ok(Ok(Some(true))) => {
+                    self.emit(RunEvent::Notice {
+                        statement_index: None,
+                        level: NoticeLevel::Warning,
+                        message: ROLLED_BACK_NOTICE.to_owned(),
+                        code: Some(ROLLED_BACK_CODE.to_owned()),
+                    })
+                    .await;
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => {
+                    tracing::debug!(error = %e, "rolling back before the per-run close failed");
+                }
+                Err(_) => tracing::debug!("rolling back before the per-run close timed out"),
+            }
+        }
+        let manager = Arc::clone(&self.manager);
+        tokio::spawn(async move { close_session(&manager, id).await });
     }
 
     /// The run's session failed with a connection error: the editor forgets it, so its next

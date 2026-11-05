@@ -709,6 +709,25 @@ Conformance and perf jobs), 1 468 in the Conformance job, 433 UI tests.
 `calamine` is at 0.38.0: an advisory against 0.37.0 (crafted XLS files could panic or exhaust
 memory) appeared during the M8 integration; the API oxbase-io uses did not change.
 
+## Sessions
+
+Each open connection keeps one session for the object tree. Query tabs get theirs according to
+the connection's **Sessions** setting (connection dialog, General tab; PostgreSQL, MySQL,
+MariaDB and SQL Server):
+
+- **Keep a session per tab** (the default): each query or table-data tab keeps its own session
+  from its first run until it closes, so transactions, `SET` values, `USE` and temporary tables
+  last between runs.
+- **Connect for each run**: a run (and each **Apply** of grid edits) connects, runs and
+  disconnects. A connection then holds one session plus one per query running now, which suits
+  servers with a connection limit, for example behind PgBouncer. Session state lasts only for
+  one run: a transaction a run leaves open (`BEGIN` without `COMMIT`, MySQL's
+  `SET autocommit = 0`) is rolled back, and the run says so in its Messages tab and in the
+  editor's status. Results stay readable after the session closes.
+
+The status bar counts the sessions Oxbase holds; click the count to see where each connection's
+sessions go (the tree, idle tabs, running queries, the rest).
+
 ## App data
 
 Profiles live in `connections.json` in the config directory (`OXBASE_CONFIG_DIR` overrides it).
@@ -747,11 +766,16 @@ pnpm tauri build                          # release bundles for the current OS
    arrive. **Stop** cancels it and keeps the rows already received.
 5. **History** lists past statements. Search them, **Open in editor**, **Delete**, clear them
    all, or turn history off.
+6. Ctrl+= and Ctrl+- zoom the whole app, Ctrl+0 goes back to 100 % (the level is remembered;
+   the status bar shows it while it is not 100 %).
 
 ### Editing data and designing tables
 
 1. With the fixture, expand `oxbase_test` > `m3` > **Tables** and double-click `m3_edit_pk`.
-   **Filter & sort** narrows and orders the rows (the query is re-run on the server).
+   **Filter & sort** narrows and orders the rows (the query is re-run on the server; Enter
+   applies). The tab loads the first 1,000 rows: the **Rows** control changes that (new tabs
+   start with your last choice), and **Load all rows** fetches the rest. Export always writes
+   every row.
 2. Double-click a cell (or start typing) to edit it, **Add row** / **Duplicate row** /
    **Delete row** to change rows, **Revert row** to drop a row's pending changes. Pending
    changes are coloured; **Apply** writes them all in one transaction, **Discard** drops them.

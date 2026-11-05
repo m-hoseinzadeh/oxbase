@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { installShortcuts, registerShortcuts, shortcutOf } from "./shortcuts";
+import { installShortcuts, registerShortcuts, shortcutOf, zoomShortcutOf } from "./shortcuts";
+import { getZoom, resetZoom } from "./zoom";
 
 const keys = (
   key: string,
@@ -89,5 +90,34 @@ describe("installShortcuts", () => {
     remove = installShortcuts(() => "tab-1");
     press("F5");
     expect(handler).not.toHaveBeenCalled();
+  });
+});
+
+describe("zoom shortcuts", () => {
+  afterEach(() => resetZoom());
+
+  it("maps Ctrl with =, +, -, 0 on the main row and the keypad", () => {
+    expect(zoomShortcutOf(keys("=", { ctrl: true }))).toBe("zoomIn");
+    expect(zoomShortcutOf(keys("+", { ctrl: true, shift: true }))).toBe("zoomIn");
+    expect(zoomShortcutOf({ ...keys("+", { ctrl: true }), code: "NumpadAdd" })).toBe("zoomIn");
+    expect(zoomShortcutOf(keys("-", { meta: true }))).toBe("zoomOut");
+    expect(zoomShortcutOf(keys("0", { ctrl: true }))).toBe("zoomReset");
+    // Another layout's character on the same physical key still zooms.
+    expect(zoomShortcutOf({ ...keys("ß", { ctrl: true }), code: "Minus" })).toBe("zoomOut");
+    expect(zoomShortcutOf(keys("="))).toBeNull();
+    expect(zoomShortcutOf(keys("0", { ctrl: true, alt: true }))).toBeNull();
+  });
+
+  it("zooms the app whichever tab is active", () => {
+    const remove = installShortcuts(() => null);
+    const event = press("=", { ctrlKey: true });
+    expect(event.defaultPrevented).toBe(true);
+    expect(getZoom()).toBe(1.1);
+    press("-", { ctrlKey: true, repeat: true });
+    press("-", { ctrlKey: true, repeat: true });
+    expect(getZoom()).toBe(0.9);
+    press("0", { ctrlKey: true });
+    expect(getZoom()).toBe(1);
+    remove();
   });
 });

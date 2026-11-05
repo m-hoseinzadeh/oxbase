@@ -1537,3 +1537,17 @@ fieldset.sort {
 .designer__ack {
   font-weight: 500;
 }
+
+/* The Rows control (how many rows a table-data tab loads). */
+.table-data__toolbar select.table-data__limit {
+  width: auto;
+  min-height: var(--control-sm, 26px);
+  margin-left: var(--space-1);
+  font-size: var(--text-sm);
+}
+
+.banner__action {
+  flex-shrink: 0;
+  margin-left: auto;
+  align-self: center;
+}

@@ -191,3 +191,30 @@ async fn a_pgbouncer_that_refuses_startup_options_gets_the_defaults_by_set() {
     check_session(key, conn.as_ref(), true).await;
     conn.close().await.unwrap();
 }
+
+/// `rollback_open_transaction` through PgBouncer in transaction pooling, where a transaction
+/// keeps its server connection and idle statements may go to another one.
+#[tokio::test]
+#[ignore = "needs the postgres and pgbouncer fixtures"]
+async fn a_transaction_left_open_through_pgbouncer_is_found_and_rolled_back() {
+    let key = "pgbouncer";
+    let conn = connect(key, &params(key)).await;
+    assert_eq!(
+        conn.rollback_open_transaction().await.unwrap(),
+        Some(false),
+        "{key}"
+    );
+    run(conn.as_ref(), "BEGIN", &[]).await;
+    run(conn.as_ref(), "SELECT 1", &[]).await;
+    assert_eq!(
+        conn.rollback_open_transaction().await.unwrap(),
+        Some(true),
+        "{key}"
+    );
+    assert_eq!(
+        conn.rollback_open_transaction().await.unwrap(),
+        Some(false),
+        "{key}"
+    );
+    conn.close().await.unwrap();
+}

@@ -49,6 +49,12 @@ import type { ResultPager } from "./pager";
 import { fromGridSelection, type GridRowSelection, toGridSelection } from "./rowSelection";
 import { ValuePanel } from "./ValuePanel";
 
+/**
+ * The grid's own keys, minus Ctrl+Enter ("scroll to the selected cell"): Ctrl+Enter runs the
+ * query wherever the focus is in the tab (../shortcuts), the grid included.
+ */
+const GRID_KEYS = { scrollToSelectedCell: false } as const;
+
 /** Rows assumed visible before the grid reports its real viewport. */
 const MIN_VIEWPORT_ROWS = 60;
 /** Dense grid metrics (docs/design-system.md: 28 px controls, 4 px grid). */
@@ -544,6 +550,7 @@ export function ResultGrid({
                   onPaste: false,
                 }
               : {})}
+            keybindings={GRID_KEYS}
             rowMarkers="number"
             rowHeight={ROW_HEIGHT}
             headerHeight={HEADER_HEIGHT}

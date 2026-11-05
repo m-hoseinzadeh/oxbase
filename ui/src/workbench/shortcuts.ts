@@ -9,6 +9,9 @@
  * | Ctrl+Shift+Enter    | run the whole script                             |                |
  * | Shift+F5            | stop the running query                           |                |
  *
+ * Ctrl+= (Ctrl++), Ctrl+- and Ctrl+0 zoom the whole app in, out and back to 100 % (./zoom),
+ * whichever tab is active.
+ *
  * The webview's own reload keys (F5, Ctrl+R, Ctrl+Shift+R, Ctrl+F5, Shift+F5) never reload the
  * app, which would drop every open session: they are always cancelled. A key a focused
  * component already handled (`defaultPrevented`: the object tree's F5 refresh, Monaco's own
@@ -16,6 +19,8 @@
  */
 
 export type ShortcutCommand = "run" | "runCurrent" | "runAll" | "cancel";
+
+import { resetZoom, zoomIn, zoomOut } from "./zoom";
 
 /** Runs `command` for its tab; `false` when the tab has nothing for it. */
 export type ShortcutHandler = (command: ShortcutCommand) => boolean;
@@ -32,6 +37,8 @@ export function registerShortcuts(panelId: string, handler: ShortcutHandler): ()
 
 interface Keys {
   key: string;
+  /** The physical key ("Equal", "Minus", "Digit0", ...), for layouts where `key` differs. */
+  code?: string;
   ctrlKey: boolean;
   metaKey: boolean;
   shiftKey: boolean;
@@ -52,6 +59,26 @@ export function shortcutOf(event: Keys): ShortcutCommand | "reload" | null {
   return null;
 }
 
+export type ZoomCommand = "zoomIn" | "zoomOut" | "zoomReset";
+
+/** Whether a key press zooms the app: Ctrl with =/+, -, or 0 (main row or keypad). */
+export function zoomShortcutOf(event: Keys): ZoomCommand | null {
+  if (!(event.ctrlKey || event.metaKey) || event.altKey) return null;
+  const { key, code = "" } = event;
+  if (key === "=" || key === "+" || code === "Equal" || code === "NumpadAdd") return "zoomIn";
+  if (key === "-" || key === "_" || code === "Minus" || code === "NumpadSubtract") {
+    return "zoomOut";
+  }
+  if (key === "0" || code === "Digit0" || code === "Numpad0") return "zoomReset";
+  return null;
+}
+
+const ZOOM: Record<ZoomCommand, () => void> = {
+  zoomIn,
+  zoomOut,
+  zoomReset: resetZoom,
+};
+
 /** The keys a command reads as in a tooltip, e.g. "F5". */
 export const SHORTCUT_LABELS: Record<ShortcutCommand, string> = {
   run: "F5",
@@ -69,7 +96,15 @@ export function installShortcuts(
   target: Window = window,
 ): () => void {
   const onKeyDown = (event: KeyboardEvent) => {
-    if (event.defaultPrevented || event.repeat) return;
+    if (event.defaultPrevented) return;
+    const zoom = zoomShortcutOf(event);
+    if (zoom !== null) {
+      // Held keys keep zooming, as in browsers.
+      event.preventDefault();
+      ZOOM[zoom]();
+      return;
+    }
+    if (event.repeat) return;
     const shortcut = shortcutOf(event);
     if (shortcut === null) return;
     const reloads = event.key === "F5" || event.key.toLowerCase() === "r";

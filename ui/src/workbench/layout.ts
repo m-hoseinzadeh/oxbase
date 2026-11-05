@@ -2,7 +2,7 @@
  * Opens workbench panels from anywhere (tree, history, toolbar): the dockview API is registered
  * here by the app shell once the layout is ready.
  */
-import type { DockviewApi } from "dockview-react";
+import type { AddPanelPositionOptions, DockviewApi } from "dockview-react";
 import type { BinaryText, ObjectRef } from "../api";
 import { qualifiedName } from "./names";
 
@@ -45,13 +45,12 @@ export function openQueryEditor(init: QueryEditorInit = {}): string | null {
   if (!api) return null;
   const editorId = newEditorId();
   const params: QueryEditorParams = { editorId, ...init };
-  const neighbour = api.panels.find((p) => p.id === "welcome" || p.id.startsWith("editor-"));
   api.addPanel({
     id: editorId,
     component: "query",
     title: init.title ?? `Query ${counter}`,
     params,
-    ...(neighbour ? { position: { referencePanel: neighbour.id, direction: "within" } } : {}),
+    position: mainAreaPosition(api),
   });
   return editorId;
 }
@@ -100,7 +99,8 @@ export function sameObject(a: ObjectRef, b: ObjectRef): boolean {
   );
 }
 
-function neighbourPanel(api: DockviewApi): string | undefined {
+/** A tab of the main area (Welcome, editors, data tabs, ...), if any is open. */
+function neighbourPanel(api: Pick<DockviewApi, "panels">): string | undefined {
   return api.panels.find(
     (p) =>
       p.id === "welcome" ||
@@ -113,6 +113,20 @@ function neighbourPanel(api: DockviewApi): string | undefined {
       p.id.startsWith("pubsub-") ||
       p.id.startsWith("sync-"),
   )?.id;
+}
+
+/**
+ * Where a new tab goes: with the main area's other tabs. When they are all closed (Welcome too),
+ * the main area is rebuilt above History, or right of the side panels, instead of the tab
+ * landing in the active group (Connections, Objects).
+ */
+export function mainAreaPosition(api: Pick<DockviewApi, "panels">): AddPanelPositionOptions {
+  const neighbour = neighbourPanel(api);
+  if (neighbour) return { referencePanel: neighbour, direction: "within" };
+  if (api.panels.some((p) => p.id === "history")) {
+    return { referencePanel: "history", direction: "above" };
+  }
+  return { direction: "right" };
 }
 
 /**
@@ -137,13 +151,12 @@ export function openTableData(init: { sessionId: string; table: ObjectRef }): st
   }
   const editorId = newEditorId();
   const params: TableDataPanelParams = { editorId, ...init };
-  const neighbour = neighbourPanel(api);
   api.addPanel({
     id: `data-${editorId}`,
     component: "tableData",
     title: qualifiedName(init.table),
     params,
-    ...(neighbour ? { position: { referencePanel: neighbour, direction: "within" } } : {}),
+    position: mainAreaPosition(api),
   });
   return editorId;
 }
@@ -174,13 +187,12 @@ export function openTableDesigner(init: DesignerPanelParams): void {
     }
   }
   counter += 1;
-  const neighbour = neighbourPanel(api);
   api.addPanel({
     id: `designer-${Date.now().toString(36)}-${counter}`,
     component: "designer",
     title: designerTitle(init),
     params: init,
-    ...(neighbour ? { position: { referencePanel: neighbour, direction: "within" } } : {}),
+    position: mainAreaPosition(api),
   });
 }
 
@@ -213,13 +225,12 @@ export function openCollection(init: { sessionId: string; collection: ObjectRef 
   }
   const editorId = newEditorId();
   const params: CollectionPanelParams = { editorId, ...init };
-  const neighbour = neighbourPanel(api);
   api.addPanel({
     id: `collection-${editorId}`,
     component: "collection",
     title: qualifiedName(init.collection),
     params,
-    ...(neighbour ? { position: { referencePanel: neighbour, direction: "within" } } : {}),
+    position: mainAreaPosition(api),
   });
   return editorId;
 }
@@ -270,13 +281,12 @@ export function openKeyBrowser(init: {
   }
   const editorId = newEditorId();
   const params: KeyBrowserParams = { editorId, ...init, request: keyRequests };
-  const neighbour = neighbourPanel(api);
   api.addPanel({
     id: `keys-${editorId}`,
     component: "keys",
     title: `Keys${init.database ? ` db${init.database}` : ""}`,
     params,
-    ...(neighbour ? { position: { referencePanel: neighbour, direction: "within" } } : {}),
+    position: mainAreaPosition(api),
   });
 }
 
@@ -293,13 +303,12 @@ export function openConsole(init: { sessionId: string; database?: string }): str
   if (!api) return null;
   const editorId = newEditorId();
   const params: ConsolePanelParams = { editorId, ...init };
-  const neighbour = neighbourPanel(api);
   api.addPanel({
     id: `console-${editorId}`,
     component: "console",
     title: `Console ${counter}`,
     params,
-    ...(neighbour ? { position: { referencePanel: neighbour, direction: "within" } } : {}),
+    position: mainAreaPosition(api),
   });
   return editorId;
 }
@@ -323,13 +332,12 @@ export function openPubSub(init: PubSubPanelParams): void {
     return;
   }
   counter += 1;
-  const neighbour = neighbourPanel(api);
   api.addPanel({
     id: `pubsub-${Date.now().toString(36)}-${counter}`,
     component: "pubsub",
     title: "Pub/Sub",
     params: init,
-    ...(neighbour ? { position: { referencePanel: neighbour, direction: "within" } } : {}),
+    position: mainAreaPosition(api),
   });
 }
 
@@ -351,13 +359,12 @@ function openSync(component: "structureSync" | "dataSync", title: string, init: 
   const api = dockview;
   if (!api) return;
   counter += 1;
-  const neighbour = neighbourPanel(api);
   api.addPanel({
     id: `sync-${component}-${Date.now().toString(36)}-${counter}`,
     component,
     title,
     params: init,
-    ...(neighbour ? { position: { referencePanel: neighbour, direction: "within" } } : {}),
+    position: mainAreaPosition(api),
   });
 }
 

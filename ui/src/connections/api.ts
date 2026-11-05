@@ -12,6 +12,7 @@ import type {
   ErrorCategory,
   SecretInput,
   SessionSummary,
+  SessionUsage,
 } from "./types";
 
 const CATEGORIES: readonly ErrorCategory[] = [
@@ -114,6 +115,11 @@ export function closeConnection(sessionId: string): Promise<void> {
 
 export function listOpenConnections(): Promise<SessionSummary[]> {
   return call("list_open_connections");
+}
+
+/** Every open connection's database sessions (the status bar's session counter). */
+export function sessionUsage(): Promise<SessionUsage[]> {
+  return call("session_usage");
 }
 
 let requestCounter = 0;

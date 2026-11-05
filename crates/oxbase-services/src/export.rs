@@ -416,11 +416,7 @@ impl ExportService {
                 let result = info.results.get(*result_index).ok_or_else(|| {
                     Error::not_found(format!("query run {run_id} has no result {result_index}"))
                 })?;
-                let engine = self
-                    .query
-                    .run_session(*run_id)
-                    .ok()
-                    .map(|s| s.summary().engine);
+                let engine = self.query.run_engine(*run_id);
                 Ok(Resolved::Result {
                     run_id: *run_id,
                     result_index: *result_index,

@@ -1,5 +1,6 @@
-import { Monitor, Moon, Sun } from "lucide-react";
+import { Monitor, Moon, Sun, ZoomIn } from "lucide-react";
 import { ICON_SM } from "./components/icons";
+import { SessionCounter } from "./connections/SessionCounter";
 import { useConnections } from "./connections/store";
 import { getAppInfo, NoCoreError } from "./ipc";
 import { errorMessage, useAsync } from "./useAsync";
@@ -8,6 +9,26 @@ import {
   type ThemePreference,
   useThemePreference,
 } from "./workbench/theme-bridge";
+import { resetZoom, useZoom, zoomLabel } from "./workbench/zoom";
+
+/** The zoom level while it is not 100 %; click resets it. */
+function ZoomIndicator() {
+  const zoom = useZoom();
+  if (zoom === 1) return null;
+  return (
+    <button
+      type="button"
+      className="status-bar__button"
+      data-testid="zoom-level"
+      title="Zoom (Ctrl+= / Ctrl+-); click to reset to 100% (Ctrl+0)"
+      aria-label={`Zoom ${zoomLabel(zoom)}, reset to 100%`}
+      onClick={resetZoom}
+    >
+      <ZoomIn {...ICON_SM} />
+      {zoomLabel(zoom)}
+    </button>
+  );
+}
 
 const THEMES: { value: ThemePreference; label: string; Icon: typeof Moon }[] = [
   { value: "dark", label: "Dark theme", Icon: Moon },
@@ -67,10 +88,12 @@ export function StatusBar() {
         />
         {open === 1 ? "1 open connection" : `${open} open connections`}
       </span>
+      <SessionCounter />
       <span className="status-bar__spacer" />
       <span className="status-bar__item" data-testid="core-version">
         {text}
       </span>
+      <ZoomIndicator />
       <ThemeSwitch />
     </footer>
   );

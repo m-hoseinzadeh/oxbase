@@ -154,6 +154,8 @@ const EDITABLE: Editability = {
 let editability: Editability;
 let applyReport: (changes: PendingChanges) => ApplyReport;
 let opens: Array<Record<string, unknown>>;
+/** Rows each open returns. */
+let totalRows: number;
 
 function runEvents(runId: string): RunEvent[] {
   return [
@@ -169,7 +171,7 @@ function runEvents(runId: string): RunEvent[] {
         { name: "note", dataType: "Utf8", nullable: true },
       ],
     },
-    { type: "resultDone", resultIndex: 0, totalRows: 3, truncated: false },
+    { type: "resultDone", resultIndex: 0, totalRows, truncated: false },
     { type: "statementDone", statementIndex: 0, elapsedMs: 2 },
     { type: "finished", elapsedMs: 3 },
   ];
@@ -190,6 +192,8 @@ beforeEach(() => {
     outcomes: changes.edits.map(() => ({ status: "applied" as const })),
   });
   opens = [];
+  totalRows = 3;
+  localStorage.clear();
   tauriCore.invoke.mockImplementation(async (cmd, args) => {
     const a = (args ?? {}) as Record<string, unknown>;
     switch (cmd) {
@@ -255,13 +259,45 @@ describe("TableDataPanel", () => {
     expect(opens[0]).toMatchObject({
       sessionId: "s-1",
       editorId: "editor-t1",
-      request: { table: TABLE, sort: [] },
+      request: { table: TABLE, sort: [], limit: 1000 },
     });
     expect(opens[0]?.request).not.toHaveProperty("filter");
     await waitFor(() => expect(calls("edit_begin")).toEqual([{ runId: "run-1", requestId: null }]));
     expect(screen.getByTestId("table-data-status")).toHaveTextContent("3 rows");
     unmount();
     expect(calls("query_close_editor")).toEqual([{ editorId: "editor-t1" }]);
+  });
+
+  it("loads the first rows only; the Rows control changes the limit and remembers it", async () => {
+    await renderPanel();
+    const rows = screen.getByRole("combobox", { name: "Rows to load" });
+    expect(rows).toHaveDisplayValue("1,000 rows");
+    // 3 rows, under the limit: nothing more to load.
+    await waitFor(() =>
+      expect(screen.getByTestId("table-data-status")).toHaveTextContent("3 rows"),
+    );
+    expect(screen.queryByTestId("row-limit-banner")).not.toBeInTheDocument();
+
+    fireEvent.change(rows, { target: { value: "100" } });
+    await waitFor(() => expect(opens).toHaveLength(2));
+    expect(opens[1]?.request).toEqual({ table: TABLE, sort: [], limit: 100 });
+    expect(localStorage.getItem("oxbase.tableData.rowLimit")).toBe("100");
+  });
+
+  it("says when the limit stopped the rows and loads all of them on request", async () => {
+    localStorage.setItem("oxbase.tableData.rowLimit", "100");
+    totalRows = 100;
+    await renderPanel();
+    expect(opens[0]?.request).toEqual({ table: TABLE, sort: [], limit: 100 });
+    const banner = await screen.findByTestId("row-limit-banner");
+    expect(banner).toHaveTextContent("Showing the first 100 rows");
+
+    fireEvent.click(within(banner).getByRole("button", { name: "Load all rows" }));
+    await waitFor(() => expect(opens).toHaveLength(2));
+    expect(opens[1]?.request).toEqual({ table: TABLE, sort: [] });
+    expect(screen.getByRole("combobox", { name: "Rows to load" })).toHaveDisplayValue("All rows");
+    await waitFor(() => expect(screen.queryByTestId("row-limit-banner")).not.toBeInTheDocument());
+    expect(localStorage.getItem("oxbase.tableData.rowLimit")).toBe("all");
   });
 
   it("shows why a result is read-only and offers no editing", async () => {
@@ -562,6 +598,7 @@ describe("TableDataPanel", () => {
         ],
       },
       sort: [{ column: "name", descending: true, nulls: "last" }],
+      limit: 1000,
     });
     expect(opens[1]?.editorId).toBe("editor-t1");
   });
@@ -580,7 +617,30 @@ describe("TableDataPanel", () => {
       table: TABLE,
       filter: { type: "rawSql", sql: "name = 'a''b'" },
       sort: [],
+      limit: 1000,
     });
+  });
+
+  it("applies the filter from the keyboard", async () => {
+    await renderPanel();
+    fireEvent.click(screen.getByRole("button", { name: /Filter & sort/ }));
+    fireEvent.click(screen.getByRole("radio", { name: "Raw WHERE" }));
+    const where = screen.getByRole("textbox", { name: "Raw WHERE clause" });
+    fireEvent.change(where, { target: { value: "id > 1" } });
+    // Enter alone is a new line in Raw WHERE; Ctrl+Enter applies.
+    fireEvent.keyDown(where, { key: "Enter" });
+    expect(opens).toHaveLength(1);
+    fireEvent.keyDown(where, { key: "Enter", ctrlKey: true });
+    await waitFor(() => expect(opens).toHaveLength(2));
+    expect(opens[1]?.request).toMatchObject({ filter: { type: "rawSql", sql: "id > 1" } });
+
+    // Enter in a condition's value submits the builders' form (the browser's implicit submit).
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Apply filter" })).not.toBeDisabled(),
+    );
+    fireEvent.click(screen.getByRole("radio", { name: "Builder" }));
+    fireEvent.submit(screen.getByRole("form", { name: "Filter and sort" }));
+    await waitFor(() => expect(opens).toHaveLength(3));
   });
 
   it("asks before a new filter drops pending changes", async () => {

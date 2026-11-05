@@ -999,6 +999,20 @@ impl Connection for PgConnection {
         }
     }
 
+    /// `ROLLBACK` either ends the open transaction (also an aborted one) or only warns with
+    /// SQLSTATE `25P01` ("there is no transaction in progress"), which tells the two apart.
+    async fn rollback_open_transaction(&self) -> Result<Option<bool>> {
+        let stream = self
+            .execute("ROLLBACK", &[], CancellationToken::new())
+            .await?;
+        let collected = collect(stream).await?;
+        let none_open = collected
+            .notices
+            .iter()
+            .any(|n| n.code.as_deref() == Some("25P01"));
+        Ok(Some(!none_open))
+    }
+
     async fn close(&self) -> Result<()> {
         let client = lock(&self.shared.client).take();
         if client.is_none() {

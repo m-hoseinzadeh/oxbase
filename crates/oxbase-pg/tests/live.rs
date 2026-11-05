@@ -814,3 +814,50 @@ async fn connects_and_cancels_through_an_ssh_tunnel() {
     conn.close().await.unwrap();
     drop(tunnel);
 }
+
+/// `rollback_open_transaction` (the per-run session mode): `ROLLBACK` either ends a transaction
+/// (also an aborted one) or only warns that none is in progress.
+#[tokio::test]
+#[ignore = "needs the postgres fixture"]
+async fn rollback_open_transaction_reports_and_ends_an_open_transaction() {
+    let f = fixture();
+    let conn = connect(&plain_params(&f)).await;
+    run(&*conn, "CREATE TEMP TABLE oxbase_rb (x int)", &[]).await;
+    assert_eq!(
+        conn.rollback_open_transaction().await.unwrap(),
+        Some(false),
+        "none open"
+    );
+
+    run(&*conn, "BEGIN", &[]).await;
+    run(&*conn, "INSERT INTO oxbase_rb VALUES (1)", &[]).await;
+    assert_eq!(
+        conn.rollback_open_transaction().await.unwrap(),
+        Some(true),
+        "BEGIN"
+    );
+    let out = run(&*conn, "SELECT count(*)::int4 FROM oxbase_rb", &[]).await;
+    assert_eq!(column_i32(&out.result_sets[0].batches[0], 0), [Some(0)]);
+    assert_eq!(
+        conn.rollback_open_transaction().await.unwrap(),
+        Some(false),
+        "ended"
+    );
+
+    // An aborted transaction (a failed statement inside it) is rolled back too.
+    run(&*conn, "BEGIN", &[]).await;
+    let failed = match conn
+        .execute("SELECT 1 / 0", &[], CancellationToken::new())
+        .await
+    {
+        Ok(stream) => collect(stream).await.is_err(),
+        Err(_) => true,
+    };
+    assert!(failed, "division by zero fails");
+    assert_eq!(
+        conn.rollback_open_transaction().await.unwrap(),
+        Some(true),
+        "aborted"
+    );
+    conn.close().await.unwrap();
+}

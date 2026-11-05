@@ -21,6 +21,7 @@ import {
   CopyPlus,
   Download,
   Funnel,
+  Info,
   LoaderCircle,
   Lock,
   type LucideIcon,
@@ -64,6 +65,7 @@ import {
 } from "../../api";
 import { ICON, ICON_LG, ICON_SM } from "../../components/icons";
 import { Modal } from "../../components/Modal";
+import { Select } from "../../components/Select";
 import { toCommandError } from "../../connections/api";
 import { useConnections } from "../../connections/store";
 import { openTableDesigner } from "../layout";
@@ -110,6 +112,14 @@ import {
   type SortDraftKey,
 } from "./filterModel";
 import { type FormFieldView, JsonView, RowForm } from "./RowViews";
+import {
+  defaultRowLimit,
+  parseRowLimit,
+  ROW_LIMITS,
+  rowLimitLabel,
+  rowLimitValue,
+  saveDefaultRowLimit,
+} from "./rowLimit";
 import { SortBuilder } from "./SortBuilder";
 
 export interface TableDataParams {
@@ -132,6 +142,8 @@ export const MAX_JSON_ROWS = 100;
 interface AppliedQuery {
   filter?: Filter;
   sort: SortKey[];
+  /** Rows to load (`null` = all); see ./rowLimit. */
+  limit: number | null;
 }
 
 function inputOfText(text: string | null | undefined): CellInput {
@@ -164,7 +176,9 @@ export function TableDataPanel({ editorId, sessionId, table }: TableDataParams) 
   const [run, dispatch] = useReducer(runReducer, IDLE_RUN);
   const [draft, setDraft] = useState<FilterDraft>(emptyDraft);
   const [sortDraft, setSortDraft] = useState<SortDraftKey[]>([]);
-  const [query, setQuery] = useState<AppliedQuery>({ sort: [] });
+  const [query, setQuery] = useState<AppliedQuery>(() => ({ sort: [], limit: defaultRowLimit() }));
+  /** The query the tab opens with (the effect below runs once per editor). */
+  const initialQuery = useRef(query);
   const [showBuilders, setShowBuilders] = useState(false);
   const [editability, setEditability] = useState<Editability | null>(null);
   const [editError, setEditError] = useState<string | null>(null);
@@ -198,6 +212,9 @@ export function TableDataPanel({ editorId, sessionId, table }: TableDataParams) 
   const stored = result?.rowCount ?? 0;
   const resultIndex = editability?.resultIndex ?? result?.resultIndex ?? 0;
   const active = isActive(run.status);
+  // The result stopped at the limit: there may be more rows.
+  const limitReached =
+    !active && query.limit !== null && result?.done === true && stored >= query.limit;
   const editable = editability?.editable === true && !active && !applying;
 
   const columns = useMemo<EditColumn[]>(() => {
@@ -236,7 +253,12 @@ export function TableDataPanel({ editorId, sessionId, table }: TableDataParams) 
         const id = await tableDataOpen(
           sessionId,
           editorId,
-          { table, ...(next.filter ? { filter: next.filter } : {}), sort: next.sort },
+          {
+            table,
+            ...(next.filter ? { filter: next.filter } : {}),
+            sort: next.sort,
+            ...(next.limit === null ? {} : { limit: next.limit }),
+          },
           (event) => {
             if (seq !== runSeq.current) return;
             dispatch({ type: "event", event });
@@ -253,7 +275,7 @@ export function TableDataPanel({ editorId, sessionId, table }: TableDataParams) 
   );
 
   useEffect(() => {
-    void open({ sort: [] });
+    void open(initialQuery.current);
     return () => {
       runSeq.current += 1;
       const closing = queryCloseEditor(editorId)
@@ -326,7 +348,11 @@ export function TableDataPanel({ editorId, sessionId, table }: TableDataParams) 
     const { filter, problems: found } = draftToFilter(draft, filterColumns);
     setFilterProblems(found);
     if (found.length > 0) return;
-    const next: AppliedQuery = { ...(filter ? { filter } : {}), sort: draftToSort(sortDraft) };
+    const next: AppliedQuery = {
+      ...(filter ? { filter } : {}),
+      sort: draftToSort(sortDraft),
+      limit: query.limit,
+    };
     guardPending(() => {
       setQuery(next);
       void open(next);
@@ -338,13 +364,23 @@ export function TableDataPanel({ editorId, sessionId, table }: TableDataParams) 
     setSortDraft([]);
     setFilterProblems([]);
     guardPending(() => {
-      setQuery({ sort: [] });
-      void open({ sort: [] });
+      const next: AppliedQuery = { sort: [], limit: query.limit };
+      setQuery(next);
+      void open(next);
     }, "Clearing the filter");
   }
 
   function refresh() {
     guardPending(() => void open(query), "Refreshing");
+  }
+
+  function changeLimit(limit: number | null) {
+    saveDefaultRowLimit(limit);
+    const next: AppliedQuery = { ...query, limit };
+    guardPending(() => {
+      setQuery(next);
+      void open(next);
+    }, "Changing how many rows load");
   }
 
   // F5 / Ctrl+R reload the rows (../shortcuts), through the same pending-changes guard.
@@ -755,6 +791,20 @@ export function TableDataPanel({ editorId, sessionId, table }: TableDataParams) 
             </span>
           ) : null}
         </button>
+        <Select
+          className="table-data__limit"
+          aria-label="Rows to load"
+          title="How many rows to load (new tabs start with your last choice)"
+          value={rowLimitValue(query.limit)}
+          disabled={active}
+          onChange={(e) => changeLimit(parseRowLimit(e.target.value))}
+        >
+          {ROW_LIMITS.map((l) => (
+            <option key={rowLimitValue(l)} value={rowLimitValue(l)}>
+              {rowLimitLabel(l)}
+            </option>
+          ))}
+        </Select>
         <span className="toolbar__separator" aria-hidden="true" />
         <button
           type="button"
@@ -891,7 +941,15 @@ export function TableDataPanel({ editorId, sessionId, table }: TableDataParams) 
       </div>
 
       {showBuilders ? (
-        <div className="table-data__builders">
+        // A form: Enter in a condition's value applies the filter (Ctrl+Enter in Raw WHERE).
+        <form
+          className="table-data__builders"
+          aria-label="Filter and sort"
+          onSubmit={(e) => {
+            e.preventDefault();
+            applyBuilders();
+          }}
+        >
           <FilterBuilder
             draft={draft}
             columns={filterColumns}
@@ -908,9 +966,9 @@ export function TableDataPanel({ editorId, sessionId, table }: TableDataParams) 
           />
           <div className="table-data__builder-actions">
             <button
-              type="button"
+              type="submit"
               className="button button--primary button--small"
-              onClick={applyBuilders}
+              title="Apply the filter and sort (Enter)"
               disabled={active}
             >
               <Check {...ICON_SM} />
@@ -931,7 +989,7 @@ export function TableDataPanel({ editorId, sessionId, table }: TableDataParams) 
               </span>
             ) : null}
           </div>
-        </div>
+        </form>
       ) : null}
 
       {readOnlyReason ? (
@@ -948,6 +1006,21 @@ export function TableDataPanel({ editorId, sessionId, table }: TableDataParams) 
           <p>
             <strong>Note:</strong> {editability.warning}
           </p>
+        </div>
+      ) : null}
+      {limitReached ? (
+        <div className="banner banner--info" role="status" data-testid="row-limit-banner">
+          <Info {...ICON_SM} className="banner__icon" />
+          <p>
+            Showing the first {query.limit?.toLocaleString("en-US")} rows; the table may have more.
+          </p>
+          <button
+            type="button"
+            className="button button--small banner__action"
+            onClick={() => changeLimit(null)}
+          >
+            Load all rows
+          </button>
         </div>
       ) : null}
       {notice ? (

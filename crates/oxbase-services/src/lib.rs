@@ -166,7 +166,7 @@ pub use oxbase_driver::{CancellationToken, ConnectParams, Connection, DriverRegi
 use oxbase_driver::{Endpoint, KeySource, PemSource, SshAuth, SshOptions, TlsOptions};
 use oxbase_net::ssh::{DEFAULT_CONNECT_TIMEOUT, TunnelHandle, TunnelPool, TunnelProvider};
 pub use oxbase_store::{
-    ConnectionProfile, KeyRef, ProfileRepository, SecretKey, SecretRef, SecretStore,
+    ConnectionProfile, KeyRef, ProfileRepository, SecretKey, SecretRef, SecretStore, SessionMode,
 };
 use oxbase_store::{PemRef, ProfileAddress, SshAuthSettings, SshSettings, TlsSettings};
 use oxbase_types::{Engine, Error, KnownHostsPolicy, Result, Secret, ServerVersion};
@@ -295,6 +295,9 @@ pub struct SessionSummary {
     /// to. `None` for base sessions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<SessionId>,
+    /// How long query tabs keep their session: the profile's mode, copied to the children.
+    #[serde(default)]
+    pub session_mode: SessionMode,
 }
 
 /// An open session. Cheap to clone; all clones share the connection.
@@ -609,6 +612,11 @@ impl ConnectionManager {
             opened_at: Utc::now(),
             database: profile.database.clone(),
             parent: None,
+            session_mode: if profile.session_mode.supported(profile.engine) {
+                profile.session_mode
+            } else {
+                SessionMode::PerTab
+            },
         };
         let handle = SessionHandle::new(summary, Arc::from(connection), tunnel);
         if let Err(e) = self.register(handle.clone()) {
@@ -933,6 +941,7 @@ impl ConnectionManager {
             opened_at: Utc::now(),
             database: opened_on,
             parent: Some(base),
+            session_mode: base_summary.session_mode,
         };
         let handle = SessionHandle::new(
             summary,
@@ -1039,6 +1048,19 @@ impl ConnectionManager {
     /// The open session `id`, if any.
     pub fn get(&self, id: SessionId) -> Option<SessionHandle> {
         self.lock().ok()?.get(&id).cloned()
+    }
+
+    /// The open child sessions of base session `base`: query editors, other databases of the
+    /// tree, and short-lived ones (a schema-cache read, a designer apply, an import, ...).
+    pub fn children_of(&self, base: SessionId) -> Vec<SessionSummary> {
+        let Ok(sessions) = self.lock() else {
+            return Vec::new();
+        };
+        sessions
+            .values()
+            .filter(|s| s.summary().parent == Some(base))
+            .map(|s| s.summary().clone())
+            .collect()
     }
 
     /// Every open base session, oldest first (child sessions are not listed).
@@ -1196,6 +1218,7 @@ mod tests {
             opened_at: Utc::now(),
             database: None,
             parent: None,
+            session_mode: SessionMode::PerTab,
         };
         let handle = SessionHandle::new(summary.clone(), conn, None);
         mgr.register(handle.clone()).unwrap();
@@ -1238,6 +1261,7 @@ mod tests {
             opened_at: Utc::now(),
             database: Some("db".into()),
             parent: None,
+            session_mode: SessionMode::PerTab,
         };
         let handle = SessionHandle::new(summary, conn, None);
         assert_eq!(handle.current_database(), None);
