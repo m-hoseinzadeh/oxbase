@@ -3,7 +3,7 @@
  * as ranges. A selection with gaps (Ctrl/Cmd-click on row markers) stays a selection with gaps;
  * it is never widened to its first..last span.
  */
-import { CompactSelection, type GridSelection } from "@glideapps/glide-data-grid";
+import { CompactSelection, type GridSelection, type Rectangle } from "@glideapps/glide-data-grid";
 
 /** A run of selected rows: `[start, end)`. */
 export type RowRange = readonly [number, number];
@@ -103,4 +103,44 @@ export function toGridSelection(selection: GridRowSelection, col = 0): GridSelec
   let rows = CompactSelection.empty();
   for (const range of ranges) rows = rows.add([range[0], range[1]]);
   return { columns, rows };
+}
+
+/**
+ * The cells a "copy as" or the context menu acts on, as rectangles: whole selected rows (row
+ * markers), else whole selected columns, else the current range and the ones Ctrl+click added.
+ */
+export function selectionRects(
+  selection: GridSelection,
+  columns: number,
+  rows: number,
+): Rectangle[] {
+  if (selection.rows.length > 0) {
+    return [...selection.rows.items].map(([a, b]) => ({
+      x: 0,
+      y: a,
+      width: columns,
+      height: b - a,
+    }));
+  }
+  if (selection.columns.length > 0) {
+    return [...selection.columns.items].map(([a, b]) => ({
+      x: a,
+      y: 0,
+      width: b - a,
+      height: rows,
+    }));
+  }
+  const current = selection.current;
+  return current ? [current.range, ...current.rangeStack] : [];
+}
+
+/** Whether cell (`col`, `row`) is in the selection (`col` -1 = the row marker). */
+export function inSelection(selection: GridSelection, col: number, row: number): boolean {
+  if (selection.rows.hasIndex(row)) return true;
+  if (col >= 0 && selection.columns.hasIndex(col)) return true;
+  const current = selection.current;
+  if (!current || col < 0) return false;
+  return [current.range, ...current.rangeStack].some(
+    (r) => col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height,
+  );
 }

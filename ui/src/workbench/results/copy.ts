@@ -16,6 +16,7 @@
 import { type GridCell, GridCellKind, type Rectangle } from "@glideapps/glide-data-grid";
 import type { Table } from "apache-arrow";
 import type { ColumnInfo } from "../../api";
+import type { CellText, CopyColumn } from "./copyFormats";
 import { type FormattedCell, formatCell } from "./format";
 import type { ResultPager } from "./pager";
 
@@ -34,9 +35,30 @@ export const NULL_COPY_TEXT = "NULL";
 export type CellArray = readonly (readonly GridCell[])[];
 export type CopyNotify = (message: string) => void;
 
+/** The copied cells that are SQL NULL (their text is "NULL", like a string "NULL"). */
+const NULL_CELLS = new WeakSet<GridCell>();
+
 function copyCell(value: FormattedCell): GridCell {
   const text = value.isNull ? NULL_COPY_TEXT : value.text;
-  return { kind: GridCellKind.Text, data: text, displayData: text, allowOverlay: false };
+  const cell: GridCell = {
+    kind: GridCellKind.Text,
+    data: text,
+    displayData: text,
+    allowOverlay: false,
+  };
+  if (value.isNull) NULL_CELLS.add(cell);
+  return cell;
+}
+
+/** A copied cell's value: its text, or `null` for SQL NULL. */
+export function cellText(cell: GridCell): CellText {
+  if (NULL_CELLS.has(cell)) return null;
+  return cell.kind === GridCellKind.Text ? cell.data : "";
+}
+
+/** A result column as the "copy as" formats see it. */
+export function copyColumn(column: ColumnInfo): CopyColumn {
+  return { name: column.name, numeric: /^(Int|UInt|Float|Decimal)/.test(column.dataType) };
 }
 
 function plural(n: number, one: string, many: string): string {
@@ -232,4 +254,21 @@ export function cellsForSelection(
   if (cached) return cached;
   if (r.height === 1) return () => readRow(pager, columns, r, signal, notify);
   return () => readCells(pager, columns, r, signal, notify);
+}
+
+/**
+ * The values of `rect` (row-major; `null` = NULL), read like a copy: from the cache when it
+ * holds them, else from the core, with the same limits.
+ */
+export async function readSelection(
+  pager: ResultPager,
+  columns: ColumnInfo[],
+  rowCount: number,
+  rect: Rectangle,
+  notify: CopyNotify,
+  signal: AbortSignal = new AbortController().signal,
+): Promise<CellText[][]> {
+  const found = cellsForSelection(pager, columns, rowCount, rect, signal, notify);
+  const cells = typeof found === "function" ? await found() : found;
+  return cells.map((row) => row.map(cellText));
 }

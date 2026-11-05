@@ -11,15 +11,26 @@
  *   shows each edit's error.
  * - Form view edits the current row field by field; JSON view shows the current or selected
  *   rows.
+ * - The grid's cell menu filters by the cell's value (=, ≠, <, ≤, >, ≥, contains, one of the
+ *   selected values, NULL), sets NULL, pastes (cells, or new rows) and adds, duplicates,
+ *   deletes or reverts rows; its header menu sorts. Delete, Ctrl+D, Ctrl+Z, Ctrl+V and
+ *   Ctrl+Shift+V do the same from the keyboard, and Ctrl+S applies the pending changes.
+ * - A status line under the grid: rows loaded (and the limit), selected rows, pending changes,
+ *   load time.
  */
+import type { Item } from "@glideapps/glide-data-grid";
 import {
+  ArrowDownWideNarrow,
+  ArrowUpNarrowWide,
   Braces,
   Check,
   CircleAlert,
   CircleCheck,
   CircleX,
+  ClipboardPaste,
   CopyPlus,
   Download,
+  Eraser,
   Funnel,
   Info,
   LoaderCircle,
@@ -49,6 +60,7 @@ import {
   editBegin,
   emptyChanges,
   type Filter,
+  type FilterOp,
   type FormRow,
   insertRow,
   type ObjectRef,
@@ -63,6 +75,7 @@ import {
   setNewCell,
   tableDataOpen,
 } from "../../api";
+import { type MenuItem, OPENS_SUBMENU } from "../../components/ContextMenu";
 import { ICON, ICON_LG, ICON_SM } from "../../components/icons";
 import { Modal } from "../../components/Modal";
 import { Select } from "../../components/Select";
@@ -70,9 +83,16 @@ import { toCommandError } from "../../connections/api";
 import { useConnections } from "../../connections/store";
 import { openTableDesigner } from "../layout";
 import { qualifiedName as qualified } from "../names";
+import { parseTsv, quoteIdent } from "../results/copyFormats";
 import { ResultPager } from "../results/pager";
 import { timedQueryPage } from "../results/perf";
-import { type CellOverride, type GridEditing, ResultGrid } from "../results/ResultGrid";
+import {
+  type CellOverride,
+  type GridCellTarget,
+  type GridEditing,
+  type GridKey,
+  ResultGrid,
+} from "../results/ResultGrid";
 import {
   type GridRowSelection,
   NO_ROWS,
@@ -107,8 +127,13 @@ import {
   draftToFilter,
   draftToSort,
   emptyDraft,
+  emptyGroup,
   type FilterColumn,
   type FilterDraft,
+  newCondition,
+  newRaw,
+  newSortKey,
+  opsFor,
   type SortDraftKey,
 } from "./filterModel";
 import { type FormFieldView, JsonView, RowForm } from "./RowViews";
@@ -344,19 +369,48 @@ export function TableDataPanel({ editorId, sessionId, table }: TableDataParams) 
     });
   }
 
-  function applyBuilders() {
-    const { filter, problems: found } = draftToFilter(draft, filterColumns);
+  function applyBuilders(withDraft: FilterDraft = draft, withSort: SortDraftKey[] = sortDraft) {
+    const { filter, problems: found } = draftToFilter(withDraft, filterColumns);
     setFilterProblems(found);
     if (found.length > 0) return;
     const next: AppliedQuery = {
       ...(filter ? { filter } : {}),
-      sort: draftToSort(sortDraft),
+      sort: draftToSort(withSort),
       limit: query.limit,
     };
     guardPending(() => {
       setQuery(next);
       void open(next);
     }, "Applying the filter");
+  }
+
+  /** Adds `column op values` to the filter (ANDed with what is there) and applies it. */
+  function quickFilter(column: string, op: FilterOp, values: string[]) {
+    let base = draft;
+    if (base.mode === "raw") {
+      const root = emptyGroup();
+      if (base.raw.trim()) root.items.push({ ...newRaw(), sql: base.raw });
+      base = { ...base, mode: "builder", root };
+    }
+    const condition = { ...newCondition(column), op, values };
+    const root =
+      base.root.join === "and" && !base.root.negate
+        ? { ...base.root, items: [...base.root.items, condition] }
+        : {
+            ...emptyGroup("and"),
+            items: base.root.items.length > 0 ? [base.root, condition] : [condition],
+          };
+    const next: FilterDraft = { ...base, root };
+    setDraft(next);
+    setShowBuilders(true);
+    applyBuilders(next, sortDraft);
+  }
+
+  /** Sorts by `column` alone and applies it (the header menu). */
+  function sortBy(column: string, descending: boolean) {
+    const next = [{ ...newSortKey(column), descending }];
+    setSortDraft(next);
+    applyBuilders(draft, next);
   }
 
   function clearBuilders() {
@@ -386,6 +440,11 @@ export function TableDataPanel({ editorId, sessionId, table }: TableDataParams) 
   // F5 / Ctrl+R reload the rows (../shortcuts), through the same pending-changes guard.
   const shortcut = useRef<ShortcutHandler>(() => false);
   shortcut.current = (command) => {
+    if (command === "save") {
+      // Ctrl+S applies the pending changes, like the Apply button.
+      if (editable && changes.edits.length > 0) void apply();
+      return true;
+    }
     if (command !== "run") return false;
     // While rows load, the key is used up, like the disabled button.
     if (!active) refresh();
@@ -483,6 +542,24 @@ export function TableDataPanel({ editorId, sessionId, table }: TableDataParams) 
       canEdit(index, col) {
         return editable && cellEditable(columns[col], rowAt(index), changes, applied);
       },
+      valueEdit(index, col) {
+        const row = rowAt(index);
+        const column = columns[col];
+        if (!row || !column) return undefined;
+        const initial: CellInput | (() => Promise<CellInput>) =
+          knownInput(row, column) ??
+          (row.type === "new"
+            ? { type: "default" }
+            : () =>
+                loadForm(row.row).then((f) =>
+                  inputOfText(f.fields.find((x) => x.column === column.name)?.text),
+                ));
+        return {
+          initial,
+          nullable: column.nullable,
+          onSave: (input) => commit(row, column.name, input),
+        };
+      },
       renderEditor({ row: index, col, initialText, finish }) {
         const row = rowAt(index);
         const column = columns[col];
@@ -532,7 +609,8 @@ export function TableDataPanel({ editorId, sessionId, table }: TableDataParams) 
     setSelection(singleRow(totalRows));
   }
 
-  async function duplicateRow() {
+  async function duplicateRow(at: number | null = current) {
+    const currentRow = at === null ? null : gridRow(at, stored, applied, changes);
     if (!currentRow || !editability) return;
     let base: (column: EditColumn) => string | null | undefined;
     if (currentRow.type === "new") {
@@ -565,9 +643,9 @@ export function TableDataPanel({ editorId, sessionId, table }: TableDataParams) 
     setSelection(singleRow(totalRows));
   }
 
-  function deleteSelected() {
+  function deleteSelected(from: GridRowSelection = selection) {
     // Exactly the selected rows: a selection with gaps never widens to its first..last span.
-    const rows = selectedRows(selection, totalRows);
+    const rows = selectedRows(from, totalRows);
     if (rows.length === 0) return;
     let next = changes;
     // New rows go by edit index: remove from the end so earlier indexes stay valid.
@@ -584,11 +662,230 @@ export function TableDataPanel({ editorId, sessionId, table }: TableDataParams) 
     setChanges(next);
   }
 
-  function revertCurrent() {
+  function revertCurrent(at: number | null = current) {
+    const currentRow = at === null ? null : gridRow(at, stored, applied, changes);
     if (!currentRow) return;
     setChanges((c) =>
       currentRow.type === "new" ? removeNewRow(c, currentRow.edit) : revertRow(c, currentRow.row),
     );
+  }
+
+  /** Pastes text cells from (`col`, `row`) on, row by row; "NULL" is NULL where allowed. */
+  function pasteCells([col, row]: Item, values: readonly (readonly string[])[]) {
+    if (!editable) return;
+    let next = changes;
+    let pasted = 0;
+    let skipped = 0;
+    values.forEach((line, r) => {
+      line.forEach((text, c) => {
+        const column = columns[col + c];
+        const target = gridRow(row + r, stored, applied, changes);
+        if (!column || !target || !cellEditable(column, target, changes, applied)) {
+          skipped += 1;
+          return;
+        }
+        const input: CellInput =
+          text === "NULL" && column.nullable ? { type: "null" } : { type: "text", text };
+        try {
+          next =
+            target.type === "new"
+              ? setNewCell(next, target.edit, column.name, input)
+              : setCell(next, target.row, column.name, input);
+          pasted += 1;
+        } catch {
+          skipped += 1;
+        }
+      });
+    });
+    setChanges(next);
+    setNotice(
+      skipped > 0
+        ? `Pasted ${plural(pasted, "cell", "cells")}; ${plural(skipped, "cell was", "cells were")} skipped (read-only, deleted or past the last row).`
+        : null,
+    );
+  }
+
+  /** Each pasted line becomes a new row, its cells from column `col` on. */
+  function pasteRows(values: string[][], col: number) {
+    if (!editable) return;
+    let next = changes;
+    for (const line of values) {
+      const cells = line.flatMap((text, c) => {
+        const column = columns[col + c];
+        if (!column?.editable) return [];
+        const input: CellInput =
+          text === "NULL" && column.nullable ? { type: "null" } : { type: "text", text };
+        return [{ column: column.name, input }];
+      });
+      next = insertRow(next, cells).changes;
+    }
+    setChanges(next);
+    setSelection(singleRow(totalRows));
+  }
+
+  async function pasteFromClipboard(at: Item, asRows: boolean) {
+    try {
+      const values = parseTsv(await navigator.clipboard.readText());
+      if (values.length === 0) return;
+      if (asRows) pasteRows(values, at[0]);
+      else pasteCells(at, values);
+    } catch {
+      setApplyError(
+        `Could not read the clipboard here: press ${asRows ? "Ctrl+Shift+V" : "Ctrl+V"} in the grid.`,
+      );
+    }
+  }
+
+  function onGridKey(key: GridKey): boolean {
+    if (!editable) return false;
+    if (key === "delete") deleteSelected();
+    else if (key === "duplicate") void duplicateRow();
+    else revertCurrent();
+    return true;
+  }
+
+  /** The table data items of the grid's cell menu (after view and copy). */
+  function cellMenu(target: GridCellTarget, rows: GridRowSelection): MenuItem[] {
+    const column = columns[target.col];
+    if (!column) return [];
+    const row = gridRow(target.row, stored, applied, changes);
+    const items: MenuItem[] = [];
+    if (editable && column.nullable && cellEditable(column, row, changes, applied) && row) {
+      items.push({
+        label: "Set NULL",
+        icon: Eraser,
+        onSelect: () => commit(row, column.name, { type: "null" }),
+      });
+    }
+
+    const name = column.name;
+    const value = target.value;
+    const short = (text: string) => (text.length > 24 ? `${text.slice(0, 24)}…` : text);
+    const ops = new Set(opsFor(column.input).map((o) => o.op));
+    const shown = (text: string) =>
+      ["integer", "decimal", "float"].includes(column.input.type)
+        ? short(text)
+        : `'${short(text).replace(/'/g, "''")}'`;
+    const filterItems: MenuItem[] = [];
+    if (typeof value === "string") {
+      const add = (op: FilterOp, label: string) => {
+        if (ops.has(op)) {
+          filterItems.push({ label, onSelect: () => quickFilter(name, op, [value]) });
+        }
+      };
+      add("eq", `= ${shown(value)}`);
+      add("ne", `≠ ${shown(value)}`);
+      add("lt", `< ${shown(value)}`);
+      add("le", `≤ ${shown(value)}`);
+      add("gt", `> ${shown(value)}`);
+      add("ge", `≥ ${shown(value)}`);
+      add("contains", `contains ${shown(value)}`);
+    }
+    const oneOf = (op: "in" | "notIn") => async () => {
+      const values = [...new Set((await target.selectedValues()).filter((v) => v !== null))];
+      if (values.length > 0) quickFilter(name, op, values as string[]);
+    };
+    if (ops.has("in")) {
+      filterItems.push(
+        {
+          label: "is one of the selected values",
+          separatorBefore: filterItems.length > 0,
+          onSelect: () => void oneOf("in")(),
+        },
+        { label: "is not one of the selected values", onSelect: () => void oneOf("notIn")() },
+      );
+    }
+    filterItems.push(
+      {
+        label: "is NULL",
+        separatorBefore: true,
+        onSelect: () => quickFilter(name, "isNull", []),
+      },
+      { label: "is not NULL", onSelect: () => quickFilter(name, "isNotNull", []) },
+    );
+    if (query.filter) {
+      filterItems.push({
+        label: "Clear the filter",
+        separatorBefore: true,
+        onSelect: clearBuilders,
+      });
+    }
+    items.push({
+      label: `Filter by ${short(name)}`,
+      icon: Funnel,
+      onSelect: OPENS_SUBMENU,
+      submenu: filterItems,
+    });
+
+    if (editable) {
+      const at: Item = [target.col, target.row];
+      const count = selectedRowCount(rows, totalRows);
+      items.push(
+        {
+          label: "Paste",
+          icon: ClipboardPaste,
+          shortcut: "Ctrl+V",
+          separatorBefore: true,
+          onSelect: () => void pasteFromClipboard(at, false),
+        },
+        {
+          label: "Paste as new rows",
+          shortcut: "Ctrl+Shift+V",
+          onSelect: () => void pasteFromClipboard(at, true),
+        },
+        { label: "Add row", icon: Plus, separatorBefore: true, onSelect: addRow },
+        {
+          label: "Duplicate row",
+          icon: CopyPlus,
+          shortcut: "Ctrl+D",
+          onSelect: () => void duplicateRow(rows.current),
+        },
+        {
+          label: count > 1 ? `Delete ${count} rows` : "Delete row",
+          icon: Trash2,
+          shortcut: "Delete",
+          danger: true,
+          onSelect: () => deleteSelected(rows),
+        },
+        {
+          label: "Revert row",
+          icon: Undo2,
+          shortcut: "Ctrl+Z",
+          onSelect: () => revertCurrent(rows.current),
+        },
+      );
+    }
+    if (items[0]) items[0] = { ...items[0], separatorBefore: true };
+    return items;
+  }
+
+  /** The table data items of the grid's header menu: sort, filter. */
+  function headerMenu(_col: number, column: { name: string }): MenuItem[] {
+    return [
+      {
+        label: "Sort ascending",
+        icon: ArrowUpNarrowWide,
+        separatorBefore: true,
+        onSelect: () => sortBy(column.name, false),
+      },
+      {
+        label: "Sort descending",
+        icon: ArrowDownWideNarrow,
+        onSelect: () => sortBy(column.name, true),
+      },
+      {
+        label: "Filter by this column…",
+        icon: Funnel,
+        onSelect: () => {
+          setDraft((d) =>
+            d.mode === "raw"
+              ? d
+              : { ...d, root: { ...d.root, items: [...d.root.items, newCondition(column.name)] } },
+          );
+          setShowBuilders(true);
+        },
+      },
+    ];
   }
 
   function discard() {
@@ -830,7 +1127,7 @@ export function TableDataPanel({ editorId, sessionId, table }: TableDataParams) 
           type="button"
           className="button button--ghost table-data__delete"
           disabled={!editable || selectedCount === 0}
-          onClick={deleteSelected}
+          onClick={() => deleteSelected()}
           title="Mark the selected rows for deletion"
         >
           <Trash2 {...ICON} />
@@ -840,7 +1137,7 @@ export function TableDataPanel({ editorId, sessionId, table }: TableDataParams) 
           type="button"
           className="icon-button"
           disabled={!editable || !currentRow}
-          onClick={revertCurrent}
+          onClick={() => revertCurrent()}
           aria-label="Revert row"
           title="Revert row: drop the pending changes of the current row"
         >
@@ -1103,6 +1400,15 @@ export function TableDataPanel({ editorId, sessionId, table }: TableDataParams) 
               valuePanel={valuePanel}
               onValuePanelChange={setValuePanel}
               engine={engine ?? null}
+              sqlTable={[table.schema ?? table.catalog, table.name]
+                .filter((part): part is string => Boolean(part))
+                .map((part) => quoteIdent(part, engine))
+                .join(".")}
+              cellMenu={cellMenu}
+              headerMenu={headerMenu}
+              onKey={onGridKey}
+              onPasteCells={pasteCells}
+              onPasteRows={pasteRows}
             />
           </div>
         ) : view === "form" ? (
@@ -1147,6 +1453,25 @@ export function TableDataPanel({ editorId, sessionId, table }: TableDataParams) 
           />
         )}
       </div>
+
+      {result ? (
+        <footer className="table-data__statusbar" data-testid="table-data-statusbar">
+          <span>
+            {plural(stored, "row", "rows")}
+            {limitReached ? ` (the first ${query.limit?.toLocaleString("en-US")})` : ""}
+            {result.done ? "" : "…"}
+          </span>
+          {selectedCount > 1 ? <span>{plural(selectedCount, "row", "rows")} selected</span> : null}
+          {pendingCount > 0 ? (
+            <span>
+              {plural(pendingCount, "pending change", "pending changes")} ({changesSummary(changes)}
+              )
+            </span>
+          ) : null}
+          {run.elapsedMs !== null ? <span>{run.elapsedMs.toLocaleString("en-US")} ms</span> : null}
+          {conditionCount > 0 ? <span>Filtered</span> : null}
+        </footer>
+      ) : null}
 
       {confirm ? (
         <Modal

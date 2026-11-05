@@ -2,10 +2,12 @@ import { CompactSelection, type GridSelection } from "@glideapps/glide-data-grid
 import { describe, expect, it } from "vitest";
 import {
   fromGridSelection,
+  inSelection,
   NO_ROWS,
   normalizeRanges,
   selectedRowCount,
   selectedRows,
+  selectionRects,
   singleRow,
   toGridSelection,
 } from "./rowSelection";
@@ -84,5 +86,41 @@ describe("row selection", () => {
       [1, 2],
       [4, 6],
     ]);
+  });
+});
+
+describe("selection rectangles", () => {
+  const cells: GridSelection = {
+    columns: CompactSelection.empty(),
+    rows: CompactSelection.empty(),
+    current: {
+      cell: [1, 2],
+      range: { x: 1, y: 2, width: 2, height: 3 },
+      rangeStack: [{ x: 0, y: 10, width: 1, height: 1 }],
+    },
+  };
+
+  it("lists whole rows, else whole columns, else the ranges Ctrl+click added", () => {
+    expect(selectionRects(markers(1, 2, 5), 4, 100)).toEqual([
+      { x: 0, y: 1, width: 4, height: 2 },
+      { x: 0, y: 5, width: 4, height: 1 },
+    ]);
+    const columns: GridSelection = {
+      columns: CompactSelection.fromSingleSelection(2),
+      rows: CompactSelection.empty(),
+    };
+    expect(selectionRects(columns, 4, 100)).toEqual([{ x: 2, y: 0, width: 1, height: 100 }]);
+    expect(selectionRects(cells, 4, 100)).toEqual([
+      { x: 1, y: 2, width: 2, height: 3 },
+      { x: 0, y: 10, width: 1, height: 1 },
+    ]);
+  });
+
+  it("tells whether a right-clicked cell is selected", () => {
+    expect(inSelection(cells, 2, 4)).toBe(true);
+    expect(inSelection(cells, 0, 10)).toBe(true);
+    expect(inSelection(cells, 0, 2)).toBe(false);
+    expect(inSelection(markers(7), 3, 7)).toBe(true);
+    expect(inSelection(markers(7), -1, 8)).toBe(false);
   });
 });

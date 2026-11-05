@@ -8,6 +8,7 @@
  * | Ctrl+Enter          | run the selection, else the statement at cursor  |                |
  * | Ctrl+Shift+Enter    | run the whole script                             |                |
  * | Shift+F5            | stop the running query                           |                |
+ * | Ctrl+S              |                                                  | apply changes  |
  *
  * Ctrl+= (Ctrl++), Ctrl+- and Ctrl+0 zoom the whole app in, out and back to 100 % (./zoom),
  * whichever tab is active.
@@ -18,7 +19,7 @@
  * Ctrl+Enter) is left alone.
  */
 
-export type ShortcutCommand = "run" | "runCurrent" | "runAll" | "cancel";
+export type ShortcutCommand = "run" | "runCurrent" | "runAll" | "cancel" | "save";
 
 import { resetZoom, zoomIn, zoomOut } from "./zoom";
 
@@ -56,6 +57,7 @@ export function shortcutOf(event: Keys): ShortcutCommand | "reload" | null {
   }
   if (mod && key === "r") return event.shiftKey ? "reload" : "run";
   if (mod && key === "Enter") return event.shiftKey ? "runAll" : "runCurrent";
+  if (mod && !event.shiftKey && key === "s") return "save";
   return null;
 }
 
@@ -85,6 +87,7 @@ export const SHORTCUT_LABELS: Record<ShortcutCommand, string> = {
   runCurrent: "Ctrl+Enter",
   runAll: "Ctrl+Shift+Enter",
   cancel: "Shift+F5",
+  save: "Ctrl+S",
 };
 
 /**
