@@ -1583,15 +1583,6 @@ async fn no_children(manager: &ConnectionManager, base: SessionId) {
     panic!("child sessions left: {:?}", manager.children_of(base));
 }
 
-fn connects(h: &Harness) -> usize {
-    h.log
-        .lock()
-        .unwrap()
-        .iter()
-        .filter(|l| l.starts_with("connect"))
-        .count()
-}
-
 #[tokio::test]
 async fn per_run_sessions_close_after_each_run() {
     let h = per_run_harness().await;

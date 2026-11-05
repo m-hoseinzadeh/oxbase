@@ -624,11 +624,10 @@ impl Drop for EditSession {
             return;
         };
         let id = self.session.id();
-        match tokio::runtime::Handle::try_current() {
-            Ok(runtime) => {
-                runtime.spawn(async move { close_session(&manager, id).await });
-            }
-            Err(_) => tracing::debug!("no runtime to close an edit session on"),
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move { close_session(&manager, id).await });
+        } else {
+            tracing::debug!("no runtime to close an edit session on");
         }
     }
 }
@@ -1716,7 +1715,7 @@ impl RunContext {
                 }
                 Ok(Ok(_)) => {}
                 Ok(Err(e)) => {
-                    tracing::debug!(error = %e, "rolling back before the per-run close failed")
+                    tracing::debug!(error = %e, "rolling back before the per-run close failed");
                 }
                 Err(_) => tracing::debug!("rolling back before the per-run close timed out"),
             }

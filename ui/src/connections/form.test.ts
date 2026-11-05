@@ -195,3 +195,26 @@ describe("profileFromForm", () => {
     expect(again).toEqual(saved);
   });
 });
+
+describe("session mode", () => {
+  it("is written only when connecting for each run, and only for the server SQL engines", () => {
+    const form = { ...emptyForm("postgres"), name: "pg", host: "db" };
+    expect(profileFromForm(form).session_mode).toBeUndefined();
+    const perRun = profileFromForm({ ...form, sessionMode: "per_run" });
+    expect(perRun.session_mode).toBe("per_run");
+    expect(formFromProfile(perRun).sessionMode).toBe("per_run");
+    // Back to per tab: the field goes away.
+    expect(
+      profileFromForm({ ...form, sessionMode: "per_tab" }, perRun).session_mode,
+    ).toBeUndefined();
+    // An engine without it never writes it, even when the form still says so.
+    const sqlite = profileFromForm({
+      ...emptyForm("sqlite"),
+      name: "file",
+      filePath: "/tmp/a.db",
+      sessionMode: "per_run",
+    });
+    expect(sqlite.session_mode).toBeUndefined();
+    expect(formFromProfile({ ...perRun, engine: "redis" }).sessionMode).toBe("per_tab");
+  });
+});

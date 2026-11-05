@@ -378,6 +378,51 @@ input[type="search"] {
   padding-left: 22px;
 }
 
+/* Choice cards: a radio group as cards (the connection dialog's session modes). */
+.session-modes {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: none;
+}
+
+.session-modes > legend {
+  width: 100%;
+  margin-bottom: var(--space-1);
+}
+
+.option-card--choice {
+  cursor: pointer;
+  transition:
+    border-color var(--duration-fast) var(--ease-out),
+    background-color var(--duration-fast) var(--ease-out);
+}
+
+.option-card--choice:hover {
+  border-color: var(--color-border-strong);
+}
+
+.option-card--selected,
+.option-card--selected:hover {
+  border-color: var(--color-accent);
+  background: var(--color-bg-elevated);
+}
+
+.option-card--choice:has(input:focus-visible) {
+  outline: 2px solid var(--color-focus);
+  outline-offset: 1px;
+}
+
+.option-card__title {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-weight: 500;
+}
+
 /* Test connection result card: status icon, title, details (the history panel reuses the card
    without an icon, so the layout only applies when there is one). */
 .modal .test-result {
@@ -874,7 +919,8 @@ input[type="search"] {
   color: var(--color-danger);
 }
 
-.query-editor__status[data-state="cancelled"] .query-editor__status-icon {
+.query-editor__status[data-state="cancelled"] .query-editor__status-icon,
+.query-editor__status[data-state="rolledBack"] .query-editor__status-icon {
   color: var(--color-warning);
 }
 

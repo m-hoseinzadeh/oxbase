@@ -13,6 +13,7 @@ import {
   type PemRef,
   type SecretInput,
   type SecretRef,
+  type SessionMode,
   type SshAuthSettings,
   type SshSettings,
   type TlsMode,
@@ -84,6 +85,9 @@ export interface ConnectionForm {
   protocol: "auto" | "resp2" | "resp3";
   /** Redis: key namespace separator for the tree (`options.namespace_separator`; "" = none). */
   namespaceSeparator: string;
+
+  /** How long query tabs keep their session (`session_mode`; see {@link offersPerRun}). */
+  sessionMode: SessionMode;
 }
 
 export type MongoAuthMechanism = "SCRAM-SHA-256" | "SCRAM-SHA-1" | "MONGODB-X509" | "PLAIN";
@@ -374,7 +378,16 @@ export function emptyForm(engine: DialogEngine = "postgres"): ConnectionForm {
     sentinelAuth: "none",
     protocol: "auto",
     namespaceSeparator: DEFAULT_SEPARATOR,
+    sessionMode: "per_tab",
   };
+}
+
+/**
+ * Engines that can connect for each run (`SessionMode::PerRun`): the server SQL engines, whose
+ * drivers can tell whether a run left a transaction open.
+ */
+export function offersPerRun(engine: DialogEngine): boolean {
+  return engine === "postgres" || engine === "mysql" || engine === "mariadb" || engine === "mssql";
 }
 
 /** Switches the engine, moving the port along when it was still the old engine's default. */
@@ -411,6 +424,8 @@ export function formFromProfile(profile: ConnectionProfile): ConnectionForm {
   form.clientCert = filePath(profile.tls.client_cert);
   form.clientKey = filePath(profile.tls.client_key);
   form.serverName = profile.tls.server_name ?? "";
+  form.sessionMode =
+    profile.session_mode === "per_run" && offersPerRun(engine) ? "per_run" : "per_tab";
   const options = profile.options ?? {};
   const traits = engineTraits(engine);
   if (traits.instance) form.instance = options[MSSQL_OPTION.instance] ?? "";
@@ -730,6 +745,12 @@ export function profileFromForm(
   if (traits.options === "mongodb") Object.assign(options, mongoOptions(form));
   if (traits.options === "redis") Object.assign(options, redisOptions(form));
   setOptional(profile, "options", Object.keys(options).length > 0 ? options : undefined);
+  // Per tab is the default and is not written out.
+  setOptional(
+    profile,
+    "session_mode",
+    offersPerRun(form.engine) && form.sessionMode === "per_run" ? "per_run" : undefined,
+  );
   return profile;
 }
 

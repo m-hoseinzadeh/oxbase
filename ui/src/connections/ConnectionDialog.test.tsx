@@ -330,3 +330,38 @@ describe("ConnectionDialog for SQL Server", () => {
     });
   });
 });
+
+describe("ConnectionDialog sessions", () => {
+  beforeEach(() => {
+    tauriCore.invoke.mockReset();
+    tauriCore.isTauri.mockReset().mockReturnValue(true);
+  });
+
+  it("offers connecting for each run on the server SQL engines and saves the choice", async () => {
+    const saved = { id: "0190f000-0000-7000-8000-000000000002" };
+    mockCommands({ save_profile: () => saved });
+    const { onSaved } = renderDialog();
+    const group = screen.getByRole("group", { name: "Sessions" });
+    const perTab = within(group).getByRole("radio", { name: "Keep a session per tab" });
+    const perRun = within(group).getByRole("radio", { name: "Connect for each run" });
+    expect(perTab).toBeChecked();
+    expect(group).toHaveAccessibleDescription(/object tree always keeps one session/);
+    fireEvent.click(perRun);
+    expect(perRun).toBeChecked();
+    type("Connection name", "behind pgbouncer");
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onSaved).toHaveBeenCalledWith(saved));
+    const [, args] = tauriCore.invoke.mock.calls[0] ?? [];
+    expect((args as { profile: ConnectionProfile }).profile.session_mode).toBe("per_run");
+  });
+
+  it("does not offer it where it does not apply", () => {
+    renderDialog();
+    fireEvent.click(screen.getByRole("radio", { name: "SQLite" }));
+    expect(screen.queryByRole("group", { name: "Sessions" })).toBeNull();
+    fireEvent.click(screen.getByRole("radio", { name: "MongoDB" }));
+    expect(screen.queryByRole("group", { name: "Sessions" })).toBeNull();
+    fireEvent.click(screen.getByRole("radio", { name: "SQL Server" }));
+    expect(screen.getByRole("group", { name: "Sessions" })).toBeInTheDocument();
+  });
+});

@@ -608,6 +608,127 @@ samp {
   flex: 1;
 }
 
+/* A status bar entry that opens something (the session counter). */
+.status-bar__button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: calc(var(--status-bar-height) - 4px);
+  padding: 0 var(--space-2);
+  border: none;
+  border-radius: var(--radius-sm);
+  background: none;
+  color: inherit;
+  font: inherit;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.status-bar__button:hover,
+.status-bar__button[aria-expanded="true"] {
+  background: var(--color-bg-muted);
+  color: var(--color-fg);
+}
+
+.session-counter {
+  position: relative;
+}
+
+.session-popover {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 0;
+  z-index: calc(var(--z-modal) + 10);
+  width: 340px;
+  max-height: min(420px, 70vh);
+  overflow-y: auto;
+  padding: var(--space-2) var(--space-3) var(--space-3);
+  border-radius: var(--radius-md);
+  background: var(--color-bg-elevated);
+  color: var(--color-fg);
+  box-shadow: var(--shadow-popover);
+  font-size: var(--text-sm);
+}
+
+.session-popover__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: var(--space-1);
+}
+
+.session-popover__title {
+  margin: 0;
+  color: var(--color-fg-muted);
+  font-size: var(--text-xs);
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.session-popover__list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.session-popover__connection {
+  padding: var(--space-2);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+}
+
+.session-popover__head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.session-popover__name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-popover__total {
+  min-width: 2ch;
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+  text-align: right;
+}
+
+.session-popover__rows {
+  margin: var(--space-1) 0 0;
+}
+
+.session-popover__rows > div {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--space-2);
+  color: var(--color-fg-muted);
+}
+
+.session-popover__rows dt,
+.session-popover__rows dd {
+  margin: 0;
+}
+
+.session-popover__rows dd {
+  font-variant-numeric: tabular-nums;
+}
+
+.session-popover__hint {
+  margin: var(--space-2) 0 0;
+  color: var(--color-fg-faint);
+  font-size: var(--text-xs);
+}
+
 /* ------------------------------------------------------------------------- shared controls */
 .button {
   display: inline-flex;

@@ -50,7 +50,15 @@ export interface RunState {
   errorCount: number;
   error: ErrorInfo | null;
   elapsedMs: number | null;
+  /**
+   * The run ended inside a transaction on a connection that connects for each run, so the
+   * transaction was rolled back (the core's {@link ROLLED_BACK_CODE} notice).
+   */
+  rolledBack: boolean;
 }
+
+/** `code` of the core's notice that a run's open transaction was rolled back (per-run mode). */
+export const ROLLED_BACK_CODE = "oxbase.rolled_back";
 
 export type RunAction =
   | { type: "start"; script: string }
@@ -72,6 +80,7 @@ export const IDLE_RUN: RunState = {
   errorCount: 0,
   error: null,
   elapsedMs: null,
+  rolledBack: false,
 };
 
 /** Most messages a run keeps; beyond it the oldest notices (then the oldest messages) go. */
@@ -163,16 +172,20 @@ function applyEvent(state: RunState, event: RunEvent): RunState {
           truncated: event.truncated,
         })),
       };
-    case "notice":
+    case "notice": {
+      // The rollback notice is the core's own: its code means nothing to the user.
+      const rolledBack = event.code === ROLLED_BACK_CODE;
       return {
         ...state,
         ...addMessage(state, {
           kind: "notice",
           level: event.level,
           ...(event.statementIndex === undefined ? {} : { statementIndex: event.statementIndex }),
-          text: event.code ? `${event.message} (${event.code})` : event.message,
+          text: event.code && !rolledBack ? `${event.message} (${event.code})` : event.message,
         }),
+        ...(rolledBack ? { rolledBack: true } : {}),
       };
+    }
     case "statementDone": {
       const rows = state.results
         .filter((r) => r.statementIndex === event.statementIndex)

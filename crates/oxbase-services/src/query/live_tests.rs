@@ -80,6 +80,7 @@ fn large_rows(fx: &toml::Table) -> u64 {
 /// A connected service on one engine, with the memory budget that forces spilling.
 struct Live {
     service: QueryService,
+    manager: Arc<ConnectionManager>,
     session: SessionId,
     engine: Engine,
     _dirs: tempfile::TempDir,
@@ -89,6 +90,15 @@ const MEMORY_BUDGET: u64 = 8 * 1024 * 1024;
 
 impl Live {
     async fn connect(key: &str, engine: Engine, history: Arc<HistoryService>) -> Self {
+        Self::connect_mode(key, engine, history, SessionMode::PerTab).await
+    }
+
+    async fn connect_mode(
+        key: &str,
+        engine: Engine,
+        history: Arc<HistoryService>,
+        mode: SessionMode,
+    ) -> Self {
         let fx = fixtures();
         let dirs = tempfile::tempdir().unwrap();
         let secrets = Arc::new(MemorySecretStore::new());
@@ -126,6 +136,7 @@ impl Live {
                 ..TlsSettings::default()
             };
             p.connect_timeout_secs = Some(15);
+            p.session_mode = mode;
             p
         };
         let manager = Arc::new(ConnectionManager::new(
@@ -142,9 +153,15 @@ impl Live {
             memory_budget_bytes: MEMORY_BUDGET,
             ..QueryConfig::default()
         };
-        let service = QueryService::new(manager, Arc::new(default_dialects()), history, config);
+        let service = QueryService::new(
+            Arc::clone(&manager),
+            Arc::new(default_dialects()),
+            history,
+            config,
+        );
         Self {
             service,
+            manager,
             session: base.id(),
             engine,
             _dirs: dirs,
@@ -695,6 +712,88 @@ async fn history_records(key: &str, engine: Engine) {
     ));
 }
 
+/// Per-run sessions on a real server (`SessionMode::PerRun`): every run connects and gives its
+/// session back; a transaction a run leaves open is rolled back (its row is gone) and the run
+/// says so; nothing is left open between runs.
+async fn per_run_sessions(key: &str, engine: Engine) {
+    let history = Arc::new(HistoryService::new(
+        Arc::new(MemoryHistoryRepository::new()),
+    ));
+    let live = Live::connect_mode(key, engine, history, SessionMode::PerRun).await;
+    let table = format!("oxbase_per_run_{}", std::process::id());
+    let no_history = || RunOptions {
+        record_history: false,
+        ..RunOptions::default()
+    };
+    let run = |script: String| {
+        let live = &live;
+        async move {
+            let handle = live.start(&script, no_history()).await;
+            let mut events = handle.events;
+            let mut all = Vec::new();
+            loop {
+                let event = next_event(&mut events, engine).await;
+                let end = event.is_terminal();
+                all.push(event);
+                if end {
+                    return (handle.id, all);
+                }
+            }
+        }
+    };
+    let rolled_back = |events: &[RunEvent]| {
+        events.iter().any(
+            |e| matches!(e, RunEvent::Notice { code: Some(code), .. } if code == ROLLED_BACK_CODE),
+        )
+    };
+    let idle = || async {
+        for _ in 0..150 {
+            if live.manager.children_of(live.session).is_empty() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("{engine}: sessions left open between runs");
+    };
+
+    let (_, events) = run(format!("CREATE TABLE {table} (id INT PRIMARY KEY)")).await;
+    assert!(
+        matches!(events.last(), Some(RunEvent::Finished { .. })),
+        "{engine}: {events:?}"
+    );
+    assert!(!rolled_back(&events), "{engine}: nothing was open");
+    idle().await;
+
+    let begin = if engine == Engine::MsSql {
+        "BEGIN TRANSACTION"
+    } else {
+        "BEGIN"
+    };
+    let (_, events) = run(format!("{begin};\nINSERT INTO {table} (id) VALUES (1)")).await;
+    assert!(
+        rolled_back(&events),
+        "{engine}: the open transaction is reported: {events:?}"
+    );
+    idle().await;
+
+    let (count, events) = run(format!("SELECT COUNT(*) AS n FROM {table}")).await;
+    assert!(!rolled_back(&events), "{engine}");
+    let page = live.service.page(count, 0, 0, 1).await.unwrap();
+    let n = oxbase_driver::cell_value(page.column(0).as_ref(), 0).unwrap();
+    assert_eq!(n, Value::Int(0), "{engine}: the insert was rolled back");
+    idle().await;
+
+    let (_, events) = run(format!("DROP TABLE {table}")).await;
+    assert!(
+        matches!(events.last(), Some(RunEvent::Finished { .. })),
+        "{engine}: {events:?}"
+    );
+    idle().await;
+    report(&format!(
+        "{engine} per-run sessions: rolled back and closed after every run"
+    ));
+}
+
 macro_rules! live_tests {
     ($($name:ident: $check:ident($key:literal, $engine:expr);)*) => {
         $(
@@ -712,6 +811,10 @@ live_tests! {
     postgres_cancel_mid_stream: cancel_mid_stream("postgres", Engine::Postgres);
     postgres_multi_statement: multi_statement("postgres", Engine::Postgres);
     postgres_history: history_records("postgres", Engine::Postgres);
+    postgres_per_run: per_run_sessions("postgres", Engine::Postgres);
+    mysql_per_run: per_run_sessions("mysql", Engine::MySql);
+    mariadb_per_run: per_run_sessions("mariadb", Engine::MariaDb);
+    mssql_per_run: per_run_sessions("mssql", Engine::MsSql);
     mysql_large_result: large_result("mysql", Engine::MySql);
     mysql_cancel_mid_stream: cancel_mid_stream("mysql", Engine::MySql);
     mysql_multi_statement: multi_statement("mysql", Engine::MySql);

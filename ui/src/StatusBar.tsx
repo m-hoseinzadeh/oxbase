@@ -1,5 +1,6 @@
 import { Monitor, Moon, Sun } from "lucide-react";
 import { ICON_SM } from "./components/icons";
+import { SessionCounter } from "./connections/SessionCounter";
 import { useConnections } from "./connections/store";
 import { getAppInfo, NoCoreError } from "./ipc";
 import { errorMessage, useAsync } from "./useAsync";
@@ -67,6 +68,7 @@ export function StatusBar() {
         />
         {open === 1 ? "1 open connection" : `${open} open connections`}
       </span>
+      <SessionCounter />
       <span className="status-bar__spacer" />
       <span className="status-bar__item" data-testid="core-version">
         {text}
