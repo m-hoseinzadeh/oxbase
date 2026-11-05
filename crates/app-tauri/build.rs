@@ -13,6 +13,8 @@ const COMMANDS: &[&str] = &[
     "cancel_request",
     "close_connection",
     "list_open_connections",
+    // Session counter of the status bar (src/workbench.rs).
+    "session_usage",
     // M2 workbench (src/workbench.rs).
     "tree_children",
     "object_load",

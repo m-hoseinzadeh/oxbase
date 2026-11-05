@@ -15,7 +15,7 @@ use oxbase_services::query::{
     EditorId, QueryService, RunEvent, RunId, RunOptions, RunTarget, StatementSpan,
 };
 use oxbase_services::tree::{TreeNode, TreeNodeRef, TreeOptions, TreeService};
-use oxbase_services::{DialectRegistry, SessionId};
+use oxbase_services::{ConnectionManager, DialectRegistry, SessionId, SessionMode};
 use oxbase_store::{HistoryEntry, HistoryQuery, HistorySettings};
 use oxbase_types::{Engine, ObjectDef, ObjectRef};
 use tauri::State;
@@ -175,6 +175,53 @@ pub async fn query_close_editor(
         async move { query.close_editor(&editor_id).await },
     )
     .await
+}
+
+/// One open connection's database sessions, for the status bar's session counter.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionUsage {
+    /// The connection (its base session).
+    pub session_id: SessionId,
+    pub profile_name: String,
+    pub session_mode: SessionMode,
+    /// Every session the connection holds: its own plus the children.
+    pub total: usize,
+    /// Query tabs keeping a session between runs (per-tab mode).
+    pub idle_tabs: usize,
+    /// Queries running now, each on its own session.
+    pub running: usize,
+    /// The rest: other databases in the tree, a schema-cache read, a grid edit, an import...
+    pub other: usize,
+}
+
+/// Every open connection's sessions (no network access).
+#[tauri::command]
+pub fn session_usage(
+    connections: State<'_, ConnectionsState>,
+    workbench: State<'_, WorkbenchState>,
+) -> Vec<SessionUsage> {
+    usage_of(connections.manager(), &workbench.query)
+}
+
+pub(crate) fn usage_of(manager: &ConnectionManager, query: &QueryService) -> Vec<SessionUsage> {
+    manager
+        .list_open()
+        .into_iter()
+        .map(|base| {
+            let children = manager.children_of(base.id).len();
+            let editors = query.editor_usage(base.id);
+            SessionUsage {
+                session_id: base.id,
+                profile_name: base.profile_name,
+                session_mode: base.session_mode,
+                total: 1 + children,
+                idle_tabs: editors.idle,
+                running: editors.running,
+                other: children.saturating_sub(editors.idle + editors.running),
+            }
+        })
+        .collect()
 }
 
 /// The statement under the cursor; `offset` is in UTF-16 code units (Monaco `getOffsetAt`).

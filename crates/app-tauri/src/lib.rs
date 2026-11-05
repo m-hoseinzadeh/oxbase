@@ -137,6 +137,7 @@ pub fn run() {
             connections::cancel_request,
             connections::close_connection,
             connections::list_open_connections,
+            workbench::session_usage,
             workbench::tree_children,
             workbench::object_load,
             workbench::query_run,

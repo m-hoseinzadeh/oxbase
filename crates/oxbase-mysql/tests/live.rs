@@ -718,4 +718,59 @@ live!(
     multi_result_sets,
     types_and_params,
     transaction_rollback,
+    rollback_open_transaction,
 );
+
+/// `rollback_open_transaction` (the per-run session mode): a transaction a script left open,
+/// by `BEGIN` or by `SET autocommit = 0`, is rolled back and reported; none open is reported as
+/// such.
+async fn rollback_open_transaction(key: &str) {
+    let c = connect(&params(key)).await;
+    let table = format!("oxbase_mysql_rb_{}", std::process::id());
+    run(&c, &format!("DROP TABLE IF EXISTS {table}")).await;
+    run(
+        &c,
+        &format!("CREATE TABLE {table} (id INT PRIMARY KEY) ENGINE=InnoDB"),
+    )
+    .await;
+    let count = format!("SELECT COUNT(*) FROM {table}");
+    assert_eq!(
+        c.rollback_open_transaction().await.unwrap(),
+        Some(false),
+        "{key}: none open"
+    );
+
+    run(&c, "BEGIN").await;
+    run(&c, &format!("INSERT INTO {table} (id) VALUES (1)")).await;
+    assert_eq!(
+        c.rollback_open_transaction().await.unwrap(),
+        Some(true),
+        "{key}: BEGIN"
+    );
+    assert_eq!(
+        scalar_text(&c, &count).await,
+        "0",
+        "{key}: the insert was rolled back"
+    );
+    assert_eq!(
+        c.rollback_open_transaction().await.unwrap(),
+        Some(false),
+        "{key}: ended"
+    );
+
+    run(&c, "SET autocommit = 0").await;
+    run(&c, &format!("INSERT INTO {table} (id) VALUES (2)")).await;
+    assert_eq!(
+        c.rollback_open_transaction().await.unwrap(),
+        Some(true),
+        "{key}: autocommit 0"
+    );
+    run(&c, "SET autocommit = 1").await;
+    assert_eq!(
+        scalar_text(&c, &count).await,
+        "0",
+        "{key}: the insert was rolled back"
+    );
+    run(&c, &format!("DROP TABLE {table}")).await;
+    c.close().await.unwrap();
+}

@@ -850,3 +850,36 @@ async fn transactions_commit_roll_back_and_roll_back_when_dropped() {
         "the session is still usable"
     );
 }
+
+/// `rollback_open_transaction` (the per-run session mode): `@@TRANCOUNT` says whether a
+/// script left a transaction open; it is rolled back.
+#[tokio::test]
+#[ignore = "needs the mssql fixture"]
+async fn rollback_open_transaction_reports_and_ends_an_open_transaction() {
+    let c = connect(&params()).await;
+    run(&c, "CREATE TABLE #rb (x int)", &[]).await;
+    assert_eq!(
+        c.rollback_open_transaction().await.unwrap(),
+        Some(false),
+        "none open"
+    );
+    run(&c, "BEGIN TRANSACTION", &[]).await;
+    run(&c, "INSERT INTO #rb VALUES (1)", &[]).await;
+    assert_eq!(
+        c.rollback_open_transaction().await.unwrap(),
+        Some(true),
+        "BEGIN"
+    );
+    let rows = run(&c, "SELECT COUNT(*) AS n FROM #rb", &[]).await;
+    let n = first_batch(&rows)
+        .column(0)
+        .as_primitive::<Int64Type>()
+        .value(0);
+    assert_eq!(n, 0, "the insert was rolled back");
+    assert_eq!(
+        c.rollback_open_transaction().await.unwrap(),
+        Some(false),
+        "ended"
+    );
+    c.close().await.unwrap();
+}

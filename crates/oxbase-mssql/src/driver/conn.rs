@@ -495,6 +495,29 @@ impl Connection for MsSqlConnection {
         Some(self)
     }
 
+    /// One batch: `@@TRANCOUNT` before a `ROLLBACK` (only when it is above 0) says whether a
+    /// transaction was open.
+    async fn rollback_open_transaction(&self) -> Result<Option<bool>> {
+        let stream = self
+            .execute(
+                "DECLARE @oxbase_open int = @@TRANCOUNT; \
+                 IF @oxbase_open > 0 ROLLBACK TRANSACTION; \
+                 SELECT @oxbase_open AS open_transactions",
+                &[],
+                CancellationToken::new(),
+            )
+            .await?;
+        let collected = oxbase_driver::collect(stream).await?;
+        let open = collected
+            .result_sets
+            .iter()
+            .find_map(|set| set.batches.first())
+            .filter(|batch| batch.num_rows() > 0)
+            .and_then(|batch| oxbase_driver::cell_value(batch.column(0).as_ref(), 0).ok())
+            .map(|value| matches!(value, Value::Int(n) if n > 0));
+        Ok(open)
+    }
+
     async fn close(&self) -> Result<()> {
         // A running statement is cancelled first; its task releases the session when done.
         self.shared.cancel_running();

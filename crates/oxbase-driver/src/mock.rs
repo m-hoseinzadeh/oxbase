@@ -142,6 +142,7 @@ impl Driver for MockDriver {
                 log: self.log.clone(),
                 running: Mutex::new(None),
                 closed: AtomicBool::new(false),
+                in_transaction: AtomicBool::new(false),
             }),
         }))
     }
@@ -156,6 +157,9 @@ struct Inner {
     /// Token of the statement currently streaming, for `cancel_running`.
     running: Mutex<Option<CancellationToken>>,
     closed: AtomicBool,
+    /// A script's `BEGIN` / `START TRANSACTION` not yet ended by `COMMIT`, `ROLLBACK` or `END`
+    /// (for `rollback_open_transaction`).
+    in_transaction: AtomicBool,
 }
 
 impl Inner {
@@ -183,6 +187,11 @@ impl Inner {
             .next()
             .unwrap_or("")
             .to_ascii_uppercase();
+        match head.as_str() {
+            "BEGIN" | "START" => self.in_transaction.store(true, Ordering::Release),
+            "COMMIT" | "ROLLBACK" | "END" => self.in_transaction.store(false, Ordering::Release),
+            _ => {}
+        }
         match head.as_str() {
             "SELECT" | "WITH" | "VALUES" | "SHOW" => {
                 // A child token: cancelling it (cancel_running) does not cancel the caller's token.
@@ -305,6 +314,14 @@ impl Connection for MockConnection {
         }))
     }
 
+    async fn rollback_open_transaction(&self) -> Result<Option<bool>> {
+        self.inner.check_open()?;
+        self.inner.record("ROLLBACK");
+        Ok(Some(
+            self.inner.in_transaction.swap(false, Ordering::AcqRel),
+        ))
+    }
+
     async fn close(&self) -> Result<()> {
         if let Some(token) = lock(&self.inner.running).take() {
             token.cancel();
@@ -371,6 +388,39 @@ mod tests {
         d.connect(&ConnectParams::network(d.engine(), "mock"))
             .await
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn rollback_open_transaction_tracks_begin_and_its_end() {
+        let d = MockDriver::new(Engine::Postgres);
+        let c = connect(&d).await;
+        assert_eq!(c.rollback_open_transaction().await.unwrap(), Some(false));
+        collect(
+            c.execute("BEGIN", &[], CancellationToken::new())
+                .await
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(c.rollback_open_transaction().await.unwrap(), Some(true));
+        assert_eq!(c.rollback_open_transaction().await.unwrap(), Some(false));
+        collect(
+            c.execute("begin", &[], CancellationToken::new())
+                .await
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        collect(
+            c.execute("COMMIT", &[], CancellationToken::new())
+                .await
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(c.rollback_open_transaction().await.unwrap(), Some(false));
+        c.close().await.unwrap();
+        assert!(c.rollback_open_transaction().await.is_err());
     }
 
     #[tokio::test]

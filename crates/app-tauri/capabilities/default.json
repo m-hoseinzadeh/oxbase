@@ -16,6 +16,7 @@
     "allow-cancel-request",
     "allow-close-connection",
     "allow-list-open-connections",
+    "allow-session-usage",
     "allow-tree-children",
     "allow-object-load",
     "allow-query-run",

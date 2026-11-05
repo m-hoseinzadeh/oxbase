@@ -43,6 +43,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures::stream;
 use futures::{FutureExt as _, StreamExt};
+use mysql_async::consts::StatusFlags;
 use mysql_async::prelude::{Protocol, Queryable};
 use mysql_async::{Conn, Opts, Params, QueryResult, Row, Value as MyValue};
 use oxbase_driver::{
@@ -260,6 +261,22 @@ impl Connection for MySqlConnection {
             shared: Arc::clone(&self.shared),
             finished: AtomicBool::new(false),
         }))
+    }
+
+    /// The status flags of the server's OK packet say whether the session is inside a
+    /// transaction (`SERVER_STATUS_IN_TRANS`, also after `SET autocommit = 0`): read after a
+    /// no-op `DO 0`, then `ROLLBACK`.
+    async fn rollback_open_transaction(&self) -> Result<Option<bool>> {
+        let mut guard = self.shared.session.lock().await;
+        let conn = guard.as_mut().ok_or_else(closed)?;
+        self.shared.rollback_if_needed(conn).await?;
+        conn.query_drop("DO 0").await.map_err(map_error)?;
+        let open = conn.last_ok_packet().map(|ok| {
+            ok.status_flags()
+                .contains(StatusFlags::SERVER_STATUS_IN_TRANS)
+        });
+        conn.query_drop("ROLLBACK").await.map_err(map_error)?;
+        Ok(open)
     }
 
     async fn close(&self) -> Result<()> {

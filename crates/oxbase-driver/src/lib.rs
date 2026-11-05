@@ -165,6 +165,18 @@ pub trait Connection: Send + Sync {
     /// Closes the connection. Later calls fail with a connection error. Closing twice is `Ok`.
     async fn close(&self) -> Result<()>;
 
+    /// Rolls back the transaction a script left open on this session (a `BEGIN` without
+    /// `COMMIT`, or MySQL's `SET autocommit = 0`), and says whether there was one:
+    /// `Some(true)` one was open and is rolled back, `Some(false)` none was open, `None` the
+    /// driver cannot tell (the default; it then does nothing).
+    ///
+    /// Used before a session is closed after a run (the per-run session mode), so the user is
+    /// told that uncommitted changes were not kept; closing the session would roll the
+    /// transaction back anyway. Call it with no statement running.
+    async fn rollback_open_transaction(&self) -> Result<Option<bool>> {
+        Ok(None)
+    }
+
     /// M5: the concrete connection, for dialect cells of the same engine crate that need the
     /// client library's own API (PostgreSQL `COPY FROM STDIN`, SQL Server bulk load). `None` by
     /// default; an engine returns `Some(self)` when one of its cells downcasts. Code outside the
