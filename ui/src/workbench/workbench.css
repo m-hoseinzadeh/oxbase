@@ -674,7 +674,7 @@ input[type="search"] {
   display: flex;
   flex-direction: column;
   min-width: 200px;
-  max-width: 240px;
+  max-width: 280px;
   padding: var(--space-1);
   border-radius: var(--radius-md);
   background: var(--color-bg-elevated);
@@ -736,6 +736,17 @@ input[type="search"] {
 
 .context-menu__shortcut {
   margin-left: var(--space-4);
+}
+
+.context-menu__chevron {
+  display: grid;
+  place-items: center;
+  margin-left: auto;
+  color: var(--color-fg-muted);
+}
+
+.context-menu__item[aria-expanded="true"] {
+  background: var(--color-bg-muted);
 }
 
 .context-menu__item--danger,
@@ -1268,7 +1279,10 @@ input[type="search"] {
   min-width: 120px;
 }
 
-.value-panel__wrap {
+.value-panel__options {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
   margin-left: auto;
 }
 
@@ -1278,7 +1292,64 @@ input[type="search"] {
   min-height: 0;
 }
 
-.value-panel__body .sql-editor {
+.value-panel__body .sql-editor,
+.value-panel__preview {
+  position: absolute;
+  inset: 0;
+}
+
+/* Previewed HTML is a document of its own: drawn on white, like a browser page. */
+.value-panel__preview {
+  width: 100%;
+  height: 100%;
+  border: none;
+  background: #fff;
+}
+
+.value-panel__image {
+  display: grid;
+  place-items: center;
+  overflow: auto;
+  padding: var(--space-3);
+  /* A checkerboard shows transparent pixels. */
+  background:
+    repeating-conic-gradient(var(--color-bg-muted) 0% 25%, var(--color-bg) 0% 50%) 50% / 16px 16px;
+}
+
+.value-panel__image img {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+}
+
+/* The value dialog (results/ValueDialog.tsx): the same view, larger, plus editing. */
+.modal.value-dialog {
+  width: min(960px, calc(100vw - 48px));
+}
+
+.value-dialog__view {
+  display: flex;
+  flex-direction: column;
+  height: min(62vh, 640px);
+  overflow: hidden;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-bg);
+}
+
+.value-dialog__hint {
+  margin-right: auto;
+  color: var(--color-fg-faint);
+  font-size: var(--text-xs);
+}
+
+.value-dialog__edit {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+}
+
+.value-dialog__edit .sql-editor {
   position: absolute;
   inset: 0;
 }
@@ -1656,4 +1727,25 @@ input[type="search"] {
 .history__more {
   align-self: center;
   flex-shrink: 0;
+}
+
+/* The hover preview of a cut-off cell value (results/ResultGrid.tsx). */
+.cell-preview {
+  position: fixed;
+  z-index: calc(var(--z-modal) + 5);
+  max-width: 480px;
+  max-height: 240px;
+  overflow: hidden;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-bg-elevated);
+  color: var(--color-fg);
+  box-shadow: var(--shadow-popover);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  pointer-events: none;
 }

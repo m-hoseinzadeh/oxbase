@@ -781,6 +781,12 @@ pnpm tauri build                          # release bundles for the current OS
    changes are coloured; **Apply** writes them all in one transaction, **Discard** drops them.
    `m3_edit_nokey` and `m3_edit_view` open read-only and say why. **Form** and **JSON** show
    the selected rows.
+   Right-click a cell to view or edit its value in a dialog (Shift+Enter; JSON, XML, HTML with
+   a safe preview, SQL, images), copy it (with column names: Ctrl+Shift+C; as JSON, Markdown,
+   SQL INSERT or an IN list), filter by it, set NULL, paste (Ctrl+V; new rows: Ctrl+Shift+V)
+   or add, duplicate (Ctrl+D), delete (Delete) and revert (Ctrl+Z) rows; Ctrl+S applies.
+   Right-click a header to sort or fit columns; Ctrl+F searches; Ctrl/Shift+click selects
+   several rows or cell ranges.
 3. **Design** (in the tab, or in the Objects panel with a table selected) opens the table
    designer; **New table** starts an empty one. Change columns, indexes, foreign keys, checks
    or options, then **Preview** shows the script. **Apply** runs it (destructive statements

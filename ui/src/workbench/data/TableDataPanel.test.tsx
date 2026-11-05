@@ -9,9 +9,11 @@ import type {
   RunEvent,
   StatementSpan,
 } from "../../api";
+import type { MenuItem } from "../../components/ContextMenu";
 import { tauriCore } from "../../test/tauriMock";
 import { NO_DESIGNER } from "../designer/designModel";
 import type { ResultGridProps } from "../results/ResultGrid";
+import { installShortcuts } from "../shortcuts";
 import { TableDataPanel } from "./TableDataPanel";
 
 vi.mock("@tauri-apps/api/core", async () => (await import("../../test/tauriMock")).tauriCore);
@@ -21,8 +23,27 @@ vi.mock("@tauri-apps/api/core", async () => (await import("../../test/tauriMock"
 vi.mock("../results/ResultGrid", async () => {
   const { useState } = await import("react");
   return {
-    ResultGrid: ({ rowCount, columns, edit, onSelectRows, selectedRows }: ResultGridProps) => {
+    ResultGrid: ({
+      rowCount,
+      columns,
+      edit,
+      onSelectRows,
+      selectedRows,
+      cellMenu,
+      headerMenu,
+      onKey,
+      onPasteCells,
+      onPasteRows,
+    }: ResultGridProps) => {
       const [open, setOpen] = useState<[number, number] | null>(null);
+      const [menu, setMenu] = useState<MenuItem[] | null>(null);
+      // A menu's items as buttons, submenus flattened ("Filter by name › = 'name1'").
+      const flat = (items: MenuItem[], prefix = ""): { label: string; run: () => void }[] =>
+        items.flatMap((item) =>
+          item.submenu
+            ? flat(item.submenu, `${prefix}${item.label} › `)
+            : [{ label: `${prefix}${item.label}`, run: item.onSelect }],
+        );
       const rows = rowCount + (edit?.extraRows ?? 0);
       const isSelected = (r: number) =>
         selectedRows?.current === r || !!selectedRows?.ranges.some(([a, b]) => r >= a && r < b);
@@ -42,6 +63,69 @@ vi.mock("../results/ResultGrid", async () => {
           >
             select rows 0 and 2
           </button>
+          <button
+            type="button"
+            onClick={() =>
+              setMenu(
+                cellMenu?.(
+                  {
+                    row: 1,
+                    col: 1,
+                    column: columns[1] as ResultGridProps["columns"][number],
+                    value: "name1",
+                    selectedValues: async () => ["name1", "name2", "name1", null],
+                  },
+                  { current: 1, ranges: [[1, 2]] },
+                ) ?? [],
+              )
+            }
+          >
+            cell menu 1 name
+          </button>
+          <button
+            type="button"
+            onClick={() =>
+              setMenu(headerMenu?.(1, columns[1] as ResultGridProps["columns"][number]) ?? [])
+            }
+          >
+            header menu name
+          </button>
+          <button type="button" onClick={() => onKey?.("delete")}>
+            key delete
+          </button>
+          <button
+            type="button"
+            onClick={() =>
+              onPasteCells?.(
+                [1, 0],
+                [
+                  ["a", "NULL"],
+                  ["b", "c"],
+                ],
+              )
+            }
+          >
+            paste cells
+          </button>
+          <button type="button" onClick={() => onPasteRows?.([["x", "y"]], 1)}>
+            paste rows
+          </button>
+          {menu ? (
+            <div data-testid="grid-menu">
+              {flat(menu).map((item) => (
+                <button
+                  key={item.label}
+                  type="button"
+                  onClick={() => {
+                    setMenu(null);
+                    item.run();
+                  }}
+                >
+                  {item.label}
+                </button>
+              ))}
+            </div>
+          ) : null}
           {Array.from({ length: rows }, (_, r) => (
             // biome-ignore lint/suspicious/noArrayIndexKey: rows are positions.
             <div key={r} data-testid={`row-${r}`} data-selected={isSelected(r) ? "yes" : "no"}>
@@ -641,6 +725,111 @@ describe("TableDataPanel", () => {
     fireEvent.click(screen.getByRole("radio", { name: "Builder" }));
     fireEvent.submit(screen.getByRole("form", { name: "Filter and sort" }));
     await waitFor(() => expect(opens).toHaveLength(3));
+  });
+
+  it("filters by a cell's value from the cell menu, ANDed with the filter there", async () => {
+    await renderPanel();
+    await waitFor(() => expect(calls("edit_begin")).toHaveLength(1));
+    fireEvent.click(screen.getByRole("button", { name: "cell menu 1 name" }));
+    const menu = screen.getByTestId("grid-menu");
+    // A text column: ordered comparisons and contains; = quotes the value.
+    expect(
+      within(menu).getByRole("button", { name: "Filter by name › contains 'name1'" }),
+    ).toBeInTheDocument();
+    fireEvent.click(within(menu).getByRole("button", { name: "Filter by name › = 'name1'" }));
+    await waitFor(() => expect(opens).toHaveLength(2));
+    expect(opens[1]?.request).toMatchObject({
+      filter: {
+        type: "condition",
+        column: "name",
+        op: "eq",
+        values: [{ type: "text", value: "name1" }],
+      },
+    });
+    // The builders show what was added; a second quick filter is ANDed with it.
+    expect(screen.getByTestId("filter-builder")).toBeInTheDocument();
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Apply filter" })).not.toBeDisabled(),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "cell menu 1 name" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "Filter by name › is one of the selected values" }),
+    );
+    await waitFor(() => expect(opens).toHaveLength(3));
+    expect(opens[2]?.request).toMatchObject({
+      filter: {
+        type: "and",
+        items: [
+          { type: "condition", op: "eq" },
+          {
+            type: "condition",
+            column: "name",
+            op: "in",
+            values: [
+              { type: "text", value: "name1" },
+              { type: "text", value: "name2" },
+            ],
+          },
+        ],
+      },
+    });
+  });
+
+  it("sorts from the header menu", async () => {
+    await renderPanel();
+    await waitFor(() => expect(calls("edit_begin")).toHaveLength(1));
+    fireEvent.click(screen.getByRole("button", { name: "header menu name" }));
+    fireEvent.click(screen.getByRole("button", { name: "Sort descending" }));
+    await waitFor(() => expect(opens).toHaveLength(2));
+    expect(opens[1]?.request).toMatchObject({ sort: [{ column: "name", descending: true }] });
+  });
+
+  it("pastes cells and new rows, sets NULL and deletes rows from the menu and keys", async () => {
+    await renderPanel();
+    await waitFor(() => expect(screen.getByRole("button", { name: "Add row" })).not.toBeDisabled());
+    // Two rows of two cells from (row 0, name): "NULL" pastes NULL where it is allowed.
+    fireEvent.click(screen.getByRole("button", { name: "paste cells" }));
+    expect(screen.getByTestId("cell-0-name").textContent).toBe("a");
+    expect(screen.getByTestId("cell-0-note").textContent).toBe("NULL");
+    expect(screen.getByTestId("cell-1-name").textContent).toBe("b");
+    expect(screen.getByTestId("cell-1-note").textContent).toBe("c");
+    fireEvent.click(screen.getByRole("button", { name: "paste rows" }));
+    expect(screen.getByTestId("cell-3-name").textContent).toBe("x");
+    expect(screen.getByTestId("cell-3-note").textContent).toBe("y");
+
+    fireEvent.click(screen.getByRole("button", { name: "cell menu 1 name" }));
+    // `name` is NOT NULL: no Set NULL.
+    expect(
+      within(screen.getByTestId("grid-menu")).queryByRole("button", { name: "Set NULL" }),
+    ).toBeNull();
+    fireEvent.click(
+      within(screen.getByTestId("grid-menu")).getByRole("button", { name: "Delete row" }),
+    );
+    expect(screen.getByTestId("cell-1-name").dataset.highlight).toBe("deleted");
+
+    fireEvent.click(screen.getByRole("button", { name: "select 2" }));
+    fireEvent.click(screen.getByRole("button", { name: "key delete" }));
+    expect(screen.getByTestId("cell-2-name").dataset.highlight).toBe("deleted");
+    expect(screen.getByTestId("table-data-statusbar")).toHaveTextContent("pending changes");
+  });
+
+  it("applies the pending changes with Ctrl+S", async () => {
+    const remove = installShortcuts(() => "data-editor-t1");
+    await renderPanel();
+    await waitFor(() => expect(screen.getByRole("button", { name: "Add row" })).not.toBeDisabled());
+    fireEvent.click(screen.getByRole("button", { name: "paste rows" }));
+    const event = new KeyboardEvent("keydown", {
+      key: "s",
+      ctrlKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    await act(async () => {
+      document.body.dispatchEvent(event);
+    });
+    expect(event.defaultPrevented).toBe(true);
+    await waitFor(() => expect(calls("edit_apply")).toHaveLength(1));
+    remove();
   });
 
   it("asks before a new filter drops pending changes", async () => {

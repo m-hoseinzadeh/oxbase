@@ -15,6 +15,8 @@ import "monaco-editor/languages/definitions/javascript/register";
 import "monaco-editor/languages/definitions/redis/register";
 // The value panel (results/ValuePanel.tsx) highlights XML values.
 import "monaco-editor/languages/definitions/xml/register";
+// ... and HTML values (a Monarch grammar; no language-service worker).
+import "monaco-editor/languages/definitions/html/register";
 import EditorWorker from "monaco-editor/editor/editor.worker?worker";
 
 globalThis.MonacoEnvironment = {

@@ -6,6 +6,18 @@
  * With `edit` (table data, M3) the grid also shows rows past the stored ones (new rows), cell
  * values that differ from the store (pending or applied edits), highlights changed, new,
  * deleted and failed rows, and opens the caller's typed editor in the cell overlay.
+ *
+ * Every grid has (1.1):
+ * - a cell menu (right-click): view or edit the value in a dialog, copy, copy with column
+ *   names, copy as JSON / Markdown / SQL INSERT / IN list / column names, plus the caller's
+ *   items (`cellMenu`); a header menu: fit the column or all columns, copy its name, plus
+ *   `headerMenu`;
+ * - keys: Enter / Space / F2 activate a cell (edit it, or open the value panel), Shift+Enter
+ *   opens the value dialog, Ctrl+Shift+C copies with column names, Ctrl+F searches; Delete,
+ *   Ctrl+D and Ctrl+Z go to the caller (`onKey`), Ctrl+V pastes into cells and Ctrl+Shift+V
+ *   pastes new rows (`onPasteCells`, `onPasteRows`);
+ * - Ctrl/Cmd+click adds cell ranges or rows to the selection, Shift+click extends it;
+ * - a preview of a cut-off value when the pointer rests on its cell.
  */
 import {
   CompactSelection,
@@ -16,6 +28,8 @@ import {
   GridCellKind,
   type GridColumn,
   GridColumnIcon,
+  type GridKeyEventArgs,
+  type GridMouseEventArgs,
   type GridSelection,
   type Item,
   type ProvideEditorCallback,
@@ -23,6 +37,19 @@ import {
   type Rectangle,
   type Theme,
 } from "@glideapps/glide-data-grid";
+import {
+  Braces,
+  ClipboardCopy,
+  ClipboardList,
+  Columns3,
+  Copy,
+  Eye,
+  FileCode,
+  List,
+  MoveHorizontal,
+  Pencil,
+  Sheet,
+} from "lucide-react";
 import {
   createContext,
   type ReactNode,
@@ -35,8 +62,25 @@ import {
   useState,
 } from "react";
 import type { ColumnInfo, Engine } from "../../api";
+import { ContextMenu, type MenuItem, OPENS_SUBMENU } from "../../components/ContextMenu";
 import { normalizeColor, subscribeTheme } from "../theme-bridge";
-import { type CopyNotify, cellsForSelection, NULL_COPY_TEXT } from "./copy";
+import {
+  type CopyNotify,
+  cellsForSelection,
+  copyColumn,
+  NULL_COPY_TEXT,
+  readSelection,
+} from "./copy";
+import {
+  type CellText,
+  parseTsv,
+  quoteIdent,
+  toInList,
+  toJson,
+  toMarkdown,
+  toSqlInsert,
+  toTsv,
+} from "./copyFormats";
 import {
   cellDisplayText,
   columnTypeLabel,
@@ -46,14 +90,33 @@ import {
 } from "./format";
 import { dataCellOf } from "./gridCoords";
 import type { ResultPager } from "./pager";
-import { fromGridSelection, type GridRowSelection, toGridSelection } from "./rowSelection";
+import {
+  fromGridSelection,
+  type GridRowSelection,
+  inSelection,
+  selectionRects,
+  toGridSelection,
+} from "./rowSelection";
+import { ValueDialog, type ValueDialogEdit } from "./ValueDialog";
 import { ValuePanel } from "./ValuePanel";
 
 /**
- * The grid's own keys, minus Ctrl+Enter ("scroll to the selected cell"): Ctrl+Enter runs the
- * query wherever the focus is in the tab (../shortcuts), the grid included.
+ * The grid's own keys, changed: no Ctrl+Enter ("scroll to the selected cell"), which runs the
+ * query wherever the focus is in the tab (../shortcuts); F2 activates a cell like Enter and
+ * Space, while Shift+Enter opens the value dialog; Ctrl+F searches.
  */
-const GRID_KEYS = { scrollToSelectedCell: false } as const;
+const GRID_KEYS = {
+  scrollToSelectedCell: false,
+  activateCell: "Enter| |F2",
+  search: true,
+} as const;
+
+/** How long the pointer rests on a cut-off cell before its value shows. */
+const PREVIEW_DELAY_MS = 600;
+/** Most characters the hover preview shows. */
+const PREVIEW_CHARS = 1500;
+/** Average width of a character of the grid's monospace font (12.5 px). */
+const CHAR_WIDTH = 7.6;
 
 /** Rows assumed visible before the grid reports its real viewport. */
 const MIN_VIEWPORT_ROWS = 60;
@@ -173,6 +236,8 @@ export interface GridEditing {
   override(row: number, col: number): CellOverride | undefined;
   highlight(row: number, col: number): CellHighlight | undefined;
   canEdit(row: number, col: number): boolean;
+  /** Editing the cell in the value dialog; `undefined` when it cannot be edited. */
+  valueEdit?(row: number, col: number): ValueDialogEdit | undefined;
   /** The typed editor of the cell overlay; `finish(move)` closes it (moving down on Enter). */
   renderEditor(args: {
     row: number;
@@ -223,6 +288,22 @@ const OverlayEditor: ProvideEditorComponent<GridCell> = ({ initialValue, onFinis
   );
 };
 
+/** Keys the grid hands to its caller (table data): mark for deletion, duplicate, revert. */
+export type GridKey = "delete" | "duplicate" | "revert";
+
+/** The cell a context menu was opened on. */
+export interface GridCellTarget {
+  row: number;
+  col: number;
+  column: ColumnInfo;
+  /** The whole value: text, `null` (NULL) or `undefined` (not loaded). */
+  value: string | null | undefined;
+  /** The values of the selected cells in this column (stored rows, read like a copy). */
+  selectedValues: () => Promise<CellText[]>;
+}
+
+type CopyKind = "names" | "json" | "markdown" | "sql" | "in" | "columns";
+
 export interface ResultGridProps {
   pager: ResultPager;
   /** The result's columns; a trailing whole-document column (`$document`) is not shown. */
@@ -248,8 +329,20 @@ export interface ResultGridProps {
    */
   valuePanel?: boolean | undefined;
   onValuePanelChange?: ((open: boolean) => void) | undefined;
-  /** The connection's engine, for the value panel's SQL beautifier. */
+  /** The connection's engine, for the value panel's SQL beautifier and "copy as SQL". */
   engine?: Engine | null | undefined;
+  /** The table "Copy as SQL INSERT" inserts into, qualified and quoted (else `table_name`). */
+  sqlTable?: string | undefined;
+  /** The caller's items of the cell menu, after the grid's own. */
+  cellMenu?: ((target: GridCellTarget, rows: GridRowSelection) => MenuItem[]) | undefined;
+  /** The caller's items of the header menu, after the grid's own. */
+  headerMenu?: ((col: number, column: ColumnInfo) => MenuItem[]) | undefined;
+  /** Delete, Ctrl+D, Ctrl+Z in the grid; `true` when the caller used the key. */
+  onKey?: ((key: GridKey) => boolean) | undefined;
+  /** Ctrl+V: cells pasted at `target` ([col, row]), row by row. */
+  onPasteCells?: ((target: Item, values: readonly (readonly string[])[]) => void) | undefined;
+  /** Ctrl+Shift+V or "Paste as new rows": each line becomes a new row from column `col`. */
+  onPasteRows?: ((values: string[][], col: number) => void) | undefined;
 }
 
 const NO_SELECTION: GridSelection = {
@@ -268,6 +361,12 @@ export function ResultGrid({
   valuePanel,
   onValuePanelChange,
   engine,
+  sqlTable,
+  cellMenu,
+  headerMenu,
+  onKey,
+  onPasteCells,
+  onPasteRows,
 }: ResultGridProps) {
   // The document column is always last, so the shown columns keep their page indexes.
   const columns = useMemo(() => visibleColumns(resultColumns), [resultColumns]);
@@ -484,6 +583,8 @@ export function ResultGrid({
   const onVisibleRegionChanged = useCallback(
     (range: Rectangle) => {
       region.current = range;
+      if (hoverTimer.current) clearTimeout(hoverTimer.current);
+      setHover(null);
       pager.setVisible(range.y, range.y + Math.max(range.height, 1) - 1);
     },
     [pager],
@@ -507,12 +608,268 @@ export function ResultGrid({
     [edit, pager, columns],
   );
 
+  /** The raw bytes of a stored binary cell (an image shows as the image), else `null`. */
+  const bytesAt = useCallback(
+    (col: number, row: number): Uint8Array | null => {
+      if (edit?.override(row, col)) return null;
+      const ref = pager.cell(row, col);
+      if (!ref) return null;
+      const value = ref.vector.get(ref.index) as unknown;
+      return value instanceof Uint8Array ? value : null;
+    },
+    [edit, pager],
+  );
+
   const onCellActivated = useCallback(
     ([col, row]: Item) => {
       if (edit?.canEdit(row, col)) return;
       setValueOpen(true);
     },
     [edit, setValueOpen],
+  );
+
+  // --- value dialog, copy as, menus, keys, hover preview (1.1) ----------------------------
+
+  const [dialog, setDialog] = useState<{ col: number; row: number; edit: boolean } | null>(null);
+  const [menu, setMenu] = useState<{
+    x: number;
+    y: number;
+    label: string;
+    items: MenuItem[];
+  } | null>(null);
+  const [hover, setHover] = useState<{ text: string; x: number; y: number } | null>(null);
+  const hoverTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const hideHover = useCallback(() => {
+    if (hoverTimer.current) clearTimeout(hoverTimer.current);
+    hoverTimer.current = null;
+    setHover(null);
+  }, []);
+  useEffect(() => hideHover, [hideHover]);
+
+  const notify = useCallback((message: string) => noticeRef.current?.(message), []);
+
+  /** Copies the selection in a "copy as" format (stored rows, read like a copy). */
+  async function copyAs(kind: CopyKind) {
+    const rects = selectionRects(selection, columns.length, rowCount);
+    const first = rects[0];
+    if (!first) return;
+    const cols = columns.slice(first.x, first.x + first.width).map(copyColumn);
+    let rows: CellText[][] = [];
+    if (kind !== "columns") {
+      try {
+        // Ranges over the same columns join; another column span keeps the first one only.
+        for (const r of rects.filter((r) => r.x === first.x && r.width === first.width)) {
+          rows = rows.concat(await readSelection(pager, columns, rowCount, r, notify));
+        }
+      } catch {
+        // `readSelection` said why (copy failed / too many rows).
+        return;
+      }
+    }
+    const table = sqlTable ?? quoteIdent("table_name", engine);
+    const numeric = cols.length > 0 && cols.every((c) => c.numeric);
+    const text =
+      kind === "names"
+        ? toTsv(cols, rows, true)
+        : kind === "json"
+          ? toJson(cols, rows)
+          : kind === "markdown"
+            ? toMarkdown(cols, rows)
+            : kind === "sql"
+              ? toSqlInsert(table, cols, rows, engine)
+              : kind === "in"
+                ? toInList(rows.flat(), numeric, engine)
+                : cols.map((c) => c.name).join(", ");
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch (error) {
+      notify(`Copy failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  async function pasteRowsFromClipboard(col: number) {
+    if (!onPasteRows) return;
+    try {
+      const text = await navigator.clipboard.readText();
+      const values = parseTsv(text);
+      if (values.length > 0) onPasteRows(values, col);
+    } catch {
+      notify("Could not read the clipboard here: press Ctrl+Shift+V in the grid.");
+    }
+  }
+
+  const select = (next: GridSelection) => onGridSelectionChange(next);
+
+  function openCellMenu([col, row]: Item, x: number, y: number) {
+    hideHover();
+    // A right-click outside the selection selects what was clicked first.
+    let current = selection;
+    if (!inSelection(selection, col, row)) {
+      current =
+        col < 0
+          ? { columns: CompactSelection.empty(), rows: CompactSelection.fromSingleSelection(row) }
+          : {
+              columns: CompactSelection.empty(),
+              rows: CompactSelection.empty(),
+              current: {
+                cell: [col, row],
+                range: { x: col, y: row, width: 1, height: 1 },
+                rangeStack: [],
+              },
+            };
+      select(current);
+    }
+    const target = col < 0 ? 0 : col;
+    const column = columns[target];
+    if (!column) return;
+    const editValue = edit?.canEdit(row, target) ? edit.valueEdit?.(row, target) : undefined;
+    const items: MenuItem[] = [
+      {
+        label: "View value",
+        icon: Eye,
+        shortcut: "Shift+Enter",
+        onSelect: () => setDialog({ col: target, row, edit: false }),
+      },
+      ...(editValue
+        ? [
+            {
+              label: "Edit value…",
+              icon: Pencil,
+              onSelect: () => setDialog({ col: target, row, edit: true }),
+            },
+          ]
+        : []),
+      {
+        label: "Copy",
+        icon: Copy,
+        shortcut: "Ctrl+C",
+        separatorBefore: true,
+        onSelect: () => void gridRef.current?.emit("copy"),
+      },
+      {
+        label: "Copy with column names",
+        icon: ClipboardList,
+        shortcut: "Ctrl+Shift+C",
+        onSelect: () => void copyAs("names"),
+      },
+      {
+        label: "Copy as",
+        icon: ClipboardCopy,
+        onSelect: OPENS_SUBMENU,
+        submenu: [
+          { label: "JSON", icon: Braces, onSelect: () => void copyAs("json") },
+          { label: "Markdown table", icon: Sheet, onSelect: () => void copyAs("markdown") },
+          { label: "SQL INSERT", icon: FileCode, onSelect: () => void copyAs("sql") },
+          { label: "IN list", icon: List, onSelect: () => void copyAs("in") },
+          { label: "Column names", icon: Columns3, onSelect: () => void copyAs("columns") },
+        ],
+      },
+      ...(cellMenu?.(
+        {
+          row,
+          col: target,
+          column,
+          value: valueAt(target, row),
+          selectedValues: async () => {
+            const values: CellText[] = [];
+            for (const r of selectionRects(current, columns.length, rowCount)) {
+              if (target < r.x || target >= r.x + r.width) continue;
+              const rect = { x: target, y: r.y, width: 1, height: r.height };
+              const rows = await readSelection(pager, columns, rowCount, rect, notify);
+              for (const line of rows) values.push(line[0] ?? null);
+            }
+            return values;
+          },
+        },
+        fromGridSelection(current),
+      ) ?? []),
+    ];
+    setMenu({ x, y, label: "Cell", items });
+  }
+
+  function openHeaderMenu(col: number, x: number, y: number) {
+    hideHover();
+    const column = columns[col];
+    if (!column) return;
+    const items: MenuItem[] = [
+      {
+        label: "Fit column",
+        icon: MoveHorizontal,
+        onSelect: () =>
+          gridRef.current?.remeasureColumns(CompactSelection.fromSingleSelection(col)),
+      },
+      {
+        label: "Fit all columns",
+        icon: Columns3,
+        onSelect: () =>
+          gridRef.current?.remeasureColumns(
+            CompactSelection.fromSingleSelection([0, columns.length]),
+          ),
+      },
+      {
+        label: "Copy column name",
+        icon: Copy,
+        onSelect: () => void navigator.clipboard.writeText(column.name).catch(() => {}),
+      },
+      ...(headerMenu?.(col, column) ?? []),
+    ];
+    setMenu({ x, y, label: `Column ${column.name}`, items });
+  }
+
+  function onGridKeyDown(event: GridKeyEventArgs) {
+    hideHover();
+    const mod = event.ctrlKey || event.metaKey;
+    const key = event.key.length === 1 ? event.key.toLowerCase() : event.key;
+    const cell = selection.current?.cell;
+    if (key === "Enter" && event.shiftKey && !mod && !event.altKey) {
+      if (!cell) return;
+      event.cancel();
+      setDialog({ col: cell[0], row: cell[1], edit: false });
+      return;
+    }
+    if (mod && event.shiftKey && key === "c") {
+      event.cancel();
+      void copyAs("names");
+      return;
+    }
+    if (mod && event.shiftKey && key === "v" && onPasteRows) {
+      event.cancel();
+      void pasteRowsFromClipboard(cell?.[0] ?? 0);
+      return;
+    }
+    const gridKey: GridKey | null =
+      key === "Delete" && !mod
+        ? "delete"
+        : mod && !event.shiftKey && key === "d"
+          ? "duplicate"
+          : mod && !event.shiftKey && key === "z"
+            ? "revert"
+            : null;
+    if (gridKey && onKey?.(gridKey)) event.cancel();
+  }
+
+  const onItemHovered = useCallback(
+    (args: GridMouseEventArgs) => {
+      if (hoverTimer.current) clearTimeout(hoverTimer.current);
+      hoverTimer.current = null;
+      setHover(null);
+      if (args.kind !== "cell") return;
+      const [col, row] = args.location;
+      const shown = gridColumns[col];
+      const width = shown && "width" in shown ? shown.width : undefined;
+      if (col < 0 || width === undefined) return;
+      const { bounds } = args;
+      hoverTimer.current = setTimeout(() => {
+        const value = valueAt(col, row);
+        if (typeof value !== "string") return;
+        // Only a value the cell cuts off: a line break, or wider than the column.
+        const cut = value.includes("\n") || value.length * CHAR_WIDTH > width - 20;
+        if (!cut) return;
+        const text = value.length > PREVIEW_CHARS ? `${value.slice(0, PREVIEW_CHARS)}…` : value;
+        setHover({ text, x: bounds.x, y: bounds.y + bounds.height + 2 });
+      }, PREVIEW_DELAY_MS);
+    },
+    [gridColumns, valueAt],
   );
 
   const currentCell = selection.current?.cell;
@@ -547,10 +904,35 @@ export function ResultGrid({
               ? {
                   provideEditor,
                   onDelete: () => false,
-                  onPaste: false,
+                  onPaste: onPasteCells
+                    ? (target: Item, values: readonly (readonly string[])[]) => {
+                        onPasteCells(target, values);
+                        // The caller applied it (or refused); Glide writes nothing itself.
+                        return false;
+                      }
+                    : false,
                 }
               : {})}
             keybindings={GRID_KEYS}
+            rangeSelect="multi-rect"
+            onKeyDown={onGridKeyDown}
+            onItemHovered={onItemHovered}
+            onCellContextMenu={(cell, event) => {
+              event.preventDefault();
+              openCellMenu(
+                cell,
+                event.bounds.x + event.localEventX,
+                event.bounds.y + event.localEventY,
+              );
+            }}
+            onHeaderContextMenu={(col, event) => {
+              event.preventDefault();
+              openHeaderMenu(
+                col,
+                event.bounds.x + event.localEventX,
+                event.bounds.y + event.localEventY,
+              );
+            }}
             rowMarkers="number"
             rowHeight={ROW_HEIGHT}
             headerHeight={HEADER_HEIGHT}
@@ -569,12 +951,54 @@ export function ResultGrid({
         <ValuePanel
           column={panelColumn}
           value={panelValue}
+          bytes={currentCell && panelColumn ? bytesAt(currentCell[0], currentCell[1]) : null}
           engine={engine}
           onClose={() => {
             setValueOpen(false);
             gridRef.current?.focus();
           }}
         />
+      ) : null}
+      {dialog && columns[dialog.col] ? (
+        <ValueDialog
+          key={`${dialog.col}:${dialog.row}:${dialog.edit}`}
+          column={columns[dialog.col] as ColumnInfo}
+          value={valueAt(dialog.col, dialog.row)}
+          bytes={bytesAt(dialog.col, dialog.row)}
+          engine={engine}
+          edit={
+            edit?.canEdit(dialog.row, dialog.col)
+              ? edit.valueEdit?.(dialog.row, dialog.col)
+              : undefined
+          }
+          startEditing={dialog.edit}
+          onClose={() => {
+            setDialog(null);
+            gridRef.current?.focus();
+          }}
+        />
+      ) : null}
+      {menu ? (
+        <ContextMenu
+          x={menu.x}
+          y={menu.y}
+          label={menu.label}
+          items={menu.items}
+          onClose={() => setMenu(null)}
+        />
+      ) : null}
+      {hover ? (
+        <div
+          className="cell-preview"
+          role="tooltip"
+          data-testid="cell-preview"
+          style={{
+            left: Math.max(4, Math.min(hover.x, window.innerWidth - 484)),
+            top: Math.min(hover.y, window.innerHeight - 120),
+          }}
+        >
+          {hover.text}
+        </div>
       ) : null}
     </div>
   );

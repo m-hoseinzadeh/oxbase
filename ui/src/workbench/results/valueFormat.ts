@@ -7,16 +7,46 @@
  * (`null`), so the panel shows the value as it is.
  */
 
-export type ValueFormat = "text" | "json" | "xml" | "sql";
+export type ValueFormat = "text" | "json" | "xml" | "html" | "sql";
 
-/** The format a value most likely is: JSON and XML by their shape, everything else text. */
+/**
+ * Tags that make markup HTML rather than some XML vocabulary (one-letter tags like `<b>` are
+ * left out: XML uses them too).
+ */
+const HTML_TAG =
+  /<\/?(html|head|body|div|span|p|br|hr|table|thead|tbody|tr|td|th|em|strong|ul|ol|li|h[1-6]|img|section|article|header|footer|nav|form|input|button|label|pre|code|blockquote|style|script|font|center)\b/i;
+
+/** Whether markup starting with `<` looks like HTML (a doctype, `<html>` or common tags). */
+export function looksLikeHtml(text: string): boolean {
+  const t = text.trim();
+  return t.startsWith("<") && (/^<!doctype html/i.test(t) || HTML_TAG.test(t));
+}
+
+/**
+ * The format a value most likely is: JSON by its shape, HTML by its tags, XML when the markup
+ * is well-formed, everything else text.
+ */
 export function detectFormat(text: string): ValueFormat {
   const t = text.trim();
   if ((t.startsWith("{") && t.endsWith("}")) || (t.startsWith("[") && t.endsWith("]"))) {
     if (prettyJson(t) !== null) return "json";
   }
+  if (looksLikeHtml(t)) return "html";
   if (t.startsWith("<") && t.endsWith(">") && prettyXml(t) !== null) return "xml";
   return "text";
+}
+
+/** The image type of `bytes` by its signature (PNG, JPEG, GIF, WebP, BMP), else `null`. */
+export function imageMime(bytes: Uint8Array | null | undefined): string | null {
+  if (!bytes || bytes.length < 12) return null;
+  const at = (i: number) => bytes[i] ?? -1;
+  if (at(0) === 0x89 && at(1) === 0x50 && at(2) === 0x4e && at(3) === 0x47) return "image/png";
+  if (at(0) === 0xff && at(1) === 0xd8 && at(2) === 0xff) return "image/jpeg";
+  if (at(0) === 0x47 && at(1) === 0x49 && at(2) === 0x46 && at(3) === 0x38) return "image/gif";
+  const ascii = (from: number, to: number) => String.fromCharCode(...bytes.subarray(from, to));
+  if (ascii(0, 4) === "RIFF" && ascii(8, 12) === "WEBP") return "image/webp";
+  if (ascii(0, 2) === "BM") return "image/bmp";
+  return null;
 }
 
 /** `text` re-indented as JSON (2 spaces), or `null` when it is not valid JSON. */

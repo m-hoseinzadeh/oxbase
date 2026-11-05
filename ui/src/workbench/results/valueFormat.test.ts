@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { detectFormat, prettyJson, prettyXml } from "./valueFormat";
+import { detectFormat, imageMime, prettyJson, prettyXml } from "./valueFormat";
 
 describe("prettyJson", () => {
   it("re-indents without changing values or key order", () => {
@@ -71,5 +71,23 @@ describe("detectFormat", () => {
     expect(detectFormat("<a><b/></a>")).toBe("xml");
     expect(detectFormat("<a>")).toBe("text");
     expect(detectFormat("SELECT 1")).toBe("text");
+  });
+
+  it("recognizes HTML by its tags, even when it is not well-formed", () => {
+    expect(detectFormat("<!DOCTYPE html><html><body>x</body></html>")).toBe("html");
+    expect(detectFormat("<p>one<br>two</p>")).toBe("html");
+    expect(detectFormat("<order><item/></order>")).toBe("xml");
+  });
+
+  it("recognizes images by their signature", () => {
+    const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13]);
+    expect(imageMime(png)).toBe("image/png");
+    expect(imageMime(new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 0, 0, 0, 0, 0, 0, 0, 0]))).toBe(
+      "image/jpeg",
+    );
+    const webp = new TextEncoder().encode("RIFF\0\0\0\0WEBPVP8 ");
+    expect(imageMime(webp)).toBe("image/webp");
+    expect(imageMime(new TextEncoder().encode("hello, world"))).toBeNull();
+    expect(imageMime(null)).toBeNull();
   });
 });
