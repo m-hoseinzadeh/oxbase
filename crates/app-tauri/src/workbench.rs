@@ -197,6 +197,7 @@ pub struct SessionUsage {
 
 /// Every open connection's sessions (no network access).
 #[tauri::command]
+#[allow(clippy::needless_pass_by_value)] // Tauri passes `State` by value.
 pub fn session_usage(
     connections: State<'_, ConnectionsState>,
     workbench: State<'_, WorkbenchState>,
