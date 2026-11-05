@@ -415,7 +415,21 @@ async function valuePanelGallery() {
     }
     await wd.click(toggle);
     await sleep(300);
-    await wd.click(canvas);
+    // A pointer click at the canvas' centre: Glide's scroller lies over the canvas, so an
+    // element click on the canvas is "intercepted" (the scroller passes the click to the grid).
+    await wd.performActions([
+      {
+        type: "pointer",
+        id: "mouse",
+        parameters: { pointerType: "mouse" },
+        actions: [
+          { type: "pointerMove", origin: canvas, x: 0, y: 0 },
+          { type: "pointerDown", button: 0 },
+          { type: "pointerUp", button: 0 },
+        ],
+      },
+    ]);
+    await wd.releaseActions();
     await sleep(500);
     const seen = await wd.execute(
       "const p = document.querySelector('[data-testid=value-panel]'); if (!p) return null;" +

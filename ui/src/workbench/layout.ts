@@ -120,12 +120,12 @@ function neighbourPanel(api: Pick<DockviewApi, "panels">): string | undefined {
  * the main area is rebuilt above History, or right of the side panels, instead of the tab
  * landing in the active group (Connections, Objects).
  */
-export function mainAreaPosition(
-  api: Pick<DockviewApi, "panels" | "getPanel">,
-): AddPanelPositionOptions {
+export function mainAreaPosition(api: Pick<DockviewApi, "panels">): AddPanelPositionOptions {
   const neighbour = neighbourPanel(api);
   if (neighbour) return { referencePanel: neighbour, direction: "within" };
-  if (api.getPanel("history")) return { referencePanel: "history", direction: "above" };
+  if (api.panels.some((p) => p.id === "history")) {
+    return { referencePanel: "history", direction: "above" };
+  }
   return { direction: "right" };
 }
 

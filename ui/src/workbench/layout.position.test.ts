@@ -2,14 +2,10 @@ import type { DockviewApi } from "dockview-react";
 import { describe, expect, it } from "vitest";
 import { mainAreaPosition } from "./layout";
 
-type Api = Pick<DockviewApi, "panels" | "getPanel">;
+type Api = Pick<DockviewApi, "panels">;
 
 function fakeApi(ids: string[]): Api {
-  const panels = ids.map((id) => ({ id }));
-  return {
-    panels: panels as unknown as Api["panels"],
-    getPanel: ((id: string) => panels.find((p) => p.id === id)) as Api["getPanel"],
-  };
+  return { panels: ids.map((id) => ({ id })) as unknown as Api["panels"] };
 }
 
 describe("mainAreaPosition", () => {
