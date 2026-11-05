@@ -732,8 +732,10 @@ describe("TableDataPanel", () => {
     await waitFor(() => expect(calls("edit_begin")).toHaveLength(1));
     fireEvent.click(screen.getByRole("button", { name: "cell menu 1 name" }));
     const menu = screen.getByTestId("grid-menu");
-    // A text column: no < or >, but contains.
-    expect(within(menu).queryByRole("button", { name: /^Filter by name › < / })).toBeNull();
+    // A text column: ordered comparisons and contains; = quotes the value.
+    expect(
+      within(menu).getByRole("button", { name: "Filter by name › contains 'name1'" }),
+    ).toBeInTheDocument();
     fireEvent.click(within(menu).getByRole("button", { name: "Filter by name › = 'name1'" }));
     await waitFor(() => expect(opens).toHaveLength(2));
     expect(opens[1]?.request).toMatchObject({

@@ -9,9 +9,12 @@
 
 export type ValueFormat = "text" | "json" | "xml" | "html" | "sql";
 
-/** Tags that make markup HTML rather than some XML vocabulary. */
+/**
+ * Tags that make markup HTML rather than some XML vocabulary (one-letter tags like `<b>` are
+ * left out: XML uses them too).
+ */
 const HTML_TAG =
-  /<\/?(html|head|body|div|span|p|br|hr|table|thead|tbody|tr|td|th|b|i|u|em|strong|ul|ol|li|h[1-6]|img|section|article|header|footer|nav|form|input|button|label|pre|code|blockquote|style|script|font|center)\b/i;
+  /<\/?(html|head|body|div|span|p|br|hr|table|thead|tbody|tr|td|th|em|strong|ul|ol|li|h[1-6]|img|section|article|header|footer|nav|form|input|button|label|pre|code|blockquote|style|script|font|center)\b/i;
 
 /** Whether markup starting with `<` looks like HTML (a doctype, `<html>` or common tags). */
 export function looksLikeHtml(text: string): boolean {
