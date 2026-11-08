@@ -9,6 +9,10 @@
  * | Ctrl+Shift+Enter    | run the whole script                             |                |
  * | Shift+F5            | stop the running query                           |                |
  * | Ctrl+S              |                                                  | apply changes  |
+ * | Ctrl+N              | (a new query tab)                                | grid: add row  |
+ *
+ * Ctrl+N opens a new query tab unless the active tab uses it (a table's grid adds a row);
+ * Ctrl+O opens a `.sql` file in a new query tab; Ctrl+, opens the Settings window.
  *
  * Ctrl+= (Ctrl++), Ctrl+- and Ctrl+0 zoom the whole app in, out and back to 100 % (./zoom),
  * whichever tab is active.
@@ -19,8 +23,11 @@
  * Ctrl+Enter) is left alone.
  */
 
-export type ShortcutCommand = "run" | "runCurrent" | "runAll" | "cancel" | "save";
+export type ShortcutCommand = "run" | "runCurrent" | "runAll" | "cancel" | "save" | "new";
 
+import { openSettings } from "../settings";
+import { openQueryEditor } from "./layout";
+import { openSqlFile } from "./openFile";
 import { resetZoom, zoomIn, zoomOut } from "./zoom";
 
 /** Runs `command` for its tab; `false` when the tab has nothing for it. */
@@ -58,6 +65,16 @@ export function shortcutOf(event: Keys): ShortcutCommand | "reload" | null {
   if (mod && key === "r") return event.shiftKey ? "reload" : "run";
   if (mod && key === "Enter") return event.shiftKey ? "runAll" : "runCurrent";
   if (mod && !event.shiftKey && key === "s") return "save";
+  if (mod && !event.shiftKey && key === "n") return "new";
+  return null;
+}
+
+/** App-wide keys that are no tab's: Ctrl+O (open a file) and Ctrl+, (Settings). */
+export function appShortcutOf(event: Keys): "openFile" | "settings" | null {
+  if (!(event.ctrlKey || event.metaKey) || event.altKey || event.shiftKey) return null;
+  const key = event.key.length === 1 ? event.key.toLowerCase() : event.key;
+  if (key === "o") return "openFile";
+  if (key === ",") return "settings";
   return null;
 }
 
@@ -88,6 +105,7 @@ export const SHORTCUT_LABELS: Record<ShortcutCommand, string> = {
   runAll: "Ctrl+Shift+Enter",
   cancel: "Shift+F5",
   save: "Ctrl+S",
+  new: "Ctrl+N",
 };
 
 /**
@@ -108,6 +126,13 @@ export function installShortcuts(
       return;
     }
     if (event.repeat) return;
+    const app = appShortcutOf(event);
+    if (app !== null) {
+      event.preventDefault();
+      if (app === "settings") openSettings();
+      else void openSqlFile();
+      return;
+    }
     const shortcut = shortcutOf(event);
     if (shortcut === null) return;
     const reloads = event.key === "F5" || event.key.toLowerCase() === "r";
@@ -116,6 +141,11 @@ export function installShortcuts(
       const handler = id ? handlers.get(id) : undefined;
       if (handler?.(shortcut)) {
         event.preventDefault();
+        return;
+      }
+      if (shortcut === "new") {
+        event.preventDefault();
+        openQueryEditor();
         return;
       }
     }

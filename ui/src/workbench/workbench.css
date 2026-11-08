@@ -42,10 +42,16 @@
 
 .app__toolbar {
   display: flex;
+  flex: 1;
   align-items: center;
   gap: 2px;
   min-width: 0;
   color: var(--color-fg-muted);
+}
+
+/* Pushes the Settings button to the bar's right end. */
+.app__toolbar-spacer {
+  flex: 1;
 }
 
 .app__toolbar .button {
@@ -1748,4 +1754,66 @@ input[type="search"] {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   pointer-events: none;
+}
+
+/* --- Settings window (workbench/SettingsDialog.tsx) ---------------------------------------- */
+
+.modal.settings-dialog {
+  width: min(720px, calc(100vw - 32px));
+}
+
+.settings {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+}
+
+.settings__group > legend,
+.settings__heading {
+  margin: 0 0 var(--space-1);
+  padding: 0;
+  font-size: var(--text-sm);
+  font-weight: 600;
+  color: var(--color-fg);
+}
+
+.settings__group .field-row > .field {
+  flex: 1;
+}
+
+.settings__shortcuts {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.shortcut-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--text-sm);
+}
+
+.shortcut-table caption {
+  padding-bottom: var(--space-1);
+  color: var(--color-fg-muted);
+  font-size: var(--text-xs);
+  font-weight: 600;
+  text-align: left;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.shortcut-table th,
+.shortcut-table td {
+  padding: var(--space-1) 0;
+  border-top: 1px solid var(--color-border);
+  vertical-align: top;
+  text-align: left;
+  font-weight: 400;
+}
+
+.shortcut-table th {
+  width: 40%;
+  padding-right: var(--space-3);
+  white-space: nowrap;
 }

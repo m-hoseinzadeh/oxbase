@@ -183,7 +183,8 @@ previewed first):
   (manifest, object definitions and DDL, table rows as zstd-compressed Arrow IPC, a SHA-256 per
   entry, no connection details), verify and list, and restore into an existing schema or
   database of the same engine (structure, data or both; drop existing and truncate need a
-  confirmation).
+  confirmation). A **Data only** backup holds just the chosen tables' rows (one table is
+  fine); restoring it loads them into the existing tables and creates nothing.
 
 Contracts and every deviation: [docs/m8-contracts.md](docs/m8-contracts.md). Numbers: see
 *Transfer, sync and backup (M8)* below.
@@ -767,15 +768,19 @@ pnpm tauri build                          # release bundles for the current OS
 5. **History** lists past statements. Search them, **Open in editor**, **Delete**, clear them
    all, or turn history off.
 6. Ctrl+= and Ctrl+- zoom the whole app, Ctrl+0 goes back to 100 % (the level is remembered;
-   the status bar shows it while it is not 100 %).
+   the status bar shows it while it is not 100 %). Ctrl+N opens a query tab, Ctrl+O opens a
+   `.sql` file in one.
+7. **Settings** (the gear at the right of the toolbar, or Ctrl+,): theme, zoom, grid row
+   height, rows to load when a table opens, whether Filter & sort starts open, the Sessions
+   setting new connections start with, and the list of keyboard shortcuts.
 
 ### Editing data and designing tables
 
 1. With the fixture, expand `oxbase_test` > `m3` > **Tables** and double-click `m3_edit_pk`.
    **Filter & sort** narrows and orders the rows (the query is re-run on the server; Enter
-   applies). The tab loads the first 1,000 rows: the **Rows** control changes that (new tabs
-   start with your last choice), and **Load all rows** fetches the rest. Export always writes
-   every row.
+   applies). The tab loads the first 1,000 rows: the **Rows** control changes that for the
+   tab (the default is in **Settings**), and **Load all rows** fetches the rest. Export always
+   writes every row.
 2. Double-click a cell (or start typing) to edit it, **Add row** / **Duplicate row** /
    **Delete row** to change rows, **Revert row** to drop a row's pending changes. Pending
    changes are coloured; **Apply** writes them all in one transaction, **Discard** drops them.
@@ -786,7 +791,8 @@ pnpm tauri build                          # release bundles for the current OS
    SQL INSERT or an IN list), filter by it, set NULL, paste (Ctrl+V; new rows: Ctrl+Shift+V)
    or add, duplicate (Ctrl+D), delete (Delete) and revert (Ctrl+Z) rows; Ctrl+S applies.
    Right-click a header to sort or fit columns; Ctrl+F searches; Ctrl/Shift+click selects
-   several rows or cell ranges.
+   several rows or cell ranges. On a foreign-key cell, **Open related row** opens the row it
+   references in a new tab.
 3. **Design** (in the tab, or in the Objects panel with a table selected) opens the table
    designer; **New table** starts an empty one. Change columns, indexes, foreign keys, checks
    or options, then **Preview** shows the script. **Apply** runs it (destructive statements

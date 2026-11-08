@@ -617,6 +617,81 @@ async fn structure_only_backups_restore_without_rows() {
 }
 
 #[tokio::test]
+async fn data_only_backups_load_rows_into_existing_tables() {
+    let dir = tempfile::tempdir().unwrap();
+    let driver = MockDriver::new(ENGINE);
+    let connection = connect(&driver).await;
+    let dialects = registry(Arc::new(Recorder::default()));
+    let spec = BackupSpec {
+        container: container(),
+        objects: vec![ObjectRef::new(ObjectKind::Table, "items")],
+        content: BackupContent::DataOnly,
+        compression: Compression::None,
+    };
+    let path = dir.path().join("rows.oxbackup");
+    let report = backup(
+        BackupJob {
+            dialects: &dialects,
+            metadata: connection.as_ref(),
+            rows: connection.as_ref(),
+            spec: &spec,
+        },
+        &path,
+        false,
+        &|_| {},
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.manifest.content, BackupContent::DataOnly);
+    assert_eq!(report.manifest.total_rows(), 12);
+
+    // Any restore of it loads the rows and creates nothing.
+    let (outcome, log) = try_restore(
+        &path,
+        &RestoreOptions {
+            truncate_before_load: true,
+            confirm_destructive: true,
+            ..options()
+        },
+        ENGINE,
+    )
+    .await;
+    assert!(outcome.error.is_none(), "{:?}", outcome.error);
+    assert_eq!(outcome.report.rows, 12);
+    assert!(
+        outcome
+            .report
+            .warnings
+            .iter()
+            .any(|w| w.contains("table rows only")),
+        "{:?}",
+        outcome.report.warnings
+    );
+    assert!(log.iter().any(|s| s == "INSERT rows"), "{log:?}");
+    assert!(
+        !log.iter()
+            .any(|s| s.starts_with("CREATE") || s.starts_with("DROP")),
+        "{log:?}"
+    );
+
+    // Structure only has nothing to restore from it.
+    let (outcome, log) = try_restore(
+        &path,
+        &RestoreOptions {
+            content: RestoreContent::StructureOnly,
+            ..options()
+        },
+        ENGINE,
+    )
+    .await;
+    let err = outcome.error.unwrap();
+    assert_eq!(err.category(), ErrorCategory::InvalidInput);
+    assert!(err.to_string().contains("restore it as data only"), "{err}");
+    assert_eq!(log, Vec::<String>::new(), "the target was touched");
+}
+
+#[tokio::test]
 async fn foreign_keys_to_the_table_itself_wait_for_the_rows() {
     let dir = tempfile::tempdir().unwrap();
     let (path, _) = make_backup_with(

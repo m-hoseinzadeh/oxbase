@@ -162,6 +162,7 @@ pub fn run() {
             files::file_pick_open,
             files::file_pick_save,
             files::file_release,
+            files::file_read_text,
             transfer::import_preview,
             transfer::import_plan,
             transfer::import_run,

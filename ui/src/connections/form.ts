@@ -2,6 +2,7 @@
  * The "New / Edit connection" form model: defaults, validation and conversion to and from a
  * {@link ConnectionProfile}. Pure functions, so they are easy to test.
  */
+import { getSettings } from "../settings";
 import {
   type ConnectionProfile,
   DIALOG_ENGINES,
@@ -378,7 +379,8 @@ export function emptyForm(engine: DialogEngine = "postgres"): ConnectionForm {
     sentinelAuth: "none",
     protocol: "auto",
     namespaceSeparator: DEFAULT_SEPARATOR,
-    sessionMode: "per_tab",
+    // The Settings window's default for new connections (used where the engine offers it).
+    sessionMode: getSettings().sessionMode,
   };
 }
 

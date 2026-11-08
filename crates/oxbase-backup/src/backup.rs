@@ -254,7 +254,11 @@ impl Run<'_> {
         )
         .await?;
         let mut warnings = loaded.warnings;
-        let objects = creation_order(loaded.objects);
+        let mut objects = creation_order(loaded.objects);
+        if !spec.content.has_structure() {
+            // Data only: the tables, whose definitions read the rows back; nothing else.
+            objects.retain(|d| matches!(d, ObjectDef::Table(_)));
+        }
         warnings.extend(fidelity_warnings(&objects, spec));
         self.progress.objects_total = u32::try_from(objects.len()).unwrap_or(u32::MAX);
         self.report(true);
@@ -264,7 +268,7 @@ impl Run<'_> {
         let mut manifest_objects = Vec::with_capacity(objects.len());
         let mut entries = std::collections::BTreeMap::new();
         let mut without_ddl: Vec<ObjectKind> = Vec::new();
-        let with_data = spec.content == BackupContent::StructureAndData;
+        let with_data = spec.content.has_rows();
         if with_data && objects.iter().any(|d| matches!(d, ObjectDef::Table(_))) {
             warnings.push(
                 "each table's rows were read in a transaction of their own; rows of different \
@@ -507,7 +511,7 @@ fn fidelity_warnings(objects: &[ObjectDef], spec: &BackupSpec) -> Vec<String> {
             _ => None,
         })
         .collect();
-    if spec.content == BackupContent::StructureAndData {
+    if spec.content.has_rows() {
         for t in &tables {
             for c in &t.columns {
                 let precision = match &c.data_type {

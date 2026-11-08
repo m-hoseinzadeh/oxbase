@@ -373,6 +373,39 @@ pub async fn file_pick_save(
     Ok(Some(files.register(path, FileAccess::Write)))
 }
 
+/// Most bytes [`file_read_text`] reads: a script opened in a query tab.
+pub const MAX_TEXT_BYTES: u64 = 16 * 1024 * 1024;
+
+/// The text of a file (UTF-8, a leading byte order mark dropped, at most
+/// [`MAX_TEXT_BYTES`]).
+fn read_text(path: &Path) -> Result<String> {
+    let unreadable = |e: std::io::Error| Error::not_found(format!("could not read the file: {e}"));
+    let len = std::fs::metadata(path).map_err(unreadable)?.len();
+    if len > MAX_TEXT_BYTES {
+        return Err(Error::invalid_input(format!(
+            "the file is {} MB; a query tab opens files of at most {} MB",
+            len.div_ceil(1024 * 1024),
+            MAX_TEXT_BYTES / (1024 * 1024)
+        )));
+    }
+    let bytes = std::fs::read(path).map_err(unreadable)?;
+    let text =
+        String::from_utf8(bytes).map_err(|_| Error::invalid_input("the file is not UTF-8 text"))?;
+    Ok(match text.strip_prefix('\u{feff}') {
+        Some(rest) => rest.to_owned(),
+        None => text,
+    })
+}
+
+/// The text of read handle `handle`: a `.sql` file opened in a query tab (Ctrl+O). UTF-8 only,
+/// at most [`MAX_TEXT_BYTES`].
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)] // Tauri passes `State` by value.
+pub fn file_read_text(files: State<'_, FilesState>, handle: FileHandle) -> CommandResult<String> {
+    let path = files.read_path(handle)?;
+    Ok(read_text(&path)?)
+}
+
 /// Drops a handle; `false` when it was unknown.
 #[tauri::command]
 #[allow(clippy::needless_pass_by_value)] // Tauri passes `State` by value.
@@ -383,6 +416,18 @@ pub fn file_release(files: State<'_, FilesState>, handle: FileHandle) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn text_files_read_as_utf8_without_a_bom() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("q.sql");
+        std::fs::write(&path, "\u{feff}SELECT 'é';\n").unwrap();
+        assert_eq!(read_text(&path).unwrap(), "SELECT 'é';\n");
+        std::fs::write(&path, [0xff, 0xfe, 0x00]).unwrap();
+        let err = read_text(&path).unwrap_err();
+        assert_eq!(err.category(), ErrorCategory::InvalidInput);
+        assert!(read_text(&dir.path().join("missing.sql")).is_err());
+    }
 
     #[test]
     fn handles_resolve_by_access_and_expire() {

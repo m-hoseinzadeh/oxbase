@@ -68,7 +68,7 @@ use tokio::sync::mpsc;
 
 use crate::archive::ArchiveReader;
 use crate::backup::{elapsed_ms, until_cancelled};
-use crate::format::{BackupContent, Manifest, ManifestObject};
+use crate::format::{Manifest, ManifestObject};
 use crate::objects::{after_data, late_order, mentions, retarget_text};
 
 /// What a restore writes.
@@ -382,14 +382,27 @@ impl Restore<'_> {
         let opened = self.open(engine).await?;
         self.progress.rows = 0;
         let manifest = opened.manifest;
-        let with_structure = options.content != RestoreContent::DataOnly;
-        let with_data = options.content != RestoreContent::StructureOnly
-            && manifest.content == BackupContent::StructureAndData;
-        if options.content != RestoreContent::StructureOnly
-            && manifest.content == BackupContent::StructureOnly
-        {
+        let with_structure =
+            options.content != RestoreContent::DataOnly && manifest.content.has_structure();
+        let with_data =
+            options.content != RestoreContent::StructureOnly && manifest.content.has_rows();
+        if options.content != RestoreContent::StructureOnly && !manifest.content.has_rows() {
             self.warnings
                 .push("the backup holds no table rows; only the structure was restored".into());
+        }
+        if !manifest.content.has_structure() {
+            if options.content == RestoreContent::StructureOnly {
+                return Err(Error::invalid_input(
+                    "the backup holds table rows only, no structure: restore it as data only",
+                ));
+            }
+            if options.content == RestoreContent::StructureAndData {
+                self.warnings.push(
+                    "the backup holds table rows only: they were loaded into the existing \
+                     tables, and no definition was created or changed"
+                        .into(),
+                );
+            }
         }
 
         // Plan: move every definition to the target container, find what exists there.

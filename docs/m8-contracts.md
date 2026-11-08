@@ -350,7 +350,8 @@ ZIP (zip64 when large), entries `manifest.json` (deflate), `objects/NNNN.json` (
 deflate), `objects/NNNN.sql` (CREATE text, deflate), `data/NNNN.arrows` (Arrow IPC stream in
 the load schema, zstd buffer compression, stored). `Manifest { format: "oxbase-backup",
 formatVersion: 1, oxbaseVersion, createdAt, engine, serverVersion, source: {container},
-content: structure_and_data | structure_only, compression: {codec: none | zstd}, objects:
+content: structure_and_data | structure_only | data_only (1.2: tables only, rows restored into
+existing tables, nothing created), compression: {codec: none | zstd}, objects:
 [ManifestObject {index, kind, ref, definition, ddl?, data?: {entry, rows, columns}}], order,
 entries: {name: {size, sha256}}, warnings, ...unknown }`. Never: hosts, ports, users,
 passwords, SSH / TLS settings, profile names, local paths. Readers refuse newer format

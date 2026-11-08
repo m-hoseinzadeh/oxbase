@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { updateSettings } from "../settings";
 import {
   emptyForm,
   firstError,
@@ -197,6 +198,13 @@ describe("profileFromForm", () => {
 });
 
 describe("session mode", () => {
+  it("starts new connections with the Settings window's default", () => {
+    updateSettings({ sessionMode: "per_run" });
+    expect(emptyForm("mysql").sessionMode).toBe("per_run");
+    updateSettings({ sessionMode: "per_tab" });
+    expect(emptyForm("mysql").sessionMode).toBe("per_tab");
+  });
+
   it("is written only when connecting for each run, and only for the server SQL engines", () => {
     const form = { ...emptyForm("postgres"), name: "pg", host: "db" };
     expect(profileFromForm(form).session_mode).toBeUndefined();

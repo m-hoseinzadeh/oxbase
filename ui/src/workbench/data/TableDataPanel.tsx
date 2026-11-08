@@ -17,6 +17,8 @@
  *   Ctrl+Shift+V do the same from the keyboard, and Ctrl+S applies the pending changes.
  * - A status line under the grid: rows loaded (and the limit), selected rows, pending changes,
  *   load time.
+ * - A foreign-key cell opens the referenced row in a new tab ("Open related row"); a tab opened
+ *   that way starts filtered to it (`related`).
  */
 import type { Item } from "@glideapps/glide-data-grid";
 import {
@@ -33,6 +35,7 @@ import {
   Eraser,
   Funnel,
   Info,
+  Link,
   LoaderCircle,
   Lock,
   type LucideIcon,
@@ -53,6 +56,7 @@ import {
   type CellInput,
   capabilitiesGet,
   deleteRow,
+  designerLoad,
   type Editability,
   type EditColumn,
   type EngineCapabilities,
@@ -61,6 +65,7 @@ import {
   emptyChanges,
   type Filter,
   type FilterOp,
+  type ForeignKeyDef,
   type FormRow,
   insertRow,
   type ObjectRef,
@@ -81,7 +86,8 @@ import { Modal } from "../../components/Modal";
 import { Select } from "../../components/Select";
 import { toCommandError } from "../../connections/api";
 import { useConnections } from "../../connections/store";
-import { openTableDesigner } from "../layout";
+import { getSettings } from "../../settings";
+import { openTableData, openTableDesigner, type RelatedValue } from "../layout";
 import { qualifiedName as qualified } from "../names";
 import { parseTsv, quoteIdent } from "../results/copyFormats";
 import { ResultPager } from "../results/pager";
@@ -143,7 +149,6 @@ import {
   ROW_LIMITS,
   rowLimitLabel,
   rowLimitValue,
-  saveDefaultRowLimit,
 } from "./rowLimit";
 import { SortBuilder } from "./SortBuilder";
 
@@ -151,6 +156,22 @@ export interface TableDataParams {
   editorId: string;
   sessionId: string;
   table: ObjectRef;
+  /** Opened from a foreign key: start filtered to the rows with these values. */
+  related?: RelatedValue[] | undefined;
+}
+
+/** The filter draft of a related-rows tab: one `=` (or IS NULL) condition per column. */
+function relatedDraft(related: RelatedValue[] | undefined): FilterDraft {
+  const draft = emptyDraft();
+  if (!related) return draft;
+  for (const r of related) {
+    draft.root.items.push({
+      ...newCondition(r.column),
+      op: r.value === null ? "isNull" : "eq",
+      values: r.value === null ? [] : [r.value],
+    });
+  }
+  return draft;
 }
 
 type View = "grid" | "form" | "json";
@@ -194,17 +215,26 @@ function plural(n: number, one: string, many: string): string {
   return `${n.toLocaleString("en-US")} ${n === 1 ? one : many}`;
 }
 
-export function TableDataPanel({ editorId, sessionId, table }: TableDataParams) {
+export function TableDataPanel({ editorId, sessionId, table, related }: TableDataParams) {
   const engine = useConnections().sessions.find((s) => s.id === sessionId)?.engine;
   const [valuePanel, setValuePanel] = useState(false);
   const [caps, setCaps] = useState<EngineCapabilities | null>(null);
   const [run, dispatch] = useReducer(runReducer, IDLE_RUN);
-  const [draft, setDraft] = useState<FilterDraft>(emptyDraft);
+  const [draft, setDraft] = useState<FilterDraft>(() => relatedDraft(related));
   const [sortDraft, setSortDraft] = useState<SortDraftKey[]>([]);
-  const [query, setQuery] = useState<AppliedQuery>(() => ({ sort: [], limit: defaultRowLimit() }));
+  const [query, setQuery] = useState<AppliedQuery>(() => {
+    // The columns are not known yet: the related filter names them itself.
+    const { filter } = draftToFilter(relatedDraft(related), []);
+    return { ...(filter ? { filter } : {}), sort: [], limit: defaultRowLimit() };
+  });
   /** The query the tab opens with (the effect below runs once per editor). */
   const initialQuery = useRef(query);
-  const [showBuilders, setShowBuilders] = useState(false);
+  const [showBuilders, setShowBuilders] = useState(
+    () => related !== undefined || getSettings().filterOpen,
+  );
+  /** The table's foreign keys ("Open related row"); empty until loaded, or without a designer. */
+  const [foreignKeys, setForeignKeys] = useState<ForeignKeyDef[]>([]);
+  const gridBox = useRef<HTMLDivElement>(null);
   const [editability, setEditability] = useState<Editability | null>(null);
   const [editError, setEditError] = useState<string | null>(null);
   const [changes, setChanges] = useState<PendingChanges>(emptyChanges);
@@ -323,6 +353,19 @@ export function TableDataPanel({ editorId, sessionId, table }: TableDataParams) 
     };
   }, [sessionId]);
 
+  // The foreign keys, for "Open related row" (tables only; engines without a designer have none).
+  useEffect(() => {
+    if (table.kind !== "table") return;
+    let alive = true;
+    designerLoad(sessionId, table).then(
+      (design) => alive && setForeignKeys(design.foreignKeys.map((f) => f.def)),
+      () => {},
+    );
+    return () => {
+      alive = false;
+    };
+  }, [sessionId, table]);
+
   // Once the rows are in, ask whether they can be edited.
   const runId = run.runId;
   const finished = run.status === "finished";
@@ -428,8 +471,8 @@ export function TableDataPanel({ editorId, sessionId, table }: TableDataParams) 
     guardPending(() => void open(query), "Refreshing");
   }
 
+  /** This tab's limit; the default for new tabs is a setting (the Settings window). */
   function changeLimit(limit: number | null) {
-    saveDefaultRowLimit(limit);
     const next: AppliedQuery = { ...query, limit };
     guardPending(() => {
       setQuery(next);
@@ -440,6 +483,12 @@ export function TableDataPanel({ editorId, sessionId, table }: TableDataParams) 
   // F5 / Ctrl+R reload the rows (../shortcuts), through the same pending-changes guard.
   const shortcut = useRef<ShortcutHandler>(() => false);
   shortcut.current = (command) => {
+    if (command === "new") {
+      // Ctrl+N in the grid adds a row; elsewhere it opens a new query tab.
+      if (!editable || !gridBox.current?.contains(document.activeElement)) return false;
+      addRow();
+      return true;
+    }
     if (command === "save") {
       // Ctrl+S applies the pending changes, like the Apply button.
       if (editable && changes.edits.length > 0) void apply();
@@ -817,6 +866,17 @@ export function TableDataPanel({ editorId, sessionId, table }: TableDataParams) 
       submenu: filterItems,
     });
 
+    for (const fk of foreignKeys) {
+      if (!fk.columns.includes(name) || !row) continue;
+      items.push({
+        label: `Open related row in ${short(qualified(fk.ref_table))}`,
+        icon: Link,
+        separatorBefore: true,
+        disabled: fk.columns.length === 1 && value === null,
+        onSelect: () => void openRelated(fk, target),
+      });
+    }
+
     if (editable) {
       const at: Item = [target.col, target.row];
       const count = selectedRowCount(rows, totalRows);
@@ -857,6 +917,40 @@ export function TableDataPanel({ editorId, sessionId, table }: TableDataParams) 
     }
     if (items[0]) items[0] = { ...items[0], separatorBefore: true };
     return items;
+  }
+
+  /** Opens the row `fk` references from row `target.row` in a new, filtered tab. */
+  async function openRelated(fk: ForeignKeyDef, target: GridCellTarget) {
+    const row = gridRow(target.row, stored, applied, changes);
+    if (!row) return;
+    let values: (string | null)[];
+    if (fk.columns.length === 1 && typeof target.value === "string") {
+      values = [target.value];
+    } else {
+      // Several columns: their exact texts from the row (pending values first).
+      let form: FormRow | null = null;
+      if (row.type === "row") {
+        try {
+          form = await loadForm(row.row);
+        } catch (error) {
+          setApplyError(`Could not read the row: ${toCommandError(error).message}`);
+          return;
+        }
+      }
+      values = fk.columns.map((c) => {
+        const column = columns.find((x) => x.name === c);
+        const input = column ? knownInput(row, column) : undefined;
+        if (input) return input.type === "text" ? input.text : null;
+        return form?.fields.find((f) => f.column === c)?.text ?? null;
+      });
+    }
+    // A NULL in a foreign key references no row.
+    if (values.some((v) => v === null)) return;
+    openTableData({
+      sessionId,
+      table: fk.ref_table,
+      related: fk.ref_columns.map((column, i) => ({ column, value: values[i] ?? null })),
+    });
   }
 
   /** The table data items of the grid's header menu: sort, filter. */
@@ -1091,7 +1185,7 @@ export function TableDataPanel({ editorId, sessionId, table }: TableDataParams) 
         <Select
           className="table-data__limit"
           aria-label="Rows to load"
-          title="How many rows to load (new tabs start with your last choice)"
+          title="How many rows this tab loads (the default for new tabs is in Settings)"
           value={rowLimitValue(query.limit)}
           disabled={active}
           onChange={(e) => changeLimit(parseRowLimit(e.target.value))}
@@ -1388,7 +1482,7 @@ export function TableDataPanel({ editorId, sessionId, table }: TableDataParams) 
             <p className="results__empty">No rows.</p>
           )
         ) : view === "grid" ? (
-          <div className="results__grid">
+          <div className="results__grid" ref={gridBox}>
             <ResultGrid
               key={runId ?? ""}
               pager={pager}

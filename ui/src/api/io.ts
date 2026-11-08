@@ -372,6 +372,11 @@ export function filePickOpen(filters: FileFilter[], title?: string): Promise<Pic
   return call("file_pick_open", { filters, title: title ?? null });
 }
 
+/** The text of a read handle (UTF-8, at most 16 MB): a `.sql` file opened in a query tab. */
+export function fileReadText(handle: FileHandle): Promise<string> {
+  return call("file_read_text", { handle });
+}
+
 /**
  * Native save dialog (shown by Rust) with `defaultName` (a plain file name) suggested. `null`
  * when the user cancelled. The handle is used up by `exportRun`.

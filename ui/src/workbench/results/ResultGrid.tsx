@@ -63,6 +63,7 @@ import {
 } from "react";
 import type { ColumnInfo, Engine } from "../../api";
 import { ContextMenu, type MenuItem, OPENS_SUBMENU } from "../../components/ContextMenu";
+import { ROW_HEIGHTS, useSettings } from "../../settings";
 import { normalizeColor, subscribeTheme } from "../theme-bridge";
 import {
   type CopyNotify,
@@ -120,8 +121,7 @@ const CHAR_WIDTH = 7.6;
 
 /** Rows assumed visible before the grid reports its real viewport. */
 const MIN_VIEWPORT_ROWS = 60;
-/** Dense grid metrics (docs/design-system.md: 28 px controls, 4 px grid). */
-const ROW_HEIGHT = 28;
+/** Dense grid metrics (docs/design-system.md: 4 px grid); the row height is a setting. */
 const HEADER_HEIGHT = 32;
 /** NULL draws as a faint italic word, so it never reads as the text "NULL". */
 const NULL_FONT_STYLE = "italic 12.5px";
@@ -374,6 +374,8 @@ export function ResultGrid({
   const portalRef = useRef<HTMLDivElement>(null);
   const region = useRef<Rectangle>({ x: 0, y: 0, width: 0, height: 0 });
   const theme = useGridTheme();
+  // Grid rows: compact, default or comfortable (the Settings window).
+  const { gridDensity } = useSettings();
   const [widths, setWidths] = useState<Record<number, number>>({});
   const [selection, setSelection] = useState<GridSelection>(() =>
     selectedRows ? toGridSelection(selectedRows) : NO_SELECTION,
@@ -838,7 +840,7 @@ export function ResultGrid({
       return;
     }
     const gridKey: GridKey | null =
-      key === "Delete" && !mod
+      (key === "Delete" && !mod) || (mod && event.altKey && key === "-")
         ? "delete"
         : mod && !event.shiftKey && key === "d"
           ? "duplicate"
@@ -934,7 +936,7 @@ export function ResultGrid({
               );
             }}
             rowMarkers="number"
-            rowHeight={ROW_HEIGHT}
+            rowHeight={ROW_HEIGHTS[gridDensity]}
             headerHeight={HEADER_HEIGHT}
             smoothScrollX
             smoothScrollY

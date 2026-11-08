@@ -211,6 +211,7 @@ export function BackupDialog({ init, onClose }: { init: BackupInit; onClose: () 
             >
               <option value="structure_and_data">Structure and data</option>
               <option value="structure_only">Structure only</option>
+              <option value="data_only">Data only (table rows)</option>
             </Select>
           </div>
           <label className="checkbox sync-inline-check">
@@ -219,7 +220,9 @@ export function BackupDialog({ init, onClose }: { init: BackupInit; onClose: () 
           </label>
         </div>
         <p className="field__hint">
-          The archive holds object definitions, their DDL and the table rows, each with a checksum.
+          {content === "data_only"
+            ? "The archive holds the chosen tables' rows, each table with a checksum; a restore loads them into existing tables and creates nothing."
+            : "The archive holds object definitions, their DDL and the table rows, each with a checksum."}{" "}
           It never holds hosts, users or passwords.
         </p>
         {pickError ? <Note tone="error">{pickError}</Note> : null}
