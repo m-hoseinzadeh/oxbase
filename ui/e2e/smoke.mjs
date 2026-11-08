@@ -1651,6 +1651,28 @@ const SUGGESTIONS =
   "  if (rows.length) return rows; }" +
   "return null;";
 
+/**
+ * Whether the open suggest widget shows its last row whole (issue #28): when every item is
+ * rendered (no scrolling), the last row must end inside the widget's border. Returns the rows,
+ * the widget's box sizing and how many pixels of the last row are cut off.
+ */
+const SUGGEST_FIT =
+  "const widgets = Array.from(document.querySelectorAll('.suggest-widget'))" +
+  "  .filter((w) => w.offsetParent !== null && getComputedStyle(w).display !== 'none');" +
+  "const w = widgets[widgets.length - 1]; if (!w) return null;" +
+  "const rows = Array.from(w.querySelectorAll('.monaco-list-row'));" +
+  "if (!rows.length) return null;" +
+  "const style = getComputedStyle(w); const box = w.getBoundingClientRect();" +
+  "const inner = box.bottom - parseFloat(style.borderBottomWidth || '0');" +
+  "const status = w.querySelector('.suggest-status-bar');" +
+  "const statusHeight = status && status.offsetParent !== null ? status.getBoundingClientRect().height : 0;" +
+  "const total = Number(rows[0].getAttribute('aria-setsize') || rows.length);" +
+  "const last = rows.reduce((a, r) => (Number(r.getAttribute('aria-posinset')) > Number(a.getAttribute('aria-posinset')) ? r : a));" +
+  "const lastBottom = last.getBoundingClientRect().bottom;" +
+  "return { rows: rows.length, total, boxSizing: style.boxSizing, widgetHeight: Math.round(box.height)," +
+  "  rowHeight: Math.round(last.getBoundingClientRect().height)," +
+  "  clippedPx: rows.length === total ? Math.max(0, Math.round((lastBottom - (inner - statusHeight)) * 10) / 10) : 0 };";
+
 /** One `insight_complete` call per sample through the webview's IPC, timed in the page. */
 const INSIGHT_PROBE = `
 const [text, samples, done] = arguments;
@@ -1744,6 +1766,14 @@ async function insightChecks() {
     );
   }
   const t1 = await wd.execute("return performance.now();");
+  // Issue #28: the list's last row must not be cut off by the widget's border.
+  const fit = await wd.execute(SUGGEST_FIT);
+  log(`completion widget: ${JSON.stringify(fit)}`);
+  // A plain screenshot: the theme buttons of `gallery` would take the focus and close the list.
+  await screenshot("ui-06-completion");
+  if (fit && fit.clippedPx > 0.5) {
+    throw new Error(`the completion list's last row is cut off by ${fit.clippedPx} px (issue #28)`);
+  }
   const ipc = await wd.execute(
     "return window.__e2e.ipc.filter((e) => e.cmd === 'insight_complete' && e.start >= arguments[0]" +
       " && e.end !== null).map((e) => e.end - e.start);",
