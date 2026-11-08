@@ -1658,14 +1658,15 @@ const SUGGESTIONS =
  */
 const SUGGEST_FIT =
   "const widgets = Array.from(document.querySelectorAll('.suggest-widget'))" +
-  "  .filter((w) => w.offsetParent !== null && getComputedStyle(w).display !== 'none');" +
+  // Visible by its box: with fixed overflow widgets the widget has no offsetParent.
+  "  .filter((w) => w.getBoundingClientRect().height > 0 && getComputedStyle(w).display !== 'none');" +
   "const w = widgets[widgets.length - 1]; if (!w) return null;" +
   "const rows = Array.from(w.querySelectorAll('.monaco-list-row'));" +
   "if (!rows.length) return null;" +
   "const style = getComputedStyle(w); const box = w.getBoundingClientRect();" +
   "const inner = box.bottom - parseFloat(style.borderBottomWidth || '0');" +
   "const status = w.querySelector('.suggest-status-bar');" +
-  "const statusHeight = status && status.offsetParent !== null ? status.getBoundingClientRect().height : 0;" +
+  "const statusHeight = status && getComputedStyle(status).display !== 'none' ? status.getBoundingClientRect().height : 0;" +
   "const total = Number(rows[0].getAttribute('aria-setsize') || rows.length);" +
   "const last = rows.reduce((a, r) => (Number(r.getAttribute('aria-posinset')) > Number(a.getAttribute('aria-posinset')) ? r : a));" +
   "const lastBottom = last.getBoundingClientRect().bottom;" +
