@@ -280,6 +280,14 @@
   box-sizing: border-box;
 }
 
+/* Monaco sizes its widgets for the browser's default box model: with border-box, the suggest
+   widget's 1 px borders came out of its rows, clipping the last one (issue #28). Its own
+   explicit box-sizing rules are more specific, or load later, and still apply. */
+.monaco-editor,
+.monaco-editor :where(*, *::before, *::after) {
+  box-sizing: content-box;
+}
+
 html,
 body,
 #root {
