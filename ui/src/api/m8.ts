@@ -458,7 +458,8 @@ export type DataApplyEvent =
 
 // --- backup / restore (oxbase_backup, oxbase_services::backup) --------------------------------
 
-export type BackupContent = "structure_and_data" | "structure_only";
+/** `data_only`: the tables' rows only (their definitions are kept just to read them back). */
+export type BackupContent = "structure_and_data" | "structure_only" | "data_only";
 export type Compression = { codec: "none" } | { codec: "zstd" };
 
 export interface BackupSpec {

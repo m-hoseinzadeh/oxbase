@@ -1,8 +1,8 @@
 /**
  * How many rows a table-data tab loads (`TableDataQuery.limit`). Opening a table without a
  * limit streams every row, and the server keeps the SELECT's locks until the stream ends, so
- * tabs load the first {@link DEFAULT_ROW_LIMIT} rows unless the user asks for more. The last
- * choice becomes the default for new tabs (until the settings window has its own field).
+ * tabs load the first {@link DEFAULT_ROW_LIMIT} rows unless the user asks for more. The default
+ * for new tabs is set in the Settings window; a tab's Rows control changes that tab only.
  */
 
 /** The choices of the Rows control; `null` = every row. */

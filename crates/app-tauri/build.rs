@@ -43,6 +43,7 @@ const COMMANDS: &[&str] = &[
     "file_pick_open",
     "file_pick_save",
     "file_release",
+    "file_read_text",
     // M5 import and export (src/transfer.rs).
     "import_preview",
     "import_plan",

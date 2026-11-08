@@ -1,5 +1,13 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { installShortcuts, registerShortcuts, shortcutOf, zoomShortcutOf } from "./shortcuts";
+import { onOpenSettings } from "../settings";
+import { setDockviewApi } from "./layout";
+import {
+  appShortcutOf,
+  installShortcuts,
+  registerShortcuts,
+  shortcutOf,
+  zoomShortcutOf,
+} from "./shortcuts";
 import { getZoom, resetZoom } from "./zoom";
 
 const keys = (
@@ -121,5 +129,39 @@ describe("zoom shortcuts", () => {
     press("0", { ctrlKey: true });
     expect(getZoom()).toBe(1);
     remove();
+  });
+});
+
+describe("app shortcuts", () => {
+  it("maps Ctrl+N, Ctrl+O and Ctrl+,", () => {
+    expect(shortcutOf(keys("n", { ctrl: true }))).toBe("new");
+    expect(appShortcutOf(keys("o", { ctrl: true }))).toBe("openFile");
+    expect(appShortcutOf(keys(",", { meta: true }))).toBe("settings");
+    expect(appShortcutOf(keys("o", { ctrl: true, shift: true }))).toBeNull();
+  });
+
+  it("Ctrl+N opens a query tab unless the active tab uses it; Ctrl+, opens Settings", () => {
+    const addPanel = vi.fn();
+    setDockviewApi({ panels: [], addPanel } as never);
+    const settings = vi.fn();
+    const stop = onOpenSettings(settings);
+    let used = false;
+    const unregister = registerShortcuts("data-1", (command) => command === "new" && used);
+    const remove = installShortcuts(() => "data-1");
+
+    expect(press("n", { ctrlKey: true }).defaultPrevented).toBe(true);
+    expect(addPanel).toHaveBeenCalledTimes(1);
+    expect(addPanel.mock.calls[0]?.[0]).toMatchObject({ component: "query" });
+    used = true;
+    press("n", { ctrlKey: true });
+    expect(addPanel).toHaveBeenCalledTimes(1);
+
+    expect(press(",", { ctrlKey: true }).defaultPrevented).toBe(true);
+    expect(settings).toHaveBeenCalledTimes(1);
+
+    remove();
+    unregister();
+    stop();
+    setDockviewApi(null);
   });
 });

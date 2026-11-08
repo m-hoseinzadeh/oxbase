@@ -7,13 +7,14 @@ import {
   type IDockviewPanelProps,
   themeLight,
 } from "dockview-react";
-import { Database, FileInput, History, Plug, SquarePen } from "lucide-react";
+import { Database, FileInput, FolderOpen, History, Plug, Settings, SquarePen } from "lucide-react";
 import { type FunctionComponent, useEffect, useState } from "react";
 import { ICON } from "./components/icons";
 import { requestNewConnection } from "./connections/requests";
 import { ConnectionsPanel } from "./panels/ConnectionsPanel";
 import { WelcomePanel } from "./panels/WelcomePanel";
 import { StatusBar } from "./StatusBar";
+import { openSettings } from "./settings";
 import { TableDataPanel } from "./workbench/data/TableDataPanel";
 import { TableDesignerPanel } from "./workbench/designer/TableDesignerPanel";
 import { QueryEditorPanel } from "./workbench/editor/QueryEditorPanel";
@@ -38,6 +39,8 @@ import { CollectionPanel } from "./workbench/nosql/CollectionPanel";
 import { ConsolePanel } from "./workbench/nosql/console/ConsolePanel";
 import { KeyBrowserPanel } from "./workbench/nosql/keys/KeyBrowserPanel";
 import { PubSubPanel } from "./workbench/nosql/pubsub/PubSubPanel";
+import { OpenFileHost, openSqlFile } from "./workbench/openFile";
+import { SettingsHost } from "./workbench/SettingsDialog";
 import { installShortcuts } from "./workbench/shortcuts";
 import { DataSyncPanel } from "./workbench/sync/DataSyncPanel";
 import { StructureSyncPanel } from "./workbench/sync/StructureSyncPanel";
@@ -58,7 +61,14 @@ function TableDataTab({ params }: IDockviewPanelProps<TableDataPanelParams>) {
   if (!params.sessionId || !params.table) {
     return <p className="results__empty">This tab lost its table. Open it again from the tree.</p>;
   }
-  return <TableDataPanel editorId={editorId} sessionId={params.sessionId} table={params.table} />;
+  return (
+    <TableDataPanel
+      editorId={editorId}
+      sessionId={params.sessionId}
+      table={params.table}
+      related={params.related}
+    />
+  );
 }
 
 function DesignerTab({ params, api }: IDockviewPanelProps<DesignerPanelParams>) {
@@ -224,11 +234,20 @@ export function App() {
           <button
             type="button"
             className="button button--ghost"
-            title="New query"
+            title="New query (Ctrl+N)"
             onClick={() => openQueryEditor()}
           >
             <SquarePen {...ICON} />
             New query
+          </button>
+          <button
+            type="button"
+            className="button button--ghost"
+            title="Open a .sql file in a new query tab (Ctrl+O)"
+            onClick={() => void openSqlFile()}
+          >
+            <FolderOpen {...ICON} />
+            Open…
           </button>
           <span className="toolbar__separator" aria-hidden="true" />
           <button type="button" className="button button--ghost" onClick={() => openImport()}>
@@ -239,6 +258,17 @@ export function App() {
           <button type="button" className="button button--ghost" onClick={showHistory}>
             <History {...ICON} />
             History
+          </button>
+          <span className="app__toolbar-spacer" />
+          <button
+            type="button"
+            className="icon-button"
+            aria-label="Settings"
+            title="Settings (Ctrl+,)"
+            data-testid="app-settings"
+            onClick={openSettings}
+          >
+            <Settings {...ICON} />
           </button>
         </div>
       </header>
@@ -253,6 +283,8 @@ export function App() {
       <StatusBar />
       <TransferHost />
       <SyncHost />
+      <SettingsHost />
+      <OpenFileHost />
     </div>
   );
 }

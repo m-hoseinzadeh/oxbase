@@ -75,11 +75,19 @@ export function showHistory(): void {
 
 // --- M3: table data and table designer tabs -----------------------------------------------
 
+/** One column = value of a related-rows filter (`null` = IS NULL). */
+export interface RelatedValue {
+  column: string;
+  value: string | null;
+}
+
 /** `params` of a table-data tab. */
 export interface TableDataPanelParams {
   editorId: string;
   sessionId: string;
   table: ObjectRef;
+  /** Opened from a foreign key: the rows with these values (the tab's starting filter). */
+  related?: RelatedValue[] | undefined;
 }
 
 /** `params` of a table designer tab; `isNew` designs a new table in `table`'s schema. */
@@ -131,12 +139,18 @@ export function mainAreaPosition(api: Pick<DockviewApi, "panels">): AddPanelPosi
 
 /**
  * Opens a table's rows in a table-data tab (or shows the tab already open for it). Returns the
- * tab's editor id.
+ * tab's editor id. With `related` (a foreign key's values) it always opens a new tab, filtered
+ * to those rows.
  */
-export function openTableData(init: { sessionId: string; table: ObjectRef }): string | null {
+export function openTableData(init: {
+  sessionId: string;
+  table: ObjectRef;
+  related?: RelatedValue[] | undefined;
+}): string | null {
   const api = dockview;
   if (!api) return null;
   const existing = api.panels.find((p) => {
+    if (init.related) return false;
     const params = p.params as Partial<TableDataPanelParams> | undefined;
     return (
       p.id.startsWith("data-") &&
@@ -154,7 +168,7 @@ export function openTableData(init: { sessionId: string; table: ObjectRef }): st
   api.addPanel({
     id: `data-${editorId}`,
     component: "tableData",
-    title: qualifiedName(init.table),
+    title: init.related ? `${qualifiedName(init.table)} (related)` : qualifiedName(init.table),
     params,
     position: mainAreaPosition(api),
   });

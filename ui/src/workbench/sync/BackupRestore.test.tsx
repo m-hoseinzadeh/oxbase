@@ -72,6 +72,23 @@ describe("BackupDialog", () => {
     });
   });
 
+  it("backs up the rows only when Data only is chosen", async () => {
+    await refreshSessions();
+    render(
+      <BackupDialog
+        init={{ source: { sessionId: PG_SOURCE.id, container: M8_SRC } }}
+        onClose={vi.fn()}
+      />,
+    );
+    const start = screen.getByTestId("backup-start");
+    await waitFor(() => expect(start).toBeEnabled());
+    fireEvent.change(screen.getByLabelText("Content"), { target: { value: "data_only" } });
+    expect(screen.getByText(/creates nothing/)).toBeInTheDocument();
+    await act(async () => fireEvent.click(start));
+    await waitFor(() => expect(callsOf("backup_run")).toHaveLength(1));
+    expect(requestOf<BackupRequest>("backup_run", 0).spec.content).toBe("data_only");
+  });
+
   it("backs up a schema into an .oxbackup file and reports it", async () => {
     await refreshSessions();
     render(

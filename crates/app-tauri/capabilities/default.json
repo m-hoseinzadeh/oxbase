@@ -41,6 +41,7 @@
     "allow-file-pick-open",
     "allow-file-pick-save",
     "allow-file-release",
+    "allow-file-read-text",
     "allow-import-preview",
     "allow-import-plan",
     "allow-import-run",

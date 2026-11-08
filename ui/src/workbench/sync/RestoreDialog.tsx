@@ -113,9 +113,14 @@ export function RestoreDialog({ init, onClose }: { init: RestoreInit; onClose: (
   const targetSession = sessions.find((s) => s.id === target.sessionId) ?? null;
   // A target of another engine (say, from the entry point) cannot take this archive.
   const wrongEngine = m !== null && targetSession !== null && targetSession.engine !== m.engine;
-  // A structure-only archive has no rows to load, whatever the form says.
+  // A structure-only archive has no rows to load, a data-only one no structure, whatever the
+  // form says.
   const effectiveContent: RestoreContent =
-    m?.content === "structure_only" ? "structure_only" : content;
+    m?.content === "structure_only"
+      ? "structure_only"
+      : m?.content === "data_only"
+        ? "data_only"
+        : content;
   const loadsData = effectiveContent !== "structure_only";
   const truncateBeforeLoad = truncate && loadsData;
   const destructive = dropExisting || truncateBeforeLoad;
@@ -288,7 +293,13 @@ export function RestoreDialog({ init, onClose }: { init: RestoreInit; onClose: (
           <dt>Created</dt>
           <dd>{`${formatDateTime(m.createdAt)} by Oxbase ${m.oxbaseVersion}`}</dd>
           <dt>Content</dt>
-          <dd>{m.content === "structure_only" ? "Structure only" : "Structure and data"}</dd>
+          <dd>
+            {m.content === "structure_only"
+              ? "Structure only"
+              : m.content === "data_only"
+                ? "Data only (table rows)"
+                : "Structure and data"}
+          </dd>
         </dl>
         <WarningList title="Noted when it was written" items={m.warnings} />
         {verifyOnly ? null : (
@@ -396,10 +407,12 @@ export function RestoreDialog({ init, onClose }: { init: RestoreInit; onClose: (
             disabled={running}
             onChange={(e) => setContent(e.target.value as RestoreContent)}
           >
-            <option value="structure_and_data" disabled={m.content === "structure_only"}>
+            <option value="structure_and_data" disabled={m.content !== "structure_and_data"}>
               Structure and data
             </option>
-            <option value="structure_only">Structure only</option>
+            <option value="structure_only" disabled={m.content === "data_only"}>
+              Structure only
+            </option>
             <option value="data_only" disabled={m.content === "structure_only"}>
               Data only (into existing tables)
             </option>

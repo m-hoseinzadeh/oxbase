@@ -278,8 +278,8 @@ export function QueryEditorPanel({
   // state through the ref, registered once per tab.
   const shortcut = useRef<ShortcutHandler>(() => false);
   shortcut.current = (command) => {
-    // Ctrl+S saves a table's pending changes; a query tab has nothing to save.
-    if (command === "save") return false;
+    // Ctrl+S saves a table's pending changes, Ctrl+N adds a table row: not a query tab's.
+    if (command === "save" || command === "new") return false;
     if (command === "cancel") {
       if (!active) return false;
       cancel();

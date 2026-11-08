@@ -4,6 +4,7 @@ import type {
   ApplyReport,
   Editability,
   EngineCapabilities,
+  ForeignKeyDef,
   ObjectRef,
   PendingChanges,
   RunEvent,
@@ -12,6 +13,7 @@ import type {
 import type { MenuItem } from "../../components/ContextMenu";
 import { tauriCore } from "../../test/tauriMock";
 import { NO_DESIGNER } from "../designer/designModel";
+import { setDockviewApi } from "../layout";
 import type { ResultGridProps } from "../results/ResultGrid";
 import { installShortcuts } from "../shortcuts";
 import { TableDataPanel } from "./TableDataPanel";
@@ -240,6 +242,8 @@ let applyReport: (changes: PendingChanges) => ApplyReport;
 let opens: Array<Record<string, unknown>>;
 /** Rows each open returns. */
 let totalRows: number;
+/** The table's foreign keys (`designer_load`). */
+let foreignKeys: ForeignKeyDef[];
 
 function runEvents(runId: string): RunEvent[] {
   return [
@@ -277,6 +281,7 @@ beforeEach(() => {
   });
   opens = [];
   totalRows = 3;
+  foreignKeys = [];
   localStorage.clear();
   tauriCore.invoke.mockImplementation(async (cmd, args) => {
     const a = (args ?? {}) as Record<string, unknown>;
@@ -294,6 +299,15 @@ beforeEach(() => {
       }
       case "edit_begin":
         return { ...editability, runId: a.runId };
+      case "designer_load":
+        return {
+          table: TABLE,
+          columns: [],
+          indexes: [],
+          foreignKeys: foreignKeys.map((def) => ({ def })),
+          checks: [],
+          extras: {},
+        };
       case "edit_apply":
         return applyReport(a.changes as PendingChanges);
       case "row_get_form": {
@@ -352,7 +366,7 @@ describe("TableDataPanel", () => {
     expect(calls("query_close_editor")).toEqual([{ editorId: "editor-t1" }]);
   });
 
-  it("loads the first rows only; the Rows control changes the limit and remembers it", async () => {
+  it("loads the first rows only; the Rows control changes this tab's limit", async () => {
     await renderPanel();
     const rows = screen.getByRole("combobox", { name: "Rows to load" });
     expect(rows).toHaveDisplayValue("1,000 rows");
@@ -365,7 +379,8 @@ describe("TableDataPanel", () => {
     fireEvent.change(rows, { target: { value: "100" } });
     await waitFor(() => expect(opens).toHaveLength(2));
     expect(opens[1]?.request).toEqual({ table: TABLE, sort: [], limit: 100 });
-    expect(localStorage.getItem("oxbase.tableData.rowLimit")).toBe("100");
+    // The default for new tabs is a setting (the Settings window), not the last choice.
+    expect(localStorage.getItem("oxbase.tableData.rowLimit")).toBeNull();
   });
 
   it("says when the limit stopped the rows and loads all of them on request", async () => {
@@ -381,7 +396,7 @@ describe("TableDataPanel", () => {
     expect(opens[1]?.request).toEqual({ table: TABLE, sort: [] });
     expect(screen.getByRole("combobox", { name: "Rows to load" })).toHaveDisplayValue("All rows");
     await waitFor(() => expect(screen.queryByTestId("row-limit-banner")).not.toBeInTheDocument());
-    expect(localStorage.getItem("oxbase.tableData.rowLimit")).toBe("all");
+    expect(localStorage.getItem("oxbase.tableData.rowLimit")).toBe("100");
   });
 
   it("shows why a result is read-only and offers no editing", async () => {
@@ -830,6 +845,70 @@ describe("TableDataPanel", () => {
     expect(event.defaultPrevented).toBe(true);
     await waitFor(() => expect(calls("edit_apply")).toHaveLength(1));
     remove();
+  });
+
+  it("opens a foreign key's referenced row in a new filtered tab", async () => {
+    foreignKeys = [
+      {
+        columns: ["name"],
+        ref_table: { kind: "table", catalog: "app", schema: "public", name: "customers" },
+        ref_columns: ["code"],
+        on_delete: "no_action",
+        on_update: "no_action",
+        extras: {},
+      } as unknown as ForeignKeyDef,
+    ];
+    const addPanel = vi.fn();
+    setDockviewApi({ panels: [], addPanel } as never);
+    await renderPanel();
+    await waitFor(() => expect(calls("designer_load")).toHaveLength(1));
+    await waitFor(() => {
+      fireEvent.click(screen.getByRole("button", { name: "cell menu 1 name" }));
+      fireEvent.click(
+        within(screen.getByTestId("grid-menu")).getByRole("button", {
+          name: "Open related row in public.customers",
+        }),
+      );
+      expect(addPanel).toHaveBeenCalledTimes(1);
+    });
+    expect(addPanel.mock.calls[0]?.[0]).toMatchObject({
+      component: "tableData",
+      title: "public.customers (related)",
+      params: {
+        sessionId: "s-1",
+        table: { name: "customers" },
+        related: [{ column: "code", value: "name1" }],
+      },
+    });
+    setDockviewApi(null);
+  });
+
+  it("starts a related-rows tab filtered to them, the builders open", async () => {
+    render(
+      <TableDataPanel
+        editorId="editor-t2"
+        sessionId="s-1"
+        table={TABLE}
+        related={[
+          { column: "id", value: "7" },
+          { column: "note", value: null },
+        ]}
+      />,
+    );
+    await screen.findByTestId("grid");
+    expect(opens[0]?.request).toEqual({
+      table: TABLE,
+      filter: {
+        type: "and",
+        items: [
+          { type: "condition", column: "id", op: "eq", values: [{ type: "text", value: "7" }] },
+          { type: "condition", column: "note", op: "isNull" },
+        ],
+      },
+      sort: [],
+      limit: 1000,
+    });
+    expect(screen.getByTestId("filter-builder")).toBeInTheDocument();
   });
 
   it("asks before a new filter drops pending changes", async () => {

@@ -73,6 +73,24 @@ pub enum BackupContent {
     StructureAndData,
     /// Definitions only.
     StructureOnly,
+    /// Table rows only (issue #22): only tables are backed up, and their definitions are
+    /// kept just to read the rows back. A restore loads the rows into existing tables and
+    /// creates or changes nothing.
+    DataOnly,
+}
+
+impl BackupContent {
+    /// Whether the backup reads and stores table rows.
+    #[must_use]
+    pub fn has_rows(self) -> bool {
+        self != Self::StructureOnly
+    }
+
+    /// Whether a restore may create or change definitions from the backup.
+    #[must_use]
+    pub fn has_structure(self) -> bool {
+        self != Self::DataOnly
+    }
 }
 
 /// The source of a backup: names only (module docs, *What is never in an archive*).
