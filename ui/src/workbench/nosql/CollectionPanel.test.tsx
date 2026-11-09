@@ -1,5 +1,5 @@
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { useEffect, useRef } from "react";
+import { useLayoutEffect, useRef } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type {
   ColumnInfo,
@@ -19,7 +19,10 @@ vi.mock("@tauri-apps/api/core", async () => (await import("../../test/tauriMock"
 vi.mock("../editor/SqlEditor", () => ({
   SqlEditor: ({ initialValue, editorRef, onChange, ariaLabel }: SqlEditorProps) => {
     const area = useRef<HTMLTextAreaElement>(null);
-    useEffect(() => {
+    // The handle is set during the commit (a layout effect), as soon as the editor is in the
+    // DOM: with a passive effect, a test that finds the dialog and clicks Save at once could run
+    // before it, and the component would read its fallback text instead of the typed one.
+    useLayoutEffect(() => {
       editorRef.current = {
         getText: () => area.current?.value ?? "",
         getSelection: () => null,
