@@ -21,6 +21,13 @@
 //!   clear, prune) and its [`HistorySettings`]. [`MemoryHistoryRepository`] for tests;
 //!   [`SqliteHistoryRepository`] in the app database. Callers redact secrets before `append`.
 //!
+//! 1.3 (see `docs/files.md`):
+//!
+//! - [`documents`]: query files read and written with their byte order mark kept
+//!   ([`read_text_file`], [`write_text_file`]), saved queries as `.sql` files in one folder per
+//!   profile ([`SavedQueries`]), and the recent files, file links and workspace kept in the app
+//!   database ([`DocumentStore`]).
+//!
 //! M6 contracts (see `docs/m6-contracts.md`):
 //!
 //! - [`SnippetRepository`]: user snippets ([`MemorySnippetRepository`],
@@ -45,6 +52,7 @@ pub use oxbase_types::{Engine, KnownHostsPolicy, Secret, TlsMode};
 use oxbase_types::{Error, Result};
 
 mod app_db;
+pub mod documents;
 mod file_repo;
 pub mod history;
 pub mod insight;
@@ -52,6 +60,10 @@ pub mod insight;
 pub use app_db::{
     AppDb, DATA_DIR_ENV, HISTORY_SETTINGS_KEY, MIGRATIONS, Migration, SqliteHistoryRepository,
     app_data_dir,
+};
+pub use documents::{
+    DocumentStore, FileLink, SavedQueries, SavedQuery, StoredTab, StoredWorkspace, TextFile,
+    read_text_file, validate_query_name, write_text_file,
 };
 pub use file_repo::{
     CONFIG_DIR_ENV, FileProfileRepository, PROFILES_FILE_SCHEMA_VERSION, app_config_dir,

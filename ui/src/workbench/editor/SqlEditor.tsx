@@ -28,6 +28,11 @@ export interface SqlEditorHandle {
   format?(): Promise<FormatOutcome>;
   /** Inserts a snippet body (Monaco snippet syntax) at the cursor. */
   insertSnippet?(body: string): void;
+  /**
+   * 1.3: the text's version (Monaco's alternative version id): it changes with every edit and
+   * goes back to an earlier value when the edits are undone.
+   */
+  getVersion?(): number;
 }
 
 /**
@@ -65,6 +70,10 @@ export interface SqlEditorProps {
   insight?: EditorInsight | undefined;
   /** Called with the whole text after every change (the builder's JSON fields). */
   onChange?: ((text: string) => void) | undefined;
+  /** 1.3: the editor is ready (the handle is set) with the text at `version`. */
+  onReady?: ((version: number) => void) | undefined;
+  /** 1.3: the text changed; it is now at `version` (see `SqlEditorHandle.getVersion`). */
+  onVersionChange?: ((version: number) => void) | undefined;
   /** A small field editor: no line numbers, gutter or folding (the builder's JSON fields). */
   compact?: boolean | undefined;
   /** Wrap long lines at the editor's width (the value panel). */

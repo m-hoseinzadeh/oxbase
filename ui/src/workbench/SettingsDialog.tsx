@@ -42,7 +42,7 @@ export const SHORTCUT_GROUPS: { title: string; keys: [string, string][] }[] = [
     title: "Everywhere",
     keys: [
       ["Ctrl+N", "New query tab (in a table's grid: add a row)"],
-      ["Ctrl+O", "Open a .sql file in a new query tab"],
+      ["Ctrl+O", "Open a .sql file in a query tab"],
       ["Ctrl+,", "Settings"],
       ["Ctrl+= / Ctrl+- / Ctrl+0", "Zoom in, out, back to 100%"],
     ],
@@ -54,6 +54,8 @@ export const SHORTCUT_GROUPS: { title: string; keys: [string, string][] }[] = [
       ["Ctrl+Enter", "Run the selection, else the statement at the cursor"],
       ["Ctrl+Shift+Enter", "Run the whole script"],
       ["Shift+F5", "Stop the running query"],
+      ["Ctrl+S", "Save (a new query: as a saved query of its connection)"],
+      ["Ctrl+Shift+S", "Save as a file"],
     ],
   },
   {

@@ -38,7 +38,7 @@ describe("shortcutOf", () => {
     expect(shortcutOf(keys("F5", { ctrl: true }))).toBe("reload");
     expect(shortcutOf(keys("R", { ctrl: true, shift: true }))).toBe("reload");
     expect(shortcutOf(keys("s", { ctrl: true }))).toBe("save");
-    expect(shortcutOf(keys("S", { ctrl: true, shift: true }))).toBeNull();
+    expect(shortcutOf(keys("S", { ctrl: true, shift: true }))).toBe("saveAs");
     expect(shortcutOf(keys("Enter"))).toBeNull();
     expect(shortcutOf(keys("r"))).toBeNull();
     expect(shortcutOf(keys("F5", { alt: true }))).toBeNull();

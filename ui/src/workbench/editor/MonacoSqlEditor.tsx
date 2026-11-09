@@ -17,6 +17,8 @@ export default function MonacoSqlEditor({
   testId,
   insight,
   onChange,
+  onReady,
+  onVersionChange,
   compact,
   wordWrap,
 }: SqlEditorProps) {
@@ -27,6 +29,10 @@ export default function MonacoSqlEditor({
   command.current = onCommand;
   const change = useRef(onChange);
   change.current = onChange;
+  const ready = useRef(onReady);
+  ready.current = onReady;
+  const versionChange = useRef(onVersionChange);
+  versionChange.current = onVersionChange;
   const initial = useRef({
     value: value ?? initialValue,
     language,
@@ -90,7 +96,12 @@ export default function MonacoSqlEditor({
         : {}),
     });
     editor.current = instance;
-    const changes = instance.onDidChangeModelContent(() => change.current?.(instance.getValue()));
+    const versionOf = () => instance.getModel()?.getAlternativeVersionId() ?? 0;
+    const changes = instance.onDidChangeModelContent(() => {
+      // The whole text only for a caller that wants it (a large script costs a copy per edit).
+      if (change.current) change.current(instance.getValue());
+      versionChange.current?.(versionOf());
+    });
     if (insightEditorId !== null) {
       attachment.current = attachInsight(instance, {
         editorId: insightEditorId,
@@ -146,6 +157,7 @@ export default function MonacoSqlEditor({
         instance.revealRangeInCenterIfOutsideViewport(range);
       },
       focus: () => instance.focus(),
+      getVersion: versionOf,
       insertSnippet: (body) => {
         instance.focus();
         const snippets = instance.getContribution("snippetController2") as unknown as {
@@ -161,6 +173,8 @@ export default function MonacoSqlEditor({
           }
         : {}),
     };
+
+    ready.current?.(versionOf());
 
     // Theme changes (user choice or OS while "system") re-read the CSS tokens.
     const unsubscribe = subscribeTheme(() => applyMonacoTheme(monaco));

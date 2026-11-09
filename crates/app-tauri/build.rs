@@ -93,6 +93,23 @@ const COMMANDS: &[&str] = &[
     "backup_verify",
     "backup_list",
     "backup_cancel",
+    // 1.3 query files, saved queries, the workspace (src/documents.rs) and desktop
+    // integration (src/shell.rs).
+    "document_open",
+    "document_reopen",
+    "document_recent",
+    "document_recent_clear",
+    "document_save",
+    "document_save_as",
+    "document_set_link",
+    "saved_query_list",
+    "saved_query_create",
+    "saved_query_rename",
+    "saved_query_delete",
+    "workspace_load",
+    "workspace_save",
+    "app_events_subscribe",
+    "app_close_ready",
 ];
 
 fn main() {

@@ -252,7 +252,7 @@ pub fn validate_default_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn dialog(
+pub(crate) fn dialog(
     app: &AppHandle,
     filters: &[FileFilter],
     title: Option<String>,
@@ -268,7 +268,7 @@ fn dialog(
     builder
 }
 
-fn local_path(picked: FilePath) -> CommandResult<PathBuf> {
+pub(crate) fn local_path(picked: FilePath) -> CommandResult<PathBuf> {
     picked.into_path().map_err(|_| {
         CommandError::new(
             ErrorCategory::Unsupported,
@@ -279,7 +279,7 @@ fn local_path(picked: FilePath) -> CommandResult<PathBuf> {
 
 /// The debug-only webview smoke test hook (module docs).
 #[cfg(debug_assertions)]
-mod e2e {
+pub(crate) mod e2e {
     use std::path::{Path, PathBuf};
 
     use oxbase_types::{Error, Result};
@@ -373,32 +373,14 @@ pub async fn file_pick_save(
     Ok(Some(files.register(path, FileAccess::Write)))
 }
 
-/// Most bytes [`file_read_text`] reads: a script opened in a query tab.
-pub const MAX_TEXT_BYTES: u64 = 16 * 1024 * 1024;
-
 /// The text of a file (UTF-8, a leading byte order mark dropped, at most
-/// [`MAX_TEXT_BYTES`]).
+/// [`oxbase_store::documents::MAX_TEXT_BYTES`]).
 fn read_text(path: &Path) -> Result<String> {
-    let unreadable = |e: std::io::Error| Error::not_found(format!("could not read the file: {e}"));
-    let len = std::fs::metadata(path).map_err(unreadable)?.len();
-    if len > MAX_TEXT_BYTES {
-        return Err(Error::invalid_input(format!(
-            "the file is {} MB; a query tab opens files of at most {} MB",
-            len.div_ceil(1024 * 1024),
-            MAX_TEXT_BYTES / (1024 * 1024)
-        )));
-    }
-    let bytes = std::fs::read(path).map_err(unreadable)?;
-    let text =
-        String::from_utf8(bytes).map_err(|_| Error::invalid_input("the file is not UTF-8 text"))?;
-    Ok(match text.strip_prefix('\u{feff}') {
-        Some(rest) => rest.to_owned(),
-        None => text,
-    })
+    Ok(oxbase_store::read_text_file(path)?.text)
 }
 
 /// The text of read handle `handle`: a `.sql` file opened in a query tab (Ctrl+O). UTF-8 only,
-/// at most [`MAX_TEXT_BYTES`].
+/// at most [`oxbase_store::documents::MAX_TEXT_BYTES`].
 #[tauri::command]
 #[allow(clippy::needless_pass_by_value)] // Tauri passes `State` by value.
 pub fn file_read_text(files: State<'_, FilesState>, handle: FileHandle) -> CommandResult<String> {

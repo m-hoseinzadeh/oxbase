@@ -38,6 +38,22 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
+    "fileAssociations": [
+      {
+        "ext": ["sql"],
+        "name": "SQL script",
+        "description": "SQL script",
+        "role": "Editor",
+        "mimeType": "application/sql"
+      },
+      {
+        "ext": ["sqlite", "sqlite3", "db", "db3"],
+        "name": "SQLite database",
+        "description": "SQLite database",
+        "role": "Editor",
+        "mimeType": "application/vnd.sqlite3"
+      }
+    ],
     "macOS": {
       "minimumSystemVersion": "13.0"
     },

@@ -27,15 +27,17 @@ use oxbase_services::transfer::TransferService;
 use oxbase_services::tree::TreeService;
 use oxbase_services::{ConnectionManager, DriverRegistry};
 use oxbase_store::{
-    AppDb, FileProfileRepository, HistoryRepository, KeyringSecretStore, MemoryHistoryRepository,
-    MemoryProfileRepository, MemorySchemaCacheRepository, MemorySnippetRepository,
-    ProfileRepository, SchemaCacheRepository, SnippetRepository, SqliteHistoryRepository,
-    SqliteSchemaCacheRepository, SqliteSnippetRepository,
+    AppDb, DocumentStore, FileProfileRepository, HistoryRepository, KeyringSecretStore,
+    MemoryHistoryRepository, MemoryProfileRepository, MemorySchemaCacheRepository,
+    MemorySnippetRepository, ProfileRepository, SavedQueries, SchemaCacheRepository,
+    SnippetRepository, SqliteHistoryRepository, SqliteSchemaCacheRepository,
+    SqliteSnippetRepository,
 };
 
 use crate::connections::ConnectionsState;
 use crate::data::DataState;
 use crate::designer::DesignerState;
+use crate::documents::DocumentsState;
 use crate::files::FilesState;
 use crate::insight::InsightState;
 use crate::nosql::NoSqlState;
@@ -62,6 +64,8 @@ pub struct AppStates {
     pub nosql: NoSqlState,
     /// M8: transfer, structure sync, data sync, backup and restore.
     pub sync: SyncState,
+    /// 1.3: query files, saved queries, recent files and the workspace.
+    pub documents: DocumentsState,
 }
 
 /// The repositories kept in the app database.
@@ -71,6 +75,8 @@ pub struct AppRepositories {
     pub snippets: Arc<dyn SnippetRepository>,
     /// M6: schema-cache snapshots.
     pub schema_caches: Arc<dyn SchemaCacheRepository>,
+    /// 1.3: recent files, file links and the workspace.
+    pub documents: DocumentStore,
 }
 
 impl AppRepositories {
@@ -80,6 +86,7 @@ impl AppRepositories {
             history,
             snippets: Arc::new(MemorySnippetRepository::new()),
             schema_caches: Arc::new(MemorySchemaCacheRepository::new()),
+            documents: DocumentStore::in_memory(),
         }
     }
 }
@@ -94,7 +101,8 @@ pub fn app_repositories() -> AppRepositories {
         Ok(db) => AppRepositories {
             history: Arc::new(SqliteHistoryRepository::new(db.clone())),
             snippets: Arc::new(SqliteSnippetRepository::new(db.clone())),
-            schema_caches: Arc::new(SqliteSchemaCacheRepository::new(db)),
+            schema_caches: Arc::new(SqliteSchemaCacheRepository::new(db.clone())),
+            documents: DocumentStore::new(db),
         },
         Err(error) => {
             // Only the error's category: the message could carry a path.
@@ -150,6 +158,7 @@ pub fn app_state_with_repositories(
         history,
         snippets,
         schema_caches,
+        documents,
     } = repositories;
     let manager = Arc::new(ConnectionManager::new(
         driver_registry(),
@@ -268,7 +277,17 @@ pub fn app_state_with_repositories(
         insight: InsightState::new(insight),
         nosql,
         sync,
+        documents: DocumentsState::new(documents, saved_queries(fallback_dir)),
     }
+}
+
+/// The saved query folders: `queries/` in the app data directory (`oxbase_store::app_data_dir`),
+/// else in the Tauri app data directory, else in the temporary folder.
+pub fn saved_queries(fallback_dir: Option<&Path>) -> SavedQueries {
+    SavedQueries::open_default().unwrap_or_else(|_| {
+        let base = fallback_dir.map_or_else(std::env::temp_dir, Path::to_path_buf);
+        SavedQueries::new(base.join(SavedQueries::DIR_NAME))
+    })
 }
 
 #[cfg(test)]

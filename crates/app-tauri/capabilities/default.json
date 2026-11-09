@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Main window. Grants exactly the app commands the UI calls (each declared in build.rs) and the dialog plugin's file-open picker (SQLite database, TLS certificate and key, SSH key files). Import and export files are picked by native dialogs shown from Rust (file_pick_open / file_pick_save return opaque handles), so they need no dialog, fs or shell permission here. core:window:allow-set-theme lets the UI pass the Dark / Light / System choice to the native window, so what the OS draws (native dropdown popups, the webview's context menu) matches. core:webview:allow-set-webview-zoom lets Ctrl+= / Ctrl+- / Ctrl+0 zoom the app. No other core or plugin permission is granted.",
+  "description": "Main window. Grants exactly the app commands the UI calls (each declared in build.rs) and the dialog plugin's file-open picker (SQLite database, TLS certificate and key, SSH key files). Import and export files are picked by native dialogs shown from Rust (file_pick_open / file_pick_save return opaque handles), so they need no dialog, fs or shell permission here. The same holds for query files (document_open / document_save_as, 1.3): the UI holds opaque document ids, never paths, and Rust sends files opened from the OS through a Channel (app_events_subscribe), so no event permission is needed. core:window:allow-set-theme lets the UI pass the Dark / Light / System choice to the native window, so what the OS draws (native dropdown popups, the webview's context menu) matches. core:webview:allow-set-webview-zoom lets Ctrl+= / Ctrl+- / Ctrl+0 zoom the app. No other core or plugin permission is granted.",
   "windows": [
     "main"
   ],
@@ -87,6 +87,21 @@
     "allow-backup-verify",
     "allow-backup-list",
     "allow-backup-cancel",
+    "allow-document-open",
+    "allow-document-reopen",
+    "allow-document-recent",
+    "allow-document-recent-clear",
+    "allow-document-save",
+    "allow-document-save-as",
+    "allow-document-set-link",
+    "allow-saved-query-list",
+    "allow-saved-query-create",
+    "allow-saved-query-rename",
+    "allow-saved-query-delete",
+    "allow-workspace-load",
+    "allow-workspace-save",
+    "allow-app-events-subscribe",
+    "allow-app-close-ready",
     "dialog:allow-open",
     "core:window:allow-set-theme",
     "core:webview:allow-set-webview-zoom"

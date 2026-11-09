@@ -2,9 +2,16 @@
  * A query editor tab: connection and database pickers, run buttons, the SQL editor, a splitter
  * and the results area. Each tab is one `EditorId` in the core, so it has its own database
  * session (opened by the core on the first run, closed with the tab).
+ *
+ * 1.3: a tab can show a file or a saved query (`document`), saved with Ctrl+S / Ctrl+Shift+S
+ * (../documents). A tab opened on a saved connection (`profileId`: a restored tab, a linked file)
+ * uses that connection's open session, or offers to connect it; a file that never ran anywhere
+ * (`pickConnection`) starts with no connection chosen. The connection a file tab runs on is
+ * remembered for that file.
  */
 import {
   Braces,
+  ChevronDown,
   CircleCheck,
   CircleSlash,
   CircleX,
@@ -15,6 +22,7 @@ import {
   type LucideIcon,
   Play,
   Plug,
+  Save,
   Square,
   TextCursorInput,
   TextSelect,
@@ -31,12 +39,16 @@ import {
   statementAt,
   treeChildren,
 } from "../../api";
+import { ContextMenu, type MenuItem } from "../../components/ContextMenu";
 import { ICON_SM } from "../../components/icons";
 import { Modal } from "../../components/Modal";
 import { Select } from "../../components/Select";
 import { toCommandError } from "../../connections/api";
+import { requestConnect } from "../../connections/requests";
 import { useConnections } from "../../connections/store";
 import { ENGINE_INFO } from "../../connections/types";
+import { rememberLink, saveTab, saveTabAs, saveTabAsQuery } from "../documents/actions";
+import { noteEditorReady, noteVersion, registerQueryTab, useTabDirty } from "../documents/tabs";
 import { notifyHistoryChanged } from "../events";
 import { formatMs } from "../format";
 import type { QueryEditorParams } from "../layout";
@@ -98,8 +110,12 @@ export function QueryEditorPanel({
   sessionId: initialSession,
   database: initialDatabase,
   sql,
+  document: initialDocument,
+  profileId: initialProfile,
+  restoredDirty,
+  pickConnection,
 }: QueryEditorParams) {
-  const { sessions } = useConnections();
+  const { sessions, profiles } = useConnections();
   const [chosenSession, setChosenSession] = useState<string | null>(initialSession ?? null);
   const [database, setDatabase] = useState<string | null>(initialDatabase ?? null);
   const [databases, setDatabases] = useState<DatabaseList>(NO_DATABASES);
@@ -119,9 +135,27 @@ export function QueryEditorPanel({
   const pendingClose = useRef<Promise<void> | null>(null);
   const startedAt = useRef(0);
 
-  // Without a choice, the editor uses the first open connection.
-  const sessionId = chosenSession ?? sessions[0]?.id ?? null;
+  /** The saved connection the tab last ran on (kept while it is not connected). */
+  const lastProfile = useRef<string | null>(initialProfile ?? null);
+  // Without a choice, the editor uses an open session of its saved connection, else (unless it
+  // must ask) the first open connection.
+  const profileSession = lastProfile.current
+    ? sessions.find((s) => s.profile_id === lastProfile.current)
+    : undefined;
+  const sessionId =
+    chosenSession ??
+    profileSession?.id ??
+    (lastProfile.current || pickConnection ? null : (sessions[0]?.id ?? null));
   const session = sessions.find((s) => s.id === sessionId) ?? null;
+  if (session) lastProfile.current = session.profile_id;
+  /** A saved connection the tab runs on that is not connected. */
+  const waitingProfile =
+    !session && chosenSession === null && lastProfile.current
+      ? (profiles.find((p) => p.id === lastProfile.current) ?? null)
+      : null;
+  const [saveMenu, setSaveMenu] = useState<{ x: number; y: number } | null>(null);
+  const saveMenuButton = useRef<HTMLButtonElement>(null);
+  const dirty = useTabDirty(editorId);
   const active = isActive(run.status);
   const now = useNow(active);
 
@@ -278,8 +312,17 @@ export function QueryEditorPanel({
   // state through the ref, registered once per tab.
   const shortcut = useRef<ShortcutHandler>(() => false);
   shortcut.current = (command) => {
-    // Ctrl+S saves a table's pending changes, Ctrl+N adds a table row: not a query tab's.
-    if (command === "save" || command === "new") return false;
+    // 1.3: Ctrl+S saves the tab's file or saved query, Ctrl+Shift+S saves it as a file.
+    if (command === "save") {
+      void saveTab(editorId);
+      return true;
+    }
+    if (command === "saveAs") {
+      void saveTabAs(editorId);
+      return true;
+    }
+    // Ctrl+N adds a table row in a table tab: not a query tab's.
+    if (command === "new") return false;
     if (command === "cancel") {
       if (!active) return false;
       cancel();
@@ -294,6 +337,64 @@ export function QueryEditorPanel({
     return true;
   };
   useEffect(() => registerShortcuts(editorId, (command) => shortcut.current(command)), [editorId]);
+
+  // 1.3: the document code reads the tab's text, version and connection through this.
+  const target = useRef<{ profileId?: string; database?: string; profileName?: string }>({});
+  target.current = {
+    ...(lastProfile.current ? { profileId: lastProfile.current } : {}),
+    ...((database ?? databases.current)
+      ? { database: (database ?? databases.current) as string }
+      : {}),
+    ...(session
+      ? { profileName: session.profile_name }
+      : waitingProfile
+        ? { profileName: waitingProfile.name }
+        : {}),
+  };
+  const opened = useRef({ sql: sql ?? "", document: initialDocument, dirty: restoredDirty });
+  useEffect(
+    () =>
+      registerQueryTab(
+        editorId,
+        {
+          getText: () => editorRef.current?.getText() ?? opened.current.sql,
+          getVersion: () => editorRef.current?.getVersion?.() ?? 1,
+          target: () => target.current,
+        },
+        { document: opened.current.document, dirty: opened.current.dirty },
+      ),
+    [editorId],
+  );
+
+  // A file tab remembers the connection and database it runs on (the next open uses them).
+  const linkProfile = session?.profile_id ?? null;
+  const linkDatabase = database;
+  useEffect(() => {
+    if (!linkProfile) return;
+    rememberLink(editorId, {
+      profileId: linkProfile,
+      ...(linkDatabase ? { database: linkDatabase } : {}),
+    });
+  }, [editorId, linkProfile, linkDatabase]);
+
+  function showSaveMenu() {
+    const rect = saveMenuButton.current?.getBoundingClientRect();
+    setSaveMenu({ x: rect?.left ?? 0, y: rect?.bottom ?? 0 });
+  }
+
+  const saveItems: MenuItem[] = [
+    { label: "Save", icon: Save, shortcut: "Ctrl+S", onSelect: () => void saveTab(editorId) },
+    {
+      label: "Save as file…",
+      shortcut: "Ctrl+Shift+S",
+      onSelect: () => void saveTabAs(editorId),
+    },
+    {
+      label: "Save as saved query…",
+      disabled: !lastProfile.current,
+      onSelect: () => void saveTabAsQuery(editorId),
+    },
+  ];
 
   function onCommand(command: EditorCommand) {
     if (command === "runAll") runAll();
@@ -401,7 +502,11 @@ export function QueryEditorPanel({
   let status = "";
   let statusTone: StatusTone = "idle";
   if (!session) {
-    status = sessions.length === 0 ? "Open a connection to run queries." : "Choose a connection.";
+    status = waitingProfile
+      ? `Connect to ${waitingProfile.name} to run this query.`
+      : sessions.length === 0
+        ? "Open a connection to run queries."
+        : "Choose a connection.";
   } else if (active) {
     const n = run.current;
     status = `Running${n === null ? "" : ` statement ${n + 1} of ${run.statements.length}`}…`;
@@ -448,7 +553,15 @@ export function QueryEditorPanel({
             disabled={active || sessions.length === 0}
             onChange={(e) => chooseSession(e.target.value)}
           >
-            {sessionId === null ? <option value="">No open connection</option> : null}
+            {sessionId === null ? (
+              <option value="">
+                {waitingProfile
+                  ? `${waitingProfile.name} (not connected)`
+                  : pickConnection && sessions.length > 0
+                    ? "Choose a connection…"
+                    : "No open connection"}
+              </option>
+            ) : null}
             {sessionId !== null && !session ? (
               <option value={sessionId}>Disconnected</option>
             ) : null}
@@ -459,6 +572,18 @@ export function QueryEditorPanel({
             ))}
           </Select>
         </label>
+        {waitingProfile ? (
+          <button
+            type="button"
+            className="button button--ghost"
+            data-testid="connect-profile"
+            title={`Connect to ${waitingProfile.name}`}
+            onClick={() => requestConnect(waitingProfile.id)}
+          >
+            <Plug {...ICON_SM} />
+            Connect
+          </button>
+        ) : null}
         <label className="query-editor__picker" title="Database the query runs in">
           <span className="visually-hidden">Database</span>
           {databases.status === "loading" ? (
@@ -531,6 +656,30 @@ export function QueryEditorPanel({
           Stop
         </button>
         <span className="toolbar__separator" aria-hidden="true" />
+        <span className="split-button">
+          <button
+            type="button"
+            className="button button--ghost split-button__main"
+            data-testid="save-button"
+            data-dirty={dirty ? "true" : undefined}
+            onClick={() => void saveTab(editorId)}
+            title={dirty ? "Save the unsaved changes (Ctrl+S)" : "Save (Ctrl+S)"}
+          >
+            <Save {...ICON_SM} />
+            Save
+          </button>
+          <button
+            ref={saveMenuButton}
+            type="button"
+            className="button button--ghost split-button__more"
+            aria-label="More ways to save"
+            aria-haspopup="menu"
+            aria-expanded={saveMenu !== null}
+            onClick={showSaveMenu}
+          >
+            <ChevronDown {...ICON_SM} />
+          </button>
+        </span>
         <button
           type="button"
           className="button button--ghost"
@@ -591,6 +740,8 @@ export function QueryEditorPanel({
             initialValue={sql ?? ""}
             language={language}
             editorRef={editorRef}
+            onReady={(version) => noteEditorReady(editorId, version)}
+            onVersionChange={(version) => noteVersion(editorId, version)}
             onCommand={onCommand}
             ariaLabel="SQL editor"
             insight={insight}
@@ -637,6 +788,15 @@ export function QueryEditorPanel({
             {confirm.message.replace(/^confirmation required:\s*/i, "")}
           </p>
         </Modal>
+      ) : null}
+      {saveMenu ? (
+        <ContextMenu
+          x={saveMenu.x}
+          y={saveMenu.y}
+          label="Save"
+          items={saveItems}
+          onClose={() => setSaveMenu(null)}
+        />
       ) : null}
       {snippetsOpen ? (
         <SnippetManager

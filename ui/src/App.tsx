@@ -7,8 +7,18 @@ import {
   type IDockviewPanelProps,
   themeLight,
 } from "dockview-react";
-import { Database, FileInput, FolderOpen, History, Plug, Settings, SquarePen } from "lucide-react";
+import {
+  Database,
+  FileCode2,
+  FileInput,
+  History,
+  Plug,
+  Settings,
+  SquarePen,
+  X,
+} from "lucide-react";
 import { type FunctionComponent, useEffect, useState } from "react";
+import { ContextMenu } from "./components/ContextMenu";
 import { ICON } from "./components/icons";
 import { requestNewConnection } from "./connections/requests";
 import { ConnectionsPanel } from "./panels/ConnectionsPanel";
@@ -17,6 +27,18 @@ import { StatusBar } from "./StatusBar";
 import { openSettings } from "./settings";
 import { TableDataPanel } from "./workbench/data/TableDataPanel";
 import { TableDesignerPanel } from "./workbench/designer/TableDesignerPanel";
+import {
+  closeGroupPanels,
+  closeOtherPanels,
+  isSidePanel,
+  requestClosePanel,
+} from "./workbench/documents/actions";
+import { installAppEvents } from "./workbench/documents/appEvents";
+import { DocumentDialogsHost } from "./workbench/documents/dialogs";
+import { OpenMenu } from "./workbench/documents/OpenMenu";
+import { QueriesPanel } from "./workbench/documents/QueriesPanel";
+import { useTabDirty } from "./workbench/documents/tabs";
+import { restoreWorkspace } from "./workbench/documents/workspace";
 import { QueryEditorPanel } from "./workbench/editor/QueryEditorPanel";
 import { HistoryPanel } from "./workbench/history/HistoryPanel";
 import {
@@ -33,13 +55,13 @@ import {
   type SyncPanelParams,
   setDockviewApi,
   showHistory,
+  showQueries,
   type TableDataPanelParams,
 } from "./workbench/layout";
 import { CollectionPanel } from "./workbench/nosql/CollectionPanel";
 import { ConsolePanel } from "./workbench/nosql/console/ConsolePanel";
 import { KeyBrowserPanel } from "./workbench/nosql/keys/KeyBrowserPanel";
 import { PubSubPanel } from "./workbench/nosql/pubsub/PubSubPanel";
-import { OpenFileHost, openSqlFile } from "./workbench/openFile";
 import { SettingsHost } from "./workbench/SettingsDialog";
 import { installShortcuts } from "./workbench/shortcuts";
 import { DataSyncPanel } from "./workbench/sync/DataSyncPanel";
@@ -147,6 +169,7 @@ function DataSyncTab({ params }: IDockviewPanelProps<SyncPanelParams>) {
 const components: Record<string, FunctionComponent<IDockviewPanelProps>> = {
   connections: () => <ConnectionsPanel />,
   objects: () => <ObjectTreePanel />,
+  queries: () => <QueriesPanel />,
   welcome: () => <WelcomePanel />,
   history: () => <HistoryPanel />,
   query: QueryPanel,
@@ -167,13 +190,44 @@ const components: Record<string, FunctionComponent<IDockviewPanelProps>> = {
  * cancelled so the webview does not start auto-scrolling.
  */
 function Tab(props: IDockviewPanelHeaderProps) {
+  const id = props.api.id;
+  // 1.3: a dot marks unsaved changes; closing such a tab asks first (./workbench/documents).
+  const dirty = useTabDirty(id);
+  const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
+  const side = isSidePanel(id);
   return (
-    <DockviewDefaultTab
-      {...props}
-      onMouseDown={(event) => {
-        if (event.button === 1) event.preventDefault();
-      }}
-    />
+    <>
+      <DockviewDefaultTab
+        {...props}
+        data-dirty={dirty ? "true" : undefined}
+        title={dirty ? "Unsaved changes" : undefined}
+        closeActionOverride={() => void requestClosePanel(id)}
+        onMouseDown={(event) => {
+          if (event.button === 1) event.preventDefault();
+        }}
+        onContextMenu={(event) => {
+          event.preventDefault();
+          setMenu({ x: event.clientX, y: event.clientY });
+        }}
+      />
+      {menu ? (
+        <ContextMenu
+          x={menu.x}
+          y={menu.y}
+          label="Tab"
+          items={[
+            { label: "Close", icon: X, onSelect: () => void requestClosePanel(id) },
+            {
+              label: "Close others",
+              disabled: side,
+              onSelect: () => void closeOtherPanels(id),
+            },
+            { label: "Close all", disabled: side, onSelect: () => void closeGroupPanels(id) },
+          ]}
+          onClose={() => setMenu(null)}
+        />
+      ) : null}
+    </>
   );
 }
 
@@ -191,11 +245,19 @@ function onReady(event: DockviewReadyEvent) {
     position: { referencePanel: welcome, direction: "left" },
     initialWidth: 280,
   });
-  event.api.addPanel({
+  const objects = event.api.addPanel({
     id: "objects",
     component: "objects",
     title: "Objects",
     position: { referencePanel: connections, direction: "below" },
+  });
+  // 1.3: saved queries, a tab next to Objects.
+  event.api.addPanel({
+    id: "queries",
+    component: "queries",
+    title: "Queries",
+    position: { referencePanel: objects, direction: "within" },
+    inactive: true,
   });
   event.api.addPanel({
     id: "history",
@@ -206,6 +268,8 @@ function onReady(event: DockviewReadyEvent) {
     inactive: true,
   });
   welcome.api.setActive();
+  // 1.3: the last session's query tabs come back, then files opened from the OS are taken.
+  void restoreWorkspace().finally(installAppEvents);
 }
 
 export function App() {
@@ -240,21 +304,22 @@ export function App() {
             <SquarePen {...ICON} />
             New query
           </button>
-          <button
-            type="button"
-            className="button button--ghost"
-            title="Open a .sql file in a new query tab (Ctrl+O)"
-            onClick={() => void openSqlFile()}
-          >
-            <FolderOpen {...ICON} />
-            Open…
-          </button>
+          <OpenMenu />
           <span className="toolbar__separator" aria-hidden="true" />
           <button type="button" className="button button--ghost" onClick={() => openImport()}>
             <FileInput {...ICON} />
             Import…
           </button>
           <SyncMenu />
+          <button
+            type="button"
+            className="button button--ghost"
+            title="Saved queries of every connection"
+            onClick={showQueries}
+          >
+            <FileCode2 {...ICON} />
+            Queries
+          </button>
           <button type="button" className="button button--ghost" onClick={showHistory}>
             <History {...ICON} />
             History
@@ -284,7 +349,7 @@ export function App() {
       <TransferHost />
       <SyncHost />
       <SettingsHost />
-      <OpenFileHost />
+      <DocumentDialogsHost />
     </div>
   );
 }

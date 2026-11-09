@@ -331,6 +331,43 @@ pub async fn delete_profile_and_caches(
     Ok(existed)
 }
 
+/// Whether `a` and `b` name the same file: equal once both are resolved (links, `..`, case on
+/// case-insensitive file systems), or equal as written when either cannot be resolved.
+fn same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
+}
+
+/// The saved SQLite connection of the database file `path` (a file opened from the OS or the
+/// command line): the first saved SQLite profile of that file, else a new profile named after
+/// the file, saved in `repo`. Returns the profile and whether it was created.
+pub async fn sqlite_profile_for_file(
+    repo: &dyn ProfileRepository,
+    path: &std::path::Path,
+) -> Result<(ConnectionProfile, bool)> {
+    let path = std::path::absolute(path)?;
+    let existing = repo.list().await?.into_iter().find(|p| {
+        p.engine == oxbase_store::Engine::Sqlite
+            && matches!(&p.address, oxbase_store::ProfileAddress::File { path: saved } if same_file(saved, &path))
+    });
+    if let Some(profile) = existing {
+        return Ok((profile, false));
+    }
+    let name = path
+        .file_name()
+        .map_or_else(|| "SQLite".to_owned(), |n| n.to_string_lossy().into_owned());
+    let profile = ConnectionProfile::new(
+        name,
+        oxbase_store::Engine::Sqlite,
+        oxbase_store::ProfileAddress::File { path },
+    );
+    profile.validate()?;
+    repo.save(&profile).await?;
+    Ok((profile, true))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -338,6 +375,29 @@ mod tests {
         Engine, KnownHostsPolicy, MemoryProfileRepository, MemorySecretStore, ProfileAddress,
         SshSettings,
     };
+
+    #[tokio::test]
+    async fn a_sqlite_file_gets_one_saved_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("orders.sqlite");
+        std::fs::write(&file, b"").unwrap();
+        let repo = MemoryProfileRepository::new();
+        let (created, new) = sqlite_profile_for_file(&repo, &file).await.unwrap();
+        assert!(new);
+        assert_eq!(created.name, "orders.sqlite");
+        assert_eq!(created.engine, Engine::Sqlite);
+        // The same file, written another way, finds it again.
+        let other = dir.path().join(".").join("orders.sqlite");
+        let (found, new) = sqlite_profile_for_file(&repo, &other).await.unwrap();
+        assert!(!new);
+        assert_eq!(found.id, created.id);
+        assert_eq!(repo.list().await.unwrap().len(), 1);
+        let (second, new) = sqlite_profile_for_file(&repo, &dir.path().join("b.db"))
+            .await
+            .unwrap();
+        assert!(new);
+        assert_ne!(second.id, created.id);
+    }
     use oxbase_types::ErrorCategory;
 
     const MARKER: &str = "pw-marker-7f3a";
