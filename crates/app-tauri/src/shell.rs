@@ -344,7 +344,7 @@ mod tests {
         let real = dir.path().join("real.db");
         let mut bytes = SQLITE_HEADER.to_vec();
         bytes.extend_from_slice(&[0; 84]);
-        std::fs::write(&real, &bytes).unwrap();
+        std::fs::write(&real, bytes).unwrap();
         assert!(has_sqlite_header(&real).unwrap());
         let empty = dir.path().join("empty.sqlite");
         std::fs::write(&empty, b"").unwrap();

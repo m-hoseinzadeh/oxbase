@@ -650,7 +650,7 @@ mod tests {
             "\u{feff}SELECT 3;\r\n".as_bytes()
         );
         write_text_file(&path, "SELECT 4;\n", false).unwrap();
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "SELECT 4;\n");
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "SELECT 4;\n");
         // No temporary file is left behind.
         let names: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
@@ -681,9 +681,9 @@ mod tests {
         std::fs::write(&real, "old").unwrap();
         std::os::unix::fs::symlink(&real, &link).unwrap();
         write_text_file(&link, "new", false).unwrap();
-        assert_eq!(std::fs::read_to_string(&real).unwrap(), "new");
+        assert_eq!(std::fs::read_to_string(real).unwrap(), "new");
         assert!(
-            std::fs::symlink_metadata(&link)
+            std::fs::symlink_metadata(link)
                 .unwrap()
                 .file_type()
                 .is_symlink()

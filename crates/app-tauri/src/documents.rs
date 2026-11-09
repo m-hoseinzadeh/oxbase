@@ -231,6 +231,7 @@ impl DocumentsState {
         }
     }
 
+    #[cfg(test)]
     pub fn store(&self) -> &DocumentStore {
         &self.store
     }
@@ -803,8 +804,8 @@ mod tests {
         });
         assert_eq!(stored.tabs[0].path.as_deref(), clean.to_str());
         assert_eq!(stored.tabs[0].text, None);
-        std::fs::write(&clean, "changed outside").unwrap();
-        std::fs::remove_file(&gone).unwrap();
+        std::fs::write(clean, "changed outside").unwrap();
+        std::fs::remove_file(gone).unwrap();
 
         // The next run: a new registry.
         let next = state(dir.path());
