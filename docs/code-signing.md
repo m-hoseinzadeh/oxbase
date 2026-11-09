@@ -6,7 +6,7 @@ The public policy is in the README ([Code signing policy](../README.md#code-sign
 | Platform | Today | With this setup |
 |---|---|---|
 | Windows | Unsigned: browser download warning and SmartScreen | `.msi` (and the app inside it) and NSIS `-setup.exe` signed by SignPath Foundation |
-| macOS | Ad-hoc signed: Gatekeeper blocks until right-click → Open | Unchanged (needs an Apple Developer ID; bundle.yml already supports `APPLE_*` secrets) |
+| macOS | Ad-hoc signed: Gatekeeper blocks the first launch until **Open Anyway** in System Settings → Privacy & Security | Unchanged (needs an Apple Developer ID; bundle.yml already supports `APPLE_*` secrets) |
 | Linux | No OS signing exists | Unchanged |
 | All | Build provenance attestations, Sigstore-signed `SHA256SUMS.txt` | Unchanged |
 
@@ -40,6 +40,10 @@ for the first releases until the certificate has reputation for this download.
   team member, on GitHub and on SignPath).
 - The README must have the **Code signing policy** section (it does) and the release pages link
   to it (release.yml does).
+- The download page must say the project uses SignPath Foundation for code signing. The README's
+  **Download** section and every release's notes (written by release.yml) carry the line "Free
+  code signing provided by SignPath.io, certificate by SignPath Foundation". In the application,
+  give `https://github.com/m-hoseinzadeh/oxbase#download` as the download URL.
 - Read the conditions: <https://signpath.org/terms>. One to raise in the application: Oxbase is
   developed as open core (a separate private repository may add paid features). This repository
   and everything SignPath would sign is Apache-2.0 only, but the conditions ask for an "OSI-approved

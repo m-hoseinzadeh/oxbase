@@ -5,6 +5,16 @@ React + TypeScript UI. v1 targets PostgreSQL, MySQL, MariaDB, SQLite, SQL Server
 Redis on Linux, macOS and Windows. The core is headless, so every feature also works from
 `oxbase-cli` and from tests. See [PLAN.md](PLAN.md) for the architecture and milestones.
 
+## Download
+
+Get the installers for Windows (`.msi`, `-setup.exe`), macOS (`.dmg`) and Linux (`.deb`, `.rpm`,
+`.AppImage`) from the [latest release](https://github.com/m-hoseinzadeh/oxbase/releases/latest).
+The release notes say how to verify a download.
+
+Windows code signing: free code signing provided by [SignPath.io](https://about.signpath.io),
+certificate by [SignPath Foundation](https://signpath.org). See the
+[code signing policy](#code-signing-policy) for what is signed and its current status.
+
 ## What works (1.0)
 
 Oxbase 1.0 is the core client: milestones M0 to M8 of [PLAN.md](PLAN.md). Jobs, ER modeling, BI,
