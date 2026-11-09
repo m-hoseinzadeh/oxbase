@@ -197,16 +197,20 @@ jobs:
             echo
             if [ "$SIGNED" != "true" ] && [ "$WINDOWS_SIGNPATH" = "true" ]; then
               echo "> The Windows installers are code-signed (publisher: SignPath Foundation). The macOS"
-              echo "> app is not signed yet: macOS blocks it until you right-click it and choose **Open**"
-              echo "> (or run \`xattr -dr com.apple.quarantine /Applications/Oxbase.app\`)."
+              echo "> app is not signed yet: macOS blocks its first launch. Open it once, then choose"
+              echo "> **Open Anyway** in System Settings → Privacy & Security (or run"
+              echo "> \`xattr -dr com.apple.quarantine /Applications/Oxbase.app\`)."
               echo
             elif [ "$SIGNED" != "true" ]; then
-              echo "> **Unsigned build.** These installers are not code-signed yet. macOS blocks the app"
-              echo "> until you right-click it and choose **Open** (or run"
-              echo "> \`xattr -dr com.apple.quarantine /Applications/Oxbase.app\`), and Windows SmartScreen"
-              echo "> shows a warning (**More info → Run anyway**)."
+              echo "> **Unsigned build.** These installers are not code-signed yet. macOS blocks the app's"
+              echo "> first launch: open it once, then choose **Open Anyway** in System Settings → Privacy &"
+              echo "> Security (or run \`xattr -dr com.apple.quarantine /Applications/Oxbase.app\`), and"
+              echo "> Windows SmartScreen shows a warning (**More info → Run anyway**)."
               echo
             fi
+            echo "Windows code signing: free code signing provided by [SignPath.io](https://about.signpath.io),"
+            echo "certificate by [SignPath Foundation](https://signpath.org)."
+            echo
             echo "| Platform | Download |"
             echo "|---|---|"
             echo "| Windows x64 | \`.msi\` or \`-setup.exe\` |"
