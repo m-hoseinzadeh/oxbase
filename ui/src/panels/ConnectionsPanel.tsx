@@ -24,7 +24,7 @@ import {
 import { CATEGORY_LABEL, ConnectionDialog, TLS_MODES } from "../connections/ConnectionDialog";
 import { EngineBadge } from "../connections/EngineBadge";
 import { promptedSecrets } from "../connections/form";
-import { onNewConnectionRequest } from "../connections/requests";
+import { onConnectRequest, onNewConnectionRequest } from "../connections/requests";
 import { refreshAll, refreshProfiles, refreshSessions, useConnections } from "../connections/store";
 import {
   type CommandError,
@@ -237,6 +237,27 @@ export function ConnectionsPanel() {
 
   // The app bar and welcome screen ask for a new connection through the request bus.
   useEffect(() => onNewConnectionRequest(() => setDialog({ kind: "edit" })), []);
+
+  // 1.3: a query tab or a file opened from the OS asks to connect a saved profile. The latest
+  // `startConnect` is used (it reads the open sessions).
+  const connectRef = useRef<(profileId: string, retried?: boolean) => void>(() => {});
+  connectRef.current = (profileId, retried = false) => {
+    const profile = profiles.find((p) => p.id === profileId);
+    if (!profile) {
+      // A profile saved a moment ago (a SQLite file opened from the OS): list them again, once,
+      // and look again after the panel re-rendered with them.
+      if (!retried) {
+        void refreshProfiles().then(() => {
+          setTimeout(() => connectRef.current(profileId, true), 0);
+        });
+      }
+      return;
+    }
+    setSelectedId(profile.id);
+    if (sessions.some((s) => s.profile_id === profile.id) || busyId === profile.id) return;
+    startConnect(profile);
+  };
+  useEffect(() => onConnectRequest((profileId) => connectRef.current(profileId)), []);
 
   const noCore = profilesStatus === "error" && profilesError?.category === "unsupported";
 

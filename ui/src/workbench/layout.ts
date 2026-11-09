@@ -3,7 +3,7 @@
  * here by the app shell once the layout is ready.
  */
 import type { AddPanelPositionOptions, DockviewApi } from "dockview-react";
-import type { BinaryText, ObjectRef } from "../api";
+import type { BinaryText, DocumentInfo, ObjectRef } from "../api";
 import { qualifiedName } from "./names";
 
 /** What a new query editor starts with (`params` of its dockview panel). */
@@ -17,6 +17,14 @@ export interface QueryEditorParams {
   sql?: string;
   /** Tab title (default `Query <n>`; the mongo shell says so). */
   title?: string;
+  /** 1.3: the file or saved query the tab shows. */
+  document?: DocumentInfo;
+  /** 1.3: the connection to run on when no session is chosen: its open session, if any. */
+  profileId?: string;
+  /** 1.3: the text is not the file's (a tab restored with unsaved changes). */
+  restoredDirty?: boolean;
+  /** 1.3: start without a connection instead of the first open one (a file from outside). */
+  pickConnection?: boolean;
 }
 
 export type QueryEditorInit = Omit<QueryEditorParams, "editorId">;
@@ -33,14 +41,56 @@ export function activePanelId(): string | null {
   return dockview?.activePanel?.id ?? null;
 }
 
+/** The dockview API, once the layout is ready. */
+export function dockviewApi(): DockviewApi | null {
+  return dockview;
+}
+
+/** Closes a tab right away (no unsaved-changes question: see documents/close). */
+export function closePanel(id: string): void {
+  dockview?.getPanel(id)?.api.close();
+}
+
+/** Shows a tab. */
+export function activatePanel(id: string): void {
+  dockview?.getPanel(id)?.api.setActive();
+}
+
+/** Sets a tab's title. */
+export function setPanelTitle(id: string, title: string): void {
+  dockview?.getPanel(id)?.api.setTitle(title);
+}
+
+/** The ids of the tabs in the same group as `id` (itself included), in tab order. */
+export function groupPanelIds(id: string): string[] {
+  const panel = dockview?.getPanel(id);
+  return panel ? panel.group.panels.map((p) => p.id) : [];
+}
+
+/** Every tab, group by group, in tab order. */
+export function allPanelIds(): string[] {
+  return dockview ? dockview.groups.flatMap((g) => g.panels.map((p) => p.id)) : [];
+}
+
+/** A tab's title. */
+export function panelTitle(id: string): string {
+  return dockview?.getPanel(id)?.title ?? "";
+}
+
 /** A fresh editor id (1 to 200 bytes, unique for this app run). */
 export function newEditorId(): string {
   counter += 1;
   return `editor-${Date.now().toString(36)}-${counter}`;
 }
 
-/** Opens a new query editor tab next to the other editors. Returns its editor id. */
-export function openQueryEditor(init: QueryEditorInit = {}): string | null {
+/**
+ * Opens a new query editor tab next to the other editors (`inactive`: behind the active tab).
+ * Returns its editor id.
+ */
+export function openQueryEditor(
+  init: QueryEditorInit = {},
+  options: { inactive?: boolean } = {},
+): string | null {
   const api = dockview;
   if (!api) return null;
   const editorId = newEditorId();
@@ -51,6 +101,7 @@ export function openQueryEditor(init: QueryEditorInit = {}): string | null {
     title: init.title ?? `Query ${counter}`,
     params,
     position: mainAreaPosition(api),
+    ...(options.inactive ? { inactive: true } : {}),
   });
   return editorId;
 }
@@ -70,6 +121,24 @@ export function showHistory(): void {
     title: "History",
     position: { direction: "below" },
     initialHeight: 220,
+  });
+}
+
+/** Shows (or re-adds) the Queries panel (1.3: saved queries), next to Objects. */
+export function showQueries(): void {
+  const api = dockview;
+  if (!api) return;
+  const existing = api.getPanel("queries");
+  if (existing) {
+    existing.api.setActive();
+    return;
+  }
+  const objects = api.getPanel("objects");
+  api.addPanel({
+    id: "queries",
+    component: "queries",
+    title: "Queries",
+    position: objects ? { referencePanel: objects, direction: "within" } : { direction: "left" },
   });
 }
 

@@ -8,6 +8,7 @@
  */
 export * from "./data";
 export * from "./designer";
+export * from "./documents";
 export * from "./insight";
 export * from "./io";
 export * from "./m8";

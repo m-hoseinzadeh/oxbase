@@ -257,6 +257,8 @@ tauri = "2.12.5"
 tauri-build = "2.7.4"
 # Native file pickers; keep on the same major.minor as @tauri-apps/plugin-dialog in ui/.
 tauri-plugin-dialog = "2.8.4"
+# 1.3: one running instance; a second launch hands its files to it.
+tauri-plugin-single-instance = "2.5.4"
 
 # --- dev / test ---
 tokio-test = "0.4.6"

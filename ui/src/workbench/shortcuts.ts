@@ -8,11 +8,12 @@
  * | Ctrl+Enter          | run the selection, else the statement at cursor  |                |
  * | Ctrl+Shift+Enter    | run the whole script                             |                |
  * | Shift+F5            | stop the running query                           |                |
- * | Ctrl+S              |                                                  | apply changes  |
+ * | Ctrl+S              | save (the file or saved query)                   | apply changes  |
+ * | Ctrl+Shift+S        | save as a file                                   |                |
  * | Ctrl+N              | (a new query tab)                                | grid: add row  |
  *
  * Ctrl+N opens a new query tab unless the active tab uses it (a table's grid adds a row);
- * Ctrl+O opens a `.sql` file in a new query tab; Ctrl+, opens the Settings window.
+ * Ctrl+O opens a `.sql` file in a query tab (./documents); Ctrl+, opens the Settings window.
  *
  * Ctrl+= (Ctrl++), Ctrl+- and Ctrl+0 zoom the whole app in, out and back to 100 % (./zoom),
  * whichever tab is active.
@@ -23,11 +24,18 @@
  * Ctrl+Enter) is left alone.
  */
 
-export type ShortcutCommand = "run" | "runCurrent" | "runAll" | "cancel" | "save" | "new";
+export type ShortcutCommand =
+  | "run"
+  | "runCurrent"
+  | "runAll"
+  | "cancel"
+  | "save"
+  | "saveAs"
+  | "new";
 
 import { openSettings } from "../settings";
+import { openFileDialog } from "./documents/actions";
 import { openQueryEditor } from "./layout";
-import { openSqlFile } from "./openFile";
 import { resetZoom, zoomIn, zoomOut } from "./zoom";
 
 /** Runs `command` for its tab; `false` when the tab has nothing for it. */
@@ -64,7 +72,7 @@ export function shortcutOf(event: Keys): ShortcutCommand | "reload" | null {
   }
   if (mod && key === "r") return event.shiftKey ? "reload" : "run";
   if (mod && key === "Enter") return event.shiftKey ? "runAll" : "runCurrent";
-  if (mod && !event.shiftKey && key === "s") return "save";
+  if (mod && key === "s") return event.shiftKey ? "saveAs" : "save";
   if (mod && !event.shiftKey && key === "n") return "new";
   return null;
 }
@@ -105,6 +113,7 @@ export const SHORTCUT_LABELS: Record<ShortcutCommand, string> = {
   runAll: "Ctrl+Shift+Enter",
   cancel: "Shift+F5",
   save: "Ctrl+S",
+  saveAs: "Ctrl+Shift+S",
   new: "Ctrl+N",
 };
 
@@ -130,7 +139,7 @@ export function installShortcuts(
     if (app !== null) {
       event.preventDefault();
       if (app === "settings") openSettings();
-      else void openSqlFile();
+      else void openFileDialog();
       return;
     }
     const shortcut = shortcutOf(event);

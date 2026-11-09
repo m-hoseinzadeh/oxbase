@@ -43,6 +43,15 @@
 //!   `data_cancel`, `backup_run` (`Channel`), `backup_restore` (`Channel`), `backup_verify`,
 //!   `backup_list` and `backup_cancel`. Contract: `docs/m8-contracts.md` §8.
 //!
+//! * Query files, saved queries and the workspace (1.3, `src/documents.rs`): `document_open`,
+//!   `document_reopen`, `document_recent`, `document_recent_clear`, `document_save`,
+//!   `document_save_as`, `document_set_link`, `saved_query_list`, `saved_query_create`,
+//!   `saved_query_rename`, `saved_query_delete`, `workspace_load` and `workspace_save`.
+//!   Desktop integration (1.3, `src/shell.rs`): files opened from the OS or the command line, one
+//!   running instance (`tauri-plugin-single-instance`), and quitting after the UI kept its
+//!   workspace: `app_events_subscribe` (events through a `Channel`) and `app_close_ready`.
+//!   Guide: `docs/files.md`.
+//!
 //! Every fallible command rejects with [`error::CommandError`], serialized as
 //! `{ "category": "<snake_case ErrorCategory>", "message": "..." }`.
 //!
@@ -54,11 +63,13 @@ mod connections;
 mod data;
 mod demo_page;
 mod designer;
+mod documents;
 mod error;
 mod files;
 mod insight;
 mod nosql;
 mod profiles;
+mod shell;
 mod sync;
 mod transfer;
 mod workbench;
@@ -111,7 +122,25 @@ fn demo_arrow_page() -> Result<Response, String> {
 /// Builds and runs the Tauri application. Called from `main`.
 pub fn run() {
     let app = tauri::Builder::default()
+        // First, so a second instance hands its files over before anything else starts.
+        .plugin(tauri_plugin_single_instance::init(|app, argv, cwd| {
+            let args = argv.into_iter().skip(1).map(std::ffi::OsString::from);
+            let paths = shell::paths_from_args(args, std::path::Path::new(&cwd));
+            shell::focus_main(app);
+            app.state::<shell::ShellState>().receive(app, paths);
+        }))
         .plugin(tauri_plugin_dialog::init())
+        .manage(shell::ShellState::new())
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event
+                && window.label() == "main"
+                && window
+                    .state::<shell::ShellState>()
+                    .hold_close(window.app_handle())
+            {
+                api.prevent_close();
+            }
+        })
         .setup(|app| {
             let data_dir = app.path().app_data_dir().ok();
             let states = backend::app_state(data_dir.as_deref());
@@ -124,6 +153,13 @@ pub fn run() {
             app.manage(states.insight);
             app.manage(states.nosql);
             app.manage(states.sync);
+            app.manage(states.documents);
+            // Files on the command line wait until the UI subscribes.
+            if let Ok(cwd) = std::env::current_dir() {
+                let paths = shell::paths_from_args(std::env::args_os().skip(1), &cwd);
+                app.state::<shell::ShellState>()
+                    .receive(app.handle(), paths);
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -208,11 +244,48 @@ pub fn run() {
             sync::backup_verify,
             sync::backup_list,
             sync::backup_cancel,
+            documents::document_open,
+            documents::document_reopen,
+            documents::document_recent,
+            documents::document_recent_clear,
+            documents::document_save,
+            documents::document_save_as,
+            documents::document_set_link,
+            documents::saved_query_list,
+            documents::saved_query_create,
+            documents::saved_query_rename,
+            documents::saved_query_delete,
+            documents::workspace_load,
+            documents::workspace_save,
+            shell::app_events_subscribe,
+            shell::app_close_ready,
         ])
         .build(tauri::generate_context!())
         .expect("error while building the oxbase desktop shell");
 
     app.run(|handle, event| {
+        // A quit the user asked for (macOS: Cmd+Q) waits for the UI to keep its workspace, like
+        // closing the window.
+        if let tauri::RunEvent::ExitRequested {
+            code: None, api, ..
+        } = &event
+            && handle.state::<shell::ShellState>().hold_close(handle)
+        {
+            api.prevent_exit();
+        }
+        // macOS hands opened files (Finder, `open -a Oxbase file.sql`) over as an event.
+        #[cfg(target_os = "macos")]
+        if let tauri::RunEvent::Opened { urls } = &event {
+            let paths = urls
+                .iter()
+                .filter(|url| url.scheme() == "file")
+                .filter_map(|url| url.to_file_path().ok())
+                .filter(|path| path.is_file())
+                .take(shell::MAX_OPEN_PATHS)
+                .collect();
+            shell::focus_main(handle);
+            handle.state::<shell::ShellState>().receive(handle, paths);
+        }
         if let tauri::RunEvent::Exit = event
             && let Some(state) = handle.try_state::<connections::ConnectionsState>()
         {

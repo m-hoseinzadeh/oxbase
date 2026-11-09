@@ -784,6 +784,20 @@ pnpm tauri build                          # release bundles for the current OS
    height, rows to load when a table opens, whether Filter & sort starts open, the Sessions
    setting new connections start with, and the list of keyboard shortcuts.
 
+### Files and saved queries
+
+Guide: [docs/files.md](docs/files.md).
+
+- **Ctrl+S** saves a query tab: to its file or saved query, or, for a new tab on a connection, as
+  a **saved query** of that connection (listed in the **Queries** panel next to Objects).
+  **Ctrl+Shift+S** saves as a file. A dot on a tab marks unsaved changes; closing it asks first.
+- **Open ▾** lists recent files. A file opens on the connection and database it last ran on;
+  one that never ran opens with no connection chosen. Nothing runs by itself.
+- Query tabs come back after a restart, unsaved text included.
+- The installers register `.sql` (opens in a query tab) and `.sqlite`, `.sqlite3`, `.db`, `.db3`
+  (opens as a SQLite connection). Double-clicking a file, or `oxbase file.sql`, hands it to the
+  running window: only one Oxbase runs at a time.
+
 ### Editing data and designing tables
 
 1. With the fixture, expand `oxbase_test` > `m3` > **Tables** and double-click `m3_edit_pk`.

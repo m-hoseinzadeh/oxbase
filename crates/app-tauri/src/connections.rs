@@ -44,6 +44,11 @@ impl ConnectionsState {
         &self.manager
     }
 
+    /// The saved profiles (1.3: a SQLite file opened from the OS gets one).
+    pub(crate) fn profiles(&self) -> &Arc<dyn ProfileRepository> {
+        &self.profiles
+    }
+
     /// Registers a cancellable request (M2 workbench commands share `cancel_request`).
     pub(crate) fn start_request(&self, id: Option<String>) -> Result<PendingGuard> {
         self.pending.start(id)
