@@ -11,9 +11,7 @@ Get the installers for Windows (`.msi`, `-setup.exe`), macOS (`.dmg`) and Linux 
 `.AppImage`) from the [latest release](https://github.com/m-hoseinzadeh/oxbase/releases/latest).
 The release notes say how to verify a download.
 
-Windows code signing: free code signing provided by [SignPath.io](https://about.signpath.io),
-certificate by [SignPath Foundation](https://signpath.org). See the
-[code signing policy](#code-signing-policy) for what is signed and its current status.
+The installers are not code-signed yet: see [Code signing](#code-signing).
 
 ## What works (1.0)
 
@@ -915,28 +913,21 @@ It prints one line per job and, for failed jobs, only the error lines of the log
 errors, failed tests, panics, `##[error]`). Exit code 0 means all green. It uses `GITHUB_TOKEN`
 or the github.com credential that `git push` uses, and never pushes to main.
 
-## Code signing policy
+## Code signing
 
-Free code signing provided by [SignPath.io](https://about.signpath.io), certificate by
-[SignPath Foundation](https://signpath.org).
+**Status:** the release installers are not code-signed. Windows SmartScreen warns when a
+downloaded installer starts (**More info → Run anyway**), and macOS blocks the app's first
+launch until you choose **Open Anyway** in System Settings → Privacy & Security. The release
+notes say how.
 
-**Status:** Oxbase has applied to the SignPath Foundation program. Until it is accepted, the
-Windows installers are not code-signed. The macOS app is not signed either (no Apple Developer
-certificate yet). Every release file has a GitHub build provenance attestation and
-`SHA256SUMS.txt` is signed with Sigstore; the release notes say how to check them.
+Every release file still has a GitHub build provenance attestation, and `SHA256SUMS.txt` is
+signed with Sigstore: they prove a file was built by this repository's release workflow from the
+tagged commit. The release notes show how to check them.
 
-- **What is signed:** the Windows installers of a release (`.msi`, with the app inside it, and
-  the NSIS `-setup.exe`), built from this repository by GitHub Actions
-  ([bundle.yml](.github/workflows/bundle.yml), [release.yml](.github/workflows/release.yml)).
-  Nothing built anywhere else is signed. Setup: [docs/code-signing.md](docs/code-signing.md).
-- **Committers and reviewers:** [Mohammad Hoseinzadeh](https://github.com/m-hoseinzadeh). Changes
-  from other contributors are reviewed by a committer before they are merged.
-- **Approvers:** [Mohammad Hoseinzadeh](https://github.com/m-hoseinzadeh). Every signing request is
-  approved by hand.
-- **Privacy:** this program will not transfer any information to other networked systems unless
-  specifically requested by the user or the person installing or operating it. Oxbase connects
-  only to the database servers, SSH bastions and other hosts you configure; it has no telemetry
-  and no update checks.
+Oxbase has no telemetry and no update checks: it connects only to the database servers, SSH
+bastions and other hosts you configure.
+
+How signing gets turned on once there are certificates: [docs/code-signing.md](docs/code-signing.md).
 
 ## License
 

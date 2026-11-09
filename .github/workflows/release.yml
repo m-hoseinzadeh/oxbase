@@ -188,29 +188,18 @@ jobs:
           VERSION: ${{ needs.prepare.outputs.version }}
           SIGNED: ${{ needs.prepare.outputs.require_signing }}
           SHA: ${{ needs.prepare.outputs.sha }}
-          # SignPath signs the Windows installers once its project is configured (bundle.yml).
-          WINDOWS_SIGNPATH: ${{ vars.SIGNPATH_PROJECT_SLUG != '' }}
         run: |
           set -euo pipefail
           {
             echo "Oxbase $VERSION, built from commit ${SHA:0:7}."
             echo
-            if [ "$SIGNED" != "true" ] && [ "$WINDOWS_SIGNPATH" = "true" ]; then
-              echo "> The Windows installers are code-signed (publisher: SignPath Foundation). The macOS"
-              echo "> app is not signed yet: macOS blocks its first launch. Open it once, then choose"
-              echo "> **Open Anyway** in System Settings → Privacy & Security (or run"
-              echo "> \`xattr -dr com.apple.quarantine /Applications/Oxbase.app\`)."
-              echo
-            elif [ "$SIGNED" != "true" ]; then
+            if [ "$SIGNED" != "true" ]; then
               echo "> **Unsigned build.** These installers are not code-signed yet. macOS blocks the app's"
               echo "> first launch: open it once, then choose **Open Anyway** in System Settings → Privacy &"
               echo "> Security (or run \`xattr -dr com.apple.quarantine /Applications/Oxbase.app\`), and"
               echo "> Windows SmartScreen shows a warning (**More info → Run anyway**)."
               echo
             fi
-            echo "Windows code signing: free code signing provided by [SignPath.io](https://about.signpath.io),"
-            echo "certificate by [SignPath Foundation](https://signpath.org)."
-            echo
             echo "| Platform | Download |"
             echo "|---|---|"
             echo "| Windows x64 | \`.msi\` or \`-setup.exe\` |"
@@ -240,8 +229,6 @@ jobs:
             echo
             echo "This proves where a file was built, not who wrote the code; it does not replace OS code"
             echo "signing."
-            echo
-            echo "[Code signing policy](https://github.com/$GITHUB_REPOSITORY#code-signing-policy)"
           } > notes.md
           cat notes.md
 

@@ -1,96 +1,55 @@
 # Code signing
 
-How Oxbase releases are signed, and how to set up SignPath Foundation signing for Windows.
-The public policy is in the README ([Code signing policy](../README.md#code-signing-policy)).
+How Oxbase releases are signed, and how to turn OS code signing on once there are certificates.
+The public status is in the README ([Code signing](../README.md#code-signing)).
 
-| Platform | Today | With this setup |
+| Platform | Today | With a certificate |
 |---|---|---|
-| Windows | Unsigned: browser download warning and SmartScreen | `.msi` (and the app inside it) and NSIS `-setup.exe` signed by SignPath Foundation |
-| macOS | Ad-hoc signed: Gatekeeper blocks the first launch until **Open Anyway** in System Settings → Privacy & Security | Unchanged (needs an Apple Developer ID; bundle.yml already supports `APPLE_*` secrets) |
+| Windows | Unsigned: browser download warning and SmartScreen | `.msi`, NSIS `-setup.exe` and the app signed with the certificate (Authenticode, SHA-256, timestamped) |
+| macOS | Ad-hoc signed: Gatekeeper blocks the first launch until **Open Anyway** in System Settings → Privacy & Security | Developer ID signed and notarized |
 | Linux | No OS signing exists | Unchanged |
 | All | Build provenance attestations, Sigstore-signed `SHA256SUMS.txt` | Unchanged |
 
-## How Windows signing works
+`bundle.yml` signs when the secrets below exist and skips signing otherwise.
+`scripts/ci-verify-signing.mjs` checks what was produced: a signature that is present but broken
+always fails the job; a missing one is a warning until signing is required.
 
-1. `bundle.yml` builds the bundles as before (`tauri-action`).
-2. With the SignPath secret and variables set, the Windows job uploads the `.msi` and the
-   `-setup.exe` as one artifact and submits a signing request with
-   `signpath/github-action-submit-signing-request` (artifact configuration
-   [`installers`](../.signpath/artifact-configurations/installers.xml)).
-3. SignPath checks that GitHub Actions built the artifact from this repository (origin
-   verification), waits for your **manual approval**, signs, and returns the files: the `.msi` is
-   deep-signed (the app `.exe` inside it, then the `.msi`), the NSIS installer is signed as a whole.
-4. The job puts the signed files back in place and over the workflow artifacts `release.yml`
-   publishes; `scripts/ci-verify-signing.mjs` then requires a valid Authenticode signature on
-   both installers. The release notes say the Windows installers are signed.
+## Windows: a code signing certificate
 
-Why not the app `.exe` before bundling: the Tauri bundler stamps the bundle type into the `.exe`
-while it builds each installer, which would break an earlier signature. Inside the NSIS installer
-the app stays unsigned (SignPath cannot open NSIS archives); Windows does not warn about an
-installed program, only about the downloaded installer, which is signed.
+Secrets (Settings → Secrets and variables → Actions):
 
-The publisher shown by Windows is **SignPath Foundation**, not Oxbase. SmartScreen can still warn
-for the first releases until the certificate has reputation for this download.
+| Secret | Value |
+|---|---|
+| `WINDOWS_CERTIFICATE` | the certificate with its private key, as a base64 `.pfx` |
+| `WINDOWS_CERTIFICATE_PASSWORD` | the `.pfx` password |
 
-## Setup (maintainer)
+The Windows job imports the `.pfx`, picks the certificate with a private key (preferring one with
+the Code Signing usage) and passes its thumbprint to the Tauri bundler, which signs with SHA-256
+and a DigiCert timestamp. Only the thumbprint leaves that step.
 
-### 1. Before applying
+New code signing certificates must keep their key on a hardware token or in a cloud key
+service, which a `.pfx` secret cannot hold. Such a service (Azure Trusted Signing, for example)
+needs a change to `bundle.yml`: Tauri's `bundle.windows.signCommand` calling the service's
+signing tool instead of the `.pfx` import.
 
-- Turn on two-factor authentication for your GitHub account (SignPath requires MFA for every
-  team member, on GitHub and on SignPath).
-- The README must have the **Code signing policy** section (it does) and the release pages link
-  to it (release.yml does).
-- The download page must say the project uses SignPath Foundation for code signing. The README's
-  **Download** section and every release's notes (written by release.yml) carry the line "Free
-  code signing provided by SignPath.io, certificate by SignPath Foundation". In the application,
-  give `https://github.com/m-hoseinzadeh/oxbase#download` as the download URL.
-- Read the conditions: <https://signpath.org/terms>. One to raise in the application: Oxbase is
-  developed as open core (a separate private repository may add paid features). This repository
-  and everything SignPath would sign is Apache-2.0 only, but the conditions ask for an "OSI-approved
-  Open Source license without commercial dual-licensing for all components", so say how the
-  paid part is separated and let them decide.
+## macOS: an Apple Developer ID
 
-### 2. Apply
+Needs the Apple Developer Program (paid, yearly).
 
-At <https://signpath.org/apply>: project name Oxbase, repository
-`https://github.com/m-hoseinzadeh/oxbase`, license Apache-2.0, build system GitHub Actions,
-artifacts: Windows `.msi` and NSIS `.exe` installers, releases at
-`https://github.com/m-hoseinzadeh/oxbase/releases`.
+| Secret | Value |
+|---|---|
+| `APPLE_CERTIFICATE` | the "Developer ID Application" certificate with its key, as a base64 `.p12` |
+| `APPLE_CERTIFICATE_PASSWORD` | the `.p12` password |
+| `APPLE_SIGNING_IDENTITY` | optional; Tauri derives it from the certificate |
+| `APPLE_ID`, `APPLE_PASSWORD`, `APPLE_TEAM_ID` | notarization: the Apple ID, an app-specific password and the team id |
 
-### 3. In SignPath, once accepted
+With them, the macOS bundles are Developer ID signed and notarized, and the verify step checks
+`codesign`, `spctl` and the stapled ticket.
 
-1. Add the predefined trusted build system **GitHub.com** to the organization and link it to the
-   project.
-2. Create the artifact configuration with slug `installers` from
-   [`.signpath/artifact-configurations/installers.xml`](../.signpath/artifact-configurations/installers.xml).
-3. Signing policies: `release-signing` (the Foundation certificate, **Use approval process**,
-   yourself as approver) and, if offered, `test-signing` (a test certificate, no approval).
-4. Create an API token for a user with submitter rights on both policies.
+## Requiring signing
 
-### 4. In GitHub (Settings → Secrets and variables → Actions)
-
-| Kind | Name | Value |
-|---|---|---|
-| Secret | `SIGNPATH_API_TOKEN` | the API token |
-| Variable | `SIGNPATH_ORGANIZATION_ID` | the organization ID |
-| Variable | `SIGNPATH_PROJECT_SLUG` | the project slug |
-| Variable (optional) | `SIGNPATH_SIGNING_POLICY_SLUG` | default `release-signing` |
-| Variable (optional) | `SIGNPATH_ARTIFACT_CONFIGURATION_SLUG` | default `installers` |
-
-Without the secret and the two required variables, nothing changes: the SignPath steps are
-skipped and the installers stay unsigned.
-
-### 5. Test run
-
-Set `SIGNPATH_SIGNING_POLICY_SLUG` to `test-signing` and run **Bundle** manually (Actions →
-Bundle → Run workflow). The run confirms the artifact configuration (the path of `app-tauri.exe`
-inside the `.msi`, the version format Tauri writes); fix `installers.xml` in SignPath if a
-restriction does not match, and run again. Then set the variable back to `release-signing` (or
-delete it).
-
-### 6. Every release
-
-Push the tag as usual. The Windows bundle job waits up to an hour for the signing request: approve
-it in SignPath's web UI (the log of the step "SignPath - sign the installers" links to it; the job
-summary keeps the link afterwards). A request that is not approved
-in time fails the release before anything is published; approve it and re-run the failed job.
+Once the secrets exist, set the repository variable `OXBASE_REQUIRE_SIGNING=true` (or tick
+`require_signing` on a manual Bundle or Release run). A release then fails before anything is
+published when a bundle is unsigned, ad-hoc signed or not notarized, and its notes stop saying
+the installers are unsigned. Update the README's [Code signing](../README.md#code-signing) status
+at the same time.
