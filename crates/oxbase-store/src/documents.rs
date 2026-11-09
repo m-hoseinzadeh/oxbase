@@ -713,7 +713,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let queries = SavedQueries::new(dir.path().join("queries"));
         let (a, b) = (Uuid::now_v7(), Uuid::now_v7());
-        assert!(queries.list().unwrap().is_empty());
+        assert_eq!(queries.list().unwrap(), Vec::new());
 
         let report = queries.create(a, "report", "SELECT 1;").unwrap();
         assert_eq!(report, queries.folder(a).join("report.sql"));
@@ -753,7 +753,7 @@ mod tests {
     #[tokio::test]
     async fn recent_files_are_newest_first_and_bounded() {
         let store = DocumentStore::in_memory();
-        assert!(store.recent().await.unwrap().is_empty());
+        assert_eq!(store.recent().await.unwrap(), Vec::<PathBuf>::new());
         for i in 0..RECENT_LIMIT + 3 {
             store
                 .touch_recent(Path::new(&format!("/q/{i}.sql")))
@@ -772,7 +772,7 @@ mod tests {
         store.remove_recent(Path::new("/q/5.sql")).await.unwrap();
         assert_eq!(store.recent().await.unwrap().len(), RECENT_LIMIT - 1);
         store.clear_recent().await.unwrap();
-        assert!(store.recent().await.unwrap().is_empty());
+        assert_eq!(store.recent().await.unwrap(), Vec::<PathBuf>::new());
     }
 
     #[tokio::test]

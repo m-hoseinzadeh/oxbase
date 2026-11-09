@@ -712,7 +712,10 @@ mod tests {
             std::fs::read(&path).unwrap(),
             "\u{feff}SELECT 2;\r\n".as_bytes()
         );
-        assert_eq!(docs.store().recent().await.unwrap(), [path.clone()]);
+        assert_eq!(
+            docs.store().recent().await.unwrap(),
+            std::slice::from_ref(&path)
+        );
 
         // The UI never sees the path, only the name and the folder.
         let json = serde_json::to_value(&opened).unwrap();
@@ -722,7 +725,7 @@ mod tests {
         // A deleted file leaves the recent list when opened again.
         std::fs::remove_file(&path).unwrap();
         assert!(docs.open_path(path, true).await.is_err());
-        assert!(docs.store().recent().await.unwrap().is_empty());
+        assert_eq!(docs.store().recent().await.unwrap(), Vec::<PathBuf>::new());
     }
 
     #[tokio::test]
@@ -758,7 +761,7 @@ mod tests {
             })
         );
         // Saved queries are not recent files.
-        assert!(docs.store().recent().await.unwrap().is_empty());
+        assert_eq!(docs.store().recent().await.unwrap(), Vec::<PathBuf>::new());
     }
 
     #[tokio::test]
