@@ -139,15 +139,13 @@ pub fn write_text_file(path: &Path, text: &str, bom: bool) -> Result<()> {
         }
         std::fs::rename(&temp, &target)
     });
-    match written {
-        Ok(()) => Ok(()),
-        Err(_) => {
-            // A temporary file could not be made or renamed here (a read-only folder with a
-            // writable file, a file another program holds open on Windows): write in place.
-            let _ = std::fs::remove_file(&temp);
-            std::fs::write(&target, &bytes).map_err(|e| write_error(&e))
-        }
+    if written.is_ok() {
+        return Ok(());
     }
+    // A temporary file could not be made or renamed here (a read-only folder with a writable
+    // file, a file another program holds open on Windows): write in place.
+    let _ = std::fs::remove_file(&temp);
+    std::fs::write(&target, &bytes).map_err(|e| write_error(&e))
 }
 
 fn write_error(e: &std::io::Error) -> Error {
