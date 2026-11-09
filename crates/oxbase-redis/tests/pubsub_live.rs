@@ -36,6 +36,20 @@ async fn publish(c: &oxbase_redis::RedisConnection, channel: &str, payload: &[u8
         .unwrap()
 }
 
+/// Waits until a publish to `channel` reaches nobody. Ending a subscription closes its own
+/// connection, and the server forgets the subscriber only once it notices the socket is gone,
+/// so a publish right after `close` can still count it.
+async fn until_nobody_listens(c: &oxbase_redis::RedisConnection, channel: &str) {
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while publish(c, channel, b"x").await > 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{channel}: still subscribed"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 #[tokio::test]
 #[ignore = "needs the redis fixture"]
 async fn channel_and_pattern_subscriptions_receive_publishes_on_both_protocols() {
@@ -103,9 +117,9 @@ async fn channel_and_pattern_subscriptions_receive_publishes_on_both_protocols()
         subscription.close().await.unwrap();
         assert_eq!(next(&mut events).await, PubSubEvent::Closed { error: None });
         subscription.close().await.unwrap();
-        // Unsubscribed: nothing arrives any more, and nobody listens on our own channel.
-        let mine = format!("m7:mine:{}", token());
-        assert_eq!(publish(&c, &mine, b"late").await, 0);
+        // Unsubscribed: the server soon forgets the pattern subscriber (nobody listens on a
+        // new m7 channel any more), and nothing arrives after `closed`.
+        until_nobody_listens(&c, &format!("m7:mine:{}", token())).await;
         match tokio::time::timeout(Duration::from_millis(300), events.recv()).await {
             Err(_) | Ok(None) => {}
             Ok(Some(event)) => panic!("{protocol}: an event after closed: {event:?}"),
@@ -204,11 +218,7 @@ async fn cancelling_the_subscribe_token_or_dropping_ends_the_subscription() {
     drop(subscription);
     assert_eq!(next(&mut events).await, PubSubEvent::Closed { error: None });
     // The server forgets the subscriber.
-    let deadline = tokio::time::Instant::now() + WAIT;
-    while publish(&c, &channel, b"x").await > 0 {
-        assert!(tokio::time::Instant::now() < deadline, "still subscribed");
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    until_nobody_listens(&c, &channel).await;
     // An already cancelled token subscribes to nothing.
     let cancelled = CancellationToken::new();
     cancelled.cancel();
