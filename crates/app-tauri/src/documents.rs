@@ -266,12 +266,6 @@ impl DocumentsState {
         self.lock().docs.get(&id).cloned().ok_or_else(gone)
     }
 
-    fn set_bom(&self, id: DocumentId, bom: bool) {
-        if let Some(doc) = self.lock().docs.get_mut(&id) {
-            doc.bom = bom;
-        }
-    }
-
     /// Points `id` at `path` (a renamed saved query).
     fn repoint(&self, id: DocumentId, path: PathBuf) {
         let mut registry = self.lock();
@@ -365,48 +359,41 @@ impl DocumentsState {
     pub async fn restore(&self, stored: StoredWorkspace) -> RestoredWorkspace {
         let mut out = RestoredWorkspace::default();
         for (index, tab) in stored.tabs.into_iter().enumerate() {
-            let restored = match tab.path {
-                Some(path) => {
-                    let path = PathBuf::from(path);
-                    match tab.text {
-                        Some(text) => {
-                            let id = self.register(path.clone(), tab.bom);
-                            Some(RestoredTab {
-                                title: tab.title,
-                                document: Some(self.info(id, &path)),
-                                text,
-                                dirty: true,
-                                profile_id: tab.profile_id,
-                                database: tab.database,
-                            })
-                        }
-                        None => match self.open_path(path, false).await {
-                            Ok(opened) => Some(RestoredTab {
-                                title: tab.title,
-                                document: Some(opened.document),
-                                text: opened.text,
-                                dirty: false,
-                                profile_id: tab.profile_id,
-                                database: tab.database,
-                            }),
-                            Err(_) => {
-                                out.skipped.push(tab.title);
-                                None
-                            }
-                        },
-                    }
-                }
-                None => {
-                    let text = tab.text.unwrap_or_default();
+            let restored = if let Some(path) = tab.path {
+                let path = PathBuf::from(path);
+                if let Some(text) = tab.text {
+                    let id = self.register(path.clone(), tab.bom);
                     Some(RestoredTab {
                         title: tab.title,
-                        document: None,
-                        dirty: !text.is_empty(),
+                        document: Some(self.info(id, &path)),
                         text,
+                        dirty: true,
                         profile_id: tab.profile_id,
                         database: tab.database,
                     })
+                } else if let Ok(opened) = self.open_path(path, false).await {
+                    Some(RestoredTab {
+                        title: tab.title,
+                        document: Some(opened.document),
+                        text: opened.text,
+                        dirty: false,
+                        profile_id: tab.profile_id,
+                        database: tab.database,
+                    })
+                } else {
+                    out.skipped.push(tab.title);
+                    None
                 }
+            } else {
+                let text = tab.text.unwrap_or_default();
+                Some(RestoredTab {
+                    title: tab.title,
+                    document: None,
+                    dirty: !text.is_empty(),
+                    text,
+                    profile_id: tab.profile_id,
+                    database: tab.database,
+                })
             };
             if let Some(restored) = restored {
                 if stored.active == Some(index) {
@@ -551,20 +538,19 @@ pub async fn document_save_as(
         crate::files::e2e::dir().map(|dir| crate::files::e2e::save_file(&dir, &default_name));
     #[cfg(not(debug_assertions))]
     let hooked: Option<PathBuf> = None;
-    let path = match hooked {
-        Some(path) => path,
-        None => {
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            dialog(&app, &sql_filters(), Some("Save SQL file".to_owned()))
-                .set_file_name(default_name)
-                .save_file(move |picked| {
-                    let _ = tx.send(picked);
-                });
-            let Some(picked) = rx.await.map_err(|_| CommandError::aborted())? else {
-                return Ok(None);
-            };
-            with_default_extension(local_path(picked)?)
-        }
+    let path = if let Some(path) = hooked {
+        path
+    } else {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        dialog(&app, &sql_filters(), Some("Save SQL file".to_owned()))
+            .set_file_name(default_name)
+            .save_file(move |picked| {
+                let _ = tx.send(picked);
+            });
+        let Some(picked) = rx.await.map_err(|_| CommandError::aborted())? else {
+            return Ok(None);
+        };
+        with_default_extension(local_path(picked)?)
     };
     let path = absolute(path);
     if documents.queries.owner(&path).is_some() {
