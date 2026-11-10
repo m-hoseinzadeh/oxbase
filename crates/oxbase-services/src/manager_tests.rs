@@ -467,6 +467,7 @@ async fn keys_resolve_from_files_and_keychain() {
             key: p.secret_key(SecretSlot::TlsClientKey),
         }),
         server_name: Some("  pg.example  ".into()),
+        allow_unverified_password: false,
         extra: Extra::new(),
     };
     p.ssh = Some(SshSettings {

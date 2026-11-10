@@ -247,3 +247,15 @@ async fn cleartext_is_answered_for_a_verified_or_local_server() {
         "loopback"
     );
 }
+
+#[tokio::test]
+async fn cleartext_is_answered_when_the_user_allows_an_unverified_server() {
+    // The user's explicit choice in the profile's TLS settings.
+    let allowed = TlsOptions::new(TlsMode::Prefer).with_unverified_password_allowed(true);
+    let (_, received) = exchange(REMOTE, allowed, None, Ask::Cleartext).await;
+    assert_eq!(
+        received,
+        Some((b'p', format!("{MARKER}\0").into_bytes())),
+        "allowed by the user"
+    );
+}

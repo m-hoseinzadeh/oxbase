@@ -263,13 +263,14 @@ fn connect_timeout(shown: &str, timeout: Duration) -> Error {
 }
 
 /// Whether `caching_sha2_password` full authentication may send the password: only when the
-/// certificate is verified (`VerifyFull`; `VerifyCa` is refused anyway) or the server is a
-/// loopback host. Otherwise an unverified peer, such as an on-path attacker that leaves TLS out
+/// certificate is verified (`VerifyFull`; `VerifyCa` is refused anyway), the server is a
+/// loopback host, or the user allowed it
+/// ([`TlsOptions::password_may_reach`](oxbase_types::TlsOptions::password_may_reach)). Otherwise an unverified peer, such as an on-path attacker that leaves TLS out
 /// of its handshake or presents any certificate, could ask for it and recover the reusable
 /// password. Fast authentication (a scramble the server checks against its cache) needs no
 /// password and works in every mode.
 fn password_disclosure_allowed(params: &ConnectParams, server: &Endpoint) -> bool {
-    params.tls.mode.verifies_certificate() || server.is_loopback()
+    params.tls.password_may_reach(server)
 }
 
 /// Opens a session; `Err(None)` is a timeout.

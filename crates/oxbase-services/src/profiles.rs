@@ -160,6 +160,7 @@ pub fn same_destination(saved: &ConnectionProfile, candidate: &ConnectionProfile
             p.tls.client_cert.clone(),
             p.tls.client_key.clone(),
             p.tls.server_name.clone(),
+            p.tls.allow_unverified_password,
         )
     };
     let options_the_same = destination_options(saved.engine)
@@ -601,6 +602,8 @@ mod tests {
         };
         let mut weaker_tls = saved.clone();
         weaker_tls.tls.mode = oxbase_store::TlsMode::Disable;
+        let mut unverified_allowed = saved.clone();
+        unverified_allowed.tls.allow_unverified_password = true;
         let mut other_user = saved.clone();
         other_user.user = Some("root".into());
         let mut other_bastion = saved.clone();
@@ -613,6 +616,7 @@ mod tests {
         for (moved, needs) in [
             (&other_host, "database password"),
             (&weaker_tls, "database password"),
+            (&unverified_allowed, "database password"),
             (&other_user, "database password"),
             (&other_bastion, "database password"),
             (&no_ssh, "database password"),

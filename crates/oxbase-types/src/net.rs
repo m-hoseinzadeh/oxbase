@@ -238,6 +238,10 @@ pub struct TlsOptions {
     /// Use it when the certificate names differ from the host the user typed (for example the
     /// server is reached by IP). It is never the tunnel address.
     pub server_name: Option<String>,
+    /// The user's explicit choice to send the password (or anything that logs in as the user)
+    /// to a server whose certificate is not verified. Off by default: see
+    /// [`TlsOptions::password_may_reach`].
+    pub allow_unverified_password: bool,
 }
 
 impl TlsOptions {
@@ -266,6 +270,25 @@ impl TlsOptions {
     pub fn with_server_name(mut self, name: impl Into<String>) -> Self {
         self.server_name = Some(name.into());
         self
+    }
+
+    /// Sets [`TlsOptions::allow_unverified_password`].
+    #[must_use]
+    pub fn with_unverified_password_allowed(mut self, allowed: bool) -> Self {
+        self.allow_unverified_password = allowed;
+        self
+    }
+
+    /// Whether a login that reveals the password itself (or a hash that logs in as the user)
+    /// may go to `server`: when the certificate is verified ([`TlsMode::VerifyCa`] /
+    /// [`TlsMode::VerifyFull`]), when the server is on this machine (a loopback host, which
+    /// through SSH is the bastion itself), or when the user chose
+    /// [`TlsOptions::allow_unverified_password`]. Otherwise an unverified peer, such as an
+    /// on-path attacker that answers in plaintext or presents any certificate, could read it.
+    /// Logins that prove the password without sending it (SCRAM, the MySQL scramble) do not
+    /// need this.
+    pub fn password_may_reach(&self, server: &Endpoint) -> bool {
+        self.mode.verifies_certificate() || self.allow_unverified_password || server.is_loopback()
     }
 
     /// The name TLS verifies and sends as SNI: [`TlsOptions::server_name`] if set, otherwise
@@ -487,6 +510,23 @@ mod tests {
         );
         assert!(TlsOptions::new(TlsMode::VerifyFull).verifies_hostname());
         assert!(!TlsOptions::new(TlsMode::Require).verifies_hostname());
+
+        // The password goes only to a verified or local server, unless the user allows it.
+        let remote = Endpoint::new("db.example.com", 5432);
+        for local in ["localhost", "127.0.0.1", "[::1]"] {
+            assert!(TlsOptions::new(TlsMode::Disable).password_may_reach(&Endpoint::new(local, 1)));
+        }
+        for m in [TlsMode::Disable, TlsMode::Prefer, TlsMode::Require] {
+            assert!(!TlsOptions::new(m).password_may_reach(&remote), "{m}");
+            assert!(
+                TlsOptions::new(m)
+                    .with_unverified_password_allowed(true)
+                    .password_may_reach(&remote),
+                "{m}"
+            );
+        }
+        assert!(TlsOptions::new(TlsMode::VerifyCa).password_may_reach(&remote));
+        assert!(TlsOptions::new(TlsMode::VerifyFull).password_may_reach(&remote));
         for m in [
             TlsMode::Disable,
             TlsMode::Prefer,

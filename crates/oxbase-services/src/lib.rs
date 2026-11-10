@@ -809,6 +809,7 @@ impl ConnectionManager {
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .map(str::to_owned),
+            allow_unverified_password: tls.allow_unverified_password,
         })
     }
 
