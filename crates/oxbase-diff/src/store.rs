@@ -8,6 +8,10 @@
 //! the source's Arrow types. Writes append batches; reads stream them back in write order (key
 //! order). The directory is deleted when the store is dropped (also after a crash of the
 //! compare: `tempfile`). Nothing in it leaves the machine or outlives the compare result.
+//!
+//! Private: the directory is created `0o700` and every file new with mode `0o600` on Unix
+//! (`oxbase_types::private_fs`), so other local users cannot list or read the rows, and a
+//! planted link is never followed.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -21,7 +25,7 @@ use arrow_ipc::reader::StreamReader;
 use arrow_ipc::writer::StreamWriter;
 use arrow_schema::{Field, Schema, SchemaRef};
 use oxbase_driver::from_arrow;
-use oxbase_types::{Error, Result};
+use oxbase_types::{Error, Result, private_fs};
 use serde::{Deserialize, Serialize};
 
 /// The kind of a differing row.
@@ -118,11 +122,13 @@ impl DiffStore {
     /// A new, empty store in a fresh temporary directory under `parent` (the system temp
     /// directory when `None`).
     pub fn new(parent: Option<&Path>) -> Result<Self> {
+        let mut builder = tempfile::Builder::new();
+        builder.prefix("oxbase-diff-");
+        #[cfg(unix)]
+        builder.permissions(private_fs::private_dir_permissions());
         let dir = match parent {
-            Some(parent) => tempfile::Builder::new()
-                .prefix("oxbase-diff-")
-                .tempdir_in(parent),
-            None => tempfile::Builder::new().prefix("oxbase-diff-").tempdir(),
+            Some(parent) => builder.tempdir_in(parent),
+            None => builder.tempdir(),
         }
         .map_err(|e| Error::internal(format!("cannot create a temporary directory: {e}")))?;
         Ok(Self {
@@ -177,7 +183,8 @@ impl DiffStore {
                 self.dir
                     .path()
                     .join(format!("{pair}-{}-{}.arrows", op.file_tag(), self.files));
-            let file = File::create(&path).map_err(|e| io_error("cannot create a file", &e))?;
+            let file = private_fs::create_private_file(&path)
+                .map_err(|e| io_error("cannot create a file", &e))?;
             let writer =
                 StreamWriter::try_new(BufWriter::new(file), &wanted).map_err(from_arrow)?;
             slot.writer = Some(writer);
@@ -325,6 +332,46 @@ mod tests {
         drop(store);
         assert!(!path.exists());
         assert_eq!(serde_json::to_string(&RowOp::Delete).unwrap(), "\"delete\"");
+    }
+
+    #[cfg(unix)]
+    fn mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::symlink_metadata(path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_directory_and_row_files_are_owner_only() {
+        let mut store = DiffStore::new(None).unwrap();
+        let b = batch(1, 1);
+        store.append(0, RowOp::Insert, &b.schema(), &b).unwrap();
+        store.finish().unwrap();
+        let files: Vec<PathBuf> = std::fs::read_dir(store.path())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert_eq!(files.len(), 1);
+        assert_eq!(mode(store.path()), 0o700);
+        assert_eq!(mode(&files[0]), 0o600);
+        assert_eq!(store.read(0, RowOp::Insert, 10).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_planted_row_file_link_is_not_followed() {
+        let other = tempfile::tempdir().unwrap();
+        let target = other.path().join("target");
+        std::fs::write(&target, b"dummy").unwrap();
+        let mut store = DiffStore::new(None).unwrap();
+        std::os::unix::fs::symlink(&target, store.path().join("0-insert-1.arrows")).unwrap();
+        let b = batch(1, 1);
+        assert!(store.append(0, RowOp::Insert, &b.schema(), &b).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"dummy");
     }
 
     fn batch(from: i64, rows: i64) -> RecordBatch {
