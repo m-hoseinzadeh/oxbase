@@ -250,6 +250,11 @@ dirs = "7.0.0"
 # (oxbase-types, Unix only). Already in the graph through tempfile (Apache-2.0 WITH
 # LLVM-exception OR Apache-2.0 OR MIT).
 rustix = "1.1.6"
+# Socket addresses of this process's descriptors and the Windows TCP connection table, which
+# tell whether an SSH tunnel's loopback peer is Oxbase itself (oxbase-net). Both already in the
+# graph through tokio (MIT OR Apache-2.0).
+socket2 = "0.6.5"
+windows-sys = "0.61.2"
 
 # --- secrets ---
 # keyring 4 `v1` (default): macOS Keychain, Windows Credential Manager, Secret Service over zbus

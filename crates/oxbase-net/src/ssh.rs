@@ -32,7 +32,9 @@
 //! 4. While the handle lives, accept **any number** of local connections and forward each one
 //!    through its own `direct-tcpip` channel to `target` (resolved by the SSH server, so in-network
 //!    names like `postgres:5432` work). This is what lets a PostgreSQL cancel request or a MySQL
-//!    `KILL QUERY` side connection reach the same server as the session.
+//!    `KILL QUERY` side connection reach the same server as the session. Only connections opened
+//!    by this process are forwarded: one from another local process or user is closed before
+//!    any channel opens (`ssh/peer.rs`).
 //! 5. `open` does not probe `target`: an unreachable target shows up as a connection error on
 //!    the first forwarded connection (the driver's connect).
 //! 6. `cancel` aborts a pending `open` with `Error::Cancelled`; it does not close a tunnel that
@@ -61,6 +63,7 @@ pub use oxbase_types::{Endpoint, KeySource, KnownHostsPolicy, Secret, SshAuth, S
 use oxbase_types::{Error, Result};
 
 mod known_hosts;
+mod peer;
 mod provider;
 #[cfg(test)]
 mod provider_tests;
