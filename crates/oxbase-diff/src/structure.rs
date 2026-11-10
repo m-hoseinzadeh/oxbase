@@ -730,6 +730,9 @@ fn retarget_def(engine: Engine, def: &mut ObjectDef, from: &Location, to: &Locat
                     }
                 }
             }
+            for text in t.extras.policy_expressions_mut() {
+                fix(text);
+            }
         }
         ObjectDef::View(v) => fix(&mut v.definition),
         ObjectDef::Routine(r) => {

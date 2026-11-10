@@ -31,7 +31,9 @@
 //! changes (a foreign key of the table to itself that references a dropped key is dropped and
 //! added again; foreign keys of other tables get a warning); column drops, changes and adds; the primary key; new or changed indexes, checks and
 //! foreign keys (`VALIDATE CONSTRAINT` when only `NOT VALID` went away, `ALTER CONSTRAINT` when
-//! only deferrability changed); table storage options; comments. PostgreSQL cannot reorder
+//! only deferrability changed); table storage options; comments; row-level security (policies
+//! that go or change dropped, `ENABLE` / `FORCE ROW LEVEL SECURITY`, new policies; a new table
+//! gets the same after its comments). PostgreSQL cannot reorder
 //! columns: kept columns must stay in order and new columns go at the end, else the alter is
 //! `Unsupported`.
 //!
@@ -1443,7 +1445,153 @@ fn create_table(v: &ServerVersion, t: &TableDef) -> Result<Script> {
             script.push_step(column_comment_step(&t.obj, &c.name, Some(text)));
         }
     }
+    row_security(&t.obj, None, &t.extras, &mut script)?;
     Ok(script)
+}
+
+// --- row-level security ---------------------------------------------------------------------
+
+/// Text field `key` of a policy object; `None` when absent or `null`.
+fn policy_text<'p>(policy: &'p serde_json::Value, key: &str) -> Result<Option<&'p str>> {
+    match policy.get(key) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(text)) => Ok(Some(text.as_str())),
+        Some(_) => Err(Error::invalid_input(format!(
+            "policy field '{key}' must be a text"
+        ))),
+    }
+}
+
+/// The name of a policy object.
+fn policy_name(policy: &serde_json::Value) -> Result<&str> {
+    policy_text(policy, "name")?
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| Error::invalid_input("a policy needs a name"))
+}
+
+/// `CREATE POLICY` for `policy` (one item of [`props::POLICIES`], from the catalog or a backup
+/// archive) on `table`: the name and roles quoted (`public` is `PUBLIC`), the command and
+/// `PERMISSIVE` / `RESTRICTIVE` from fixed words, and the `USING` and `WITH CHECK` expressions
+/// through [`checked`] like every other expression spliced into DDL.
+fn create_policy_step(table: &ObjectRef, policy: &serde_json::Value) -> Result<ScriptStep> {
+    let name = policy_name(policy)?;
+    let bad = |why: String| Error::invalid_input(format!("policy {name}: {why}"));
+    let command = match policy_text(policy, "command")?.unwrap_or("all") {
+        "all" => "ALL",
+        "select" => "SELECT",
+        "insert" => "INSERT",
+        "update" => "UPDATE",
+        "delete" => "DELETE",
+        other => return Err(bad(format!("unknown command '{other}'"))),
+    };
+    let permissive = match policy.get("permissive") {
+        None | Some(serde_json::Value::Null) => true,
+        Some(serde_json::Value::Bool(permissive)) => *permissive,
+        Some(_) => return Err(bad("'permissive' must be a boolean".into())),
+    };
+    let roles: Vec<String> = match policy.get("roles") {
+        None | Some(serde_json::Value::Null) => Vec::new(),
+        Some(serde_json::Value::Array(roles)) => roles
+            .iter()
+            .map(|role| match role.as_str() {
+                Some("public") => Ok("PUBLIC".to_owned()),
+                Some(role) if !role.is_empty() => Ok(ident(role)),
+                _ => Err(bad("'roles' must be role names".into())),
+            })
+            .collect::<Result<_>>()?,
+        Some(_) => return Err(bad("'roles' must be a JSON array".into())),
+    };
+    let mut sql = format!(
+        "CREATE POLICY {} ON {} AS {} FOR {command}",
+        ident(name),
+        table_sql(table),
+        if permissive {
+            "PERMISSIVE"
+        } else {
+            "RESTRICTIVE"
+        }
+    );
+    if !roles.is_empty() {
+        let _ = write!(sql, " TO {}", roles.join(", "));
+    }
+    if let Some(using) = policy_text(policy, "using")? {
+        let text = checked(&format!("USING of policy {name}"), using)?;
+        let _ = write!(sql, " USING ({text})");
+    }
+    if let Some(check) = policy_text(policy, "check")? {
+        let text = checked(&format!("WITH CHECK of policy {name}"), check)?;
+        let _ = write!(sql, " WITH CHECK ({text})");
+    }
+    Ok(ScriptStep::new(sql).described(format!("Create policy {name}")))
+}
+
+/// Row-level security of `table` going from `cur` (`None` for a new table) to `new`: policies
+/// that go or change are dropped, `ENABLE` / `DISABLE` and `FORCE` / `NO FORCE ROW LEVEL
+/// SECURITY` follow [`props::ROW_SECURITY`] and [`props::FORCE_ROW_SECURITY`], and new or
+/// changed policies ([`props::POLICIES`]) are created. Like the comparison, an existing table's
+/// flag or policy list only changes when both sides report it (a definition from an archive
+/// written before they were read leaves them as they are).
+fn row_security(
+    table: &ObjectRef,
+    cur: Option<&Extras>,
+    new: &Extras,
+    s: &mut Script,
+) -> Result<()> {
+    let name = table_sql(table);
+    let none = Vec::new();
+    let (before, after) = match (cur, json_array(new, &props::POLICIES)?) {
+        (None, Some(after)) => (&none, after),
+        (Some(cur), Some(after)) => match json_array(cur, &props::POLICIES)? {
+            Some(before) => (before, after),
+            None => (&none, &none),
+        },
+        (_, None) => (&none, &none),
+    };
+    for policy in before.iter().filter(|p| !after.contains(p)) {
+        let policy = policy_name(policy)?;
+        s.push_step(
+            ScriptStep::new(format!("DROP POLICY {} ON {name}", ident(policy)))
+                .described(format!("Drop policy {policy}")),
+        );
+    }
+    for (prop, on, off, what) in [
+        (
+            props::ROW_SECURITY,
+            "ENABLE ROW LEVEL SECURITY",
+            "DISABLE ROW LEVEL SECURITY",
+            "row-level security",
+        ),
+        (
+            props::FORCE_ROW_SECURITY,
+            "FORCE ROW LEVEL SECURITY",
+            "NO FORCE ROW LEVEL SECURITY",
+            "row-level security for the owner",
+        ),
+    ] {
+        let wanted = flag(new, &prop);
+        let change = match cur {
+            None => wanted,
+            Some(cur) => {
+                cur.get(&prop).is_some() && new.get(&prop).is_some() && flag(cur, &prop) != wanted
+            }
+        };
+        if change {
+            s.push_step(
+                ScriptStep::new(format!(
+                    "ALTER TABLE {name} {}",
+                    if wanted { on } else { off }
+                ))
+                .described(format!(
+                    "{} {what}",
+                    if wanted { "Enable" } else { "Disable" }
+                )),
+            );
+        }
+    }
+    for policy in after.iter().filter(|p| !before.contains(p)) {
+        s.push_step(create_policy_step(table, policy)?);
+    }
+    Ok(())
 }
 
 // --- alter table ----------------------------------------------------------------------------
@@ -2043,6 +2191,7 @@ fn alter_table(
     s.extend(fk_adds);
 
     table_options(&cur, new, table, &mut s)?;
+    row_security(table, Some(&cur.extras), &new.extras, &mut s)?;
 
     // Comments last.
     if comment_text(cur.comment.as_deref()) != comment_text(new.comment.as_deref()) {
@@ -3816,5 +3965,105 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    fn secured_table() -> TableDef {
+        let mut t = TableDef::new(table_ref("accounts"));
+        t.columns.push(col("tenant", "text"));
+        t.extras.insert(props::ROW_SECURITY, true);
+        t.extras.insert(props::FORCE_ROW_SECURITY, true);
+        t.extras.insert(
+            props::POLICIES,
+            Value::Json(serde_json::json!([
+                {"name": "tenant_rows", "command": "all", "permissive": true,
+                 "roles": ["public"], "using": "(tenant = CURRENT_USER)", "check": null},
+                {"name": "no \"x\"", "command": "insert", "permissive": false,
+                 "roles": ["app", "Ops"], "using": null, "check": "(tenant <> 'x')"},
+            ])),
+        );
+        t
+    }
+
+    /// Row-level security and its policies come with a created table and follow an alter
+    /// (audit lead 11); policy expressions go through the same checks as every expression.
+    #[test]
+    fn row_level_security_and_policies() {
+        let t = secured_table();
+        let script = create(&ObjectDef::Table(t.clone())).unwrap();
+        assert_eq!(
+            sqls(&script)[1..],
+            [
+                "ALTER TABLE \"m3\".\"accounts\" ENABLE ROW LEVEL SECURITY",
+                "ALTER TABLE \"m3\".\"accounts\" FORCE ROW LEVEL SECURITY",
+                "CREATE POLICY \"tenant_rows\" ON \"m3\".\"accounts\" AS PERMISSIVE FOR ALL TO PUBLIC USING ((tenant = CURRENT_USER))",
+                "CREATE POLICY \"no \"\"x\"\"\" ON \"m3\".\"accounts\" AS RESTRICTIVE FOR INSERT TO \"app\", \"Ops\" WITH CHECK ((tenant <> 'x'))",
+            ]
+        );
+        assert_eq!(sqls(&alter_with(&t, &t, &[]).unwrap()), Vec::<&str>::new());
+
+        // One policy changed, one gone, FORCE off.
+        let mut changed = t.clone();
+        changed.extras.insert(props::FORCE_ROW_SECURITY, false);
+        changed.extras.insert(
+            props::POLICIES,
+            Value::Json(serde_json::json!([
+                {"name": "tenant_rows", "command": "select", "permissive": true,
+                 "roles": [], "using": "true", "check": null},
+            ])),
+        );
+        assert_eq!(
+            sqls(&alter_with(&t, &changed, &[]).unwrap()),
+            [
+                "DROP POLICY \"tenant_rows\" ON \"m3\".\"accounts\"",
+                "DROP POLICY \"no \"\"x\"\"\" ON \"m3\".\"accounts\"",
+                "ALTER TABLE \"m3\".\"accounts\" NO FORCE ROW LEVEL SECURITY",
+                "CREATE POLICY \"tenant_rows\" ON \"m3\".\"accounts\" AS PERMISSIVE FOR SELECT USING (true)",
+            ]
+        );
+
+        // A side that does not report them (an archive written before they were read, a
+        // hand-built definition) leaves them as they are.
+        let mut unknown = t.clone();
+        for prop in [
+            props::ROW_SECURITY,
+            props::FORCE_ROW_SECURITY,
+            props::POLICIES,
+        ] {
+            unknown.extras.remove(&prop);
+        }
+        assert_eq!(
+            sqls(&alter_with(&t, &unknown, &[]).unwrap()),
+            Vec::<&str>::new()
+        );
+        assert_eq!(
+            sqls(&alter_with(&unknown, &t, &[]).unwrap()),
+            Vec::<&str>::new()
+        );
+        assert_eq!(
+            sqls(&create(&ObjectDef::Table(unknown)).unwrap()).len(),
+            1,
+            "only CREATE TABLE"
+        );
+
+        // Policy text from a catalog or an archive cannot reach outside its clause.
+        for policy in [
+            serde_json::json!({"name": "p", "using": "true) TO PUBLIC USING (true"}),
+            serde_json::json!({"name": "p", "using": "true; DROP TABLE x"}),
+            serde_json::json!({"name": "p", "check": "true -- x"}),
+            serde_json::json!({"name": "p", "using": "1, 2"}),
+            serde_json::json!({"name": "p", "command": "drop"}),
+            serde_json::json!({"name": "p", "roles": [""]}),
+            serde_json::json!({"name": "p", "roles": "public"}),
+            serde_json::json!({"name": "p", "permissive": "yes"}),
+            serde_json::json!({"using": "true"}),
+        ] {
+            let mut bad = t.clone();
+            bad.extras.insert(
+                props::POLICIES,
+                Value::Json(serde_json::Value::Array(vec![policy.clone()])),
+            );
+            let e = create(&ObjectDef::Table(bad)).unwrap_err();
+            assert!(matches!(e, Error::InvalidInput { .. }), "{policy}: {e}");
+        }
     }
 }

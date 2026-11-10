@@ -93,8 +93,8 @@ pub use compare::{PgComparator, PgRules, canonical_type, normalize_def, normaliz
 pub use fetch::{
     BASE_TYPE, CTYPE, ENUM_LABELS, EXCLUSION, EXTENSION_SCHEMA, EXTENSION_VERSION,
     IDENTITY_SEQUENCE, INDEX_OPTIONS, KEY_COLLATIONS, MATCH_TYPE, NO_INHERIT, NOT_ENFORCED,
-    NOT_VALID, NULLS_FIRST, NULLS_NOT_DISTINCT, OPCLASS_OPTIONS, OPCLASSES, PARALLEL, SETTINGS,
-    SQL_STANDARD_BODY, TYPE_KIND,
+    NOT_VALID, NULLS_FIRST, NULLS_NOT_DISTINCT, OPCLASS_OPTIONS, OPCLASSES, PARALLEL,
+    SECURITY_BARRIER, SECURITY_INVOKER, SETTINGS, SQL_STANDARD_BODY, TYPE_KIND,
 };
 
 /// Object kinds PostgreSQL has (everything but MySQL events and key-value keys).
@@ -204,7 +204,7 @@ impl Capabilities for PgCapabilities {
             | "file" => false,
             "generated" => sql::at_least(v, 12),
             "include_columns" => sql::at_least(v, 11),
-            "nulls_not_distinct" => sql::at_least(v, 15),
+            "nulls_not_distinct" | "security_invoker" => sql::at_least(v, 15),
             _ => true,
         }
     }

@@ -1202,3 +1202,49 @@ async fn postgres_restore_keeps_routine_settings() {
         )]]
     );
 }
+
+/// A restored table keeps row-level security (`ENABLE`, `FORCE`) and its policies (switched on
+/// after its rows, which all load), and a view its `security_barrier` / `security_invoker`
+/// options (audit lead 11).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs the Docker fixtures (scripts/fixtures-up.sh)"]
+async fn postgres_restore_keeps_row_security() {
+    let live = Live::connect("postgres", Engine::Postgres).await;
+    let src = format!("oxbase_bk_{}_l11", token());
+    let dst = format!("{src}_restored");
+    for sql in [
+        format!("CREATE SCHEMA {src}"),
+        format!("CREATE TABLE {src}.t (id integer PRIMARY KEY, tenant text NOT NULL)"),
+        format!("INSERT INTO {src}.t VALUES (1, 'a'), (2, 'b')"),
+        format!("ALTER TABLE {src}.t ENABLE ROW LEVEL SECURITY"),
+        format!("ALTER TABLE {src}.t FORCE ROW LEVEL SECURITY"),
+        format!("CREATE POLICY own ON {src}.t USING (tenant = current_user)"),
+        format!(
+            "CREATE VIEW {src}.vi WITH (security_barrier = true, security_invoker = true) AS \
+             SELECT id, tenant FROM {src}.t"
+        ),
+    ] {
+        live.exec(&sql).await;
+    }
+    let state = |schema: &str| {
+        format!(
+            "SELECT c.relrowsecurity::text || ' ' || c.relforcerowsecurity::text, \
+                    (SELECT pg_catalog.count(*) FROM {schema}.t)::text, \
+                    (SELECT pg_catalog.string_agg(p.polname::text || ' ' || \
+                            pg_catalog.pg_get_expr(p.polqual, p.polrelid), ', ') \
+                       FROM pg_catalog.pg_policy p WHERE p.polrelid = c.oid), \
+                    (SELECT pg_catalog.array_to_json(v.reloptions)::text \
+                       FROM pg_catalog.pg_class v WHERE v.oid = '{schema}.vi'::regclass) \
+             FROM pg_catalog.pg_class c WHERE c.oid = '{schema}.t'::regclass"
+        )
+    };
+    let before = live.exec(&state(&src)).await;
+    postgres_schema_restore(&live, &src, &dst).await;
+    let after = live.exec(&state(&dst)).await;
+    for schema in [&src, &dst] {
+        live.exec(&format!("DROP SCHEMA {schema} CASCADE")).await;
+    }
+    assert_eq!(before[0][0], Value::Text("true true".to_owned()));
+    assert_eq!(before[0][1], Value::Text("2".to_owned()));
+    assert_eq!(after, before);
+}

@@ -19,7 +19,9 @@
 //!    rows: drops of replaced objects (dependents first), then creates in the archive's
 //!    creation order, tables without the foreign keys that point at themselves or at a table
 //!    created later. After the rows: those foreign keys, then materialized views, triggers and
-//!    every view or routine that names one of them (`objects::after_data`). Each part runs as
+//!    every view or routine that names one of them (`objects::after_data`), then row-level
+//!    security and policies of the created tables (the table's `alter` from the table without
+//!    them, so a policy binding the owner does not filter the load). Each part runs as
 //!    one script through the services' `execute_script` (one transaction where the engine has
 //!    transactional DDL). The target container itself must exist.
 //! 4. **Data** (content `structure_and_data` / `data_only`). A table that existed and is not
@@ -714,6 +716,8 @@ impl Restore<'_> {
             .map(|p| p.def.object_ref())
             .collect();
         let mut deferred: Vec<(TableDef, Vec<oxbase_types::ForeignKeyDef>)> = Vec::new();
+        // (created without, with) row-level security: switched on after the rows.
+        let mut secured: Vec<(TableDef, TableDef)> = Vec::new();
         for p in planned.iter().filter(|p| p.create) {
             let generator = dialects.ddl(engine, p.def.kind())?;
             match &p.def {
@@ -733,7 +737,15 @@ impl Restore<'_> {
                                 .is_some_and(|q| q >= position)
                         });
                     now.foreign_keys = keep;
-                    pre.append(generator.create(&ObjectDef::Table(now.clone()), &ctx)?);
+                    match now.without_row_security() {
+                        Some(bare) => {
+                            pre.append(generator.create(&ObjectDef::Table(bare.clone()), &ctx)?);
+                            secured.push((bare, now.clone()));
+                        }
+                        None => {
+                            pre.append(generator.create(&ObjectDef::Table(now.clone()), &ctx)?);
+                        }
+                    }
                     if !later.is_empty() {
                         deferred.push((now, later));
                     }
@@ -769,6 +781,16 @@ impl Restore<'_> {
             let def = deferred[i];
             let generator = dialects.ddl(engine, def.kind())?;
             post.append(generator.create(def, &ctx)?);
+        }
+        if !secured.is_empty() {
+            let generator = dialects.ddl(engine, ObjectKind::Table)?;
+            for (bare, table) in secured {
+                post.append(generator.alter(
+                    &ObjectDef::Table(bare),
+                    &ObjectDef::Table(table),
+                    &ctx,
+                )?);
+            }
         }
         Ok((pre, post))
     }

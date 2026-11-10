@@ -199,6 +199,19 @@ pub const CYCLE: PropId = PropId::from_static("cycle");
 /// The column that owns a sequence (text, `table.column`).
 pub const OWNED_BY: PropId = PropId::from_static("owned_by");
 
+// --- Row-level security (PostgreSQL tables) ---
+
+/// Table has row-level security enabled (bool, PostgreSQL `relrowsecurity`).
+pub const ROW_SECURITY: PropId = PropId::from_static("row_security");
+/// Row-level security applies to the table's owner too (bool, PostgreSQL
+/// `relforcerowsecurity`).
+pub const FORCE_ROW_SECURITY: PropId = PropId::from_static("force_row_security");
+/// Row-level security policies of a table, a JSON array of objects in name order: `name`,
+/// `command` (`all`, `select`, `insert`, `update`, `delete`), `permissive` (bool), `roles` (role
+/// names, `public` for everyone) and the engine-native SQL expressions `using` and `check` (or
+/// `null`). See [`Extras::policy_expressions_mut`].
+pub const POLICIES: PropId = PropId::from_static("policies");
+
 /// Typed map of database-specific properties, ordered by id so output is deterministic.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -243,6 +256,29 @@ impl Extras {
 
     pub fn iter(&self) -> impl Iterator<Item = (&PropId, &Value)> {
         self.0.iter()
+    }
+
+    /// The SQL expressions of the [`POLICIES`] extra (each policy's `using` and `check` text),
+    /// for moving the names inside them like the other expressions of a table. Empty when
+    /// there is no such extra.
+    pub fn policy_expressions_mut(&mut self) -> Vec<&mut String> {
+        let Some(Value::Json(serde_json::Value::Array(policies))) = self.0.get_mut(&POLICIES)
+        else {
+            return Vec::new();
+        };
+        policies
+            .iter_mut()
+            .filter_map(serde_json::Value::as_object_mut)
+            .flat_map(|policy| {
+                policy
+                    .iter_mut()
+                    .filter(|(key, _)| matches!(key.as_str(), "using" | "check"))
+                    .filter_map(|(_, value)| match value {
+                        serde_json::Value::String(text) => Some(text),
+                        _ => None,
+                    })
+            })
+            .collect()
     }
 
     /// Ids present in either map whose values differ (including present-vs-absent), in id order.
@@ -295,6 +331,28 @@ mod tests {
         let changed: Vec<&str> = a.changed_keys(&b).into_iter().map(PropId::as_str).collect();
         assert_eq!(changed, ["fill_factor", "tablespace", "unlogged"]);
         assert_eq!(a.changed_keys(&a).len(), 0);
+    }
+
+    #[test]
+    fn policy_expressions_can_be_rewritten() {
+        let mut e = Extras::new().with(
+            POLICIES,
+            Value::Json(serde_json::json!([
+                {"name": "p", "using": "a = 1", "check": null, "roles": ["using"]},
+                {"name": "q", "using": null, "check": "b = 2"},
+            ])),
+        );
+        for text in e.policy_expressions_mut() {
+            text.push_str(" AND true");
+        }
+        assert_eq!(
+            e.get(&POLICIES),
+            Some(&Value::Json(serde_json::json!([
+                {"name": "p", "using": "a = 1 AND true", "check": null, "roles": ["using"]},
+                {"name": "q", "using": null, "check": "b = 2 AND true"},
+            ])))
+        );
+        assert_eq!(Extras::new().policy_expressions_mut().len(), 0);
     }
 
     #[test]

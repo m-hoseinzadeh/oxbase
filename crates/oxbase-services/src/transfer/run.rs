@@ -323,13 +323,60 @@ impl Job {
                 _ => {}
             }
         }
-        if outcome.cancelled || outcome.error.is_some() {
-            return;
+        if !outcome.cancelled && outcome.error.is_none() {
+            self.after_load(loader.as_ref(), token, outcome).await;
         }
-        self.after_load(loader.as_ref(), token, outcome).await;
+        // Also after a failure: a created table that holds its rows gets its row-level
+        // security, whatever else went wrong.
+        if !outcome.cancelled {
+            self.row_security(token, outcome).await;
+        }
     }
 
-    /// Foreign keys of the loaded tables, then identity resyncs.
+    /// Row-level security and policies of the created tables that loaded (last: a policy
+    /// that binds the owner would filter or refuse the load, the foreign keys' checks and the
+    /// identity resyncs' `max`). A failure fails the run: the table holds its rows without
+    /// the security of its source.
+    async fn row_security(&self, token: &CancellationToken, outcome: &mut Outcome) {
+        let plan = &self.prepared.plan;
+        for &index in &plan.order {
+            let Some(script) = &self.prepared.tables[index].row_security else {
+                continue;
+            };
+            if outcome.reports[index].status != TableStatus::Done {
+                continue;
+            }
+            if token.is_cancelled() {
+                outcome.cancelled = true;
+                return;
+            }
+            let atomic = plan.transactional_ddl && script.is_atomic();
+            match run_steps(self.target(), &script.steps, atomic, token).await {
+                Ok(()) => {}
+                Err(e) if e.is_cancelled() => {
+                    outcome.cancelled = true;
+                    return;
+                }
+                Err(e) => {
+                    let message = format!(
+                        "switching on the row-level security of {} failed: {e}",
+                        plan.tables[index].target.display_name()
+                    );
+                    if outcome.error.is_none() {
+                        outcome.error = Some(ErrorInfo {
+                            category: e.category(),
+                            message,
+                        });
+                    } else {
+                        outcome.warnings.push(message);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Foreign keys of the loaded tables, then identity resyncs (row-level security comes
+    /// after them, [`Self::row_security`]).
     async fn after_load(
         &self,
         loader: &dyn BulkLoader,

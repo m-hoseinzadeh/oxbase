@@ -116,10 +116,30 @@ SELECT pg_catalog.obj_description(c.oid, 'pg_class') AS comment, \
        c.relispartition AS is_partition, \
        pg_catalog.pg_get_userbyid(c.relowner)::text AS owner, \
        ts.spcname::text AS tablespace, \
-       pg_catalog.pg_get_partkeydef(c.oid) AS partition_by \
+       pg_catalog.pg_get_partkeydef(c.oid) AS partition_by, \
+       c.relrowsecurity AS row_security, \
+       c.relforcerowsecurity AS force_row_security \
 FROM pg_catalog.pg_class c \
 LEFT JOIN pg_catalog.pg_tablespace ts ON ts.oid = c.reltablespace \
 WHERE c.oid = $1";
+
+/// Row-level security policies of table `$1` (oid), by name: roles as a JSON array of names
+/// (`public` for the `PUBLIC` entry, oid 0), the `USING` and `WITH CHECK` expressions as the
+/// server prints them.
+pub(crate) const TABLE_POLICIES: &str = "\
+SELECT p.polname::text AS name, \
+       p.polcmd::text AS command, \
+       p.polpermissive AS permissive, \
+       pg_catalog.array_to_json(ARRAY( \
+         SELECT CASE WHEN u.r OPERATOR(pg_catalog.=) '0'::pg_catalog.oid THEN 'public' \
+                     ELSE pg_catalog.pg_get_userbyid(u.r)::text END \
+         FROM pg_catalog.unnest(p.polroles) WITH ORDINALITY AS u(r, n) \
+         ORDER BY u.n))::text AS roles, \
+       pg_catalog.pg_get_expr(p.polqual, p.polrelid, true) AS using_expr, \
+       pg_catalog.pg_get_expr(p.polwithcheck, p.polrelid, true) AS check_expr \
+FROM pg_catalog.pg_policy p \
+WHERE p.polrelid = $1 \
+ORDER BY p.polname";
 
 /// Columns of relation `$1` (oid), in ordinal order. `$generated` is the `attgenerated`
 /// expression (12+) or an empty string.
@@ -476,7 +496,13 @@ SELECT c.relkind::text AS relkind, \
        c.relispopulated AS populated, \
        ts.spcname::text AS tablespace, \
        (SELECT o.option_value FROM pg_catalog.pg_options_to_table(c.reloptions) o \
-         WHERE o.option_name = 'check_option') AS check_option \
+         WHERE o.option_name = 'check_option') AS check_option, \
+       (SELECT o.option_value::pg_catalog.bool \
+          FROM pg_catalog.pg_options_to_table(c.reloptions) o \
+         WHERE o.option_name = 'security_barrier') AS security_barrier, \
+       (SELECT o.option_value::pg_catalog.bool \
+          FROM pg_catalog.pg_options_to_table(c.reloptions) o \
+         WHERE o.option_name = 'security_invoker') AS security_invoker \
 FROM pg_catalog.pg_class c \
 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
 LEFT JOIN pg_catalog.pg_tablespace ts ON ts.oid = c.reltablespace \
@@ -609,6 +635,7 @@ pub(crate) const ALL: &[&str] = &[
     SEQUENCES,
     RELATION,
     TABLE_HEAD,
+    TABLE_POLICIES,
     COLUMNS_12,
     COLUMNS_10,
     CONSTRAINTS_18,
