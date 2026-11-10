@@ -56,6 +56,11 @@
 //!   mismatch by looking for `NotValidForName` in the rustls error text, which rustls 0.23.46 no
 //!   longer prints, so it could only behave like `VerifyFull`. Use `VerifyFull` (with
 //!   `TlsOptions::server_name` when connecting by IP or alias) or `Require`.
+//! - `caching_sha2_password` full authentication (the server has not cached the password)
+//!   sends the password itself, so it is refused with `Error::Auth` unless the certificate is
+//!   verified (`VerifyFull`) or the server is a loopback host (the vendored `mysql_async`'s
+//!   `OptsBuilder::password_disclosure`, see `vendor/mysql_async/OXBASE.md`). Fast
+//!   authentication works in every mode; `mysql_clear_password` stays off.
 //! - `mysql_async` keeps the password and inline client key as plain `String`/bytes in its
 //!   options for the life of the connection (needed for cancel side connections); they are
 //!   never logged or formatted by this crate.

@@ -51,6 +51,14 @@ impl Endpoint {
             .ok()
     }
 
+    /// `true` when the host is this machine: `localhost` or a loopback IP literal (no DNS
+    /// lookup). Through an SSH tunnel the server host is resolved by the bastion, so there it means
+    /// the bastion itself.
+    pub fn is_loopback(&self) -> bool {
+        self.host.trim().eq_ignore_ascii_case("localhost")
+            || matches!(self.ip(), Some(ip) if ip.is_loopback())
+    }
+
     /// The endpoint as a socket address, if the host is an IP literal (no DNS lookup).
     pub fn socket_addr(&self) -> Option<SocketAddr> {
         self.ip().map(|ip| SocketAddr::new(ip, self.port))
@@ -448,6 +456,19 @@ mod tests {
         assert_eq!(e.to_string(), "127.0.0.1:41234");
         assert_eq!(e.socket_addr(), Some(sa));
         assert_eq!(Endpoint::new("db.local", 1).socket_addr(), None);
+        for local in [
+            "localhost",
+            "LocalHost",
+            "127.0.0.1",
+            "127.8.9.10",
+            "::1",
+            "[::1]",
+        ] {
+            assert!(Endpoint::new(local, 1).is_loopback(), "{local}");
+        }
+        for remote in ["db.local", "10.0.0.5", "localhost.example.com", "::2"] {
+            assert!(!Endpoint::new(remote, 1).is_loopback(), "{remote}");
+        }
     }
 
     #[test]

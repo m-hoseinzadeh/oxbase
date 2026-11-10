@@ -10,3 +10,12 @@ ui/pnpm-lock.yaml, and checked in CI by cargo-deny (see deny.toml).
 vendor/tiberius is a copy of the tiberius 0.13.0 crate (https://github.com/prisma/tiberius),
 licensed MIT OR Apache-2.0 (vendor/tiberius/LICENSE-MIT.txt, vendor/tiberius/LICENSE-APACHE.txt),
 with the changes listed in vendor/tiberius/OXBASE.md.
+
+vendor/tokio-postgres is a copy of the tokio-postgres 0.7.18 crate
+(https://github.com/rust-postgres/rust-postgres), licensed MIT OR Apache-2.0
+(vendor/tokio-postgres/LICENSE-MIT, vendor/tokio-postgres/LICENSE-APACHE), with the changes listed
+in vendor/tokio-postgres/OXBASE.md.
+
+vendor/mysql_async is a copy of the mysql_async 0.37.1 crate (https://github.com/blackbeam/mysql_async),
+licensed MIT OR Apache-2.0 (vendor/mysql_async/LICENSE-MIT, vendor/mysql_async/LICENSE-APACHE), with
+the changes listed in vendor/mysql_async/OXBASE.md.
