@@ -88,9 +88,13 @@ function cell(value: string | null | undefined): ReactNode {
   return value ?? "";
 }
 
-/** A statement of the preview, ended so the lines read as a script. */
+/** The preview as a script: the session statements around the statements (the inlined
+ * literals read back as written only in that session), each ended so the lines read as a
+ * script. */
 function scriptText(script: DataScript): string {
-  return script.statements.map((s) => (/;\s*$|\bGO\s*$/i.test(s) ? s : `${s};`)).join("\n");
+  return [...(script.prologue ?? []), ...script.statements, ...(script.epilogue ?? [])]
+    .map((s) => (/;\s*$|\bGO\s*$/i.test(s) ? s : `${s};`))
+    .join("\n");
 }
 
 export function DataSyncPanel({ params }: { params: SyncPanelParams }) {

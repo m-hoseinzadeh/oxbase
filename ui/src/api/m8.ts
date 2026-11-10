@@ -405,7 +405,12 @@ export interface DataScriptRequest {
 
 export interface DataScript {
   engine: Engine;
+  /** Session statements the inlined literals need (the engine's SQL dump session), before the
+   * statements; not counted in `totalStatements`. */
+  prologue?: string[];
   statements: string[];
+  /** Session statements after the statements (undo the prologue where possible). */
+  epilogue?: string[];
   totalStatements: number;
   truncated: boolean;
   destructive: boolean;

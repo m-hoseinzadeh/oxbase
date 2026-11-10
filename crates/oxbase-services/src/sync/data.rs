@@ -16,13 +16,14 @@
 //!   effort). Then the applied pairs are compared again. A compare is applied at most once;
 //!   another apply needs a fresh compare.
 
+use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use oxbase_dialect::{DialectRegistry, inline_params, table_dependencies};
+use oxbase_dialect::{DialectRegistry, Quoting, inline_params, table_dependencies};
 use oxbase_diff::data::{
     CompareJob, InsertSession, compare_table, data_statements, insert_session, row_key,
 };
@@ -30,6 +31,7 @@ use oxbase_diff::{DiffStore, RowOp};
 use oxbase_driver::{Tx, collect};
 use oxbase_types::{
     BoundStatement, Engine, Error, ObjectDef, ObjectKind, Result, RowKey, ServerVersion, TableDef,
+    Value,
 };
 use tokio::sync::mpsc;
 
@@ -652,6 +654,25 @@ fn script_warnings(
     Ok(warnings)
 }
 
+/// The session statements around a script preview, each ended with `terminator`: the engine's
+/// SQL dump session ([`Quoting::dump_session`]). The preview inlines its values with
+/// `Quoting::dump_literal`, whose escaping is right only in that session (PostgreSQL
+/// `standard_conforming_strings = on`; MySQL / MariaDB `sql_mode` without
+/// `NO_BACKSLASH_ESCAPES` and `SET NAMES utf8mb4`), so a script copied into a client whose
+/// session differs would read a backslash in a value differently and could end a string
+/// early. `zoned`: a value is a timestamp with a time zone.
+fn script_session(quoting: &dyn Quoting, zoned: bool) -> (Vec<String>, Vec<String>) {
+    let terminator = quoting.script_terminator();
+    let session = quoting.dump_session(zoned);
+    let end = |statements: Vec<String>| -> Vec<String> {
+        statements
+            .into_iter()
+            .map(|s| format!("{s}{terminator}"))
+            .collect()
+    };
+    (end(session.prologue), end(session.epilogue))
+}
+
 /// Renders the script preview of `entry`.
 pub(super) fn script(
     ctx: &Ctx,
@@ -666,7 +687,15 @@ pub(super) fn script(
     let total = total_statements(entry, &groups, &sessions);
     let limit = options.preview_limit;
     let mut statements = Vec::new();
+    let zoned = Cell::new(false);
     let render = |statement: &BoundStatement| -> Result<String> {
+        if statement
+            .params
+            .iter()
+            .any(|v| matches!(v, Value::TimestampTz(_)))
+        {
+            zoned.set(true);
+        }
         let text = inline_params(quoting.as_ref(), statement)?;
         Ok(format!("{text}{terminator}"))
     };
@@ -711,6 +740,7 @@ pub(super) fn script(
             statements.push(render(statement)?);
         }
     }
+    let (prologue, epilogue) = script_session(quoting.as_ref(), zoned.get());
     let destructive = options.deletes
         && groups
             .iter()
@@ -718,7 +748,9 @@ pub(super) fn script(
     Ok(DataScript {
         engine: entry.engine,
         truncated: u64::try_from(statements.len()).unwrap_or(u64::MAX) < total,
+        prologue,
         statements,
+        epilogue,
         total_statements: total,
         destructive,
         warnings: script_warnings(ctx, entry, options)?,
@@ -1290,5 +1322,48 @@ async fn execute_one(
              changed since the compare); its transaction was rolled back and the apply stopped",
             table.obj.display_name()
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use oxbase_dialect::{AnsiQuoting, BacktickQuoting, BracketQuoting, PgQuoting};
+    use pretty_assertions::assert_eq;
+
+    use super::*;
+
+    /// Audit lead 4: the preview inlines `dump_literal` values, so it carries the dump session
+    /// that makes them read back as written.
+    #[test]
+    fn script_previews_carry_the_dump_session() {
+        let (prologue, epilogue) = script_session(&PgQuoting, false);
+        assert_eq!(prologue, ["SET standard_conforming_strings = on;"]);
+        assert_eq!(epilogue, Vec::<String>::new());
+
+        let (prologue, epilogue) = script_session(&BacktickQuoting, false);
+        assert!(
+            prologue.iter().any(|s| s.contains("NO_BACKSLASH_ESCAPES")),
+            "{prologue:?}"
+        );
+        assert_eq!(
+            prologue.last().map(String::as_str),
+            Some("SET NAMES utf8mb4;")
+        );
+        assert_eq!(
+            epilogue.last().map(String::as_str),
+            Some("SET sql_mode = @oxbase_sql_mode;")
+        );
+        assert!(!prologue.iter().any(|s| s.contains("time_zone")));
+        let (zoned, _) = script_session(&BacktickQuoting, true);
+        assert!(
+            zoned.iter().any(|s| s == "SET time_zone = '+00:00';"),
+            "{zoned:?}"
+        );
+
+        assert_eq!(script_session(&AnsiQuoting, true), (Vec::new(), Vec::new()));
+        assert_eq!(
+            script_session(&BracketQuoting, true),
+            (Vec::new(), Vec::new())
+        );
     }
 }
