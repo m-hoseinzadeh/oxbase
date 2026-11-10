@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { utf8 } from "../../../api";
 import {
+  cellBinary,
   createEdit,
   EMPTY_ELEMENT,
   elementDraft,
@@ -47,6 +48,24 @@ describe("key model", () => {
       { type: "hashDelete", fields: [utf8("f1")] },
     ]);
     expect(() => elementEdits("hash", null, EMPTY_ELEMENT)).toThrow(/field name/);
+  });
+
+  it("names a BOM-prefixed field, member or key by its exact bytes (audit lead 25)", () => {
+    // EF BB BF "role": a field next to "role" itself; dropping the BOM would hit that one.
+    const bom = Uint8Array.of(0xef, 0xbb, 0xbf, 0x72, 0x6f, 0x6c, 0x65);
+    const field = cellBinary(bom);
+    expect(field).toEqual(utf8("\uFEFFrole"));
+    expect(field).not.toEqual(cellBinary(new TextEncoder().encode("role")));
+    if (!field) throw new Error("the bytes are UTF-8");
+    const row = { field, value: utf8("x") };
+    expect(removeEdit("hash", row)).toEqual({ type: "hashDelete", fields: [utf8("\uFEFFrole")] });
+    expect(elementEdits("hash", row, { ...elementDraft(row), value: "y" })).toEqual([
+      { type: "hashSet", field: utf8("\uFEFFrole"), value: utf8("y") },
+    ]);
+    expect(removeEdit("set", { member: field })).toEqual({
+      type: "setRemove",
+      members: [utf8("\uFEFFrole")],
+    });
   });
 
   it("keeps binary bytes that were not changed", () => {
