@@ -110,6 +110,12 @@ pub fn escape_like(q: &dyn Quoting, text: &str) -> String {
 ///
 /// It is a lexical check, not a parser: it refuses some valid SQL (a `;` inside an unknown kind
 /// of quoting) but never accepts text that ends the statement or comments out what follows.
+///
+/// Text from outside the user (a source server's catalog, a backup archive) goes through the
+/// same check before the DDL generators splice it, so the lexing has to agree with the server's
+/// wherever that matters: PostgreSQL identifiers and dollar-quote tags take any non-ASCII
+/// character, as the server's lexer does (otherwise `€$a$...` or `€E'...'` would hide a `;` in
+/// what this check took for a string).
 pub fn check_expression(q: &dyn Quoting, text: &str) -> Result<()> {
     if text.trim().is_empty() {
         return Err(Error::invalid_input("the SQL expression is empty"));
@@ -172,8 +178,11 @@ fn comment_error() -> Error {
     Error::invalid_input("the SQL expression contains a comment")
 }
 
+/// `true` for a character that continues an identifier, as PostgreSQL's lexer sees it: ASCII
+/// letters and digits, `_`, `$` and any non-ASCII character (the server takes every byte from
+/// 0x80 up, so `€` continues an identifier although it is not alphanumeric).
 fn is_ident_char(c: char) -> bool {
-    c.is_alphanumeric() || c == '_' || c == '$'
+    c.is_ascii_alphanumeric() || c == '_' || c == '$' || !c.is_ascii()
 }
 
 /// The upper-cased leading keywords of `text` (at most `max`), after whitespace and comments
@@ -275,7 +284,9 @@ fn skip_bracketed(chars: &[char], start: usize) -> Result<usize> {
     ))
 }
 
-/// If a dollar-quote tag (`$$` or `$tag$`) starts at `start`, the index just past it.
+/// If a dollar-quote tag (`$$` or `$tag$`) starts at `start`, the index just past it. Tag
+/// characters follow PostgreSQL: an ASCII letter, `_` or any non-ASCII character first, then
+/// also ASCII digits.
 fn dollar_tag_end(chars: &[char], start: usize) -> Option<usize> {
     let mut j = start + 1;
     while let Some(&c) = chars.get(j) {
@@ -283,9 +294,9 @@ fn dollar_tag_end(chars: &[char], start: usize) -> Option<usize> {
             return Some(j + 1);
         }
         let ok = if j == start + 1 {
-            c.is_alphabetic() || c == '_'
+            c.is_ascii_alphabetic() || c == '_' || !c.is_ascii()
         } else {
-            c.is_alphanumeric() || c == '_'
+            c.is_ascii_alphanumeric() || c == '_' || !c.is_ascii()
         };
         if !ok {
             return None;
@@ -728,6 +739,25 @@ mod tests {
         assert!(check_expression(&BracketQuoting, "x = 1 -- c").is_err());
         // PostgreSQL arrays are not identifiers.
         assert!(check_expression(&PgQuoting, "a[1] = 2").is_ok());
+    }
+
+    /// PostgreSQL's lexer takes every non-ASCII character as an identifier character, so
+    /// `€$a$` is one identifier (not a dollar quote) and `€E'...'` is an identifier followed by
+    /// a plain string (not an escape string). Reading them otherwise would hide the `;`.
+    #[test]
+    fn expression_check_reads_non_ascii_identifiers_like_postgres() {
+        for text in [
+            "\u{20AC}$a$ > 0)\n); DROP TABLE victim; SELECT (($q$\u{20AC}$a$$q$",
+            "\u{20AC}$a$; SELECT 1; \u{20AC}$a$",
+            "\u{20AC}E'\\'; SELECT 1; --'",
+            "$\u{20AC}$'$\u{20AC}$; SELECT 1; --'",
+        ] {
+            assert!(check_expression(&PgQuoting, text).is_err(), "{text:?}");
+        }
+        // A real dollar quote with a non-ASCII tag, and identifiers with non-ASCII characters.
+        assert!(check_expression(&PgQuoting, "x = $\u{20AC}$a;b$\u{20AC}$").is_ok());
+        assert!(check_expression(&PgQuoting, "pr\u{e9}x\u{20AC} > 0").is_ok());
+        assert!(check_expression(&PgQuoting, "x = E'it\\'s'").is_ok());
     }
 
     #[test]

@@ -321,9 +321,12 @@ fn checked(what: &str, text: &str) -> Result<String> {
     one_expression(text.trim()).map_err(named)
 }
 
-/// `true` for characters that continue an identifier or keyword.
+/// `true` for characters that continue an identifier or keyword, as the server's lexer reads
+/// them: ASCII letters and digits, `_`, `$` and any non-ASCII character (PostgreSQL takes every
+/// byte from 0x80 up, so `€` continues an identifier although it is not alphanumeric; see
+/// `oxbase_dialect::sql::check_expression`, which must agree).
 fn is_ident_char(c: char) -> bool {
-    c.is_alphanumeric() || c == '_' || c == '$'
+    c.is_ascii_alphanumeric() || c == '_' || c == '$' || !c.is_ascii()
 }
 
 /// End (exclusive) of the quoted text starting at `start` (a `'` or `"`), with doubled quotes
@@ -350,8 +353,10 @@ fn quoted_end(chars: &[char], start: usize, backslashes: bool) -> Result<usize> 
 
 /// End (exclusive) of the dollar-quoted string starting at `start`, if one starts there.
 fn dollar_end(chars: &[char], start: usize) -> Option<usize> {
+    // The server's tag characters: ASCII letters, digits, `_` and any non-ASCII character.
+    let tag_char = |c: char| c.is_ascii_alphanumeric() || c == '_' || !c.is_ascii();
     let mut j = start + 1;
-    while j < chars.len() && (chars[j].is_alphanumeric() || chars[j] == '_') {
+    while j < chars.len() && tag_char(chars[j]) {
         j += 1;
     }
     if chars.get(j) != Some(&'$') || chars.get(start + 1).is_some_and(char::is_ascii_digit) {
@@ -2657,6 +2662,11 @@ mod tests {
             "1; DROP TABLE x",
             "0, \"x\" text",
             "1) , \"x\" text CHECK (true",
+            // The server reads `€$a$` as an identifier and `€E` as an identifier before a plain
+            // string, so the `;` is code, not string content (audit: non-ASCII lexing).
+            "\u{20AC}$a$; DROP TABLE x; \u{20AC}$a$",
+            "\u{20AC}E'\\'; DROP TABLE x; --'",
+            "$\u{20AC}$'$\u{20AC}$; DROP TABLE x; --'",
         ] {
             let mut t = TableDef::new(table_ref("t"));
             let mut c = col("c", "integer");
