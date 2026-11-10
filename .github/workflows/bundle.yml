@@ -25,6 +25,11 @@ name: Bundle
 # and scripts/ci-tauri.mjs (tauri-action's `tauriScript`) drops empty/partial signing
 # variables and skips `beforeBuildCommand`, so vite and its npm plugins never see them.
 # Third-party actions are pinned to commit SHAs (Dependabot updates the pins).
+# No caches: this job holds the signing secrets and builds the shipped installers, and cache
+# entries carry no producer identity (any workflow running on main can write main-scope
+# entries, e.g. ci.yml's pnpm store under the same lockfile key). Rust and pnpm are fetched
+# fresh from crates.io and the npm registry on every run, so nothing written by another
+# workflow reaches this job. A cold build takes about 15 minutes per platform.
 #
 # Linux bundles are built on ubuntu-24.04, so the AppImage/deb need glibc >= 2.39.
 # That is fine for dev bundles; release bundles should use the oldest supported runner.
@@ -130,11 +135,6 @@ jobs:
         if: runner.os == 'Linux'
         run: bash scripts/ci-install-linux-deps.sh
 
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
-          shared-key: bundle-${{ matrix.name }}
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-
       # Keep PNPM_VERSION equal to the pnpm that wrote ui/pnpm-lock.yaml. If ui/package.json
       # gains a "packageManager" field, it must name the same version (or drop `version:`).
       - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
@@ -145,8 +145,8 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: ${{ env.NODE_VERSION }}
-          cache: pnpm
-          cache-dependency-path: ui/pnpm-lock.yaml
+          # No pnpm store cache (see the header); also no automatic npm cache.
+          package-manager-cache: false
 
       - name: Install UI dependencies
         working-directory: ui
