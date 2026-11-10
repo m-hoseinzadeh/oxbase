@@ -7,7 +7,9 @@
 //! (`Quoting::dump_session`: PostgreSQL `standard_conforming_strings`, MySQL / MariaDB
 //! `sql_mode`, character set and time zone) and explicit identity values
 //! (`Quoting::dump_identity_insert`: SQL Server `SET IDENTITY_INSERT`, PostgreSQL
-//! `OVERRIDING SYSTEM VALUE`) are the dialect's too, so nothing here depends on the engine.
+//! `OVERRIDING SYSTEM VALUE`) are the dialect's too, and so is the check of every name the dump
+//! writes (`Quoting::check_script_ident`: SQL Server refuses line breaks), so nothing here
+//! depends on the engine.
 
 use std::io::{BufWriter, Write};
 use std::sync::Arc;
@@ -116,6 +118,40 @@ fn rename_constraints(table: &mut TableDef, old: &str, notes: &mut Vec<String>) 
             "the table is written as {new}: its keys, indexes and constraints were renamed to match"
         ));
     }
+}
+
+/// Every name the dump can write: the table's and its schema's, its columns', keys', indexes'
+/// and constraints' (with the tables and columns its foreign keys refer to), and the exported
+/// columns'. The database is never written (names are qualified without it, or the dump loads
+/// into the current one).
+fn dump_names<'a>(table: &'a TableDef, schema: &'a Schema) -> Vec<&'a str> {
+    let mut names = vec![table.obj.name.as_str()];
+    names.extend(table.obj.schema.as_deref());
+    names.extend(table.columns.iter().map(|c| c.name.as_str()));
+    if let Some(pk) = &table.primary_key {
+        names.extend(pk.name.as_deref());
+        names.extend(pk.columns.iter().map(String::as_str));
+    }
+    for index in &table.indexes {
+        names.push(&index.name);
+        names.extend(
+            index
+                .columns
+                .iter()
+                .filter(|c| !c.is_expression)
+                .map(|c| c.name.as_str()),
+        );
+    }
+    for fk in &table.foreign_keys {
+        names.extend(fk.name.as_deref());
+        names.extend(fk.columns.iter().map(String::as_str));
+        names.push(&fk.ref_table.name);
+        names.extend(fk.ref_table.schema.as_deref());
+        names.extend(fk.ref_columns.iter().map(String::as_str));
+    }
+    names.extend(table.checks.iter().filter_map(|c| c.name.as_deref()));
+    names.extend(schema.fields().iter().map(|f| f.name().as_str()));
+    names
 }
 
 /// A table definition from the rows' Arrow types: nullable columns, no keys.
@@ -383,6 +419,10 @@ pub(crate) fn writer(
             dump_name(options, context.table.as_ref().map(|t| &t.obj)),
         ),
     };
+    // A name the target's scripts cannot carry (SQL Server: a line break) fails the dump.
+    for name in dump_names(&table, &schema) {
+        quoting.check_script_ident(name)?;
+    }
 
     let mut sql = String::new();
     if options.include_create {

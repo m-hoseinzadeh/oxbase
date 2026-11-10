@@ -2,7 +2,7 @@
 
 use std::fmt::Write as _;
 
-use oxbase_types::{ColumnDef, ObjectKind, ObjectRef, Value};
+use oxbase_types::{ColumnDef, Error, ObjectKind, ObjectRef, Result, Value};
 
 use crate::dump::{DumpLiteral, DumpSession, IdentityInsert, push_datetime, push_time};
 
@@ -159,6 +159,13 @@ pub trait Quoting: Send + Sync {
     /// Server, decimals in SQLite `TEXT` columns).
     fn dump_literal(&self, v: &Value) -> DumpLiteral {
         DumpLiteral::exact(self.literal(v))
+    }
+
+    /// Checks that a SQL script file (a SQL dump) can carry `ident` quoted with
+    /// [`Quoting::quote_ident`]: `Unsupported` when it cannot. Default: every name can.
+    fn check_script_ident(&self, ident: &str) -> Result<()> {
+        let _ = ident;
+        Ok(())
     }
 
     /// What ends each statement of a script written out as text (M8: structure and data sync
@@ -538,6 +545,9 @@ impl Quoting for BracketQuoting {
         }
     }
 
+    /// Strings with a line break or `$(` as a `CONCAT` of pieces without them (see
+    /// [`line_safe`]).
+    ///
     /// Date-times with at most 7 fractional digits. A string converted to `datetime` may have
     /// at most 3 (the driver reads `datetime` ticks as `…00.003333`) and `yyyy-mm-dd` follows
     /// `DATEFORMAT` there, so timestamps without a zone are
@@ -554,7 +564,7 @@ impl Quoting for BracketQuoting {
                 (cut, false)
             }
             Value::Time(t) => (push_time(*t, DIGITS, &mut text), false),
-            other => return DumpLiteral::exact(self.literal(other)),
+            other => return DumpLiteral::exact(line_safe(self.literal(other))),
         };
         let quoted = self.quote_str(&text);
         DumpLiteral {
@@ -565,6 +575,19 @@ impl Quoting for BracketQuoting {
             },
             cut_to: cut.then_some(DIGITS),
         }
+    }
+
+    /// Refuses a name with a line break: inside `[...]` it would put the rest of the name on a
+    /// line of its own, which sqlcmd and SSMS read before the server does (a `GO` line ends the
+    /// batch, `!!` and `:r` lines are their commands), and T-SQL has no escape for it.
+    fn check_script_ident(&self, ident: &str) -> Result<()> {
+        if ident.contains(['\r', '\n']) {
+            return Err(Error::unsupported(format!(
+                "the name {ident:?} has a line break, which a SQL Server script cannot carry: \
+                 sqlcmd and SSMS would read the line after it as a batch end or a command"
+            )));
+        }
+        Ok(())
     }
 
     /// `SET IDENTITY_INSERT <table> ON` / `OFF` around the inserts when a written column is an
@@ -583,6 +606,81 @@ impl Quoting for BracketQuoting {
             IdentityInsert::default()
         }
     }
+}
+
+/// Arguments per `CONCAT` (T-SQL takes at most 254) in [`line_safe`].
+const CONCAT_ARGS: usize = 250;
+
+/// UTF-16 units of the longest string a `CONCAT` without an `nvarchar(max)` argument returns.
+const NVARCHAR_LIMIT: usize = 4000;
+
+/// A T-SQL string literal (`N'...'`) whose text has a line break or `$(`, as an expression whose
+/// SQL text has neither; any other literal as it is. A SQL Server script is read by a
+/// line-oriented batch tool before the server sees it (sqlcmd, SSMS): it takes a line holding
+/// `GO` as the end of a batch, runs a line starting with `!!` or `:` as its own command, and
+/// replaces `$(name)` even inside a string. So the text is cut there, the line breaks become
+/// `NCHAR(13)` / `NCHAR(10)` and the pieces are joined with `CONCAT` (nested by
+/// [`CONCAT_ARGS`], so many lines do not make a deep expression):
+/// `CONCAT(N'a', NCHAR(10), N'b')`. A text longer than [`NVARCHAR_LIMIT`] starts every
+/// `CONCAT` with an `nvarchar(max)`, which keeps the result from being cut there.
+fn line_safe(literal: String) -> String {
+    let Some(body) = literal
+        .strip_prefix("N'")
+        .and_then(|b| b.strip_suffix('\''))
+    else {
+        return literal;
+    };
+    if !body.contains(['\r', '\n']) && !body.contains("$(") {
+        return literal;
+    }
+    // The body only has its quotes doubled (`quote_str`).
+    let text = body.replace("''", "'");
+    let long = text.encode_utf16().count() > NVARCHAR_LIMIT;
+    let mut parts = Vec::new();
+    let mut piece = String::new();
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\r' | '\n' => {
+                if !piece.is_empty() {
+                    parts.push(BracketQuoting.quote_str(&std::mem::take(&mut piece)));
+                }
+                parts.push(if c == '\r' { "NCHAR(13)" } else { "NCHAR(10)" }.to_owned());
+            }
+            '$' if chars.peek() == Some(&'(') => {
+                piece.push('$');
+                parts.push(BracketQuoting.quote_str(&std::mem::take(&mut piece)));
+            }
+            c => piece.push(c),
+        }
+    }
+    if !piece.is_empty() {
+        parts.push(BracketQuoting.quote_str(&piece));
+    }
+    concat(&parts, long)
+}
+
+/// `parts` joined with `CONCAT`, at most [`CONCAT_ARGS`] per call; `long`: every call starts
+/// with an `nvarchar(max)`.
+fn concat(parts: &[String], long: bool) -> String {
+    if parts.len() > CONCAT_ARGS {
+        let groups: Vec<String> = parts
+            .chunks(CONCAT_ARGS)
+            .map(|group| concat(group, long))
+            .collect();
+        return concat(&groups, long);
+    }
+    if let [only] = parts
+        && !long
+    {
+        return only.clone();
+    }
+    let start = if long {
+        "CAST(N'' AS nvarchar(max)), "
+    } else {
+        ""
+    };
+    format!("CONCAT({start}{})", parts.join(", "))
 }
 
 #[cfg(test)]
@@ -774,5 +872,56 @@ mod tests {
             BracketQuoting.sync_session(Some("dbo")),
             Vec::<String>::new()
         );
+    }
+
+    /// Audit lead 21: sqlcmd and SSMS read a SQL Server script line by line before the server
+    /// does, so no line of a value may reach them.
+    #[test]
+    fn sql_server_dump_strings_have_no_line_breaks_or_variables() {
+        let ms = BracketQuoting;
+        let lit = |s: &str| ms.dump_literal(&Value::Text(s.to_owned())).sql;
+        assert_eq!(lit("it's"), "N'it''s'");
+        assert_eq!(lit("line\nnext"), "CONCAT(N'line', NCHAR(10), N'next')");
+        assert_eq!(
+            lit("a'\r\nGO\r\n"),
+            "CONCAT(N'a''', NCHAR(13), NCHAR(10), N'GO', NCHAR(13), NCHAR(10))"
+        );
+        assert_eq!(lit("\n"), "NCHAR(10)");
+        assert_eq!(lit("x $(PATH) $"), "CONCAT(N'x $', N'(PATH) $')");
+        // The plain literal keeps them (DDL arguments must be constants).
+        assert_eq!(ms.quote_str("a\nb"), "N'a\nb'");
+        // Longer than an nvarchar without max: every CONCAT starts with one.
+        let (a, b) = ("a".repeat(3000), "b".repeat(3000));
+        assert_eq!(
+            lit(&format!("{a}\n{b}")),
+            format!("CONCAT(CAST(N'' AS nvarchar(max)), N'{a}', NCHAR(10), N'{b}')")
+        );
+        // Many lines: nested calls of at most 250 arguments.
+        let many = lit(&"x\n".repeat(300));
+        assert!(!many.contains(['\r', '\n']), "{many}");
+        assert_eq!(many.matches("CONCAT(").count(), 4, "{many}");
+        assert!(
+            many.starts_with("CONCAT(CONCAT(N'x', NCHAR(10), "),
+            "{many}"
+        );
+        // Other engines' lexers read quoted line breaks as text.
+        assert_eq!(
+            PgQuoting.dump_literal(&Value::Text("a\nb".into())).sql,
+            "'a\nb'"
+        );
+    }
+
+    #[test]
+    fn sql_server_script_names_have_no_line_breaks() {
+        assert_eq!(BracketQuoting.check_script_ident("a]b $(c)").ok(), Some(()));
+        for name in ["d\nGO", "d\r"] {
+            let err = BracketQuoting.check_script_ident(name).unwrap_err();
+            assert_eq!(
+                err.category(),
+                oxbase_types::ErrorCategory::Unsupported,
+                "{err}"
+            );
+        }
+        assert_eq!(PgQuoting.check_script_ident("d\nGO").ok(), Some(()));
     }
 }

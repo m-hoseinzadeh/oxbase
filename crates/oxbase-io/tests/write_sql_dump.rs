@@ -149,11 +149,11 @@ INSERT INTO \"export\" (\"flag\", \"n\", \"dec\", \"txt\", \"bin\", \"at_tz\", \
 (NULL, NULL, NULL, NULL, NULL, NULL, NULL);
 "
         }
+        // Line breaks as `NCHAR(10)`: sqlcmd and SSMS read the script line by line.
         Engine::MsSql => {
             "INSERT INTO [export] ([flag], [n], [dec], [txt], [bin], [at_tz], [id]) VALUES
 (1, 1, 12.50, N'it''s \\ back', 0x00ff, N'2023-11-14T22:13:20.123456+00:00', N'12345678-9abc-def0-1234-56789abcdef0'),
-(0, 9007199254740993, -0.05, N'line
-next ☃ 🚀', 0x, N'1970-01-01T00:00:00+00:00', N'ffffffff-ffff-ffff-ffff-ffffffffffff');
+(0, 9007199254740993, -0.05, CONCAT(N'line', NCHAR(10), N'next ☃ 🚀'), 0x, N'1970-01-01T00:00:00+00:00', N'ffffffff-ffff-ffff-ffff-ffffffffffff');
 INSERT INTO [export] ([flag], [n], [dec], [txt], [bin], [at_tz], [id]) VALUES
 (NULL, NULL, NULL, NULL, NULL, NULL, NULL);
 "
@@ -884,4 +884,81 @@ fn sqlite_dumps_keep_long_decimals_exact() {
             (None, "null".to_owned()),
         ]
     );
+}
+
+/// Whether a line of a SQL Server script is one sqlcmd or SSMS reads as theirs: a batch end
+/// (`GO`) or a command (`!!`, `:r`, `:setvar`, ...).
+fn batch_tool_line(line: &str) -> bool {
+    let line = line.trim_start();
+    let go = line
+        .get(..2)
+        .is_some_and(|go| go.eq_ignore_ascii_case("go"))
+        && line[2..]
+            .chars()
+            .next()
+            .is_none_or(|c| !c.is_alphanumeric() && c != '_');
+    go || line.starts_with("!!") || line.starts_with(':')
+}
+
+#[test]
+fn sql_server_dumps_keep_value_lines_from_batch_tools() {
+    // Audit lead 21: a value's lines must not reach sqlcmd / SSMS as lines of the script.
+    let values = [
+        Some("a\nGO\nSELECT 1/0 AS oxbase_canary\nGO\n--"),
+        Some("b\r\n!! echo oxbase_canary_os\r\n:setvar X 1\n:r oxbase_canary.sql\n$(PATH)"),
+        Some("\n"),
+        Some("it's $(X) and $ ( and $"),
+    ];
+    let text = dump(
+        Engine::MsSql,
+        SqlDumpOptions::new(Engine::MsSql),
+        &context(),
+        &[texts(&values)],
+    );
+    let lines: Vec<&str> = text.lines().filter(|l| batch_tool_line(l)).collect();
+    assert_eq!(lines, Vec::<&str>::new(), "{text}");
+    assert!(!text.contains("$("), "{text}");
+    assert!(!text.contains('\r'), "{text}");
+    assert!(
+        text.ends_with(
+            "INSERT INTO [export] ([txt]) VALUES\n\
+             (CONCAT(N'a', NCHAR(10), N'GO', NCHAR(10), N'SELECT 1/0 AS oxbase_canary', \
+             NCHAR(10), N'GO', NCHAR(10), N'--')),\n\
+             (CONCAT(N'b', NCHAR(13), NCHAR(10), N'!! echo oxbase_canary_os', NCHAR(13), \
+             NCHAR(10), N':setvar X 1', NCHAR(10), N':r oxbase_canary.sql', NCHAR(10), N'$', \
+             N'(PATH)')),\n\
+             (NCHAR(10)),\n\
+             (CONCAT(N'it''s $', N'(X) and $ ( and $'));\n"
+        ),
+        "{text}"
+    );
+    // The other engines' lexers and tools read quoted line breaks as text.
+    let pg = dump(
+        Engine::Postgres,
+        SqlDumpOptions::new(Engine::Postgres),
+        &context(),
+        &[texts(&values)],
+    );
+    assert!(pg.contains("'a\nGO\n"), "{pg}");
+}
+
+#[test]
+fn sql_server_dumps_refuse_names_with_line_breaks() {
+    // Audit lead 21: `[...]` has no escape for a line break.
+    for (column, table) in [("d\nGO", None), ("txt", Some("t\r\n!! x"))] {
+        let schema = Arc::new(Schema::new(vec![Field::new(column, ArrowType::Utf8, true)]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(vec![Some("v")]))])
+                .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dump.sql");
+        let options = WriteOptions::SqlDump(SqlDumpOptions {
+            table: table.map(|t| ObjectRef::table(None, Some("dbo"), t)),
+            ..SqlDumpOptions::new(Engine::MsSql)
+        });
+        let err = write_all(&path, &options, &context(), &[batch]).unwrap_err();
+        assert_eq!(err.category(), ErrorCategory::Unsupported, "{err}");
+        assert!(err.to_string().contains("line break"), "{err}");
+        assert_eq!(write_support::files(dir.path()), Vec::<String>::new());
+    }
 }
