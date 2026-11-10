@@ -79,7 +79,7 @@ export default function MonacoSqlEditor({
             padding: { top: 4, bottom: 4 },
             renderLineHighlight: "none" as const,
             overviewRulerLanes: 0,
-            scrollbar: { verticalScrollbarSize: 8, horizontalScrollbarSize: 8 },
+            scrollbar: { verticalScrollbarSize: 12, horizontalScrollbarSize: 12 },
           }
         : {}),
       // With insight the core offers the names; plain words of the text would only add noise.
