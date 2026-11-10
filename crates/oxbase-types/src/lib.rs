@@ -32,6 +32,8 @@
 //! - [`relocate`] (M8): [`Location`] (a database and schema) and [`relocate_def`], which moves a
 //!   definition read in a source container to a target container (structure sync, transfer,
 //!   restore; `docs/m8-contracts.md` §3.2).
+//! - [`private_fs`]: owner-only directories and files for data spilled to disk (query results,
+//!   data compare rows).
 
 pub mod catalog;
 pub mod data_type;
@@ -46,6 +48,7 @@ mod int_text;
 pub mod keyvalue;
 pub mod net;
 pub mod object;
+pub mod private_fs;
 pub mod progress;
 pub mod props;
 pub mod relocate;

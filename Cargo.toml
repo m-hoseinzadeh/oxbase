@@ -246,6 +246,10 @@ ring = "0.17.14"
 # --- platform ---
 # Platform config directory for the profile file (oxbase-store; MIT OR Apache-2.0).
 dirs = "7.0.0"
+# Safe wrapper for the effective user id behind the private spill directory checks
+# (oxbase-types, Unix only). Already in the graph through tempfile (Apache-2.0 WITH
+# LLVM-exception OR Apache-2.0 OR MIT).
+rustix = "1.1.6"
 
 # --- secrets ---
 # keyring 4 `v1` (default): macOS Keychain, Windows Credential Manager, Secret Service over zbus

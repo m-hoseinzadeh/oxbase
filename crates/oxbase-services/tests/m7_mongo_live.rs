@@ -216,7 +216,7 @@ impl Live {
             Arc::clone(&dialects),
             history,
             QueryConfig {
-                spill_dir: spill.path().to_path_buf(),
+                spill_dir: spill.path().join("results"),
                 ..QueryConfig::default()
             },
         ));

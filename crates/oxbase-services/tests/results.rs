@@ -64,7 +64,7 @@ struct Setup {
 
 fn setup(memory: u64, disk: u64) -> Setup {
     let base = tempfile::tempdir().unwrap();
-    let dir = Arc::new(RunDir::create(base.path()).unwrap());
+    let dir = Arc::new(RunDir::create(&base.path().join("results")).unwrap());
     Setup {
         _base: base,
         dir,
