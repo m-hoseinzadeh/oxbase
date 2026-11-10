@@ -27,7 +27,8 @@ const AUTH_ERRORS: [u16; 6] = [
 /// What a user can do about refused `caching_sha2_password` full authentication.
 const DISCLOSURE_HINT: &str = "oxbase sends the password itself only to a server whose TLS \
      certificate it verified: use TLS mode verify_full (with the server's CA file if it is \
-     private)";
+     private), or, accepting the risk, tick \"Send the password to an unverified server\" in the \
+     connection's TLS settings";
 
 /// Statement deadlines: MySQL `max_execution_time` (3024), MariaDB `max_statement_time` (1969).
 const TIMEOUT_ERRORS: [u16; 2] = [3024, 1969];

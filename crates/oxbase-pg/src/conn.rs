@@ -760,19 +760,22 @@ const DISCLOSURE_REFUSED: &str =
 /// What a user can do about a refused cleartext / MD5 request.
 const DISCLOSURE_HINT: &str = "oxbase sends the password itself (or its MD5 hash) only to a \
      server whose TLS certificate it verified: use TLS mode verify_full (or verify_ca with a CA \
-     file), or switch the server's pg_hba.conf entry to scram-sha-256";
+     file), switch the server's pg_hba.conf entry to scram-sha-256, or, accepting the risk, tick \
+     \"Send the password to an unverified server\" in the connection's TLS settings";
 
 /// Whether the server may receive the password itself (cleartext) or its MD5 hash, which logs in
-/// as the user. Only when the TLS certificate is verified, or the server is on this machine (a
-/// Unix socket, or a loopback host, which through SSH is the bastion itself): otherwise an
-/// unverified peer, such as an on-path attacker answering `N` to the TLS request or presenting
-/// any certificate, could ask for either and recover the reusable password. SCRAM needs neither.
+/// as the user. Only when the TLS certificate is verified, the server is on this machine (a
+/// Unix socket, or a loopback host, which through SSH is the bastion itself), or the user allowed
+/// it ([`TlsOptions::password_may_reach`](oxbase_types::TlsOptions::password_may_reach)):
+/// otherwise an unverified peer, such as an on-path attacker answering `N` to the TLS request or
+/// presenting any certificate, could ask for either and recover the reusable password. SCRAM
+/// needs neither.
 fn password_disclosure_allowed(
     params: &ConnectParams,
     server: &Endpoint,
     unix_socket: bool,
 ) -> bool {
-    params.tls.mode.verifies_certificate() || unix_socket || server.is_loopback()
+    unix_socket || params.tls.password_may_reach(server)
 }
 
 fn connect_error(err: &tokio_postgres::Error, server: &Endpoint, dial: &Endpoint) -> Error {

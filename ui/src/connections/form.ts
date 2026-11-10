@@ -40,6 +40,8 @@ export interface ConnectionForm {
   clientCert: string;
   clientKey: string;
   serverName: string;
+  /** `tls.allow_unverified_password`. */
+  allowUnverifiedPassword: boolean;
 
   sshEnabled: boolean;
   sshHost: string;
@@ -291,6 +293,15 @@ export function hostListProblem(text: string): string | null {
   return null;
 }
 
+/**
+ * Whether the TLS tab offers "Send the password to an unverified server": every network engine
+ * whose login can send the password itself. MongoDB's PLAIN has its own rule (it needs a verified
+ * server), and its SCRAM never sends the password.
+ */
+export function offersUnverifiedPassword(engine: DialogEngine): boolean {
+  return engine !== "sqlite" && engine !== "mongodb";
+}
+
 /** TLS modes that check (or at least require) encryption; strict encryption needs one. */
 export const STRICT_TLS_MODES: readonly TlsMode[] = ["require", "verify_ca", "verify_full"];
 
@@ -360,6 +371,7 @@ export function emptyForm(engine: DialogEngine = "postgres"): ConnectionForm {
     clientCert: "",
     clientKey: "",
     serverName: "",
+    allowUnverifiedPassword: false,
     sshEnabled: false,
     sshHost: "",
     sshPort: "22",
@@ -434,6 +446,7 @@ export function formFromProfile(profile: ConnectionProfile): ConnectionForm {
   form.clientCert = filePath(profile.tls.client_cert);
   form.clientKey = filePath(profile.tls.client_key);
   form.serverName = profile.tls.server_name ?? "";
+  form.allowUnverifiedPassword = profile.tls.allow_unverified_password === true;
   form.sessionMode =
     profile.session_mode === "per_run" && offersPerRun(engine) ? "per_run" : "per_tab";
   const options = profile.options ?? {};
@@ -724,6 +737,13 @@ export function profileFromForm(
     clientCerts ? keyRef(form.clientKey, base?.tls.client_key) : undefined,
   );
   setOptional(tls, "server_name", networked ? optionalText(form.serverName) : undefined);
+  setOptional(
+    tls,
+    "allow_unverified_password",
+    networked && offersUnverifiedPassword(form.engine) && form.allowUnverifiedPassword
+      ? true
+      : undefined,
+  );
 
   if (networked && form.sshEnabled) {
     const ssh: SshSettings = {

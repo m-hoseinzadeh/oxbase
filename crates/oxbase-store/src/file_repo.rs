@@ -515,6 +515,7 @@ mod tests {
                 key: p.secret_key(SecretSlot::TlsClientKey),
             }),
             server_name: Some("db.example".into()),
+            allow_unverified_password: false,
             extra: Extra::new(),
         };
         p.ssh = Some(SshSettings {

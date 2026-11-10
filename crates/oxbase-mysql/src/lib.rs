@@ -58,7 +58,8 @@
 //!   `TlsOptions::server_name` when connecting by IP or alias) or `Require`.
 //! - `caching_sha2_password` full authentication (the server has not cached the password)
 //!   sends the password itself, so it is refused with `Error::Auth` unless the certificate is
-//!   verified (`VerifyFull`) or the server is a loopback host (the vendored `mysql_async`'s
+//!   verified (`VerifyFull`), the server is a loopback host or the user allowed it
+//!   (`TlsOptions::allow_unverified_password`; the vendored `mysql_async`'s
 //!   `OptsBuilder::password_disclosure`, see `vendor/mysql_async/OXBASE.md`). Fast
 //!   authentication works in every mode; `mysql_clear_password` stays off.
 //! - `mysql_async` keeps the password and inline client key as plain `String`/bytes in its

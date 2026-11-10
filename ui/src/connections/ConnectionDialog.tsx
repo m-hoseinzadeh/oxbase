@@ -49,6 +49,7 @@ import {
   type MongoAuthMechanism,
   type MongoReadPreference,
   offersPerRun,
+  offersUnverifiedPassword,
   profileFromForm,
   type RedisMode,
   type SshAuthMethod,
@@ -321,6 +322,7 @@ export function ConnectionDialog({ profile, onClose, onSaved }: ConnectionDialog
       | "saveSshSecret"
       | "strictEncryption"
       | "readOnlyIntent"
+      | "allowUnverifiedPassword"
       | "srv",
   ) {
     return (event: ChangeEvent<HTMLInputElement>) => set(key, event.target.checked);
@@ -828,6 +830,26 @@ export function ConnectionDialog({ profile, onClose, onSaved }: ConnectionDialog
               />
             )}
           </Field>
+          {offersUnverifiedPassword(form.engine) ? (
+            <div className="field">
+              <label className="checkbox">
+                <input
+                  id={fieldId("allowUnverifiedPassword")}
+                  type="checkbox"
+                  checked={form.allowUnverifiedPassword}
+                  aria-describedby={`${fieldId("allowUnverifiedPassword")}-hint`}
+                  onChange={check("allowUnverifiedPassword")}
+                />
+                Send the password to an unverified server
+              </label>
+              <p id={`${fieldId("allowUnverifiedPassword")}-hint`} className="field__hint">
+                Risky. When the server certificate is not verified (the modes Disable, Prefer and
+                Require), a login that sends the password itself is refused, because anyone between
+                you and the server could read it. Tick this only on a network you trust. Connections
+                to this computer and to verified servers never need it.
+              </p>
+            </div>
+          ) : null}
         </div>
 
         <div

@@ -608,6 +608,10 @@ pub struct TlsSettings {
     pub client_key: Option<KeyRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server_name: Option<String>,
+    /// Send the password to a server whose certificate is not verified (the user's explicit
+    /// choice; `oxbase_types::TlsOptions::allow_unverified_password`). Absent means `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_unverified_password: bool,
     #[serde(flatten)]
     pub extra: Extra,
 }

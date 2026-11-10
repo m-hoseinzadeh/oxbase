@@ -97,6 +97,25 @@ describe("profileFromForm", () => {
     expect(secretsFromForm(form)).toEqual({ password: "hunter2-marker" });
   });
 
+  it("keeps the unverified-password choice only where it applies", () => {
+    const form = { ...emptyForm(), name: "x", host: "db.example.com", tlsMode: "prefer" as const };
+    expect(profileFromForm(form).tls).toEqual({ mode: "prefer" });
+    const allowed = profileFromForm({ ...form, allowUnverifiedPassword: true });
+    expect(allowed.tls).toEqual({ mode: "prefer", allow_unverified_password: true });
+    expect(formFromProfile(allowed).allowUnverifiedPassword).toBe(true);
+    // Unticking it removes it from a saved profile.
+    const unticked = profileFromForm({
+      ...formFromProfile(allowed),
+      allowUnverifiedPassword: false,
+    });
+    expect(unticked.tls.allow_unverified_password).toBeUndefined();
+    // MongoDB has no such login (PLAIN needs a verified server); SQLite has no network.
+    for (const engine of ["mongodb", "sqlite"] as const) {
+      const other = { ...withEngine(form, engine), allowUnverifiedPassword: true };
+      expect(profileFromForm(other).tls.allow_unverified_password).toBeUndefined();
+    }
+  });
+
   it("asks every time when saving is off", () => {
     const profile = profileFromForm({ ...emptyForm(), name: "x", savePassword: false });
     expect(profile.password).toEqual({ source: "prompt" });

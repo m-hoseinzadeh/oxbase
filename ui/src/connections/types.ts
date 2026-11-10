@@ -34,6 +34,11 @@ export interface TlsSettings {
   client_cert?: PemRef;
   client_key?: KeyRef;
   server_name?: string;
+  /**
+   * Send the password to a server whose certificate is not verified (the user's explicit
+   * choice; absent = no). Logins that carry the password itself are refused otherwise.
+   */
+  allow_unverified_password?: boolean;
 }
 
 export type SshAuthSettings =

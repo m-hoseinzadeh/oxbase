@@ -325,3 +325,15 @@ async fn full_auth_proceeds_for_a_verified_or_local_server() {
         "loopback"
     );
 }
+
+#[tokio::test]
+async fn full_auth_proceeds_when_the_user_allows_an_unverified_server() {
+    // The user's explicit choice in the profile's TLS settings: the plaintext RSA path starts.
+    let allowed = TlsOptions::new(TlsMode::Prefer).with_unverified_password_allowed(true);
+    let (_, seen) = exchange(REMOTE, allowed, None, Answer::FullAuth).await;
+    assert_eq!(
+        seen.after_answer.first().map(Vec::as_slice),
+        Some(&[0x02][..]),
+        "allowed by the user"
+    );
+}
