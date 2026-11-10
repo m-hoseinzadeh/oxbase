@@ -39,6 +39,11 @@ pub const PARALLEL: PropId = PropId::from_static("parallel");
 /// server's deparse, not string content. Always reported, `false` for a quoted (`prosrc`) body,
 /// so the DDL quotes a body unless the catalog says it is a standard one.
 pub const SQL_STANDARD_BODY: PropId = PropId::from_static("sql_standard_body");
+/// Extra: a routine's `SET` clauses (`pg_proc.proconfig`), a JSON array of `name=value` texts as
+/// the server stores them (`search_path=pg_catalog, pg_temp`). Always reported (`[]` when there
+/// are none), so a comparison sees a setting, such as the `search_path` pin of a
+/// `SECURITY DEFINER` routine, go.
+pub const SETTINGS: PropId = PropId::from_static("settings");
 /// Extra: database `LC_CTYPE`.
 pub const CTYPE: PropId = PropId::from_static("ctype");
 /// Extra: the kind of a user-defined type (`enum`, `composite`, `domain`, `range`,
@@ -806,6 +811,13 @@ async fn load_routine(cx: &Cx<'_>, obj: &ObjectRef) -> Result<ObjectDef> {
     if let Some(p) = parallel {
         def.extras.insert(PARALLEL, p);
     }
+    let settings: Vec<String> = match row.opt_str("settings")? {
+        Some(text) => serde_json::from_str(text)
+            .map_err(|e| Error::internal(format!("unreadable routine settings: {e}")))?,
+        None => Vec::new(),
+    };
+    def.extras
+        .insert(SETTINGS, Value::Json(serde_json::Value::from(settings)));
     if let Some(owner) = row.opt_string("owner")? {
         def.extras.insert(props::OWNER, owner);
     }

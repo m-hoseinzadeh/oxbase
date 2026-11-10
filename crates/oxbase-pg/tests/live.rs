@@ -23,7 +23,7 @@ use oxbase_net::ssh::{
     TunnelProvider,
 };
 use oxbase_pg::PgDriver;
-use oxbase_pg::dialect::SQL_STANDARD_BODY;
+use oxbase_pg::dialect::{SETTINGS, SQL_STANDARD_BODY};
 use oxbase_types::{Endpoint, Engine, Error, ObjectDef, ObjectKind, ObjectRef, Script, Value};
 
 struct Fixture {
@@ -1057,6 +1057,109 @@ async fn quoted_sql_bodies_that_start_with_return_stay_quoted() {
         )
         .await,
         Some("true".to_owned())
+    );
+    drop_schemas(&*conn, &[src, tgt]).await;
+}
+
+/// `proconfig` of routine `signature` (`schema.f()`), as a JSON array text.
+async fn settings_of(conn: &dyn Connection, signature: &str) -> Option<String> {
+    text_of(
+        conn,
+        &format!(
+            "SELECT pg_catalog.array_to_json(proconfig)::text FROM pg_catalog.pg_proc \
+             WHERE oid = '{signature}'::regprocedure"
+        ),
+    )
+    .await
+}
+
+/// A `SECURITY DEFINER` routine keeps its `SET search_path` pin when it is created on the
+/// target and when an existing one is replaced, and a lost pin shows as a difference (audit
+/// lead 13).
+#[tokio::test]
+#[ignore = "needs the postgres fixture"]
+async fn definer_routines_keep_their_settings() {
+    let f = fixture();
+    let conn = connect(&plain_params(&f)).await;
+    let (src, tgt) = ("oxbase_l13_src", "oxbase_l13_tgt");
+    fresh_schemas(&*conn, &[src, tgt]).await;
+    let pinned = "SECURITY DEFINER SET search_path = pg_catalog, pg_temp";
+    for (schema, name, letter, settings) in [
+        (src, "f", "A", pinned),
+        (src, "h", "A", pinned),
+        (tgt, "h", "B", pinned),
+        (tgt, "u", "A", "SECURITY DEFINER"),
+    ] {
+        run(
+            &*conn,
+            &format!(
+                "CREATE FUNCTION {schema}.{name}() RETURNS text LANGUAGE sql {settings} \
+                 AS 'SELECT lower(''{letter}''::text)'"
+            ),
+            &[],
+        )
+        .await;
+    }
+    let source = settings_of(&*conn, &format!("{src}.f()")).await;
+    assert_eq!(
+        source.as_deref(),
+        Some(r#"["search_path=pg_catalog, pg_temp"]"#)
+    );
+    let routine = |schema: &str, name: &str| {
+        ObjectRef::schema(None, schema)
+            .child(ObjectKind::Function, name)
+            .with_signature("")
+    };
+    let moved = |mut def: ObjectDef, name: &str| {
+        let ObjectDef::Routine(r) = &mut def else {
+            panic!("{name} is not a routine")
+        };
+        r.obj.schema = Some(tgt.to_owned());
+        r.obj.name = name.to_owned();
+        def
+    };
+
+    // Created on the target.
+    let f_def = moved(load_def(&*conn, &routine(src, "f")).await, "f");
+    let script = create_def(&*conn, &f_def).await;
+    assert!(
+        script.steps[0].sql.contains("SET \"search_path\" TO"),
+        "{}",
+        script.steps[0].sql
+    );
+    assert_eq!(settings_of(&*conn, &format!("{tgt}.f()")).await, source);
+
+    // An existing target routine replaced in place (`CREATE OR REPLACE`).
+    let old = load_def(&*conn, &routine(tgt, "h")).await;
+    let new = moved(load_def(&*conn, &routine(src, "h")).await, "h");
+    let version = conn.server_version().clone();
+    let script = generator(ObjectKind::Function)
+        .alter(&old, &new, &DdlContext::new(&version))
+        .unwrap();
+    assert!(script.steps[0].sql.starts_with("CREATE OR REPLACE"));
+    for step in &script.steps {
+        collect(
+            conn.execute_one(&step.sql, CancellationToken::new())
+                .await
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    }
+    assert_eq!(settings_of(&*conn, &format!("{tgt}.h()")).await, source);
+
+    // An unpinned target routine differs from the pinned source.
+    let unpinned = load_def(&*conn, &routine(tgt, "u")).await;
+    let source_like = moved(load_def(&*conn, &routine(src, "f")).await, "u");
+    let mut reg = DialectRegistry::new();
+    oxbase_pg::dialect::register(&mut reg);
+    let diff = reg
+        .comparator(Engine::Postgres, ObjectKind::Function)
+        .unwrap()
+        .diff(&unpinned, &source_like);
+    assert!(
+        diff.iter().any(|d| d.prop.as_ref() == Some(&SETTINGS)),
+        "{diff:?}"
     );
     drop_schemas(&*conn, &[src, tgt]).await;
 }
