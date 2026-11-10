@@ -117,6 +117,17 @@ pub fn escape_like(q: &dyn Quoting, text: &str) -> String {
 /// character, as the server's lexer does (otherwise `€$a$...` or `€E'...'` would hide a `;` in
 /// what this check took for a string).
 pub fn check_expression(q: &dyn Quoting, text: &str) -> Result<()> {
+    scan_expression(q, text, false)
+}
+
+/// [`check_expression`], and also refuses a `,` outside parentheses: for text that is not
+/// wrapped in parentheses where it is spliced (`DEFAULT x`, `ON UPDATE x`, an index key or a
+/// predicate), where a top-level comma would start another column definition or clause.
+pub fn check_one_expression(q: &dyn Quoting, text: &str) -> Result<()> {
+    scan_expression(q, text, true)
+}
+
+fn scan_expression(q: &dyn Quoting, text: &str, refuse_top_comma: bool) -> Result<()> {
     if text.trim().is_empty() {
         return Err(Error::invalid_input("the SQL expression is empty"));
     }
@@ -153,6 +164,12 @@ pub fn check_expression(q: &dyn Quoting, text: &str) -> Result<()> {
             '-' if next == Some('-') => return Err(comment_error()),
             '/' if next == Some('*') => return Err(comment_error()),
             '#' if rules.hash_comments => return Err(comment_error()),
+            ',' if refuse_top_comma && depth == 0 => {
+                return Err(Error::invalid_input(
+                    "the SQL expression contains ',' outside parentheses (only one expression \
+                     is allowed)",
+                ));
+            }
             '(' => {
                 depth += 1;
                 i += 1;
@@ -758,6 +775,16 @@ mod tests {
         assert!(check_expression(&PgQuoting, "x = $\u{20AC}$a;b$\u{20AC}$").is_ok());
         assert!(check_expression(&PgQuoting, "pr\u{e9}x\u{20AC} > 0").is_ok());
         assert!(check_expression(&PgQuoting, "x = E'it\\'s'").is_ok());
+    }
+
+    #[test]
+    fn one_expression_check_refuses_top_level_commas() {
+        assert!(check_one_expression(&BacktickQuoting, "1, DROP COLUMN `x`").is_err());
+        assert!(check_one_expression(&AnsiQuoting, "a, b").is_err());
+        assert!(check_one_expression(&BacktickQuoting, "concat('a,b', `c`)").is_ok());
+        assert!(check_one_expression(&AnsiQuoting, "(1, 2)").is_ok());
+        assert!(check_expression(&AnsiQuoting, "a, b").is_ok());
+        assert!(check_one_expression(&BacktickQuoting, "1; DROP TABLE t").is_err());
     }
 
     #[test]
