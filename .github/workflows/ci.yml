@@ -8,6 +8,11 @@ name: CI
 #   squash-merged PR), pushes to main, the weekly schedule and manual runs. Everything on Linux,
 #   macOS and Windows.
 # scripts/ci-wait.mjs pushes a branch and waits for this workflow's result on that commit.
+#
+# Actions are pinned to commit SHAs (Dependabot updates the pins): pushes to main save caches
+# in the main scope, so a moved upstream tag must not be able to write them.
+# dtolnay/rust-toolchain is pinned to the head of its `stable` branch (the toolchain itself is
+# still the latest stable); Dependabot does not track branch pins, so bump it by hand.
 on:
   push:
     branches: [main, "wip/**"]
@@ -42,18 +47,18 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: rustfmt, clippy
 
       - name: Install Tauri Linux system libraries
         run: bash scripts/ci-install-linux-deps.sh
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: lint
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -77,17 +82,17 @@ jobs:
         # wip/** pushes (fast lane) run Linux only.
         os: ${{ fromJSON(startsWith(github.ref, 'refs/heads/wip/') && '["ubuntu-latest"]' || '["ubuntu-latest", "macos-latest", "windows-latest"]') }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
 
       - name: Install Tauri Linux system libraries
         if: runner.os == 'Linux'
         run: bash scripts/ci-install-linux-deps.sh
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: test
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -114,11 +119,11 @@ jobs:
         # wip/** pushes (fast lane) run Linux only.
         os: ${{ fromJSON(startsWith(github.ref, 'refs/heads/wip/') && '["ubuntu-latest"]' || '["ubuntu-latest", "macos-latest", "windows-latest"]') }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
 
       - name: Install D-Bus and gnome-keyring
         if: runner.os == 'Linux'
@@ -126,7 +131,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends dbus gnome-keyring
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: keychain
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -143,18 +148,18 @@ jobs:
       run:
         working-directory: ui
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       # Keep PNPM_VERSION equal to the pnpm that wrote ui/pnpm-lock.yaml. If ui/package.json
       # gains a "packageManager" field, it must name the same version (or drop `version:`).
-      - uses: pnpm/action-setup@v6
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         with:
           version: ${{ env.PNPM_VERSION }}
           package_json_file: ui/package.json
 
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: pnpm
@@ -185,13 +190,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: conformance
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -303,13 +308,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: perf
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -372,13 +377,13 @@ jobs:
     env:
       OXBASE_REQUIRE_M6_PERF: "1"
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: perf
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -437,11 +442,11 @@ jobs:
       # Apache-2.0 OR MIT; a binary tool, not a dependency of the workspace.
       TAURI_DRIVER_VERSION: "2.1.0"
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
 
       - name: Install Tauri Linux system libraries, WebKitWebDriver and Xvfb
         run: |
@@ -450,17 +455,17 @@ jobs:
           command -v WebKitWebDriver
 
       # Restores the Linux test job's dependency cache (debug profile); never saves its own.
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: test
           save-if: false
 
-      - uses: pnpm/action-setup@v6
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         with:
           version: ${{ env.PNPM_VERSION }}
           package_json_file: ui/package.json
 
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: pnpm
@@ -474,7 +479,7 @@ jobs:
 
       - name: Cache tauri-driver
         id: tauri-driver-cache
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cargo/bin/tauri-driver
           key: tauri-driver-${{ runner.os }}-${{ env.TAURI_DRIVER_VERSION }}
@@ -507,7 +512,7 @@ jobs:
 
       - name: Upload e2e results
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: webview-smoke-linux
           path: ${{ runner.temp }}/e2e
@@ -535,11 +540,11 @@ jobs:
     # dispatch) they fail the run. Licenses/bans/sources always block.
     continue-on-error: ${{ matrix.checks == 'advisories' && github.event_name == 'pull_request' }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           command: check ${{ matrix.checks }}
           arguments: --all-features
