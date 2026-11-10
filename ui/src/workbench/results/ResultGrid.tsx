@@ -66,8 +66,10 @@ import { ContextMenu, type MenuItem, OPENS_SUBMENU } from "../../components/Cont
 import { ROW_HEIGHTS, useSettings } from "../../settings";
 import { normalizeColor, subscribeTheme } from "../theme-bridge";
 import {
+  type CopiedText,
   type CopyNotify,
   cellsForSelection,
+  copiedSelection,
   copyColumn,
   NULL_COPY_TEXT,
   readSelection,
@@ -104,13 +106,40 @@ import { ValuePanel } from "./ValuePanel";
 /**
  * The grid's own keys, changed: no Ctrl+Enter ("scroll to the selected cell"), which runs the
  * query wherever the focus is in the tab (../shortcuts); F2 activates a cell like Enter and
- * Space, while Shift+Enter opens the value dialog; Ctrl+F searches.
+ * Space, while Shift+Enter opens the value dialog; Ctrl+F searches. No copy: Glide writes the
+ * cell text into the clipboard's HTML table unescaped, so Oxbase copies itself
+ * (`copiedSelection`).
  */
 const GRID_KEYS = {
   scrollToSelectedCell: false,
   activateCell: "Enter| |F2",
   search: true,
+  copy: false,
 } as const;
+
+/** Whether `element` takes typed text (a copy there copies its own selection). */
+function takesText(element: Element): boolean {
+  return (
+    element instanceof HTMLInputElement ||
+    element instanceof HTMLTextAreaElement ||
+    (element instanceof HTMLElement && element.isContentEditable)
+  );
+}
+
+/** Writes both flavours of a copy with the async clipboard API (plain text where it lacks
+ * `write`). */
+async function writeCopied(copied: CopiedText): Promise<void> {
+  if (typeof ClipboardItem !== "undefined" && navigator.clipboard.write !== undefined) {
+    await navigator.clipboard.write([
+      new ClipboardItem({
+        "text/plain": new Blob([copied.text], { type: "text/plain" }),
+        "text/html": new Blob([copied.html], { type: "text/html" }),
+      }),
+    ]);
+  } else {
+    await navigator.clipboard.writeText(copied.text);
+  }
+}
 
 /** How long the pointer rests on a cut-off cell before its value shows. */
 const PREVIEW_DELAY_MS = 600;
@@ -372,6 +401,7 @@ export function ResultGrid({
   const columns = useMemo(() => visibleColumns(resultColumns), [resultColumns]);
   const gridRef = useRef<DataEditorRef>(null);
   const portalRef = useRef<HTMLDivElement>(null);
+  const mainRef = useRef<HTMLDivElement>(null);
   const region = useRef<Rectangle>({ x: 0, y: 0, width: 0, height: 0 });
   const theme = useGridTheme();
   // Grid rows: compact, default or comfortable (the Settings window).
@@ -650,6 +680,52 @@ export function ResultGrid({
 
   const notify = useCallback((message: string) => noticeRef.current?.(message), []);
 
+  /**
+   * Plain Copy (Ctrl+C, the cell menu's Copy): the selection as tab-separated text and an
+   * escaped HTML table. In a `copy` event whose cells are all cached it fills the event's
+   * clipboard at once; otherwise it reads them first and writes with the clipboard API.
+   */
+  function copySelection(event?: ClipboardEvent) {
+    const rects = selectionRects(selection, columns.length, rowCount);
+    if (rects.length === 0) return;
+    const copied = copiedSelection(pager, columns, rowCount, rects, notify);
+    if (!(copied instanceof Promise) && event?.clipboardData) {
+      event.clipboardData.setData("text/plain", copied.text);
+      event.clipboardData.setData("text/html", copied.html);
+      return;
+    }
+    void (async () => {
+      let result: CopiedText;
+      try {
+        result = await copied;
+      } catch {
+        // `copiedSelection` said why (copy failed / too many rows).
+        return;
+      }
+      try {
+        await writeCopied(result);
+      } catch (error) {
+        notify(`Copy failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    })();
+  }
+
+  // Ctrl+C (and the system's Copy command) while the grid has the focus; a text field in it
+  // (the cell editor, the search box) copies its own text.
+  const copyRef = useRef(copySelection);
+  copyRef.current = copySelection;
+  useEffect(() => {
+    const onCopy = (event: ClipboardEvent) => {
+      const active = document.activeElement;
+      if (!active || !mainRef.current?.contains(active) || takesText(active)) return;
+      if (portalRef.current?.contains(active)) return;
+      event.preventDefault();
+      copyRef.current(event);
+    };
+    window.addEventListener("copy", onCopy);
+    return () => window.removeEventListener("copy", onCopy);
+  }, []);
+
   /** Copies the selection in a "copy as" format (stored rows, read like a copy). */
   async function copyAs(kind: CopyKind) {
     const rects = selectionRects(selection, columns.length, rowCount);
@@ -746,7 +822,7 @@ export function ResultGrid({
         icon: Copy,
         shortcut: "Ctrl+C",
         separatorBefore: true,
-        onSelect: () => void gridRef.current?.emit("copy"),
+        onSelect: () => copySelection(),
       },
       {
         label: "Copy with column names",
@@ -886,7 +962,7 @@ export function ResultGrid({
       className={`result-grid${valueOpen ? " result-grid--with-value" : ""}`}
       data-testid="result-grid"
     >
-      <div className="result-grid__main">
+      <div ref={mainRef} className="result-grid__main">
         <OverlayTarget.Provider value={overlay}>
           <DataEditor
             ref={gridRef}

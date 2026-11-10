@@ -4,6 +4,7 @@ import {
   parseTsv,
   quoteIdent,
   sqlLiteral,
+  toHtmlTable,
   toInList,
   toJson,
   toMarkdown,
@@ -73,6 +74,18 @@ describe("copy formats", () => {
     expect(sqlLiteral("a\\b", false, "postgres")).toBe("'a\\b'");
     expect(sqlLiteral("a\\b", false, "mssql")).toBe("N'a\\b'");
     expect(sqlLiteral("a\\b", false, null)).toBe("'a\\b'");
+  });
+
+  it("copies an HTML table with every value escaped (audit lead 24)", () => {
+    expect(toHtmlTable([["<b>x</b> & 'y'", null], ['a"  b\tc']])).toBe(
+      '<style type="text/css"><!--br {mso-data-placement:same-cell;}--></style><table><tbody>' +
+        '<tr><td gdg-raw-value="&lt;b&gt;x&lt;/b&gt; &amp; &#39;y&#39;" gdg-format="string">' +
+        "&lt;b&gt;x&lt;/b&gt; &amp; &#39;y&#39;</td>" +
+        '<td gdg-raw-value="NULL" gdg-format="string">NULL</td></tr>' +
+        '<tr><td gdg-raw-value="a&quot;  b\tc" gdg-format="string">' +
+        "a&quot;<span> </span><span> </span>b<span> </span><span> </span><span> </span><span> </span>c</td></tr>" +
+        "</tbody></table>",
+    );
   });
 
   it("copies an IN list of the distinct values, without NULL", () => {
