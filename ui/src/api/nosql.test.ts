@@ -151,6 +151,17 @@ describe("M7 helpers", () => {
     expect(displayBinary(utf8("plain"))).toBe("plain");
   });
 
+  it("keeps a leading UTF-8 BOM byte for byte (audit lead 25)", () => {
+    const bytes = Uint8Array.of(0xef, 0xbb, 0xbf, 0x72, 0x6f, 0x6c, 0x65);
+    const text = binaryText(bytes);
+    expect(text).toEqual(utf8("\uFEFFrole"));
+    expect(text).not.toEqual(binaryText(new TextEncoder().encode("role")));
+    // As plain arrays: jsdom's TextEncoder returns another realm's Uint8Array.
+    expect(Array.from(new TextEncoder().encode((text as { text: string }).text))).toEqual(
+      Array.from(bytes),
+    );
+  });
+
   it("recognizes the confirmation error", () => {
     expect(
       isConfirmationRequired({

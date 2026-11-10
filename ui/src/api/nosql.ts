@@ -223,10 +223,14 @@ export function utf8(text: string): BinaryText {
   return { encoding: "utf8", text };
 }
 
-/** `bytes` as `BinaryText`: UTF-8 when they decode, else hex. */
+/**
+ * `bytes` as `BinaryText`: UTF-8 when they decode, else hex. Byte for byte: a leading UTF-8
+ * BOM (`EF BB BF`) stays in the text as U+FEFF (`ignoreBOM`), because the text is the key,
+ * field or member that edits and removals name; dropped, they would name another one.
+ */
 export function binaryText(bytes: Uint8Array): BinaryText {
   try {
-    return utf8(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+    return utf8(new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes));
   } catch {
     return {
       encoding: "hex",

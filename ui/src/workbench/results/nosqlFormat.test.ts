@@ -30,6 +30,8 @@ describe("M7 cell formatting", () => {
 
   it("shows user bytes as text when they are UTF-8, else escaped", () => {
     expect(bytesText(new TextEncoder().encode("héllo"))).toBe("héllo");
+    // A leading BOM stays (audit lead 25).
+    expect(bytesText(Uint8Array.of(0xef, 0xbb, 0xbf, 0x41))).toBe("\uFEFFA");
     expect(bytesText(Uint8Array.from([0x00, 0xff, 0x22, 0x0a, 0x41]))).toBe('\\x00\\xff\\"\\nA');
     const column: ColumnInfo = {
       name: "value",

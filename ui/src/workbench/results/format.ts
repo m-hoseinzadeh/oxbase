@@ -21,7 +21,8 @@ const META_ROLE = "oxbase.role";
 /** Bytes of user data decoded for a cell (the overlay shows them; the rest is cut). */
 const MAX_TEXT_BYTES = 64 * 1024;
 
-const UTF8 = new TextDecoder("utf-8", { fatal: true });
+/** Keeps a leading BOM (U+FEFF), so user bytes show as `binaryText` reads them (../../api). */
+const UTF8 = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 
 /**
  * User bytes as text: UTF-8 as is, other bytes escaped like `redis-cli` (`\xff`), so a value
