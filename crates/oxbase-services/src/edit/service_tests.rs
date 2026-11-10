@@ -590,7 +590,18 @@ impl Harness {
         lock(&self.state).log.len()
     }
 
+    /// The statements logged from now on; connects are left out (an apply opens a session of
+    /// its own, see `raw_log_since`).
     fn log_since(&self, mark: usize) -> Vec<String> {
+        lock(&self.state).log[mark..]
+            .iter()
+            .filter(|line| !line.starts_with("connect "))
+            .cloned()
+            .collect()
+    }
+
+    /// Every log line from now on, connects included.
+    fn raw_log_since(&self, mark: usize) -> Vec<String> {
         lock(&self.state).log[mark..].to_vec()
     }
 }
@@ -644,7 +655,7 @@ async fn open_table_data_builds_a_bound_select_on_the_table_database() {
     let mark = h.mark();
     let run = h.open_query("e1", request).await;
     assert_eq!(
-        h.log_since(mark),
+        h.raw_log_since(mark),
         [
             "connect db1",
             "SELECT * FROM \"public\".\"t\" WHERE (\"code\" = $1 AND \"id\" > $2 AND \"code\" \
@@ -1183,6 +1194,30 @@ async fn returning_writers_count_returned_rows() {
 }
 
 #[tokio::test]
+async fn table_data_gives_its_session_back_and_an_apply_connects_for_itself() {
+    let h = harness(Some(false)).await;
+    let run = h.open("t").await;
+    // Per tab, but the tab keeps no session once the rows are in (issue #22, item 1).
+    for _ in 0..100 {
+        if h.query.manager().children_of(h.session).is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(h.query.manager().children_of(h.session).len(), 0);
+    let mark = h.mark();
+    let report = h.apply(run, vec![update(0, "code", "z")]).await;
+    assert!(report.committed, "{report:?}");
+    let log = h.raw_log_since(mark);
+    assert_eq!(
+        log.first().map(String::as_str),
+        Some("connect db1"),
+        "{log:?}"
+    );
+    assert_eq!(log.last().map(String::as_str), Some("COMMIT"), "{log:?}");
+}
+
+#[tokio::test]
 async fn apply_is_refused_while_the_rows_are_loading() {
     let h = harness(Some(false)).await;
     let handle = h
@@ -1270,7 +1305,7 @@ async fn run_bound_is_one_statement_with_bound_values_and_no_values_in_history()
     assert!(statements[0].returns_rows);
     assert!(matches!(events.last(), Some(RunEvent::Finished { .. })));
     // The driver got the whole text and the value as a parameter.
-    assert_eq!(h.log_since(mark)[1], format!("{sql} [hunter2]"));
+    assert_eq!(h.raw_log_since(mark)[1], format!("{sql} [hunter2]"));
     // Paging is the M2 path.
     let page = h.query.page(run, 0, 1, 10).await.unwrap();
     assert_eq!(page.num_rows(), 2);
