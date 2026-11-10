@@ -295,8 +295,16 @@ codegen-units = 16
 # rounds amounts above about 9.007e11; the vendored copy decodes them to an exact scale-4
 # `Numeric` (one function, see vendor/tiberius/OXBASE.md). Drop this once upstream decodes money
 # exactly or the own TDS decoder (docs/m4-contracts.md §11) replaces tiberius.
+#
+# tokio-postgres 0.7.18 and mysql_async 0.37.1 send the password to whatever server asks for it
+# (PostgreSQL cleartext / MD5, MySQL caching_sha2_password full auth). The vendored copies add one
+# switch each (`password_disclosure`) that oxbase-pg / oxbase-mysql turn off unless the server
+# certificate is verified (audit lead 5; see vendor/<crate>/OXBASE.md). Drop them once upstream
+# can refuse those exchanges itself.
 [patch.crates-io]
 tiberius = { path = "vendor/tiberius" }
+tokio-postgres = { path = "vendor/tokio-postgres" }
+mysql_async = { path = "vendor/mysql_async" }
 
 # M5: the 1 GB import exit check (docs/m5-contracts.md §9) runs optimized, without the slow
 # fat LTO link: `cargo test -p oxbase-services --profile perf --test import_perf`.

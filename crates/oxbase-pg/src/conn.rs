@@ -753,6 +753,28 @@ fn session_defaults_sql() -> String {
         .join("; ")
 }
 
+/// The end of the vendored tokio-postgres' refusal (`Config::password_disclosure`).
+const DISCLOSURE_REFUSED: &str =
+    "which would reveal the password and is disabled for this connection";
+
+/// What a user can do about a refused cleartext / MD5 request.
+const DISCLOSURE_HINT: &str = "oxbase sends the password itself (or its MD5 hash) only to a \
+     server whose TLS certificate it verified: use TLS mode verify_full (or verify_ca with a CA \
+     file), or switch the server's pg_hba.conf entry to scram-sha-256";
+
+/// Whether the server may receive the password itself (cleartext) or its MD5 hash, which logs in
+/// as the user. Only when the TLS certificate is verified, or the server is on this machine (a
+/// Unix socket, or a loopback host, which through SSH is the bastion itself): otherwise an
+/// unverified peer, such as an on-path attacker answering `N` to the TLS request or presenting
+/// any certificate, could ask for either and recover the reusable password. SCRAM needs neither.
+fn password_disclosure_allowed(
+    params: &ConnectParams,
+    server: &Endpoint,
+    unix_socket: bool,
+) -> bool {
+    params.tls.mode.verifies_certificate() || unix_socket || server.is_loopback()
+}
+
 fn connect_error(err: &tokio_postgres::Error, server: &Endpoint, dial: &Endpoint) -> Error {
     let via = if dial == server {
         String::new()
@@ -760,6 +782,9 @@ fn connect_error(err: &tokio_postgres::Error, server: &Endpoint, dial: &Endpoint
         format!(" via {dial}")
     };
     match from_pg(err) {
+        Error::Auth { message } if message.contains(DISCLOSURE_REFUSED) => Error::auth(format!(
+            "PostgreSQL at {server}{via}: {message}. {DISCLOSURE_HINT}"
+        )),
         Error::Connection { message } => {
             Error::connection(format!("PostgreSQL at {server}{via}: {message}"))
         }
@@ -837,6 +862,7 @@ impl PgConnection {
         let negotiation = ssl_negotiation(option_value(params, "sslnegotiation"), mode)?;
         cfg.ssl_mode(ssl_mode(mode));
         cfg.ssl_negotiation(negotiation);
+        cfg.password_disclosure(password_disclosure_allowed(params, &server, unix_socket));
         let base = cfg.clone();
         apply_options(&mut cfg, params, true)?;
 

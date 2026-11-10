@@ -7,7 +7,7 @@ use mysql_async::prelude::Queryable;
 use mysql_async::{ClientIdentity, Conn, Opts, OptsBuilder, SslOpts};
 use oxbase_driver::{ConnectParams, Connection, Driver, DriverRegistry};
 use oxbase_net::tls;
-use oxbase_types::{Engine, Error, Result, ServerVersion, TlsMode};
+use oxbase_types::{Endpoint, Engine, Error, Result, ServerVersion, TlsMode};
 
 use crate::conn::MySqlConnection;
 use crate::error::{is_no_tls_offered, map_connect_error, map_error};
@@ -174,7 +174,11 @@ impl MySqlDriver {
             // An UPDATE reports matched rows, not changed ones, so writing the value a row
             // already has still counts 1 (the grid editor's "exactly one row" check, M3).
             .client_found_rows(true)
-            .tcp_nodelay(true);
+            .tcp_nodelay(true)
+            // caching_sha2_password full authentication sends the password itself (in clear over
+            // TLS, else encrypted to an RSA key the server sends): only to a verified server or
+            // one on this machine (a loopback host, which through SSH is the bastion itself).
+            .password_disclosure(password_disclosure_allowed(params, &server));
         if let Some(name) = &params.application_name {
             base = base.connect_attribute("program_name", name.clone());
         }
@@ -256,6 +260,16 @@ fn connect_timeout(shown: &str, timeout: Duration) -> Error {
         "connecting to {shown} took longer than {}s",
         timeout.as_secs_f64()
     ))
+}
+
+/// Whether `caching_sha2_password` full authentication may send the password: only when the
+/// certificate is verified (`VerifyFull`; `VerifyCa` is refused anyway) or the server is a
+/// loopback host. Otherwise an unverified peer, such as an on-path attacker that leaves TLS out
+/// of its handshake or presents any certificate, could ask for it and recover the reusable
+/// password. Fast authentication (a scramble the server checks against its cache) needs no
+/// password and works in every mode.
+fn password_disclosure_allowed(params: &ConnectParams, server: &Endpoint) -> bool {
+    params.tls.mode.verifies_certificate() || server.is_loopback()
 }
 
 /// Opens a session; `Err(None)` is a timeout.

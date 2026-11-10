@@ -37,3 +37,6 @@ serde_json.workspace = true
 [dev-dependencies]
 toml.workspace = true
 tokio.workspace = true
+# tests/password_disclosure.rs: the fake server's TLS side.
+rcgen.workspace = true
+tokio-rustls.workspace = true

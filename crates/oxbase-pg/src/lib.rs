@@ -12,6 +12,13 @@
 //! `Connection::tls_in_use` reports what was negotiated. Cancel requests dial the same address
 //! with the same TLS settings.
 //!
+//! The server picks the password exchange. Cleartext and MD5 hand it the password itself or a
+//! hash that logs in as the user, so the driver answers them only when the certificate is
+//! verified (`VerifyCa` / `VerifyFull`) or the server is local (a Unix socket or a loopback
+//! host); otherwise they fail with `Error::Auth` before anything is sent (the vendored
+//! tokio-postgres' `Config::password_disclosure`, see `vendor/tokio-postgres/OXBASE.md`). SCRAM
+//! works in every mode.
+//!
 //! # Options (`ConnectParams::options`)
 //!
 //! - `sslnegotiation`: `postgres` (default) or `direct` (PostgreSQL 17+, needs a TLS mode that

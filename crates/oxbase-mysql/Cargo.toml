@@ -36,3 +36,6 @@ serde_json.workspace = true
 tokio.workspace = true
 # Reads tests/fixtures.toml in the live tests.
 toml.workspace = true
+# tests/password_disclosure.rs: the fake server's TLS side.
+rcgen.workspace = true
+tokio-rustls.workspace = true

@@ -82,6 +82,13 @@ provider (`tls::crypto_provider()`).
   driver docs. Call `install_default_crypto_provider()` before
   such a library builds a config. It is idempotent.
 - ALPN (PostgreSQL direct TLS) is per driver: clone the config and set `alpn_protocols`.
+- Server-chosen password exchanges (audit lead 5): PostgreSQL cleartext / MD5 and MySQL
+  `caching_sha2_password` full authentication hand the server the reusable password (or a hash
+  that logs in). The drivers allow them only when the certificate is verified (`VerifyCa` /
+  `VerifyFull`; MySQL: `VerifyFull`) or the server is local (a loopback host, PostgreSQL also a
+  Unix socket); otherwise they fail with `Error::Auth` before anything is sent. SCRAM and MySQL
+  fast authentication work in every mode. The switch is `password_disclosure` in the vendored
+  `tokio-postgres` / `mysql_async` (vendor/<crate>/OXBASE.md).
 - `Connection::tls_in_use()` (a default method, `false`) must be overridden by every network
   driver to report whether the session is actually encrypted.
 

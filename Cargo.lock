@@ -3892,8 +3892,6 @@ dependencies = [
 [[package]]
 name = "mysql_async"
 version = "0.37.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "40d11da0e2d9fad4640c9f9198ee431c6d68444568f83ef1f10f3367270071e4"
 dependencies = [
  "arc-swap",
  "bytes",
@@ -4642,8 +4640,10 @@ dependencies = [
  "oxbase-net",
  "oxbase-sql",
  "oxbase-types",
+ "rcgen",
  "serde_json",
  "tokio",
+ "tokio-rustls",
  "tokio-util",
  "toml 1.1.8+spec-1.1.0",
  "tracing",
@@ -4686,10 +4686,12 @@ dependencies = [
  "oxbase-driver",
  "oxbase-net",
  "oxbase-types",
+ "rcgen",
  "serde_json",
  "tokio",
  "tokio-postgres",
  "tokio-postgres-rustls",
+ "tokio-rustls",
  "tokio-util",
  "toml 1.1.8+spec-1.1.0",
  "tracing",
@@ -7434,8 +7436,6 @@ dependencies = [
 [[package]]
 name = "tokio-postgres"
 version = "0.7.18"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a528f7d280f6d5b9cd149635c8705b0dd049754bc67d81d31fa25169a93809d3"
 dependencies = [
  "async-trait",
  "byteorder",

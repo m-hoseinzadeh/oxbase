@@ -24,6 +24,11 @@ const AUTH_ERRORS: [u16; 6] = [
     1862, // ER_MUST_CHANGE_PASSWORD_LOGIN
 ];
 
+/// What a user can do about refused `caching_sha2_password` full authentication.
+const DISCLOSURE_HINT: &str = "oxbase sends the password itself only to a server whose TLS \
+     certificate it verified: use TLS mode verify_full (with the server's CA file if it is \
+     private)";
+
 /// Statement deadlines: MySQL `max_execution_time` (3024), MariaDB `max_statement_time` (1969).
 const TIMEOUT_ERRORS: [u16; 2] = [3024, 1969];
 
@@ -65,6 +70,9 @@ pub(crate) fn map_error(e: mysql_async::Error) -> Error {
             }
             DriverError::NoClientSslFlagFromServer => {
                 Error::connection("the server does not support TLS")
+            }
+            DriverError::PasswordDisclosureDisabled => {
+                Error::auth(format!("{d}. {DISCLOSURE_HINT}"))
             }
             other => Error::connection(other.to_string()),
         },
@@ -136,5 +144,12 @@ mod tests {
         let no_tls = mysql_async::Error::Driver(DriverError::NoClientSslFlagFromServer);
         assert!(is_no_tls_offered(&no_tls));
         assert!(matches!(map_error(no_tls), Error::Connection { .. }));
+        let refused = mysql_async::Error::Driver(DriverError::PasswordDisclosureDisabled);
+        let e = map_connect_error(refused, "db.example:3306");
+        let Error::Auth { message } = &e else {
+            panic!("expected an authentication error, got {e}");
+        };
+        assert!(message.contains("db.example:3306"), "{message}");
+        assert!(message.contains("verify_full"), "{message}");
     }
 }
