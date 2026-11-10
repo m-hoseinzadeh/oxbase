@@ -71,6 +71,17 @@ describe("MongoDB connection form", () => {
     expect(
       validateForm({ ...form("mongodb"), authMechanism: "PLAIN", tlsMode: "verify_full" }, "save"),
     ).toEqual({});
+    // Verify certificate authority counts only with the profile's own CA file.
+    expect(
+      validateForm({ ...form("mongodb"), authMechanism: "PLAIN", tlsMode: "verify_ca" }, "save")
+        .authMechanism,
+    ).toMatch(/CA file/);
+    expect(
+      validateForm(
+        { ...form("mongodb"), authMechanism: "PLAIN", tlsMode: "verify_ca", caCert: "/etc/ca.pem" },
+        "save",
+      ),
+    ).toEqual({});
   });
 
   it("reads the options back from a saved profile", () => {

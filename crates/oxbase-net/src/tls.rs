@@ -9,8 +9,14 @@
 //! | [`TlsMode::Disable`] | no (`client_config` returns an error) | - | - |
 //! | [`TlsMode::Prefer`] | if the server supports it | **no** | **no** |
 //! | [`TlsMode::Require`] | yes | **no** | **no** |
-//! | [`TlsMode::VerifyCa`] | yes | yes | no |
+//! | [`TlsMode::VerifyCa`] with a CA file | yes | yes | no |
+//! | [`TlsMode::VerifyCa`] without a CA file | yes | yes | **yes** |
 //! | [`TlsMode::VerifyFull`] | yes | yes | yes |
+//!
+//! `VerifyCa` without a CA file is upgraded to `VerifyFull`: the platform store trusts every
+//! public CA, so a chain-only check would accept a certificate for any domain (libpq refuses
+//! `verify-ca` with `sslrootcert=system` for the same reason). [`TlsOptions::verifies_hostname`]
+//! tells the two cases apart.
 //!
 //! `Prefer` and `Require` use [`InsecureNoVerification`]: the handshake signatures are still
 //! checked, but **any** certificate is accepted, so an active attacker can impersonate the server.
@@ -94,10 +100,13 @@ pub fn client_config(opts: &TlsOptions) -> Result<Arc<ClientConfig>> {
             ));
         }
         TlsMode::Prefer | TlsMode::Require => Arc::new(InsecureNoVerification::new(&provider)),
-        TlsMode::VerifyCa => Arc::new(ChainOnlyVerification {
+        // VerifyCa without a CA file checks the name too (see the module docs).
+        TlsMode::VerifyCa | TlsMode::VerifyFull if opts.verifies_hostname() => {
+            webpki_verifier(opts, &provider)?
+        }
+        TlsMode::VerifyCa | TlsMode::VerifyFull => Arc::new(ChainOnlyVerification {
             inner: webpki_verifier(opts, &provider)?,
         }),
-        TlsMode::VerifyFull => webpki_verifier(opts, &provider)?,
     };
     let builder = ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
@@ -116,8 +125,9 @@ pub fn client_config(opts: &TlsOptions) -> Result<Arc<ClientConfig>> {
 /// The rustls server name for a connection to `server_host` (the *server* endpoint host, never
 /// the tunnel address), honouring [`TlsOptions::server_name`].
 ///
-/// For [`TlsMode::VerifyFull`] an unusable name is an error. Other modes do not check the name,
-/// so an unusable one falls back to an IP placeholder (which also means no SNI is sent).
+/// When the name is checked ([`TlsOptions::verifies_hostname`]: [`TlsMode::VerifyFull`], or
+/// [`TlsMode::VerifyCa`] without a CA file) an unusable name is an error. Otherwise an unusable
+/// one falls back to an IP placeholder (which also means no SNI is sent).
 pub fn server_name(opts: &TlsOptions, server_host: &str) -> Result<ServerName<'static>> {
     let name = opts
         .effective_server_name(server_host)
@@ -125,7 +135,7 @@ pub fn server_name(opts: &TlsOptions, server_host: &str) -> Result<ServerName<'s
         .trim_end_matches(']');
     match ServerName::try_from(name) {
         Ok(n) => Ok(n.to_owned()),
-        Err(_) if !opts.mode.verifies_hostname() => Ok(ServerName::IpAddress(
+        Err(_) if !opts.verifies_hostname() => Ok(ServerName::IpAddress(
             IpAddr::V4(Ipv4Addr::UNSPECIFIED).into(),
         )),
         Err(e) => Err(Error::invalid_input(format!(
@@ -319,9 +329,9 @@ impl ServerCertVerifier for InsecureNoVerification {
     }
 }
 
-/// Verifier for [`TlsMode::VerifyCa`]: full WebPKI chain validation (trust anchor, validity
-/// dates, key usage, revocation data if any), but a certificate that does not match the server
-/// name is accepted.
+/// Verifier for [`TlsMode::VerifyCa`] with a CA file: full WebPKI chain validation (trust
+/// anchor, validity dates, key usage, revocation data if any), but a certificate that does not
+/// match the server name is accepted. Never used with the platform store.
 ///
 /// rustls checks the name *after* the chain, so a name-mismatch error implies the chain passed.
 pub struct ChainOnlyVerification {

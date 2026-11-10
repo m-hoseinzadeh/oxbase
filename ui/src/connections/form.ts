@@ -260,8 +260,16 @@ export const MONGO_READ_PREFERENCES: readonly MongoReadPreference[] = [
 const REDIS_MODES: readonly RedisMode[] = ["standalone", "cluster", "sentinel"];
 const DEFAULT_SEPARATOR = ":";
 
-/** TLS modes that verify the server certificate (MongoDB PLAIN needs one). */
-export const VERIFYING_TLS_MODES: readonly TlsMode[] = ["verify_ca", "verify_full"];
+/**
+ * Whether the TLS settings authenticate the server (MongoDB PLAIN needs that): Verify certificate
+ * and host name, or Verify certificate authority against the profile's own CA file. Without a CA
+ * file any public authority's certificate would do, so it does not count here.
+ */
+export function authenticatesServer(form: Pick<ConnectionForm, "tlsMode" | "caCert">): boolean {
+  return (
+    form.tlsMode === "verify_full" || (form.tlsMode === "verify_ca" && form.caCert.trim() !== "")
+  );
+}
 
 /**
  * Why `text` is not a seed list (`host`, `host:port` or `[v6]:port`, comma-separated), or
@@ -302,7 +310,7 @@ const ENGINE_FORM: Partial<Record<DialogEngine, Partial<EngineFormTraits>>> = {
       require:
         "Always encrypt and trust the server's certificate without checking it (like Encrypt with TrustServerCertificate). Stops eavesdropping, not a fake server.",
       verify_ca:
-        "Always encrypt and check that the server's certificate was issued by a trusted authority (the CA file below, or your system's trusted list). The host name in the certificate is not checked.",
+        "Always encrypt and check that the server's certificate was issued by the authority in the CA file below. The host name in the certificate is not checked. Without a CA file, your system's trusted list is used and the host name is checked too, as with Verify certificate and host name.",
       verify_full:
         "Always encrypt, check the certificate authority and that the certificate belongs to this server's host name (TrustServerCertificate off). The safest choice for remote servers.",
     },
@@ -563,9 +571,9 @@ function mongoErrors(form: ConnectionForm, errors: FormErrors) {
   } else if (form.sshEnabled && form.hosts.trim() !== "" && !errors.hosts) {
     errors.hosts = "An SSH tunnel reaches one server: remove the other hosts.";
   }
-  if (form.authMechanism === "PLAIN" && !VERIFYING_TLS_MODES.includes(form.tlsMode)) {
+  if (form.authMechanism === "PLAIN" && !authenticatesServer(form)) {
     errors.authMechanism =
-      "PLAIN sends the password itself: set the encryption mode to Verify certificate authority or Verify certificate and host name.";
+      "PLAIN sends the password itself: set the encryption mode to Verify certificate and host name, or to Verify certificate authority with a CA file.";
   }
 }
 

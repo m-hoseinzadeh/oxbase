@@ -132,7 +132,12 @@ pub enum TlsMode {
     /// Require TLS, without verifying the certificate. Encrypts, but does not authenticate the
     /// server. **Insecure** against an active attacker.
     Require,
-    /// Require TLS and verify the certificate chain against the CA, but not the host name.
+    /// Require TLS and verify the certificate chain against the CA file, but not the host name.
+    ///
+    /// Without a CA file ([`TlsOptions::ca_cert`] `None`) the chain is checked against the
+    /// platform store, so any public CA would do; the host name is then checked too, exactly as
+    /// for [`TlsMode::VerifyFull`] (libpq refuses `verify-ca` with the system store for the same
+    /// reason). See [`TlsOptions::verifies_hostname`].
     VerifyCa,
     /// Require TLS, verify the chain and check the server name (the default for remote hosts
     /// in the UI).
@@ -155,7 +160,8 @@ impl TlsMode {
         matches!(self, Self::VerifyCa | Self::VerifyFull)
     }
 
-    /// `true` when the certificate must also match the server name.
+    /// `true` when the certificate must match the server name whatever the CA source.
+    /// [`TlsOptions::verifies_hostname`] also covers `VerifyCa` without a CA file.
     pub fn verifies_hostname(self) -> bool {
         matches!(self, Self::VerifyFull)
     }
@@ -211,8 +217,9 @@ pub enum KeySource {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TlsOptions {
     pub mode: TlsMode,
-    /// CA certificates to trust. `None` uses the platform trust store. When set, **only** these
-    /// CAs are trusted for [`TlsMode::VerifyCa`] / [`TlsMode::VerifyFull`].
+    /// CA certificates to trust. `None` uses the platform trust store (and then
+    /// [`TlsMode::VerifyCa`] checks the host name too). When set, **only** these CAs are trusted
+    /// for [`TlsMode::VerifyCa`] / [`TlsMode::VerifyFull`].
     pub ca_cert: Option<PemSource>,
     /// Client certificate chain (PEM) for mutual TLS. Must be given together with `client_key`.
     pub client_cert: Option<PemSource>,
@@ -261,6 +268,17 @@ impl TlsOptions {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .unwrap_or(server_host)
+    }
+
+    /// `true` when the certificate must match the server name: [`TlsMode::VerifyFull`], and
+    /// [`TlsMode::VerifyCa`] without a CA file (the platform store holds every public CA, so a
+    /// chain check alone would accept any site's certificate).
+    pub fn verifies_hostname(&self) -> bool {
+        match self.mode {
+            TlsMode::VerifyFull => true,
+            TlsMode::VerifyCa => self.ca_cert.is_none(),
+            TlsMode::Disable | TlsMode::Prefer | TlsMode::Require => false,
+        }
     }
 
     /// Checks the options are consistent (client certificate and key given together).
@@ -439,6 +457,15 @@ mod tests {
         assert!(TlsMode::Require.requires_tls() && !TlsMode::Require.verifies_certificate());
         assert!(TlsMode::VerifyCa.verifies_certificate() && !TlsMode::VerifyCa.verifies_hostname());
         assert!(TlsMode::VerifyFull.verifies_hostname());
+        // VerifyCa checks the name too unless a CA file narrows the trusted CAs.
+        assert!(TlsOptions::new(TlsMode::VerifyCa).verifies_hostname());
+        assert!(
+            !TlsOptions::new(TlsMode::VerifyCa)
+                .with_ca_cert(PemSource::Pem("ca".into()))
+                .verifies_hostname()
+        );
+        assert!(TlsOptions::new(TlsMode::VerifyFull).verifies_hostname());
+        assert!(!TlsOptions::new(TlsMode::Require).verifies_hostname());
         for m in [
             TlsMode::Disable,
             TlsMode::Prefer,

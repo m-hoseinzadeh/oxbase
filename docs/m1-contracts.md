@@ -66,7 +66,7 @@ provider (`tls::crypto_provider()`).
 | `Disable` | no | - | - | `client_config` returns `InvalidInput`. Drivers use plaintext. |
 | `Prefer` (default) | if offered | no | no | Insecure. The driver falls back to plaintext when the server has no TLS. |
 | `Require` | yes | no | no | Insecure (`InsecureNoVerification`). A CA file does **not** upgrade it to `VerifyCa`. |
-| `VerifyCa` | yes | yes | no | `ChainOnlyVerification`: WebPKI chain + validity dates, name mismatch accepted. |
+| `VerifyCa` | yes | yes | no (yes without `ca_cert`) | With `ca_cert`: `ChainOnlyVerification`, WebPKI chain + validity dates, name mismatch accepted. Without `ca_cert` it is `VerifyFull` (`TlsOptions::verifies_hostname`): the platform store trusts every public CA, so a chain-only check would accept any domain's certificate (libpq refuses `verify-ca` with `sslrootcert=system`). |
 | `VerifyFull` | yes | yes | yes | Standard WebPKI. |
 
 - Roots: `ca_cert` if set (then *only* those CAs). Otherwise the platform store
@@ -77,7 +77,7 @@ provider (`tls::crypto_provider()`).
   `load_key_pem`, `load_certificates` and `load_private_key`, and keep the semantics above:
   use `with_disable_built_in_roots(true)` when `ca_cert` is set,
   `with_danger_accept_invalid_certs` for Require/Prefer, and
-  `with_danger_skip_domain_validation` for VerifyCa. Without `ca_cert`, `mysql_async` trusts its bundled
+  `with_danger_skip_domain_validation` for VerifyCa with `ca_cert` only. Without `ca_cert`, `mysql_async` trusts its bundled
   webpki-roots instead of the platform store. That is acceptable for M1, but record it in the
   driver docs. Call `install_default_crypto_provider()` before
   such a library builds a config. It is idempotent.
