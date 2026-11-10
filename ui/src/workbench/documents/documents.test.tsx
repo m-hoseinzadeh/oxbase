@@ -35,6 +35,8 @@ vi.mock("../layout", () => ({
   },
 }));
 
+import { getSettings, updateSettings } from "../../settings";
+import { noteUnappliedChanges, resetUnappliedChanges } from "../unappliedChanges";
 import {
   closeGroupPanels,
   closeTabs,
@@ -295,12 +297,68 @@ describe("the workspace", () => {
 
     tauriCore.invoke.mockClear();
     t.edit("abc");
+    updateSettings({ confirmQuit: false });
     handleAppEvent({ type: "closeRequested" });
     await vi.advanceTimersByTimeAsync(10);
     expect(tauriCore.invoke.mock.calls.map((c) => c[0])).toEqual([
       "workspace_save",
       "app_close_ready",
     ]);
+    updateSettings({ confirmQuit: true });
+  });
+});
+
+describe("quitting", () => {
+  beforeEach(() => updateSettings({ confirmQuit: true }));
+  afterEach(() => {
+    updateSettings({ confirmQuit: true });
+    resetUnappliedChanges();
+  });
+
+  const calls = () => tauriCore.invoke.mock.calls.map((c) => c[0]);
+
+  it("asks first; Cancel keeps the app open and the next close asks again", async () => {
+    tauriCore.invoke.mockResolvedValue(undefined);
+    render(<DocumentDialogsHost />);
+    act(() => handleAppEvent({ type: "closeRequested" }));
+    await vi.waitFor(() => expect(calls()).toEqual(["app_close_wait"]));
+    expect(screen.getByRole("dialog", { name: "Quit Oxbase?" })).toBeInTheDocument();
+    // A second close while the question is open asks nothing more.
+    act(() => handleAppEvent({ type: "closeRequested" }));
+    expect(screen.getAllByRole("dialog")).toHaveLength(1);
+    await act(async () => fireEvent.click(screen.getByTestId("quit-cancel")));
+    await vi.waitFor(() => expect(calls()).toEqual(["app_close_wait", "app_close_cancel"]));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    act(() => handleAppEvent({ type: "closeRequested" }));
+    expect(screen.getByRole("dialog", { name: "Quit Oxbase?" })).toBeInTheDocument();
+    await act(async () => fireEvent.click(screen.getByTestId("quit-cancel")));
+  });
+
+  it("names the tables whose pending changes would be lost, and quits on Quit", async () => {
+    tauriCore.invoke.mockResolvedValue(undefined);
+    noteUnappliedChanges("data-1", "public.orders", 3);
+    noteUnappliedChanges("data-2", "public.items", 0);
+    render(<DocumentDialogsHost />);
+    act(() => handleAppEvent({ type: "closeRequested" }));
+    const dialog = screen.getByRole("dialog", { name: "Quit Oxbase?" });
+    expect(dialog).toHaveTextContent("public.orders (3 pending changes)");
+    expect(dialog).not.toHaveTextContent("public.items");
+    expect(screen.getByTestId("quit-confirm")).toHaveClass("button--danger");
+    await act(async () => fireEvent.click(screen.getByTestId("quit-confirm")));
+    await vi.waitFor(() => expect(calls()).toContain("app_close_ready"));
+    expect(calls()[0]).toBe("app_close_wait");
+    expect(calls()).not.toContain("app_close_cancel");
+    expect(getSettings().confirmQuit).toBe(true);
+  });
+
+  it('"Don\'t ask again" turns the question off', async () => {
+    tauriCore.invoke.mockResolvedValue(undefined);
+    render(<DocumentDialogsHost />);
+    act(() => handleAppEvent({ type: "closeRequested" }));
+    fireEvent.click(screen.getByTestId("quit-dont-ask"));
+    await act(async () => fireEvent.click(screen.getByTestId("quit-confirm")));
+    expect(getSettings().confirmQuit).toBe(false);
+    await vi.waitFor(() => expect(calls()).toContain("app_close_ready"));
   });
 });
 

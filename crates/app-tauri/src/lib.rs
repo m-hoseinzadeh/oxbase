@@ -50,7 +50,8 @@
 //!   Desktop integration (1.3, `src/shell.rs`): files opened from the OS or the command line, one
 //!   running instance (`tauri-plugin-single-instance`; on macOS `src/single_instance.rs`, a
 //!   per-user socket), and quitting after the UI kept its
-//!   workspace: `app_events_subscribe` (events through a `Channel`) and `app_close_ready`.
+//!   workspace: `app_events_subscribe` (events through a `Channel`), `app_close_ready`, and
+//!   `app_close_wait` / `app_close_cancel` while the UI asks whether to quit (1.5).
 //!   Guide: `docs/files.md`.
 //!
 //! Every fallible command rejects with [`error::CommandError`], serialized as
@@ -276,6 +277,8 @@ pub fn run() {
             documents::workspace_save,
             shell::app_events_subscribe,
             shell::app_close_ready,
+            shell::app_close_wait,
+            shell::app_close_cancel,
         ])
         .build(tauri::generate_context!())
         .expect("error while building the oxbase desktop shell");

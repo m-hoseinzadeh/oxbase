@@ -109,6 +109,7 @@ import {
 import { IDLE_RUN, isActive, rowCountLabel, runReducer } from "../results/runState";
 import { registerShortcuts, type ShortcutHandler } from "../shortcuts";
 import { openExport } from "../transfer/store";
+import { noteUnappliedChanges } from "../unappliedChanges";
 import { CellEditor } from "./CellEditor";
 import {
   type AppliedState,
@@ -1026,6 +1027,14 @@ export function TableDataPanel({ editorId, sessionId, table, related }: TableDat
       setApplying(false);
     }
   }
+
+  // Quitting the app says which tables would lose pending changes (../unappliedChanges).
+  const tableName = qualified(table);
+  const pendingEdits = changes.edits.length;
+  useEffect(() => {
+    noteUnappliedChanges(editorId, tableName, pendingEdits);
+    return () => noteUnappliedChanges(editorId, tableName, 0);
+  }, [editorId, tableName, pendingEdits]);
 
   // --- form / JSON --------------------------------------------------------------------------
 

@@ -32,7 +32,22 @@ type RequestBody =
       submit: (name: string) => Promise<string | null>;
       done: (answer: SaveQueryAnswer) => void;
     }
-  | { kind: "confirm"; title: string; text: string; action: string; done: (ok: boolean) => void };
+  | { kind: "confirm"; title: string; text: string; action: string; done: (ok: boolean) => void }
+  | { kind: "quit"; summary: QuitSummary; done: (answer: QuitAnswer) => void };
+
+/** What closing the app would end (1.5). */
+export interface QuitSummary {
+  /** Open connections (base sessions). */
+  connections: number;
+  /** Tables with pending changes that were not applied, one entry per tab. */
+  unapplied: { table: string; count: number }[];
+}
+
+export interface QuitAnswer {
+  quit: boolean;
+  /** "Don't ask again" was ticked (only with `quit`). */
+  dontAskAgain: boolean;
+}
 
 let queue: Request[] = [];
 let nextId = 0;
@@ -80,6 +95,91 @@ export function askName(options: {
   submit: (name: string) => Promise<string | null>;
 }): Promise<SaveQueryAnswer> {
   return new Promise((resolve) => push({ kind: "name", ...options, done: resolve }));
+}
+
+/** Asks whether to quit the app. */
+export function askQuit(summary: QuitSummary): Promise<QuitAnswer> {
+  return new Promise((resolve) => push({ kind: "quit", summary, done: resolve }));
+}
+
+function plural(n: number, one: string, many: string): string {
+  return `${n.toLocaleString("en-US")} ${n === 1 ? one : many}`;
+}
+
+function QuitDialog({ request }: { request: Extract<Request, { kind: "quit" }> }) {
+  const [dontAsk, setDontAsk] = useState(false);
+  const { connections, unapplied } = request.summary;
+  const losing = unapplied.length > 0;
+  const answer = (quit: boolean) => {
+    pop();
+    request.done({ quit, dontAskAgain: quit && dontAsk });
+  };
+  return (
+    <Modal
+      title="Quit Oxbase?"
+      onClose={() => answer(false)}
+      footer={
+        <>
+          <label className="checkbox modal__footer-start">
+            <input
+              type="checkbox"
+              checked={dontAsk}
+              data-testid="quit-dont-ask"
+              onChange={(e) => setDontAsk(e.target.checked)}
+            />
+            Don't ask again
+          </label>
+          <button
+            type="button"
+            className="button"
+            data-testid="quit-cancel"
+            data-autofocus={losing ? true : undefined}
+            onClick={() => answer(false)}
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            className={`button ${losing ? "button--danger" : "button--primary"}`}
+            data-testid="quit-confirm"
+            data-autofocus={losing ? undefined : true}
+            onClick={() => answer(true)}
+          >
+            Quit
+          </button>
+        </>
+      }
+    >
+      {losing ? (
+        <>
+          <p className="confirm__text">
+            <TriangleAlert {...ICON_SM} className="confirm__icon" />
+            <span>
+              {unapplied.length === 1
+                ? "This table has changes that were not applied. They are lost if you quit now."
+                : "These tables have changes that were not applied. They are lost if you quit now."}
+            </span>
+          </p>
+          <ul className="unsaved__list">
+            {unapplied.map((t, i) => (
+              // The same table can be open in two tabs.
+              // biome-ignore lint/suspicious/noArrayIndexKey: names are not unique
+              <li key={i}>
+                {t.table} ({plural(t.count, "pending change", "pending changes")})
+              </li>
+            ))}
+          </ul>
+        </>
+      ) : null}
+      <p className="field__hint">
+        {connections > 0
+          ? `Quitting closes ${plural(connections, "open connection", "open connections")}. `
+          : ""}
+        Query tabs come back the next time Oxbase starts. You can turn this question off in
+        Settings.
+      </p>
+    </Modal>
+  );
 }
 
 /** Asks to confirm a destructive action. */
@@ -263,6 +363,8 @@ function Dialog({ request }: { request: Request }) {
     }
     case "name":
       return <NameDialog request={request} />;
+    case "quit":
+      return <QuitDialog request={request} />;
     case "confirm": {
       const answer = (ok: boolean) => {
         pop();

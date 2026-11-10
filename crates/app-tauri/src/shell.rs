@@ -14,6 +14,9 @@
 //!   workspace: Rust sends [`AppEvent::CloseRequested`], the UI saves and calls
 //!   `app_close_ready`, which closes the window. Without a subscribed UI, or when the UI does not
 //!   answer within [`CLOSE_TIMEOUT`], the app closes anyway.
+//! - **Asking first** (1.5). When the UI asks the user whether to quit, it calls
+//!   `app_close_wait` at once, which stops the [`CLOSE_TIMEOUT`] for this close; the answer is
+//!   `app_close_ready` (quit) or `app_close_cancel` (stay: the next close asks again).
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -77,7 +80,40 @@ struct Inner {
     channel: Option<Channel<AppEvent>>,
     queued: Vec<PathBuf>,
     close_asked: bool,
+    /// The UI is asking the user about the current close: no timeout.
+    close_waiting: bool,
+    /// Counts the closes asked of the UI, so a cancelled close's timeout does nothing later.
+    close_seq: u64,
     closing: bool,
+}
+
+impl Inner {
+    /// A close was just asked of the UI; returns its number.
+    fn start_close(&mut self) -> u64 {
+        self.close_asked = true;
+        self.close_waiting = false;
+        self.close_seq += 1;
+        self.close_seq
+    }
+
+    /// Whether the timeout of close `seq` lets the app close: the close is still pending, and
+    /// the UI is not asking the user about it.
+    fn times_out(&self, seq: u64) -> bool {
+        self.close_asked && !self.close_waiting && !self.closing && self.close_seq == seq
+    }
+
+    /// The UI asks the user about the pending close (no-op without one).
+    fn wait_for_user(&mut self) {
+        if self.close_asked {
+            self.close_waiting = true;
+        }
+    }
+
+    /// The user kept the app open: the next close asks the UI again.
+    fn cancel_close(&mut self) {
+        self.close_asked = false;
+        self.close_waiting = false;
+    }
 }
 
 /// The UI's event channel, files waiting for it, and the close handshake. Managed as Tauri
@@ -222,7 +258,7 @@ impl ShellState {
     fn subscribe(&self, app: &AppHandle, channel: Channel<AppEvent>) {
         let mut inner = self.lock();
         inner.channel = Some(channel);
-        inner.close_asked = false;
+        inner.cancel_close();
         let queued = std::mem::take(&mut inner.queued);
         drop(inner);
         if !queued.is_empty() {
@@ -231,7 +267,8 @@ impl ShellState {
     }
 
     /// Whether to hold a close of the main window (or a quit) while the UI keeps its
-    /// workspace. The first call asks the UI and starts the [`CLOSE_TIMEOUT`].
+    /// workspace or asks the user. The first call asks the UI and starts the [`CLOSE_TIMEOUT`]
+    /// (stopped by `app_close_wait`).
     pub fn hold_close(&self, app: &AppHandle) -> bool {
         let mut inner = self.lock();
         if inner.closing {
@@ -248,14 +285,28 @@ impl ShellState {
             inner.channel = None;
             return false;
         }
-        inner.close_asked = true;
+        let seq = inner.start_close();
         drop(inner);
         let app = app.clone();
         tauri::async_runtime::spawn(async move {
             tokio::time::sleep(CLOSE_TIMEOUT).await;
-            app.state::<ShellState>().finish_close(&app);
+            let shell = app.state::<ShellState>();
+            let times_out = shell.lock().times_out(seq);
+            if times_out {
+                shell.finish_close(&app);
+            }
         });
         true
+    }
+
+    /// The UI asks the user whether to quit: the pending close waits for the answer.
+    pub fn wait_for_user(&self) {
+        self.lock().wait_for_user();
+    }
+
+    /// The user kept the app open.
+    pub fn cancel_close(&self) {
+        self.lock().cancel_close();
     }
 
     /// Lets the close through and closes the main window (which quits the app).
@@ -305,6 +356,21 @@ pub fn app_close_ready(app: AppHandle, shell: State<'_, ShellState>) {
     shell.finish_close(&app);
 }
 
+/// The UI asks the user whether to quit: hold the close until `app_close_ready` or
+/// `app_close_cancel`.
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)] // Tauri passes `State` by value.
+pub fn app_close_wait(shell: State<'_, ShellState>) {
+    shell.wait_for_user();
+}
+
+/// The user kept the app open.
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)] // Tauri passes `State` by value.
+pub fn app_close_cancel(shell: State<'_, ShellState>) {
+    shell.cancel_close();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -352,6 +418,32 @@ mod tests {
         let thumbs = dir.path().join("Thumbs.db");
         std::fs::write(&thumbs, b"\xd0\xcf\x11\xe0 not sqlite").unwrap();
         assert!(!has_sqlite_header(&thumbs).unwrap());
+    }
+
+    #[test]
+    fn a_close_the_user_is_asked_about_does_not_time_out() {
+        let mut inner = Inner::default();
+        let first = inner.start_close();
+        assert!(inner.times_out(first));
+        inner.wait_for_user();
+        assert!(!inner.times_out(first));
+        // The user stays: the old timeout does nothing, and the next close asks again.
+        inner.cancel_close();
+        assert!(!inner.close_asked);
+        assert!(!inner.times_out(first));
+        let second = inner.start_close();
+        assert_ne!(first, second);
+        assert!(!inner.times_out(first));
+        assert!(inner.times_out(second));
+        inner.closing = true;
+        assert!(!inner.times_out(second));
+    }
+
+    #[test]
+    fn waiting_without_a_pending_close_does_nothing() {
+        let mut inner = Inner::default();
+        inner.wait_for_user();
+        assert!(!inner.close_waiting);
     }
 
     #[test]

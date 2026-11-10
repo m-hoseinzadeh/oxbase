@@ -157,3 +157,13 @@ export function appEventsSubscribe(onEvent: (event: AppEvent) => void): Promise<
 export function appCloseReady(): Promise<void> {
   return call("app_close_ready");
 }
+
+/** The user is asked whether to quit: Rust holds the close until the answer (1.5). */
+export function appCloseWait(): Promise<void> {
+  return call("app_close_wait");
+}
+
+/** The user kept the app open: the next close asks again. */
+export function appCloseCancel(): Promise<void> {
+  return call("app_close_cancel");
+}

@@ -110,6 +110,8 @@ const COMMANDS: &[&str] = &[
     "workspace_save",
     "app_events_subscribe",
     "app_close_ready",
+    "app_close_wait",
+    "app_close_cancel",
 ];
 
 fn main() {

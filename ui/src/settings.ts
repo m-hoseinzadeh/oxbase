@@ -15,12 +15,15 @@ export interface Settings {
   filterOpen: boolean;
   /** The Sessions setting new connections start with (where the engine offers it). */
   sessionMode: SessionMode;
+  /** Closing the app asks first ("Quit Oxbase?"). */
+  confirmQuit: boolean;
 }
 
 export const DEFAULT_SETTINGS: Settings = {
   gridDensity: "default",
   filterOpen: false,
   sessionMode: "per_tab",
+  confirmQuit: true,
 };
 
 export const ROW_HEIGHTS: Record<GridDensity, number> = {
@@ -45,6 +48,7 @@ function read(): Settings {
           : "default",
       filterOpen: stored.filterOpen === true,
       sessionMode: stored.sessionMode === "per_run" ? "per_run" : "per_tab",
+      confirmQuit: stored.confirmQuit !== false,
     };
   } catch {
     // Unreadable or unavailable storage: the defaults apply.
