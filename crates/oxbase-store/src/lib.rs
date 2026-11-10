@@ -59,7 +59,7 @@ pub mod insight;
 
 pub use app_db::{
     AppDb, DATA_DIR_ENV, HISTORY_SETTINGS_KEY, MIGRATIONS, Migration, SqliteHistoryRepository,
-    app_data_dir,
+    app_cache_dir, app_data_dir,
 };
 pub use documents::{
     DocumentStore, FileLink, SavedQueries, SavedQuery, StoredTab, StoredWorkspace, TextFile,

@@ -4841,8 +4841,10 @@ version = "1.3.0"
 dependencies = [
  "chrono",
  "pretty_assertions",
+ "rustix",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.21",
  "uuid",
 ]

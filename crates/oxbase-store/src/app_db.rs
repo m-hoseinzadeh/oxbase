@@ -63,6 +63,28 @@ pub fn app_data_dir() -> Result<PathBuf> {
     Ok(base.join(crate::file_repo::app_dir_name()))
 }
 
+/// The app's cache directory, for files that may go at any time (query result spill files):
+///
+/// | Platform | Directory |
+/// |---|---|
+/// | Linux / BSD | `$XDG_CACHE_HOME/oxbase` or `~/.cache/oxbase` |
+/// | macOS | `~/Library/Caches/dev.oxbase.app` |
+/// | Windows | `%LOCALAPPDATA%\oxbase` |
+///
+/// With a non-empty [`DATA_DIR_ENV`] (`OXBASE_DATA_DIR`) it is `cache` in that directory. Per
+/// user, unlike the system temp directory on Linux. The directory is not created here.
+pub fn app_cache_dir() -> Result<PathBuf> {
+    if let Some(dir) = std::env::var_os(DATA_DIR_ENV).filter(|d| !d.is_empty()) {
+        return Ok(PathBuf::from(dir).join("cache"));
+    }
+    let base = dirs::cache_dir().ok_or_else(|| {
+        Error::unsupported(format!(
+            "cannot find the user cache directory; set {DATA_DIR_ENV}"
+        ))
+    })?;
+    Ok(base.join(crate::file_repo::app_dir_name()))
+}
+
 /// One schema migration of the app database.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Migration {

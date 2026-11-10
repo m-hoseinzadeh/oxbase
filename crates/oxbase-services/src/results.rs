@@ -5,7 +5,11 @@
 //!
 //! - Every run gets a [`RunDir`]: a fresh directory `run-*` under the service's spill base
 //!   directory, deleted when the last reference to it drops (run closed, editor closed,
-//!   service dropped). Nothing a run writes lives outside it.
+//!   service dropped). Nothing a run writes lives outside it. The base and the run directory
+//!   are private to the user (`0o700` on Unix; a base that is a symbolic link, belongs to
+//!   another user or is open to others is refused) and segment files are created new, `0o600`
+//!   (`oxbase_types::private_fs`), so other local users can neither read the rows nor plant
+//!   files or links in their place.
 //! - Every result set of a run is one [`ResultStore`]. Appended batches stay in memory while
 //!   the run's [`ByteBudget`] (memory) allows. When an append does not fit, the store first
 //!   makes room by spilling the in-memory batches of the run's *earlier, complete* result sets
@@ -45,6 +49,7 @@ use arrow_ipc::reader::FileReader;
 use arrow_ipc::writer::FileWriter;
 use arrow_schema::SchemaRef;
 
+use oxbase_types::private_fs;
 use oxbase_types::{Error, Result};
 
 /// A byte budget shared by several users (a run's memory, the service-wide spill disk cap).
@@ -113,10 +118,16 @@ pub struct RunDir {
 }
 
 impl RunDir {
-    /// Creates a fresh `run-*` directory under `base` (creating `base` if needed).
+    /// Creates a fresh, private `run-*` directory under `base` (creating `base` if needed).
+    /// Fails when `base` is not a private directory of the user
+    /// ([`private_fs::check_private_dir`]).
     pub fn create(base: &Path) -> Result<Self> {
-        std::fs::create_dir_all(base)?;
-        let dir = tempfile::Builder::new().prefix("run-").tempdir_in(base)?;
+        private_fs::create_private_dir_all(base)?;
+        let mut builder = tempfile::Builder::new();
+        builder.prefix("run-");
+        #[cfg(unix)]
+        builder.permissions(private_fs::private_dir_permissions());
+        let dir = builder.tempdir_in(base)?;
         Ok(Self { dir })
     }
 
@@ -608,7 +619,7 @@ fn overlap(first: u64, n: u64, offset: u64, end: u64) -> Option<(usize, usize)> 
 
 /// Writes `batches` as one Arrow IPC file at `path`; returns its size in bytes.
 fn write_segment(path: &Path, schema: &SchemaRef, batches: &[RecordBatch]) -> Result<u64> {
-    let file = std::fs::File::create(path)?;
+    let file = private_fs::create_private_file(path)?;
     let mut writer = FileWriter::try_new_buffered(file, schema).map_err(arrow_error)?;
     for batch in batches {
         writer.write(batch).map_err(arrow_error)?;
@@ -714,7 +725,7 @@ mod tests {
     #[test]
     fn a_later_result_evicts_earlier_ones_instead_of_spilling_batch_by_batch() {
         let base = tempfile::tempdir().unwrap();
-        let dir = Arc::new(RunDir::create(base.path()).unwrap());
+        let dir = Arc::new(RunDir::create(&base.path().join("results")).unwrap());
         let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
         let one = to_u64(int_batch(&schema, 0, 100).get_array_memory_size());
         // Room for 10 batches of 100 rows.
@@ -768,6 +779,87 @@ mod tests {
         drop(second);
         assert_eq!(memory.used(), 0);
         assert_eq!(disk.used(), 0);
+    }
+
+    /// A store over `dir` whose first append spills (1-byte memory budget).
+    #[cfg(unix)]
+    fn spilling_store(dir: &Arc<RunDir>, schema: &SchemaRef) -> ResultStore {
+        ResultStore::new(
+            Arc::clone(schema),
+            Arc::clone(dir),
+            Arc::new(ByteBudget::new(1)),
+            Arc::new(ByteBudget::new(u64::MAX)),
+        )
+    }
+
+    #[cfg(unix)]
+    fn mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::symlink_metadata(path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spill_directories_and_files_are_owner_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("oxbase-results");
+        let dir = Arc::new(RunDir::create(&base).unwrap());
+        let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
+        let store = spilling_store(&dir, &schema);
+        assert_eq!(
+            store.append(int_batch(&schema, 0, 10)).unwrap(),
+            AppendOutcome::Stored
+        );
+        assert_eq!(store.segment_count(), 1);
+        let files: Vec<PathBuf> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert_eq!(files.len(), 1);
+        assert_eq!(mode(&base), 0o700);
+        assert_eq!(mode(dir.path()), 0o700);
+        assert_eq!(mode(&files[0]), 0o600);
+        assert_eq!(page_ids(&store, 0, 3), [0, 1, 2]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_base_open_to_others_or_linked_elsewhere_is_refused() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let tmp = tempfile::tempdir().unwrap();
+        let open = tmp.path().join("open");
+        std::fs::create_dir(&open).unwrap();
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(RunDir::create(&open).is_err());
+        assert_eq!(std::fs::read_dir(&open).unwrap().count(), 0);
+
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::fs::set_permissions(&elsewhere, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let link = tmp.path().join("link");
+        symlink(&elsewhere, &link).unwrap();
+        assert!(RunDir::create(&link).is_err());
+        assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_planted_segment_link_is_not_followed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = Arc::new(RunDir::create(&tmp.path().join("results")).unwrap());
+        let other = tempfile::tempdir().unwrap();
+        let target = other.path().join("target");
+        std::fs::write(&target, b"dummy").unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
+        let store = spilling_store(&dir, &schema);
+        std::os::unix::fs::symlink(&target, dir.file(&format!("result-{}-0.arrow", store.id)))
+            .unwrap();
+        assert!(store.append(int_batch(&schema, 0, 10)).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"dummy");
     }
 
     #[test]

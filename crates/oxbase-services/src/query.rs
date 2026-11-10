@@ -540,10 +540,15 @@ impl QueryConfig {
 }
 
 impl Default for QueryConfig {
-    /// Spills into `<system temp dir>/oxbase-results`.
+    /// Spills into `results` in the per-user app cache directory
+    /// ([`oxbase_store::app_cache_dir`]), or into `<system temp dir>/oxbase-results` when there
+    /// is none. Either way the directory must be private to the user (`RunDir::create`).
     fn default() -> Self {
         Self {
-            spill_dir: std::env::temp_dir().join("oxbase-results"),
+            spill_dir: oxbase_store::app_cache_dir().map_or_else(
+                |_| std::env::temp_dir().join("oxbase-results"),
+                |dir| dir.join("results"),
+            ),
             memory_budget_bytes: Self::DEFAULT_MEMORY_BUDGET,
             disk_cap_bytes: Self::DEFAULT_DISK_CAP,
             event_capacity: 256,
@@ -2111,6 +2116,10 @@ fn delete_run_dir(run: &Run) {
 
 /// Removes `run-*` directories under `base` that were last modified at least `age` ago.
 fn remove_stale_run_dirs(base: &Path, age: Duration) {
+    // Only in a base the next run would use too (not another user's directory).
+    if oxbase_types::private_fs::check_private_dir(base).is_err() {
+        return;
+    }
     let Ok(entries) = std::fs::read_dir(base) else {
         return;
     };
@@ -2265,7 +2274,10 @@ mod tests {
     #[test]
     fn default_config() {
         let c = QueryConfig::default();
-        assert!(c.spill_dir.ends_with("oxbase-results"));
+        match oxbase_store::app_cache_dir() {
+            Ok(cache) => assert_eq!(c.spill_dir, cache.join("results")),
+            Err(_) => assert!(c.spill_dir.ends_with("oxbase-results")),
+        }
         assert_eq!(c.memory_budget_bytes, 64 * 1024 * 1024);
         assert!(c.event_capacity > 0 && c.max_page_rows > 0);
     }
