@@ -81,6 +81,7 @@
 //!   stops (and changes nothing) when the table has one it was not given.
 
 use oxbase_dialect::compare::{diff_indexes, diff_tables};
+use oxbase_dialect::sql::{check_expression, check_one_expression};
 use oxbase_dialect::{AnsiQuoting, DdlContext, DdlGenerator, Quoting};
 use oxbase_types::{
     CheckDef, ColumnDef, DataType, DiffKind, Error, Extras, FkAction, ForeignKeyDef, IndexDef,
@@ -358,6 +359,26 @@ fn is_plain_int_pk(t: &TableDef, c: &ColumnDef) -> bool {
     !without_rowid(t) && !c.auto_increment && matches!(pk_columns(t), [only] if *only == c.name)
 }
 
+/// `Ok` when `text` is one SQL expression that cannot end or extend the statement it is spliced
+/// into (`check_expression` with SQLite's lexing: `'...'`, `"..."`, `` `...` `` and `[...]`), else
+/// `InvalidInput` naming `what`. Defaults, generation and check expressions, index keys and
+/// predicates come from the designer, from an untrusted SQLite file's schema (structure sync,
+/// transfer) or from a backup archive, whose text never went through SQLite's own parser, so they
+/// are checked here like the PostgreSQL and SQL Server generators check theirs. `bare`: the text
+/// is not wrapped in parentheses where it goes (an index key, a `WHERE` predicate), so a `,`
+/// outside parentheses is refused too.
+fn check_sql_expression(text: &str, what: &str, bare: bool) -> Result<()> {
+    let checked = if bare {
+        check_one_expression(&AnsiQuoting, text)
+    } else {
+        check_expression(&AnsiQuoting, text)
+    };
+    checked.map_err(|e| match e {
+        Error::InvalidInput { message } => Error::invalid_input(format!("{what}: {message}")),
+        other => other,
+    })
+}
+
 fn check_index(t: &TableDef, idx: &IndexDef, v: &ServerVersion) -> Result<()> {
     if idx.name.trim().is_empty() {
         return Err(Error::invalid_input("an index has no name"));
@@ -392,6 +413,7 @@ fn check_index(t: &TableDef, idx: &IndexDef, v: &ServerVersion) -> Result<()> {
             if !v.at_least(3, 9) {
                 return Err(Error::unsupported("indexes on expressions need SQLite 3.9"));
             }
+            check_sql_expression(&part.name, &format!("index {} key", idx.name), true)?;
         } else if !t.columns.iter().any(|c| same_name(&c.name, &part.name)) {
             return Err(Error::invalid_input(format!(
                 "index {} uses column {}, which the table does not have",
@@ -401,6 +423,9 @@ fn check_index(t: &TableDef, idx: &IndexDef, v: &ServerVersion) -> Result<()> {
     }
     if idx.predicate.is_some() && !v.at_least(3, 8) {
         return Err(Error::unsupported("partial indexes need SQLite 3.8"));
+    }
+    if let Some(predicate) = idx.predicate.as_deref().filter(|p| !p.trim().is_empty()) {
+        check_sql_expression(predicate, &format!("index {} predicate", idx.name), true)?;
     }
     Ok(())
 }
@@ -541,6 +566,11 @@ fn check_table(t: &TableDef, v: &ServerVersion) -> Result<()> {
         if check.expression.trim().is_empty() {
             return Err(Error::invalid_input("a check has no expression"));
         }
+        check_sql_expression(
+            &check.expression,
+            &format!("check {}", check.name.as_deref().unwrap_or("(unnamed)")),
+            false,
+        )?;
     }
     Ok(())
 }
@@ -574,6 +604,7 @@ fn column_sql(t: &TableDef, c: &ColumnDef, inline_pk: bool) -> Result<String> {
             .map(str::trim)
             .filter(|d| !d.is_empty())
     {
+        check_sql_expression(default, &format!("column {}: default", c.name), false)?;
         sql.push_str(" DEFAULT (");
         sql.push_str(default);
         sql.push(')');
@@ -583,6 +614,11 @@ fn column_sql(t: &TableDef, c: &ColumnDef, inline_pk: bool) -> Result<String> {
         sql.push_str(&collation_sql(collation));
     }
     if let Some(generated) = &c.generated {
+        check_sql_expression(
+            &generated.expression,
+            &format!("column {}: generation expression", c.name),
+            false,
+        )?;
         sql.push_str(" GENERATED ALWAYS AS (");
         sql.push_str(generated.expression.trim());
         sql.push_str(if generated.stored {
@@ -2572,6 +2608,54 @@ mod tests {
             .alter(&ObjectDef::Table(base()), &ObjectDef::Table(first), &ctx)
             .unwrap();
         assert!(sqls(&script).contains(&"PRAGMA foreign_keys = OFF"));
+    }
+
+    /// Defaults, generation and check expressions, expression keys and predicates can come from
+    /// a backup archive that never went through SQLite's parser: none can end the statement.
+    #[test]
+    fn expressions_cannot_leave_their_place() {
+        let version = v("3.51.0");
+        let ctx = DdlContext::new(&version);
+        let refused = |t: TableDef| {
+            let e = SqliteDdl
+                .create(&ObjectDef::Table(t), &ctx)
+                .expect_err("should be refused");
+            assert!(matches!(e, Error::InvalidInput { .. }), "{e}");
+        };
+        let mut t = base();
+        t.columns[1].default = Some("1)); CREATE TABLE injected(x); SELECT ((1".into());
+        refused(t);
+        let mut t = base();
+        t.checks.push(CheckDef {
+            name: None,
+            expression: "qty > 0)); CREATE TABLE injected(x); SELECT ((1".into(),
+            extras: Extras::new(),
+        });
+        refused(t);
+        let mut t = base();
+        t.indexes[0].predicate = Some("1; CREATE TABLE injected(x)".into());
+        refused(t);
+        let mut t = base();
+        t.indexes[0].predicate = Some("[a'] ; CREATE TABLE injected(x); --'".into());
+        refused(t);
+        let mut t = base();
+        let mut key = IndexColumn::column("qty) ; DROP TABLE t; --");
+        key.is_expression = true;
+        t.indexes[0].columns = vec![key];
+        refused(t);
+        let mut t = base();
+        let mut g = col("g", "INTEGER");
+        g.generated = Some(GeneratedColumn {
+            expression: "1) VIRTUAL; DROP TABLE t; SELECT (1".into(),
+            stored: false,
+        });
+        t.columns.push(g);
+        refused(t);
+        // Ordinary expressions still pass.
+        let mut t = base();
+        t.columns[2].default = Some("'a;b'".into());
+        t.indexes[0].predicate = Some("qty > 0 AND note <> 'x,y'".into());
+        assert!(SqliteDdl.create(&ObjectDef::Table(t), &ctx).is_ok());
     }
 
     #[test]
