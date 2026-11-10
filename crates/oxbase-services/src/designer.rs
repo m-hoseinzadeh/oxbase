@@ -716,10 +716,13 @@ enum Runner<'a> {
 }
 
 impl Runner<'_> {
+    /// Runs one step. Steps go through `execute_one`, so a step whose text the engine would read
+    /// as several statements (a definition from a catalog or an archive that ends the
+    /// statement) fails before anything in it runs.
     async fn execute(self, sql: &str, cancel: &CancellationToken) -> Result<Collected> {
         let stream = match self {
-            Self::Connection(c) => c.execute(sql, &[], cancel.clone()).await?,
-            Self::Tx(tx) => tx.execute(sql, &[], cancel.clone()).await?,
+            Self::Connection(c) => c.execute_one(sql, cancel.clone()).await?,
+            Self::Tx(tx) => tx.execute_one(sql, cancel.clone()).await?,
         };
         collect(stream).await
     }

@@ -52,6 +52,7 @@ impl Shared {
         params: &[Value],
         cancel: &CancellationToken,
         tx: Option<u64>,
+        single: bool,
     ) -> Result<ResultStream> {
         if cancel.is_cancelled() {
             return Err(Error::Cancelled);
@@ -68,6 +69,7 @@ impl Shared {
             token: token.clone(),
             out,
             done: done.clone(),
+            single,
         }))?;
         // Interrupts SQLite as soon as the token is cancelled, even while nobody polls the
         // stream. (Without a runtime the stream and the progress handler still cancel.)
@@ -238,7 +240,12 @@ impl Connection for SqliteConnection {
         params: &[Value],
         cancel: CancellationToken,
     ) -> Result<ResultStream> {
-        self.shared.execute(sql, params, &cancel, None)
+        self.shared.execute(sql, params, &cancel, None, false)
+    }
+
+    /// One statement, checked by SQLite's parser before anything runs (`MultipleStatement`).
+    async fn execute_one(&self, sql: &str, cancel: CancellationToken) -> Result<ResultStream> {
+        self.shared.execute(sql, &[], &cancel, None, true)
     }
 
     async fn cancel_running(&self) -> Result<()> {
@@ -305,7 +312,12 @@ impl Tx for SqliteTx {
         params: &[Value],
         cancel: CancellationToken,
     ) -> Result<ResultStream> {
-        self.shared.execute(sql, params, &cancel, Some(self.id))
+        self.shared
+            .execute(sql, params, &cancel, Some(self.id), false)
+    }
+
+    async fn execute_one(&self, sql: &str, cancel: CancellationToken) -> Result<ResultStream> {
+        self.shared.execute(sql, &[], &cancel, Some(self.id), true)
     }
 
     async fn commit(mut self: Box<Self>) -> Result<()> {

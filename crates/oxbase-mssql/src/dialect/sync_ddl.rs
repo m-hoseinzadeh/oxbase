@@ -28,6 +28,7 @@
 use std::fmt::Write as _;
 
 use oxbase_dialect::compare::{CompareRules, normalize_ws};
+use oxbase_dialect::sql::leading_keywords;
 use oxbase_dialect::{BracketQuoting, DdlContext, DdlGenerator, Quoting};
 use oxbase_types::{
     Error, ObjectDef, ObjectKind, ObjectRef, Result, RoutineDef, Script, ScriptStep, SequenceDef,
@@ -315,8 +316,13 @@ fn qualify_header(text: &str, name: &str, table: Option<&str>) -> String {
 }
 
 /// The module text of a routine or trigger, ready to run.
+///
+/// The text is used whole (from `sys.sql_modules` or a backup archive), so it must be the
+/// object's own `CREATE [OR ALTER] PROCEDURE | FUNCTION | TRIGGER` with a header
+/// [`qualify_header`] can rewrite to the object's name (and a trigger's table): otherwise a
+/// definition such as `DROP TABLE x` would run as it is.
 fn module_text(definition: Option<&str>, r: &ObjectRef) -> Result<String> {
-    definition
+    let text = definition
         .map(str::trim)
         .filter(|d| !d.is_empty())
         .map(|d| d.trim_end_matches(';').trim_end().to_owned())
@@ -326,7 +332,28 @@ fn module_text(definition: Option<&str>, r: &ObjectRef) -> Result<String> {
                 r.kind.display_name(),
                 r.name
             ))
-        })
+        })?;
+    let words = leading_keywords(&text, true, 4);
+    let words: Vec<&str> = words.iter().map(String::as_str).collect();
+    let kind = match words.as_slice() {
+        ["CREATE", "OR", "ALTER", kind, ..] | ["CREATE", kind, ..] => Some(*kind),
+        _ => None,
+    };
+    let expected: &[&str] = match r.kind {
+        ObjectKind::Procedure => &["PROCEDURE", "PROC"],
+        ObjectKind::Function => &["FUNCTION"],
+        ObjectKind::Trigger => &["TRIGGER"],
+        _ => &[],
+    };
+    if !kind.is_some_and(|k| expected.contains(&k)) || header_names(&text).is_none() {
+        return Err(Error::invalid_input(format!(
+            "the definition of {} {} is not a CREATE {} statement for it",
+            r.kind.display_name().to_lowercase(),
+            r.name,
+            expected.first().copied().unwrap_or("MODULE")
+        )));
+    }
+    Ok(text)
 }
 
 impl DdlGenerator for MsSqlSyncDdl {
@@ -630,6 +657,21 @@ mod tests {
         );
         f.definition = None;
         assert!(MsSqlSyncDdl.create(&ObjectDef::Routine(f), &ctx).is_err());
+        // The module text is used whole (a backup archive can carry any text): it must be the
+        // routine's own CREATE statement.
+        for bad in [
+            "DROP TABLE [m8_tgt].[orders]",
+            "CREATE VIEW [m8_tgt].[order_total] AS SELECT 1",
+            "CREATE PROCEDURE [m8_tgt].[order_total] AS SELECT 1",
+            "/* CREATE FUNCTION x() */ EXEC sp_who",
+        ] {
+            let mut f = RoutineDef::new(schema().child(ObjectKind::Function, "order_total"));
+            f.definition = Some(bad.into());
+            let e = MsSqlSyncDdl
+                .create(&ObjectDef::Routine(f), &ctx)
+                .unwrap_err();
+            assert!(matches!(e, Error::InvalidInput { .. }), "{bad}: {e}");
+        }
 
         let table = ObjectRef::table(Some("oxbase_test"), Some("m8_tgt"), "orders");
         let trigger = TriggerDef {

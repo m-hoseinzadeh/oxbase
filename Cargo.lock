@@ -4640,6 +4640,7 @@ dependencies = [
  "oxbase-dialect",
  "oxbase-driver",
  "oxbase-net",
+ "oxbase-sql",
  "oxbase-types",
  "serde_json",
  "tokio",

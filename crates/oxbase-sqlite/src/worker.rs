@@ -126,6 +126,8 @@ pub(crate) struct Job {
     pub out: mpsc::Sender<Result<ResultItem>>,
     /// Cancelled by the worker when the execution is over (stops the cancel watcher).
     pub done: CancellationToken,
+    /// `execute_one`: `sql` must be exactly one statement (see [`one_statement`]).
+    pub single: bool,
 }
 
 pub(crate) enum Command {
@@ -404,6 +406,7 @@ fn run_job(
         token,
         out,
         done,
+        single,
     } = job;
     let early = if state.closing.load(Ordering::Acquire) {
         Some(Error::connection("the SQLite connection is closed"))
@@ -429,6 +432,9 @@ fn run_job(
     let watch = token.clone();
     let handler = conn.progress_handler(PROGRESS_OPS, Some(move || watch.is_cancelled()));
     let result = match handler {
+        Ok(()) if single => {
+            one_statement(conn, &sql).and_then(|()| run_script(conn, &sql, &params, &token, &out))
+        }
         Ok(()) => run_script(conn, &sql, &params, &token, &out),
         Err(e) => Err(Halt::from(e)),
     };
@@ -450,6 +456,21 @@ fn run_job(
     // Before `out` drops: the stream treats an end without this as a worker that died.
     done.cancel();
     // `out` drops here, which ends the stream.
+}
+
+/// Checks, before anything runs, that `sql` is exactly one statement, with SQLite's own parser:
+/// `prepare` succeeds only when the text after the first statement is whitespace or comments
+/// (`MultipleStatement` otherwise). Any other prepare error is returned as it is: the single
+/// statement could not run either, and a tail that fails to compile (say, it uses a table the
+/// first statement creates) must not get to run after the first one.
+fn one_statement(conn: &rusqlite::Connection, sql: &str) -> Result<(), Halt> {
+    match conn.prepare(sql) {
+        Ok(_) => Ok(()),
+        Err(rusqlite::Error::MultipleStatement) => Err(Halt::Fail(Error::invalid_input(
+            "the step holds more than one statement; nothing was run",
+        ))),
+        Err(e) => Err(Halt::from(e)),
+    }
 }
 
 /// Runs every statement of `sql` in order, using SQLite's own parser to find statement
