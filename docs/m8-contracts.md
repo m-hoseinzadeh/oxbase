@@ -263,6 +263,10 @@ or built from the model where the engine's definition is not a full statement), 
 in the engine's syntax (`DROP FUNCTION f(<signature>)`, `DROP TRIGGER t ON tbl` on PostgreSQL,
 `DROP TRIGGER [s].[t]` on SQL Server, ...), `alter` = `CREATE OR REPLACE` / `CREATE OR ALTER`
 where the engine has it, else drop + create (steps flagged; MySQL / MariaDB non-transactional).
+MySQL / MariaDB statements carry no `DEFINER`, so the applying account becomes the definer, also
+on an alter with `compareOwnership` off; the script warns for every trigger, and every view or
+routine whose `SQL SECURITY` is not `INVOKER`, whose definer is not kept. A restore lists the
+same warnings in its report.
 Round trip like M3: an object fetched right after `create` / `alter` compares equal to the
 definition the script came from.
 

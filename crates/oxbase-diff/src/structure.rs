@@ -761,8 +761,11 @@ fn retarget_def(engine: Engine, def: &mut ObjectDef, from: &Location, to: &Locat
     }
 }
 
-/// Takes the properties the options do not compare from the target, so they neither show as
-/// differences nor get changed by a script.
+/// Takes the properties the options do not compare from the target, so they do not show as
+/// differences, and a script that changes the object for other reasons keeps them where its
+/// engine can. MySQL / MariaDB cannot keep a definer (`DEFINER`): a view, routine or trigger
+/// they create or re-create gets the applying account as its definer, and the script warns for
+/// each one whose definer is lost (`oxbase-mysql` `sync_ddl.rs`, "Definers").
 fn take_switched_off(source: &mut ObjectDef, target: &ObjectDef, options: &StructureOptions) {
     let mut extras_to_copy: Vec<PropId> = Vec::new();
     if !options.compare_ownership {

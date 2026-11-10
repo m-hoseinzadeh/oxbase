@@ -19,6 +19,14 @@
 //!   drop stays destructive (the sequence starts again) and the script warns.
 //!
 //! Every statement commits on its own (`transactional = false`); drops are destructive.
+//!
+//! # Definers
+//!
+//! No statement carries a `DEFINER` (setting another account needs `SET_USER_ID` / `SUPER`),
+//! so the server records the account that applies the script, also on an alter, where the
+//! target's definer is lost. A trigger always runs with its definer's privileges, and so does a
+//! view or routine whose `SQL SECURITY` is not `INVOKER`: for each of them whose definition
+//! names a definer (`props::DEFINER`), the script warns that the definer is not kept.
 
 use std::fmt::Write as _;
 
@@ -184,6 +192,23 @@ fn same_text(a: Option<&str>, b: Option<&str>) -> bool {
     }
 }
 
+/// Warns that `what` loses its definer (module docs, "Definers"): it runs with the privileges
+/// of the account that applies the script from then on. An `INVOKER` view or routine runs with
+/// the caller's privileges, so its definer does not matter.
+fn definer_warning(script: &mut Script, what: &str, kind: ObjectKind, extras: &Extras) {
+    let Some(definer) = text_extra(extras, &props::DEFINER) else {
+        return;
+    };
+    let invoker = kind != ObjectKind::Trigger
+        && text_extra(extras, &props::SECURITY).is_some_and(|s| s.eq_ignore_ascii_case("INVOKER"));
+    if !invoker {
+        script.warn(format!(
+            "{what} is created without its DEFINER {definer}: the account that applies this \
+             script becomes its definer, and it runs with that account's privileges"
+        ));
+    }
+}
+
 fn create_view(v: &ViewDef, replace: bool) -> Script {
     let mut sql = String::from("CREATE ");
     if replace {
@@ -213,6 +238,12 @@ fn create_view(v: &ViewDef, replace: bool) -> Script {
             v.obj.name
         ),
     ));
+    definer_warning(
+        &mut script,
+        &format!("view {}", v.obj.name),
+        ObjectKind::View,
+        &v.extras,
+    );
     script
 }
 
@@ -270,6 +301,16 @@ fn create_routine(r: &RoutineDef) -> Result<Script> {
             r.obj.name
         ),
     ));
+    definer_warning(
+        &mut script,
+        &format!(
+            "{} {}",
+            if procedure { "procedure" } else { "function" },
+            r.obj.name
+        ),
+        r.obj.kind,
+        &r.extras,
+    );
     Ok(script)
 }
 
@@ -316,6 +357,12 @@ fn create_trigger(t: &TriggerDef) -> Result<Script> {
         sql,
         format!("Create trigger {} on {}", t.obj.name, table.name),
     ));
+    definer_warning(
+        &mut script,
+        &format!("trigger {} on {}", t.obj.name, table.name),
+        ObjectKind::Trigger,
+        &t.extras,
+    );
     Ok(script)
 }
 
@@ -415,6 +462,7 @@ mod tests {
             ]
         );
         assert!(!script.steps[0].transactional);
+        assert_eq!(script.warnings, Vec::<String>::new(), "an INVOKER view");
         let script = MYSQL
             .alter(
                 &ObjectDef::View(view.clone()),
@@ -500,6 +548,116 @@ mod tests {
             ["DROP TRIGGER `m8_tgt`.`orders_audit`"]
         );
         assert!(!MySqlSyncRules.compare_extra(ObjectKind::Trigger, &ACTION_ORDER));
+    }
+
+    #[test]
+    fn definers_are_not_kept_and_the_script_warns() {
+        let version = ServerVersion::new(8, 4, 13);
+        let ctx = DdlContext::new(&version);
+        let warned = |script: &Script, what: &str| {
+            script.warnings.iter().any(|w| {
+                w.starts_with(&format!("{what} is created without its DEFINER low@%"))
+                    && w.contains("the account that applies this script becomes its definer")
+            })
+        };
+
+        // A view: SQL SECURITY DEFINER (also when the security is not known) warns, on create
+        // and on the CREATE OR REPLACE alter; INVOKER does not.
+        let mut view = ViewDef {
+            obj: db().child(ObjectKind::View, "v_orders"),
+            definition: "select 1 AS `x`".into(),
+            columns: Vec::new(),
+            comment: None,
+            extras: Extras::new()
+                .with(props::SECURITY, "DEFINER")
+                .with(props::DEFINER, "low@%"),
+        };
+        let script = MYSQL.create(&ObjectDef::View(view.clone()), &ctx).unwrap();
+        assert!(
+            !script.steps[0].sql.contains("DEFINER ="),
+            "{:?}",
+            sql(&script)
+        );
+        assert!(warned(&script, "view v_orders"), "{:?}", script.warnings);
+        let script = MYSQL
+            .alter(
+                &ObjectDef::View(view.clone()),
+                &ObjectDef::View(view.clone()),
+                &ctx,
+            )
+            .unwrap();
+        assert!(warned(&script, "view v_orders"), "{:?}", script.warnings);
+        view.extras.remove(&props::SECURITY);
+        let script = MYSQL.create(&ObjectDef::View(view.clone()), &ctx).unwrap();
+        assert!(warned(&script, "view v_orders"), "{:?}", script.warnings);
+        view.extras.insert(props::SECURITY, "invoker");
+        let script = MYSQL.create(&ObjectDef::View(view), &ctx).unwrap();
+        assert_eq!(script.warnings, Vec::<String>::new());
+
+        // A routine: the same rule; an alter drops and creates, and warns too.
+        let mut routine = RoutineDef::new(db().child(ObjectKind::Procedure, "p"));
+        routine.body = Some("SELECT 1".into());
+        routine.extras.insert(props::SECURITY, "DEFINER");
+        let script = MYSQL
+            .create(&ObjectDef::Routine(routine.clone()), &ctx)
+            .unwrap();
+        assert_eq!(script.warnings, Vec::<String>::new(), "no definer known");
+        routine.extras.insert(props::DEFINER, "low@%");
+        let script = MYSQL
+            .alter(
+                &ObjectDef::Routine(routine.clone()),
+                &ObjectDef::Routine(routine.clone()),
+                &ctx,
+            )
+            .unwrap();
+        assert!(warned(&script, "procedure p"), "{:?}", script.warnings);
+        assert!(
+            script.warnings.iter().any(|w| w.as_str() == NOT_ATOMIC),
+            "{:?}",
+            script.warnings
+        );
+        routine.extras.insert(props::SECURITY, "INVOKER");
+        let script = MYSQL.create(&ObjectDef::Routine(routine), &ctx).unwrap();
+        assert_eq!(script.warnings, Vec::<String>::new());
+
+        // A trigger always runs as its definer.
+        let table = ObjectRef::table(Some("m8_tgt"), None, "orders");
+        let trigger = TriggerDef {
+            obj: table.child(ObjectKind::Trigger, "orders_t"),
+            timing: TriggerTiming::After,
+            events: vec![TriggerEvent::Insert],
+            update_columns: Vec::new(),
+            level: TriggerLevel::Row,
+            condition: None,
+            function: None,
+            body: Some("SET @x = 1".into()),
+            definition: None,
+            enabled: true,
+            comment: None,
+            extras: Extras::new()
+                .with(props::DEFINER, "low@%")
+                .with(props::SECURITY, "INVOKER"),
+        };
+        let script = MYSQL
+            .create(&ObjectDef::Trigger(trigger.clone()), &ctx)
+            .unwrap();
+        assert!(
+            warned(&script, "trigger orders_t on orders"),
+            "{:?}",
+            script.warnings
+        );
+        let script = MYSQL
+            .alter(
+                &ObjectDef::Trigger(trigger.clone()),
+                &ObjectDef::Trigger(trigger),
+                &ctx,
+            )
+            .unwrap();
+        assert!(
+            warned(&script, "trigger orders_t on orders"),
+            "{:?}",
+            script.warnings
+        );
     }
 
     #[test]

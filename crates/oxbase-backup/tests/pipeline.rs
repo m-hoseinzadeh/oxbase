@@ -99,6 +99,7 @@ impl Fetcher for Tables {
 }
 
 /// `CREATE TABLE <name>` / `DROP TABLE <name>`: enough for the mock, which accepts anything.
+/// A table's create warns, as a MySQL trigger's does when its definer is not kept.
 struct Ddl;
 
 impl DdlGenerator for Ddl {
@@ -110,11 +111,14 @@ impl DdlGenerator for Ddl {
                 foreign_key.name.as_deref().unwrap_or("?"),
                 table.display_name()
             ),
-            ObjectDef::Table(t) => format!(
-                "CREATE TABLE {} ({} foreign keys)",
-                t.obj.display_name(),
-                t.foreign_keys.len()
-            ),
+            ObjectDef::Table(t) => {
+                s.warn(format!("{} gets a new definer", t.obj.display_name()));
+                format!(
+                    "CREATE TABLE {} ({} foreign keys)",
+                    t.obj.display_name(),
+                    t.foreign_keys.len()
+                )
+            }
             _ => format!("CREATE {}", d.object_ref().display_name()),
         };
         s.push_step(ScriptStep::new(sql).described("create"));
@@ -368,6 +372,13 @@ async fn backup_then_restore_over_the_mock() {
     .await;
     assert!(outcome.error.is_none(), "{:?}", outcome.error);
     assert_eq!(outcome.report.objects[0].status, RestoredStatus::Replaced);
+    // The structure script's warnings are the report's.
+    assert_eq!(
+        outcome.report.warnings,
+        ["items gets a new definer"],
+        "{:?}",
+        outcome.report.warnings
+    );
     let log = target_driver.log();
     let drop_at = log
         .iter()

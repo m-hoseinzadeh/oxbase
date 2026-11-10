@@ -37,7 +37,8 @@
 //!    draws from it (`ALTER SEQUENCE ... RESTART WITH`, SQL standard).
 //! 6. Report per object (created, replaced, kept, loaded, failed) and what a failure or cancel
 //!    left: structure steps follow the script rules (rolled back where atomic); data per table
-//!    (a failed table rolls back; earlier tables stay).
+//!    (a failed table rolls back; earlier tables stay). The structure scripts' warnings are
+//!    the report's warnings too (a MySQL / MariaDB definer that is not kept, ...).
 //!
 //! Destructive restores (drop existing, truncate) need the caller's confirmation
 //! ([`RestoreOptions::confirm_destructive`]); the services refuse without it.
@@ -790,8 +791,14 @@ impl Restore<'_> {
         }
     }
 
-    /// Runs one structure script; marks `slots` created / replaced, or failed.
+    /// Runs one structure script; marks `slots` created / replaced, or failed. The script's
+    /// warnings (a MySQL definer that is not kept, ...) go into the report.
     async fn script(&mut self, script: Script, slots: &[usize]) -> Result<()> {
+        for warning in &script.warnings {
+            if !self.warnings.contains(warning) {
+                self.warnings.push(warning.clone());
+            }
+        }
         let run = (self.run_script)(script);
         let result = until_cancelled(&self.cancel, run).await;
         match result {
