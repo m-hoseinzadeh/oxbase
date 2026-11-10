@@ -7,8 +7,9 @@
 //!   materialized `WITH NO DATA` when not populated), `COMMENT ON`. An alter drops and creates.
 //! - Routines: built from the model (`CREATE FUNCTION q(args) RETURNS ... LANGUAGE ...
 //!   <volatility> [STRICT] [SECURITY DEFINER] [PARALLEL ...] AS $body$...$body$`; a SQL-standard
-//!   body, `RETURN ...` / `BEGIN ATOMIC ... END`, inline), so names inside the body that structure
-//!   sync moved between schemas are what runs. An alter is `CREATE OR REPLACE` when the
+//!   body, `RETURN ...` / `BEGIN ATOMIC ... END`, inline, but only when the catalog reports one,
+//!   `SQL_STANDARD_BODY`), so names inside the body that structure sync moved between schemas
+//!   are what runs. An alter is `CREATE OR REPLACE` when the
 //!   arguments and the return type stay (PostgreSQL refuses to change them in place), else a
 //!   drop and a create. `DROP FUNCTION q(<identity arguments>)`.
 //! - Triggers: the server's `pg_get_triggerdef` text (names already moved by the caller), or
@@ -31,7 +32,7 @@ use oxbase_types::{
     props,
 };
 
-use super::fetch::PARALLEL;
+use super::fetch::{PARALLEL, SQL_STANDARD_BODY};
 
 /// The kinds these cells cover.
 pub(crate) const KINDS: [ObjectKind; 6] = [
@@ -247,6 +248,30 @@ fn dollar_tag(body: &str) -> String {
     tag
 }
 
+/// `true` when `body` (of a `LANGUAGE sql` routine) is a SQL-standard body, written inline;
+/// any other body is dollar-quoted. Only the catalog can tell: a quoted body is string content
+/// that may itself start with `RETURN` or `BEGIN ATOMIC` (written inline it would be read as
+/// SQL, statements after a `;` included), so the text is never the test.
+///
+/// The fetcher reports [`SQL_STANDARD_BODY`]. A definition without it (a backup archive written
+/// before it existed) is a standard body only when its `pg_get_functiondef` text ends with the
+/// body: the server writes a quoted body between dollar tags it picks so that they do not occur
+/// in the body, so such a text always ends with a tag, never with the body.
+fn standard_body(r: &RoutineDef, body: &str) -> bool {
+    match r.extras.get(&SQL_STANDARD_BODY) {
+        Some(Value::Bool(standard)) => *standard,
+        Some(_) => false,
+        None => {
+            let body = body.trim();
+            let upper = body.to_ascii_uppercase();
+            (upper.starts_with("BEGIN ATOMIC") || upper.starts_with("RETURN "))
+                && r.definition
+                    .as_deref()
+                    .is_some_and(|d| d.trim_end().ends_with(body))
+        }
+    }
+}
+
 fn create_routine(r: &RoutineDef, replace: bool) -> Result<Script> {
     let procedure = r.obj.kind == ObjectKind::Procedure;
     let body = r.body.as_deref().ok_or_else(|| {
@@ -292,10 +317,7 @@ fn create_routine(r: &RoutineDef, replace: bool) -> Result<Script> {
     if !procedure && let Some(Value::Text(parallel)) = r.extras.get(&PARALLEL) {
         let _ = write!(sql, " PARALLEL {}", parallel.to_uppercase());
     }
-    let trimmed = body.trim_start().to_ascii_uppercase();
-    let standard_body = language.eq_ignore_ascii_case("sql")
-        && (trimmed.starts_with("BEGIN ATOMIC") || trimmed.starts_with("RETURN "));
-    if standard_body {
+    if language.eq_ignore_ascii_case("sql") && standard_body(r, body) {
         let _ = write!(sql, "\n{}", body.trim());
     } else {
         let tag = dollar_tag(body);
@@ -826,6 +848,7 @@ mod tests {
         let mut standard = function();
         standard.language = Some("sql".into());
         standard.body = Some("RETURN (p_id + 1)".into());
+        standard.extras.insert(SQL_STANDARD_BODY, true);
         let script = PgSyncDdl
             .create(&ObjectDef::Routine(standard), &ctx)
             .unwrap();
@@ -855,6 +878,65 @@ mod tests {
         assert_eq!(
             sql(&PgSyncDdl.drop_object(&procedure.obj, &ctx).unwrap()),
             ["DROP PROCEDURE \"m8_tgt\".\"p\"()"]
+        );
+    }
+
+    /// A quoted (`prosrc`) body that starts with `RETURN` stays quoted: written inline, the
+    /// statement after its `;` would run on the target (audit lead 12).
+    #[test]
+    fn only_catalog_standard_bodies_are_written_inline() {
+        let version = ctx_version();
+        let ctx = DdlContext::new(&version);
+        let body = "RETURN 1; CREATE TABLE public.oxbase_probe(x int)";
+        let header = "CREATE FUNCTION \"m8_tgt\".\"f\"()\n RETURNS integer\n LANGUAGE sql";
+        let routine = |standard: Option<bool>, definition: Option<&str>| {
+            let mut f =
+                RoutineDef::new(schema().child(ObjectKind::Function, "f").with_signature(""));
+            f.returns = Some("integer".into());
+            f.language = Some("sql".into());
+            f.body = Some(body.into());
+            f.definition = definition.map(str::to_owned);
+            if let Some(standard) = standard {
+                f.extras.insert(SQL_STANDARD_BODY, standard);
+            }
+            ObjectDef::Routine(f)
+        };
+        let quoted = format!("{header}\nAS $body${body}$body$");
+        let first = |def: &ObjectDef| PgSyncDdl.create(def, &ctx).unwrap().steps[0].sql.clone();
+        // The catalog says it is a quoted body.
+        assert_eq!(first(&routine(Some(false), None)), quoted);
+        // An archive written before the flag: quoted unless the server's definition ends with
+        // the body (it ends with the closing dollar tag for a quoted one).
+        assert_eq!(first(&routine(None, None)), quoted);
+        let server_quoted = format!(
+            "CREATE OR REPLACE FUNCTION m8_tgt.f()\n RETURNS integer\n LANGUAGE sql\nAS $function${body}$function$\n"
+        );
+        assert_eq!(first(&routine(None, Some(&server_quoted))), quoted);
+        // A real standard body: inline, from the flag or from the server's definition.
+        let standard = "RETURN 1";
+        let inline = |def: ObjectDef| {
+            let ObjectDef::Routine(mut f) = def else {
+                unreachable!()
+            };
+            f.body = Some(standard.into());
+            ObjectDef::Routine(f)
+        };
+        let expected = format!("{header}\n{standard}");
+        assert_eq!(first(&inline(routine(Some(true), None))), expected);
+        let server_standard =
+            "CREATE OR REPLACE FUNCTION m8_tgt.f()\n RETURNS integer\n LANGUAGE sql\nRETURN 1\n";
+        assert_eq!(
+            first(&inline(routine(None, Some(server_standard)))),
+            expected
+        );
+        // Only `LANGUAGE sql` has standard bodies.
+        let ObjectDef::Routine(mut plpgsql) = inline(routine(Some(true), None)) else {
+            unreachable!()
+        };
+        plpgsql.language = Some("plpgsql".into());
+        assert!(
+            first(&ObjectDef::Routine(plpgsql))
+                .ends_with("LANGUAGE plpgsql\nAS $body$RETURN 1$body$")
         );
     }
 
