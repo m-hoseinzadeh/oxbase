@@ -154,6 +154,21 @@ pub trait Connection: Send + Sync {
         cancel: CancellationToken,
     ) -> Result<ResultStream>;
 
+    /// Runs `sql` as exactly one statement, like [`Connection::execute`] without parameters, but
+    /// refusing (before anything runs) text the engine would read as several statements.
+    ///
+    /// Generated scripts (`execute_script`: structure sync, restore, the table designer) run
+    /// every step through this. A step is always one statement, and its text can carry SQL from
+    /// outside the user (a source server's catalog, a backup archive), so a definition that
+    /// ends the statement must fail instead of running what follows. Engines enforce it with
+    /// the strongest means they have: PostgreSQL lets the server parse the step as one prepared
+    /// statement, SQLite prepares it with the library's own parser, MySQL counts statements with
+    /// the compound-statement-aware splitter. The default runs `sql` unchanged, for engines
+    /// whose unit of execution is a batch (SQL Server) or that have no statements.
+    async fn execute_one(&self, sql: &str, cancel: CancellationToken) -> Result<ResultStream> {
+        self.execute(sql, &[], cancel).await
+    }
+
     /// Cancels the statement currently running on this connection, if any. Returns `Ok` when
     /// nothing is running.
     async fn cancel_running(&self) -> Result<()>;
@@ -199,6 +214,11 @@ pub trait Tx: Send + Sync {
         params: &[Value],
         cancel: CancellationToken,
     ) -> Result<ResultStream>;
+
+    /// Same contract as [`Connection::execute_one`], inside the transaction.
+    async fn execute_one(&self, sql: &str, cancel: CancellationToken) -> Result<ResultStream> {
+        self.execute(sql, &[], cancel).await
+    }
 
     async fn commit(self: Box<Self>) -> Result<()>;
 

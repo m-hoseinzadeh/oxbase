@@ -719,7 +719,43 @@ live!(
     types_and_params,
     transaction_rollback,
     rollback_open_transaction,
+    execute_one_runs_exactly_one_statement,
 );
+
+/// `execute_one` (generated script steps: structure sync, restore, the designer) refuses text
+/// with a second statement before anything is sent, and runs a compound body as one statement.
+async fn execute_one_runs_exactly_one_statement(key: &str) {
+    let c = connect(&params(key)).await;
+    let table = format!("oxbase_mysql_one_{}", std::process::id());
+    let procedure = format!("{table}_p");
+    run(&c, &format!("DROP TABLE IF EXISTS {table}")).await;
+    run(&c, &format!("DROP PROCEDURE IF EXISTS {procedure}")).await;
+    let one = |sql: String| {
+        let c = &c;
+        async move { collect(c.execute_one(&sql, CancellationToken::new()).await?).await }
+    };
+    one(format!("CREATE TABLE {table} (id int)")).await.unwrap();
+    let refused = one(format!(
+        "CREATE TABLE {table}_x (id int DEFAULT 1); DROP TABLE {table}"
+    ))
+    .await;
+    assert!(
+        matches!(refused, Err(Error::InvalidInput { .. })),
+        "{refused:?}"
+    );
+    let exists = format!(
+        "SELECT COUNT(*) FROM information_schema.tables \
+         WHERE table_schema = DATABASE() AND table_name = '{table}'"
+    );
+    assert_eq!(scalar_text(&c, &exists).await, "1");
+    one(format!(
+        "CREATE PROCEDURE {procedure}() BEGIN SELECT 1; SELECT 2; END"
+    ))
+    .await
+    .unwrap();
+    run(&c, &format!("DROP PROCEDURE {procedure}")).await;
+    run(&c, &format!("DROP TABLE {table}")).await;
+}
 
 /// `rollback_open_transaction` (the per-run session mode): a transaction a script left open,
 /// by `BEGIN` or by `SET autocommit = 0`, is rolled back and reported; none open is reported as

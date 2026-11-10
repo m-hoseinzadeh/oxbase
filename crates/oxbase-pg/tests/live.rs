@@ -181,6 +181,46 @@ async fn connects_plain_and_reports_version() {
     assert!(matches!(err, Error::Connection { .. }), "{err}");
 }
 
+/// `execute_one` (generated script steps: structure sync, restore, the designer) sends one
+/// prepared statement: the server refuses text that holds two, so nothing in it runs, while a
+/// `BEGIN ATOMIC` body with inner semicolons and an ordinary query run normally.
+#[tokio::test]
+#[ignore = "needs the postgres fixture"]
+async fn execute_one_runs_exactly_one_statement() {
+    let f = fixture();
+    let conn = connect(&plain_params(&f)).await;
+    let one = |sql: &'static str| {
+        let conn = &conn;
+        async move { collect(conn.execute_one(sql, CancellationToken::new()).await?).await }
+    };
+    run(&*conn, "DROP TABLE IF EXISTS oxbase_one_stmt", &[]).await;
+    run(&*conn, "DROP FUNCTION IF EXISTS oxbase_one_f()", &[]).await;
+    one("CREATE TABLE oxbase_one_stmt (id int)").await.unwrap();
+    let refused = one("CREATE VIEW oxbase_one_v AS SELECT 1; DROP TABLE oxbase_one_stmt").await;
+    assert!(refused.is_err(), "{refused:?}");
+    let out = run(
+        &*conn,
+        "SELECT (to_regclass('oxbase_one_stmt') IS NOT NULL)::int4, \
+                (to_regclass('oxbase_one_v') IS NULL)::int4",
+        &[],
+    )
+    .await;
+    let batch = &out.result_sets[0].batches[0];
+    assert_eq!(
+        column_i32(batch, 0),
+        [Some(1)],
+        "the table must still exist"
+    );
+    assert_eq!(column_i32(batch, 1), [Some(1)], "the view must not exist");
+    one("CREATE FUNCTION oxbase_one_f() RETURNS int LANGUAGE sql BEGIN ATOMIC SELECT 1; SELECT 2; END")
+        .await
+        .unwrap();
+    let out = one("SELECT 7::int4").await.unwrap();
+    assert_eq!(column_i32(&out.result_sets[0].batches[0], 0), [Some(7)]);
+    run(&*conn, "DROP FUNCTION oxbase_one_f()", &[]).await;
+    run(&*conn, "DROP TABLE oxbase_one_stmt", &[]).await;
+}
+
 #[tokio::test]
 #[ignore = "needs the postgres fixture"]
 async fn wrong_password_is_an_auth_error_without_the_password() {

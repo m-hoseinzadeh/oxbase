@@ -345,11 +345,13 @@ fn replaceable(old: &RoutineDef, new: &RoutineDef) -> bool {
 
 fn trigger_sql(t: &TriggerDef, table: &ObjectRef) -> Result<String> {
     if let Some(definition) = t.definition.as_deref().filter(|d| !d.trim().is_empty()) {
-        return Ok(definition
-            .trim()
-            .trim_end_matches(';')
-            .trim_end()
-            .to_owned());
+        let definition = definition.trim().trim_end_matches(';').trim_end();
+        return trigger_on_table(definition, table).map_err(|why| {
+            Error::invalid_input(format!(
+                "the definition of trigger {} is not usable: {why}",
+                t.obj.name
+            ))
+        });
     }
     let function = t
         .function
@@ -389,6 +391,192 @@ fn trigger_sql(t: &TriggerDef, table: &ObjectRef) -> Result<String> {
     }
     let _ = write!(sql, " EXECUTE FUNCTION {}()", q(function));
     Ok(sql)
+}
+
+/// `definition` (the whole `CREATE TRIGGER` statement, from `pg_get_triggerdef` or a backup
+/// archive) when it creates a trigger on `table`: it must start with `CREATE [OR REPLACE]
+/// [CONSTRAINT] TRIGGER`, and the relation after `ON` must be `table`. An unqualified relation
+/// (the server leaves the schema out when it is on the `search_path`) is qualified with
+/// `table`'s schema, so the trigger lands on that table whatever the session's `search_path`.
+///
+/// The text is used whole, so this is what keeps a definition from doing something else
+/// (`DROP SCHEMA ...`, a trigger on another schema's table). That the step is one statement is
+/// enforced when it runs (`execute_one`: one prepared statement, parsed by the server).
+fn trigger_on_table(definition: &str, table: &ObjectRef) -> std::result::Result<String, String> {
+    let mut lx = TriggerLexer::new(definition);
+    let word = |lx: &mut TriggerLexer<'_>| match lx.token() {
+        Some(TriggerToken::Word(w)) => Some(w),
+        _ => None,
+    };
+    let start = "it does not start with CREATE [OR REPLACE] [CONSTRAINT] TRIGGER";
+    if word(&mut lx).as_deref() != Some("create") {
+        return Err(start.into());
+    }
+    let mut next = word(&mut lx);
+    if next.as_deref() == Some("or") {
+        if word(&mut lx).as_deref() != Some("replace") {
+            return Err(start.into());
+        }
+        next = word(&mut lx);
+    }
+    if next.as_deref() == Some("constraint") {
+        next = word(&mut lx);
+    }
+    if next.as_deref() != Some("trigger") {
+        return Err(start.into());
+    }
+    // The name, timing and events: words, quoted names and the commas of `UPDATE OF a, b`.
+    loop {
+        match lx.token() {
+            Some(TriggerToken::Word(w)) if w == "on" => break,
+            Some(TriggerToken::Word(_) | TriggerToken::Quoted(_) | TriggerToken::Comma) => {}
+            _ => return Err("it has no ON <table> after the trigger events".into()),
+        }
+    }
+    let target_start = lx.offset();
+    let first = lx.name().ok_or("it names no table after ON")?;
+    let (schema, name) = if lx.dot() {
+        let second = lx.name().ok_or("it names no table after ON")?;
+        (Some(first), second)
+    } else {
+        (None, first)
+    };
+    let target_end = lx.offset();
+    if name != table.name {
+        return Err(format!("it is on table {name}, not {}", table.name));
+    }
+    match (schema, table.schema.as_deref()) {
+        (Some(s), Some(expected)) if s != expected => {
+            Err(format!("it is on a table of schema {s}, not {expected}"))
+        }
+        (None, Some(_)) => Ok(format!(
+            "{} {}{}",
+            definition[..target_start].trim_end(),
+            q(table),
+            &definition[target_end..]
+        )),
+        _ => Ok(definition.to_owned()),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum TriggerToken {
+    /// An unquoted word, folded to lower case like the server folds names.
+    Word(String),
+    /// A `"..."` name, `""` undoubled.
+    Quoted(String),
+    Comma,
+    Dot,
+    /// Anything else (strings, operators, parentheses): never part of the checked prefix.
+    Other,
+}
+
+/// Just enough PostgreSQL lexing for [`trigger_on_table`]: whitespace, `--` and nested `/* */`
+/// comments, words (letters, digits, `_`, `$` and non-ASCII characters, as the server reads
+/// them) and quoted names.
+struct TriggerLexer<'a> {
+    text: &'a str,
+    pos: usize,
+}
+
+impl<'a> TriggerLexer<'a> {
+    fn new(text: &'a str) -> Self {
+        Self { text, pos: 0 }
+    }
+
+    /// The byte offset after the last token (and before any space that follows it).
+    fn offset(&self) -> usize {
+        self.pos
+    }
+
+    fn skip_space(&mut self) {
+        let b = self.text.as_bytes();
+        while self.pos < b.len() {
+            if b[self.pos].is_ascii_whitespace() {
+                self.pos += 1;
+            } else if b[self.pos..].starts_with(b"--") {
+                self.pos = b[self.pos..]
+                    .iter()
+                    .position(|&c| c == b'\n')
+                    .map_or(b.len(), |p| self.pos + p + 1);
+            } else if b[self.pos..].starts_with(b"/*") {
+                let mut depth = 0usize;
+                while self.pos < b.len() {
+                    if b[self.pos..].starts_with(b"/*") {
+                        depth += 1;
+                        self.pos += 2;
+                    } else if b[self.pos..].starts_with(b"*/") {
+                        depth -= 1;
+                        self.pos += 2;
+                        if depth == 0 {
+                            break;
+                        }
+                    } else {
+                        self.pos += 1;
+                    }
+                }
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn token(&mut self) -> Option<TriggerToken> {
+        self.skip_space();
+        let rest = &self.text[self.pos..];
+        let c = rest.chars().next()?;
+        let ident_start = |c: char| c.is_ascii_alphabetic() || c == '_' || !c.is_ascii();
+        let ident_char =
+            |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '$' || !c.is_ascii();
+        if ident_start(c) {
+            let len = rest.find(|c: char| !ident_char(c)).unwrap_or(rest.len());
+            self.pos += len;
+            return Some(TriggerToken::Word(rest[..len].to_ascii_lowercase()));
+        }
+        if c == '"' {
+            let mut name = String::new();
+            let mut chars = rest.char_indices().skip(1).peekable();
+            while let Some((i, ch)) = chars.next() {
+                if ch == '"' {
+                    if chars.peek().is_some_and(|&(_, n)| n == '"') {
+                        chars.next();
+                        name.push('"');
+                        continue;
+                    }
+                    self.pos += i + 1;
+                    return Some(TriggerToken::Quoted(name));
+                }
+                name.push(ch);
+            }
+            self.pos = self.text.len();
+            return Some(TriggerToken::Other);
+        }
+        self.pos += c.len_utf8();
+        Some(match c {
+            ',' => TriggerToken::Comma,
+            '.' => TriggerToken::Dot,
+            _ => TriggerToken::Other,
+        })
+    }
+
+    /// A word or quoted name, as the server stores it.
+    fn name(&mut self) -> Option<String> {
+        match self.token() {
+            Some(TriggerToken::Word(w) | TriggerToken::Quoted(w)) => Some(w),
+            _ => None,
+        }
+    }
+
+    /// Consumes a `.` when one comes next.
+    fn dot(&mut self) -> bool {
+        let saved = self.pos;
+        if self.token() == Some(TriggerToken::Dot) {
+            true
+        } else {
+            self.pos = saved;
+            false
+        }
+    }
 }
 
 fn create_trigger(t: &TriggerDef) -> Result<Script> {
@@ -710,6 +898,66 @@ mod tests {
         assert_eq!(
             sql(&PgSyncDdl.drop_object(&t.obj, &ctx).unwrap()),
             ["DROP TRIGGER \"orders_audit\" ON \"m8_tgt\".\"orders\""]
+        );
+    }
+
+    /// The definition is used whole (it comes from the catalog or a backup archive), so it must
+    /// be a `CREATE TRIGGER` on the trigger's own table (audit: restore container check).
+    #[test]
+    fn trigger_definitions_must_create_this_trigger() {
+        let v = ctx_version();
+        let ctx = DdlContext::new(&v);
+        let table = ObjectRef::table(Some("oxbase_test"), Some("m8_tgt"), "orders");
+        let def = |definition: &str| {
+            ObjectDef::Trigger(TriggerDef {
+                obj: table.child(ObjectKind::Trigger, "orders_audit"),
+                timing: TriggerTiming::After,
+                events: vec![TriggerEvent::Insert],
+                update_columns: vec![],
+                level: TriggerLevel::Row,
+                condition: None,
+                function: None,
+                body: None,
+                definition: Some(definition.into()),
+                enabled: true,
+                comment: None,
+                extras: Extras::new(),
+            })
+        };
+        for bad in [
+            "DROP SCHEMA other CASCADE",
+            "SELECT 1",
+            "CREATE TRIGGER t AFTER INSERT ON other.accounts FOR EACH ROW EXECUTE FUNCTION m8_tgt.f()",
+            "CREATE TRIGGER t AFTER INSERT ON m8_tgt.accounts FOR EACH ROW EXECUTE FUNCTION m8_tgt.f()",
+            "CREATE OR DROP TRIGGER t AFTER INSERT ON m8_tgt.orders EXECUTE FUNCTION f()",
+            "CREATE TRIGGER t AFTER INSERT ('x') ON m8_tgt.orders EXECUTE FUNCTION f()",
+            "CREATE TRIGGER t AFTER INSERT ON",
+        ] {
+            let e = PgSyncDdl.create(&def(bad), &ctx).unwrap_err();
+            assert!(matches!(e, Error::InvalidInput { .. }), "{bad}: {e}");
+        }
+        // Accepted as they are: the server's own forms, comments and quoted names included.
+        for good in [
+            "CREATE TRIGGER orders_audit AFTER INSERT ON m8_tgt.orders FOR EACH ROW EXECUTE FUNCTION m8_tgt.audit()",
+            "CREATE CONSTRAINT TRIGGER \"Orders Audit\" AFTER UPDATE OF status, \"on\" ON \"m8_tgt\".\"orders\" DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION m8_tgt.audit('a')",
+            "/* c */ create or replace trigger t before delete on m8_tgt.orders for each statement execute function m8_tgt.audit()",
+        ] {
+            let script = PgSyncDdl.create(&def(good), &ctx).unwrap();
+            assert_eq!(sql(&script), [good]);
+        }
+        // An unqualified table (left out by the server when on the search_path) is pinned to
+        // the trigger's schema.
+        let script = PgSyncDdl
+            .create(
+                &def("CREATE TRIGGER t AFTER INSERT ON orders FOR EACH ROW EXECUTE FUNCTION f()"),
+                &ctx,
+            )
+            .unwrap();
+        assert_eq!(
+            sql(&script),
+            [
+                "CREATE TRIGGER t AFTER INSERT ON \"m8_tgt\".\"orders\" FOR EACH ROW EXECUTE FUNCTION f()"
+            ]
         );
     }
 

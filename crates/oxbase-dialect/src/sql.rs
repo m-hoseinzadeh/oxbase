@@ -176,6 +176,62 @@ fn is_ident_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_' || c == '$'
 }
 
+/// The upper-cased leading keywords of `text` (at most `max`), after whitespace and comments
+/// (`--` to the end of the line, `/* ... */`, which nest when `nested_comments`; PostgreSQL and
+/// SQL Server nest them, SQLite and MySQL do not). Stops at the first token that is not an ASCII
+/// word. Used to check that a definition taken whole from a catalog or an archive is the kind
+/// of statement its object says (`CREATE TRIGGER`, `CREATE PROCEDURE`, ...).
+pub fn leading_keywords(text: &str, nested_comments: bool, max: usize) -> Vec<String> {
+    let b = text.as_bytes();
+    let mut i = 0;
+    let mut words = Vec::new();
+    while i < b.len() && words.len() < max {
+        if b[i].is_ascii_whitespace() {
+            i += 1;
+        } else if b[i..].starts_with(b"--") {
+            i = b[i..]
+                .iter()
+                .position(|&c| c == b'\n')
+                .map_or(b.len(), |p| i + p + 1);
+        } else if b[i..].starts_with(b"/*") {
+            i = block_comment_end(b, i, nested_comments);
+        } else if b[i].is_ascii_alphabetic() || b[i] == b'_' {
+            let start = i;
+            while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                i += 1;
+            }
+            if b.get(i).is_some_and(|c| !c.is_ascii()) {
+                break;
+            }
+            words.push(text[start..i].to_ascii_uppercase());
+        } else {
+            break;
+        }
+    }
+    words
+}
+
+/// Index just past the block comment opening at `start` (the end of `b` when unterminated).
+fn block_comment_end(b: &[u8], start: usize, nested: bool) -> usize {
+    let mut i = start + 2;
+    let mut depth = 1usize;
+    while i < b.len() {
+        if nested && b[i..].starts_with(b"/*") {
+            depth += 1;
+            i += 2;
+        } else if b[i..].starts_with(b"*/") {
+            depth -= 1;
+            i += 2;
+            if depth == 0 {
+                return i;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    b.len()
+}
+
 /// Index just past the quoted run that starts at `start` (its quote character), honouring
 /// doubled quotes and, if `backslash`, backslash escapes.
 fn skip_quoted(chars: &[char], start: usize, backslash: bool) -> Result<usize> {
@@ -672,6 +728,29 @@ mod tests {
         assert!(check_expression(&BracketQuoting, "x = 1 -- c").is_err());
         // PostgreSQL arrays are not identifiers.
         assert!(check_expression(&PgQuoting, "a[1] = 2").is_ok());
+    }
+
+    #[test]
+    fn leading_keywords_skip_whitespace_and_comments() {
+        let kw = |t: &str, nested| leading_keywords(t, nested, 3);
+        assert_eq!(kw("  create TRIGGER t", true), ["CREATE", "TRIGGER", "T"]);
+        assert_eq!(
+            kw("-- note\n/* x */ CREATE OR ALTER", true),
+            ["CREATE", "OR", "ALTER"]
+        );
+        assert_eq!(kw("DROP TABLE x", false), ["DROP", "TABLE", "X"]);
+        // Nesting follows the engine: SQLite ends the comment at the first `*/`.
+        assert_eq!(
+            kw("/* /* */ DROP TABLE x; */ CREATE TRIGGER", false),
+            ["DROP", "TABLE", "X"]
+        );
+        assert_eq!(
+            kw("/* /* */ DROP TABLE x; */ CREATE TRIGGER", true),
+            ["CREATE", "TRIGGER"]
+        );
+        // A word that runs into a non-ASCII character is not a keyword.
+        assert_eq!(kw("CREATE\u{20AC} TRIGGER", true), Vec::<String>::new());
+        assert_eq!(kw("'CREATE' TRIGGER", true), Vec::<String>::new());
     }
 
     #[test]

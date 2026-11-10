@@ -175,6 +175,11 @@ enum Mode {
     Auto,
     /// Internal commands (`BEGIN`, `COMMIT`, ...): simple protocol, no prepare.
     Script,
+    /// `execute_one`: always the extended protocol, never the simple-protocol fallback. The
+    /// server parses the text as one prepared statement and refuses several ("cannot insert
+    /// multiple commands into a prepared statement"), so a generated step whose spliced text
+    /// ends the statement fails before anything runs, whatever a client-side lexer thinks.
+    Single,
 }
 
 struct Shared {
@@ -456,11 +461,11 @@ async fn run_statement(
     sink: &Sink,
 ) -> Result<()> {
     drain_notices(notices, sink).await;
-    if !params.is_empty() {
+    if !params.is_empty() || mode == Mode::Single {
         return run_extended(client, sql, params, notices, sink).await;
     }
     let typed = match mode {
-        Mode::Script => None,
+        Mode::Script | Mode::Single => None,
         Mode::Auto => match count_statements(sql) {
             0 => return Ok(()),
             1 => match sink.check().map(|()| client.prepare(sql))?.await {
@@ -974,6 +979,12 @@ impl Connection for PgConnection {
         self.shared.execute(sql, params, cancel, Mode::Auto)
     }
 
+    /// One prepared statement through the extended protocol: the server refuses text that holds
+    /// several statements (see [`Mode::Single`]).
+    async fn execute_one(&self, sql: &str, cancel: CancellationToken) -> Result<ResultStream> {
+        self.shared.execute(sql, &[], cancel, Mode::Single)
+    }
+
     /// Interrupts the running statement and any submitted after it that are still queued (see
     /// the module docs). A statement submitted after this call is not affected.
     async fn cancel_running(&self) -> Result<()> {
@@ -1061,6 +1072,10 @@ impl Tx for PgTx {
         cancel: CancellationToken,
     ) -> Result<ResultStream> {
         self.shared.execute(sql, params, cancel, Mode::Auto)
+    }
+
+    async fn execute_one(&self, sql: &str, cancel: CancellationToken) -> Result<ResultStream> {
+        self.shared.execute(sql, &[], cancel, Mode::Single)
     }
 
     async fn commit(self: Box<Self>) -> Result<()> {

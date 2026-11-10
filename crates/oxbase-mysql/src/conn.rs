@@ -245,6 +245,13 @@ impl Connection for MySqlConnection {
         execute(&self.shared, sql, params, cancel).await
     }
 
+    /// One statement, counted with the MySQL splitter before anything is sent (the session
+    /// allows multi-statement text, so the server would run every statement it finds).
+    async fn execute_one(&self, sql: &str, cancel: CancellationToken) -> Result<ResultStream> {
+        one_statement(self.flavor, sql)?;
+        execute(&self.shared, sql, &[], cancel).await
+    }
+
     async fn cancel_running(&self) -> Result<()> {
         self.shared.cancel_running();
         Ok(())
@@ -259,6 +266,7 @@ impl Connection for MySqlConnection {
             .map_err(map_error)?;
         Ok(Box::new(MySqlTx {
             shared: Arc::clone(&self.shared),
+            flavor: self.flavor,
             finished: AtomicBool::new(false),
         }))
     }
@@ -295,6 +303,7 @@ impl Connection for MySqlConnection {
 /// A transaction started with `START TRANSACTION`.
 struct MySqlTx {
     shared: Arc<Shared>,
+    flavor: Flavor,
     finished: AtomicBool,
 }
 
@@ -342,12 +351,47 @@ impl Tx for MySqlTx {
         execute(&self.shared, sql, params, cancel).await
     }
 
+    async fn execute_one(&self, sql: &str, cancel: CancellationToken) -> Result<ResultStream> {
+        one_statement(self.flavor, sql)?;
+        self.execute(sql, &[], cancel).await
+    }
+
     async fn commit(self: Box<Self>) -> Result<()> {
         self.finish("COMMIT").await
     }
 
     async fn rollback(self: Box<Self>) -> Result<()> {
         self.finish("ROLLBACK").await
+    }
+}
+
+/// Refuses `sql` unless the MySQL splitter finds exactly one statement in it. mysql_async always
+/// negotiates multi-statement text, so this client-side count is the guard for `execute_one`;
+/// the splitter keeps `CREATE PROCEDURE / FUNCTION / TRIGGER / EVENT ... BEGIN ... END` bodies
+/// (and their inner `;`) as one statement, as the server does.
+///
+/// Two things the splitter reads differently from the server are refused outright, since no
+/// generated step needs them: a `DELIMITER` line (a client directive the server does not know)
+/// and an executable comment (`/*! ... */`, `/*M! ... */`), whose content the server may run.
+fn one_statement(flavor: Flavor, sql: &str) -> Result<()> {
+    let delimiter_line = sql.lines().any(|line| {
+        let word = line.split_whitespace().next().unwrap_or("");
+        word.eq_ignore_ascii_case("delimiter")
+    });
+    if delimiter_line || sql.contains("/*!") || sql.contains("/*M!") {
+        return Err(Error::invalid_input(
+            "the step holds a DELIMITER line or an executable comment (/*! ... */); nothing was run",
+        ));
+    }
+    let dialect = oxbase_sql::SqlDialect::MySql {
+        mariadb: flavor == Flavor::MariaDb,
+    };
+    match oxbase_sql::split(dialect, sql).len() {
+        1 => Ok(()),
+        0 => Err(Error::invalid_input("the step holds no statement")),
+        n => Err(Error::invalid_input(format!(
+            "the step holds {n} statements, but only one is allowed; nothing was run"
+        ))),
     }
 }
 
@@ -845,6 +889,31 @@ fn value_text(v: &MyValue) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `execute_one` (generated script steps): one statement, compound bodies included.
+    #[test]
+    fn one_statement_counts_compound_bodies_as_one() {
+        for flavor in [Flavor::MySql, Flavor::MariaDb] {
+            for ok in [
+                "CREATE TABLE `t` (`c` int DEFAULT 1)",
+                "CREATE TRIGGER `tr` BEFORE INSERT ON `t` FOR EACH ROW BEGIN\n  SET NEW.c = 1;\n  \
+                 IF NEW.c > 0 THEN SET NEW.c = 2; END IF;\nEND",
+                "CREATE PROCEDURE `p`() BEGIN SELECT 1; SELECT 2; END",
+                "CREATE VIEW `v` AS SELECT 'a;b' AS `x`",
+            ] {
+                assert!(one_statement(flavor, ok).is_ok(), "{ok}");
+            }
+            for bad in [
+                "CREATE TABLE `t` (`c` int DEFAULT 1); DROP TABLE `x`",
+                "CREATE VIEW `v` AS SELECT 1; DROP TABLE `x`",
+                "CREATE TABLE `t` (`c` int CHECK (`c` > 0 /*!50000 ; DROP TABLE x */))",
+                "CREATE VIEW `v` AS SELECT 1\nDELIMITER //\n; DROP TABLE `x` //",
+                "",
+            ] {
+                assert!(one_statement(flavor, bad).is_err(), "{bad}");
+            }
+        }
+    }
 
     #[test]
     fn warning_rows_never_panic() {
