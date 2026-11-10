@@ -581,6 +581,10 @@ impl EditService {
             options.database = Some(catalog.clone());
         }
         options.record_history = false;
+        // 1.5: once the rows are read the tab needs nothing on the server (paging, the form and
+        // editability read the stored rows), so it gives its session back whatever the
+        // connection's Sessions setting; an apply opens one for itself.
+        options.release_session = true;
         check_cancelled(&cancel)?;
         drop(cancel);
         let handle = self.query.run_bound(target, statement, options).await?;
@@ -725,8 +729,9 @@ impl EditService {
             });
         }
 
-        // 3. Run in one transaction on the run's own session (per-run mode: on a session opened
-        //    for the apply; `lease` closes it when the apply ends, after `guard` and `tx`).
+        // 3. Run in one transaction on a session opened for the apply (table data gives its
+        //    session back once the rows are in, 1.5; `lease` closes it when the apply ends,
+        //    after `guard` and `tx`), or on the run's own session for other results.
         let lease = self.query.edit_session(run, &cancel).await?;
         let session = lease.session.clone();
         let guard = until_cancelled(&cancel, async { Ok(session.exclusive().await) }).await?;

@@ -153,6 +153,12 @@ pub const ROLLED_BACK_CODE: &str = "oxbase.rolled_back";
 const ROLLED_BACK_NOTICE: &str = "The run ended inside a transaction, so it was rolled back: this \
      connection connects for each run and keeps no session between runs. End the script with \
      COMMIT to keep its changes.";
+
+/// The [`ROLLED_BACK_CODE`] notice of a run that gives its session back whatever the mode
+/// ([`RunOptions::release_session`], table data).
+const RELEASED_ROLLED_BACK_NOTICE: &str = "The rows were read inside a transaction the server \
+     opened (it does not commit by itself), so it was rolled back when the tab gave its session \
+     back.";
 /// Warning sent when a run starts on a new session because the editor's last cancelled
 /// statement had not finished stopping on the old one.
 const REPLACED_UNCLEAN_NOTICE: &str = "the last cancelled statement was still stopping on the \
@@ -246,6 +252,11 @@ pub struct RunOptions {
     /// `false`, then not serialized; see the module docs).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub confirm_destructive: bool,
+    /// 1.5: give the session back when the run ends, as [`SessionMode::PerRun`] does, whatever
+    /// the connection's mode (table-data tabs: once the rows are read, nothing stays open on
+    /// the server). Set by Rust callers only; never read from or sent to the UI.
+    #[serde(skip)]
+    pub release_session: bool,
 }
 
 impl Default for RunOptions {
@@ -257,6 +268,7 @@ impl Default for RunOptions {
             record_history: true,
             keep_previous: false,
             confirm_destructive: false,
+            release_session: false,
         }
     }
 }
@@ -673,6 +685,8 @@ struct Run {
     dir: Mutex<Option<Arc<RunDir>>>,
     /// M3: the session the run executes on, once it is open (`QueryService::run_session`).
     session: Mutex<Option<SessionHandle>>,
+    /// 1.5: the run gives its session back when it ends ([`RunOptions::release_session`]).
+    release_session: bool,
 }
 
 impl Run {
@@ -827,8 +841,9 @@ impl QueryService {
     /// apply ends (see [`EditSession`]).
     ///
     /// - [`SessionMode::PerTab`]: the run's own session ([`QueryService::run_session`]).
-    /// - [`SessionMode::PerRun`]: the run gave its session back when it ended, so a new one is
-    ///   opened on the run's database, and closed when the [`EditSession`] is dropped.
+    /// - [`SessionMode::PerRun`], or a run that gave its session back
+    ///   ([`RunOptions::release_session`], table data): a new one is opened on the run's
+    ///   database, and closed when the [`EditSession`] is dropped.
     ///
     /// `NotFound` for an unknown or closed run, or when its connection is closed.
     pub async fn edit_session(
@@ -844,7 +859,12 @@ impl QueryService {
             .manager
             .get(found.base)
             .ok_or_else(|| Error::not_found("this connection is not open"))?;
-        if base.summary().session_mode != SessionMode::PerRun {
+        let released = base.summary().session_mode == SessionMode::PerRun || found.release_session;
+        // A run on the base session itself (a private in-memory database) kept it.
+        let on_base = lock(&found.session)
+            .as_ref()
+            .is_some_and(|s| s.summary().parent.is_none());
+        if !released || on_base {
             return Ok(EditSession {
                 session: self.run_session(run)?,
                 owner: None,
@@ -977,6 +997,7 @@ impl QueryService {
             results: Mutex::new(Vec::new()),
             dir: Mutex::new(Some(Arc::clone(&dir))),
             session: Mutex::new(None),
+            release_session: options.release_session,
         });
         lock(&self.registry.runs).insert(run_id, Arc::clone(&run));
         if let Some(editor) = lock(&self.registry.editors).get_mut(&target.editor) {
@@ -1680,16 +1701,17 @@ impl RunContext {
         Ok(new)
     }
 
-    /// [`SessionMode::PerRun`]: the run gives its session back when it ends. The editor
-    /// forgets it (its next run connects again, on the same database), a transaction the
-    /// script left open is rolled back (announced with a [`ROLLED_BACK_CODE`] warning) and the
-    /// session is closed in the background. A session a stopped statement may still be busy
-    /// on is closed without the rollback check (closing rolls the transaction back too).
+    /// [`SessionMode::PerRun`] (or [`RunOptions::release_session`]): the run gives its session
+    /// back when it ends. The editor forgets it (its next run connects again, on the same
+    /// database), a transaction the script left open is rolled back (announced with a
+    /// [`ROLLED_BACK_CODE`] warning) and the session is closed in the background. A session a
+    /// stopped statement may still be busy on is closed without the rollback check (closing
+    /// rolls the transaction back too). A base session the editor runs on is never released.
     async fn release_per_run_session(&self) {
         let session = self.session();
-        if session.summary().session_mode != SessionMode::PerRun
-            || session.summary().parent.is_none()
-        {
+        let releases =
+            session.summary().session_mode == SessionMode::PerRun || self.run.release_session;
+        if !releases || session.summary().parent.is_none() {
             return;
         }
         let id = session.id();
@@ -1710,10 +1732,15 @@ impl RunContext {
             };
             match tokio::time::timeout(ROLLBACK_CHECK_DEADLINE, check).await {
                 Ok(Ok(Some(true))) => {
+                    let message = if session.summary().session_mode == SessionMode::PerRun {
+                        ROLLED_BACK_NOTICE
+                    } else {
+                        RELEASED_ROLLED_BACK_NOTICE
+                    };
                     self.emit(RunEvent::Notice {
                         statement_index: None,
                         level: NoticeLevel::Warning,
-                        message: ROLLED_BACK_NOTICE.to_owned(),
+                        message: message.to_owned(),
                         code: Some(ROLLED_BACK_CODE.to_owned()),
                     })
                     .await;

@@ -1644,6 +1644,48 @@ async fn per_tab_sessions_stay_and_are_never_checked() {
 }
 
 #[tokio::test]
+async fn a_run_that_releases_its_session_gives_it_back_per_tab_too() {
+    let h = Harness::new(|_| {}).await;
+    let release = RunOptions {
+        release_session: true,
+        ..no_history()
+    };
+    let (run, events) = h.run("a", "rows 3", release.clone()).await;
+    assert_eq!(shape(&events).last().unwrap(), "finished");
+    assert!(!events.iter().any(rolled_back), "{events:?}");
+    no_children(&h.manager, h.session).await;
+    assert_eq!(h.service.editor_usage(h.session), EditorUsage::default());
+    assert!(h.log.lock().unwrap().contains(&"rollback-check".to_owned()));
+    // The rows stay readable, and edits get a session of their own.
+    let page = h.service.page(run, 0, 0, 10).await.unwrap();
+    assert_eq!(page.num_rows(), 3);
+    let lease = h
+        .service
+        .edit_session(run, &CancellationToken::new())
+        .await
+        .unwrap();
+    assert!(lease.is_own());
+    drop(lease);
+    no_children(&h.manager, h.session).await;
+
+    // A transaction the server left open is rolled back, with this mode's notice.
+    let (_, events) = h.run("a", "begin; update 1", release).await;
+    let notice = events.iter().find(|e| rolled_back(e)).expect("a notice");
+    assert!(
+        matches!(notice, RunEvent::Notice { message, .. } if message.contains("gave its session back")),
+        "{notice:?}"
+    );
+    no_children(&h.manager, h.session).await;
+    // The option is internal: never part of the UI's JSON.
+    let json = serde_json::to_value(RunOptions {
+        release_session: true,
+        ..RunOptions::default()
+    })
+    .unwrap();
+    assert!(json.get("releaseSession").is_none(), "{json}");
+}
+
+#[tokio::test]
 async fn edits_of_a_per_run_result_get_a_session_of_their_own() {
     let h = per_run_harness().await;
     let (run, _) = h.run("a", "rows 2", no_history()).await;

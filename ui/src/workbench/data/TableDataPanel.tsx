@@ -3,7 +3,9 @@
  * the builders, paged into the grid like a query result, and edited in place.
  *
  * - The rows are an ordinary run of the tab's own editor session (`table_data_open`); paging,
- *   cancel and close are the M2 run path.
+ *   cancel and close are the M2 run path. Once the rows are in, the tab gives that session back
+ *   (1.5, whatever the connection's Sessions setting): nothing stays open on the server, and
+ *   Refresh, a new filter and Apply connect again.
  * - `edit_begin` says whether the result is editable; a read-only result shows why.
  * - Edits go into a pending-changes buffer held here (`ui/src/api/pending.ts`): changed cells,
  *   new rows and deleted rows are highlighted until Apply sends the buffer whole

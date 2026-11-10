@@ -724,15 +724,21 @@ Each open connection keeps one session for the object tree. Query tabs get their
 the connection's **Sessions** setting (connection dialog, General tab; PostgreSQL, MySQL,
 MariaDB and SQL Server):
 
-- **Keep a session per tab** (the default): each query or table-data tab keeps its own session
-  from its first run until it closes, so transactions, `SET` values, `USE` and temporary tables
-  last between runs.
+- **Keep a session per tab** (the default): each query tab keeps its own session from its first
+  run until it closes, so transactions, `SET` values, `USE` and temporary tables last between
+  runs.
 - **Connect for each run**: a run (and each **Apply** of grid edits) connects, runs and
   disconnects. A connection then holds one session plus one per query running now, which suits
   servers with a connection limit, for example behind PgBouncer. Session state lasts only for
   one run: a transaction a run leaves open (`BEGIN` without `COMMIT`, MySQL's
   `SET autocommit = 0`) is rolled back, and the run says so in its Messages tab and in the
   editor's status. Results stay readable after the session closes.
+
+Table-data tabs (a table's rows) keep no session in either mode. Once the rows are in, the tab
+gives its session back, so nothing stays open on the server for that table: no lock, no
+transaction (one the server opened by itself is rolled back), no idle connection. Paging,
+copying and the form view read the loaded rows. **Refresh**, a new filter or row limit, and
+**Apply** each connect again.
 
 The status bar counts the sessions Oxbase holds; click the count to see where each connection's
 sessions go (the tree, idle tabs, running queries, the rest).

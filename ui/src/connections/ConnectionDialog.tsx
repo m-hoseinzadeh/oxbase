@@ -256,7 +256,7 @@ const SESSION_MODES: { value: SessionMode; label: string; hint: string }[] = [
   {
     value: "per_tab",
     label: "Keep a session per tab",
-    hint: "Each query tab keeps its own connection, so transactions, SET values and temporary tables last until the tab closes.",
+    hint: "Each query tab keeps its own connection, so transactions, SET values and temporary tables last until the tab closes. Table tabs disconnect once their rows are loaded.",
   },
   {
     value: "per_run",
