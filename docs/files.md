@@ -84,7 +84,10 @@ The installers register two file types:
   keep another default; choose Oxbase in **Open with**).
 - Only one Oxbase runs at a time. Opening a file while it runs (double-click, `oxbase file.sql`)
   hands the file to the running window, which comes to the front. On Linux this uses the D-Bus
-  session bus; without one, each launch is its own instance.
+  session bus; without one, each launch is its own instance. On macOS it uses a socket in a
+  private folder of the user's own temporary directory, and both sides check that the other
+  runs as the same user, so another account on the Mac can neither block Oxbase from starting
+  nor see what it was launched with.
 - Command line: `oxbase report.sql data.sqlite` (the program is `app-tauri` / `Oxbase`).
   Arguments starting with `-` are ignored; relative paths are relative to the current folder.
   At most 32 files per launch.

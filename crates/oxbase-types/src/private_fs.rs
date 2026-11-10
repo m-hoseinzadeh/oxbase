@@ -38,7 +38,7 @@ pub fn check_private_dir(dir: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        if meta.uid() != rustix::process::geteuid().as_raw() {
+        if meta.uid() != effective_uid() {
             return Err(not_private(dir, "belongs to another user"));
         }
         if meta.mode() & 0o077 != 0 {
@@ -46,6 +46,12 @@ pub fn check_private_dir(dir: &Path) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// The effective user id of this process: the user private data must belong to.
+#[cfg(unix)]
+pub fn effective_uid() -> u32 {
+    rustix::process::geteuid().as_raw()
 }
 
 /// Owner-only directory permissions (`0o700`), e.g. for `tempfile::Builder::permissions`.
