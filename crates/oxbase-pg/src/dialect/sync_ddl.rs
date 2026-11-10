@@ -6,7 +6,8 @@
 //! - Views: `CREATE [MATERIALIZED] VIEW q [(columns)] AS <query>` (`WITH ... CHECK OPTION`,
 //!   materialized `WITH NO DATA` when not populated), `COMMENT ON`. An alter drops and creates.
 //! - Routines: built from the model (`CREATE FUNCTION q(args) RETURNS ... LANGUAGE ...
-//!   <volatility> [STRICT] [SECURITY DEFINER] [PARALLEL ...] AS $body$...$body$`; a SQL-standard
+//!   <volatility> [STRICT] [SECURITY DEFINER] [PARALLEL ...] [SET name TO value ...]
+//!   AS $body$...$body$`, the `SET` clauses from `proconfig` (`SETTINGS`); a SQL-standard
 //!   body, `RETURN ...` / `BEGIN ATOMIC ... END`, inline, but only when the catalog reports one,
 //!   `SQL_STANDARD_BODY`), so names inside the body that structure sync moved between schemas
 //!   are what runs. An alter is `CREATE OR REPLACE` when the
@@ -32,7 +33,8 @@ use oxbase_types::{
     props,
 };
 
-use super::fetch::{PARALLEL, SQL_STANDARD_BODY};
+use super::ddl::literal;
+use super::fetch::{PARALLEL, SETTINGS, SQL_STANDARD_BODY};
 
 /// The kinds these cells cover.
 pub(crate) const KINDS: [ObjectKind; 6] = [
@@ -248,6 +250,107 @@ fn dollar_tag(body: &str) -> String {
     tag
 }
 
+/// Settings whose value is a list of names, which the server quotes element by element (its
+/// `GUC_LIST_QUOTE` flag; the same list as `pg_dump`'s `variable_is_guc_list_quote`).
+const LIST_SETTINGS: [&str; 6] = [
+    "local_preload_libraries",
+    "search_path",
+    "session_preload_libraries",
+    "shared_preload_libraries",
+    "temp_tablespaces",
+    "unix_socket_directories",
+];
+
+/// The elements of a stored list setting (`pg_catalog, "My Schema"`), read like the server's
+/// `SplitGUCList`: separated by `,`, a `"..."` element with `""` undoubled, an unquoted one up
+/// to the next `,` or space and kept as it is. `None` when the text is not such a list.
+fn setting_list(text: &str) -> Option<Vec<String>> {
+    let space = |c: char| matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0b' | '\x0c');
+    let mut out = Vec::new();
+    let mut rest = text.trim_start_matches(space);
+    if rest.is_empty() {
+        return Some(out);
+    }
+    loop {
+        if let Some(quoted) = rest.strip_prefix('"') {
+            let mut name = String::new();
+            let mut chars = quoted.char_indices().peekable();
+            let end = loop {
+                let (i, c) = chars.next()?;
+                if c == '"' {
+                    if chars.peek().is_some_and(|&(_, n)| n == '"') {
+                        chars.next();
+                    } else {
+                        break i + 1;
+                    }
+                }
+                name.push(c);
+            };
+            out.push(name);
+            rest = &quoted[end..];
+        } else {
+            let end = rest
+                .find(|c: char| c == ',' || space(c))
+                .unwrap_or(rest.len());
+            if end == 0 {
+                return None;
+            }
+            out.push(rest[..end].to_owned());
+            rest = &rest[end..];
+        }
+        rest = rest.trim_start_matches(space);
+        match rest.strip_prefix(',') {
+            Some(after) => rest = after.trim_start_matches(space),
+            None if rest.is_empty() => return Some(out),
+            None => return None,
+        }
+    }
+}
+
+/// The `SET name TO value` clauses of a routine's [`SETTINGS`] (`proconfig`, from the catalog
+/// or a backup archive), in order. The name is quoted as an identifier and the value written as
+/// string literals, one per element for a list setting such as `search_path` (as `pg_dump`
+/// writes them), so no text of a setting can end the clause. A routine without the extra (an
+/// archive written before it was read) gets none.
+fn setting_clauses(r: &RoutineDef) -> Result<Vec<String>> {
+    let bad = |why: &str| {
+        Error::invalid_input(format!(
+            "the settings of {} are not usable: {why}",
+            r.obj.display_name()
+        ))
+    };
+    let items = match r.extras.get(&SETTINGS) {
+        None | Some(Value::Null) => return Ok(Vec::new()),
+        Some(Value::Json(serde_json::Value::Array(items))) => items,
+        Some(_) => return Err(bad("they must be a JSON array")),
+    };
+    items
+        .iter()
+        .map(|item| {
+            let text = item
+                .as_str()
+                .ok_or_else(|| bad("each setting must be a name=value text"))?;
+            let (name, value) = text
+                .split_once('=')
+                .filter(|(name, _)| !name.trim().is_empty())
+                .ok_or_else(|| bad(&format!("'{text}' is not name=value")))?;
+            let value = if LIST_SETTINGS.iter().any(|l| l.eq_ignore_ascii_case(name)) {
+                let elements = setting_list(value)
+                    .filter(|elements| !elements.is_empty())
+                    .ok_or_else(|| bad(&format!("'{text}' is not a list of names")))?;
+                elements
+                    .iter()
+                    .map(|e| literal(e))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            } else {
+                literal(value)
+            };
+            Ok(format!("SET {} TO {value}", ident(name)))
+        })
+        .collect()
+}
+
 /// `true` when `body` (of a `LANGUAGE sql` routine) is a SQL-standard body, written inline;
 /// any other body is dollar-quoted. Only the catalog can tell: a quoted body is string content
 /// that may itself start with `RETURN` or `BEGIN ATOMIC` (written inline it would be read as
@@ -316,6 +419,9 @@ fn create_routine(r: &RoutineDef, replace: bool) -> Result<Script> {
     }
     if !procedure && let Some(Value::Text(parallel)) = r.extras.get(&PARALLEL) {
         let _ = write!(sql, " PARALLEL {}", parallel.to_uppercase());
+    }
+    for clause in setting_clauses(r)? {
+        let _ = write!(sql, "\n {clause}");
     }
     if language.eq_ignore_ascii_case("sql") && standard_body(r, body) {
         let _ = write!(sql, "\n{}", body.trim());
@@ -937,6 +1043,94 @@ mod tests {
         assert!(
             first(&ObjectDef::Routine(plpgsql))
                 .ends_with("LANGUAGE plpgsql\nAS $body$RETURN 1$body$")
+        );
+    }
+
+    /// `SET` clauses (`proconfig`) are written back, so a `SECURITY DEFINER` routine keeps its
+    /// `search_path` pin, also through `CREATE OR REPLACE` (audit lead 13).
+    #[test]
+    fn routine_settings_become_set_clauses() {
+        let version = ctx_version();
+        let ctx = DdlContext::new(&version);
+        let mut f = RoutineDef::new(schema().child(ObjectKind::Function, "f").with_signature(""));
+        f.returns = Some("text".into());
+        f.language = Some("sql".into());
+        f.body = Some("SELECT lower('A'::text)".into());
+        f.extras.insert(props::SECURITY, "definer");
+        f.extras.insert(SQL_STANDARD_BODY, false);
+        let with = |f: &RoutineDef, settings: serde_json::Value| {
+            let mut f = f.clone();
+            f.extras.insert(SETTINGS, Value::Json(settings));
+            ObjectDef::Routine(f)
+        };
+        let def = with(
+            &f,
+            serde_json::json!([
+                "search_path=pg_catalog, \"My \"\"S\", pg_temp",
+                "work_mem=64MB",
+                "myext.note=it's; DROP TABLE x",
+                "DateStyle=ISO, MDY",
+            ]),
+        );
+        let script = PgSyncDdl.create(&def, &ctx).unwrap();
+        assert_eq!(
+            sql(&script),
+            [concat!(
+                "CREATE FUNCTION \"m8_tgt\".\"f\"()\n RETURNS text\n LANGUAGE sql SECURITY DEFINER",
+                "\n SET \"search_path\" TO 'pg_catalog', 'My \"S', 'pg_temp'",
+                "\n SET \"work_mem\" TO '64MB'",
+                "\n SET \"myext.note\" TO 'it''s; DROP TABLE x'",
+                "\n SET \"DateStyle\" TO 'ISO, MDY'",
+                "\nAS $body$SELECT lower('A'::text)$body$"
+            )]
+        );
+        // The replace keeps them too (`CREATE OR REPLACE` resets what it does not state).
+        let replaced = PgSyncDdl
+            .alter(&ObjectDef::Routine(f.clone()), &def, &ctx)
+            .unwrap();
+        assert!(
+            replaced.steps[0]
+                .sql
+                .starts_with("CREATE OR REPLACE FUNCTION")
+        );
+        assert!(
+            replaced.steps[0]
+                .sql
+                .contains("\n SET \"search_path\" TO 'pg_catalog', 'My \"S', 'pg_temp'\n")
+        );
+        // None (an archive written before they were read) or an empty list: no clause.
+        for def in [
+            ObjectDef::Routine(f.clone()),
+            with(&f, serde_json::json!([])),
+        ] {
+            let script = PgSyncDdl.create(&def, &ctx).unwrap();
+            assert!(
+                !script.steps[0].sql.contains("SET "),
+                "{}",
+                script.steps[0].sql
+            );
+        }
+        // Text that is not a setting is refused, not written.
+        for bad in [
+            serde_json::json!("search_path=public"),
+            serde_json::json!(["no equals sign"]),
+            serde_json::json!(["=x"]),
+            serde_json::json!([1]),
+            serde_json::json!(["search_path=a b"]),
+            serde_json::json!(["search_path=\"open"]),
+            serde_json::json!(["search_path=a,"]),
+            serde_json::json!(["search_path="]),
+        ] {
+            let e = PgSyncDdl.create(&with(&f, bad.clone()), &ctx).unwrap_err();
+            assert!(matches!(e, Error::InvalidInput { .. }), "{bad}: {e}");
+        }
+        assert_eq!(
+            setting_list(" \"$user\" , public,\"a,b\""),
+            Some(vec![
+                "$user".to_owned(),
+                "public".to_owned(),
+                "a,b".to_owned()
+            ])
         );
     }
 

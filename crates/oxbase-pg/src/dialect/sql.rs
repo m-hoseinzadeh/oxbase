@@ -395,7 +395,8 @@ pub(crate) const PROCEDURES: &str = routines!("p.prokind = 'p'", "");
 /// Procedures of schema `$1` named `$2` (PostgreSQL 11+).
 pub(crate) const PROCEDURES_BY_NAME: &str = routines!("p.prokind = 'p'", " AND p.proname = $2");
 
-/// Details of routine `$1` (oid). `$sql_body` is the SQL-standard body (14+) or NULL.
+/// Details of routine `$1` (oid). `$sql_body` is the SQL-standard body (14+) or NULL;
+/// `settings` the `SET` clauses (`proconfig`, `name=value` texts) as a JSON array, or NULL.
 macro_rules! routine {
     ($sql_body:literal) => {
         concat!(
@@ -410,6 +411,7 @@ macro_rules! routine {
             "p.proisstrict AS is_strict, ",
             "p.prosecdef AS security_definer, ",
             "p.proparallel::text AS parallel, ",
+            "pg_catalog.array_to_json(p.proconfig)::text AS settings, ",
             "pg_catalog.pg_get_userbyid(p.proowner)::text AS owner ",
             "FROM pg_catalog.pg_proc p ",
             "JOIN pg_catalog.pg_language l ON l.oid = p.prolang ",

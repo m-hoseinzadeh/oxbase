@@ -1151,3 +1151,54 @@ async fn mssql_round_trip() {
 async fn sqlite_round_trip() {
     round_trip("sqlite", Engine::Sqlite).await;
 }
+
+/// Backs up the whole PostgreSQL schema `src` and restores it into the new, empty schema `dst`.
+async fn postgres_schema_restore(live: &Live, src: &str, dst: &str) {
+    let database = live.container.catalog.clone();
+    let schema = |name: &str| ObjectRef::schema(database.as_deref(), name);
+    live.exec(&format!("CREATE SCHEMA {dst}")).await;
+    let path = live.dir.path().join(format!("{src}.oxbackup"));
+    live.backup(
+        BackupSpec {
+            container: schema(src),
+            objects: Vec::new(),
+            content: BackupContent::StructureAndData,
+            compression: Compression::Zstd,
+        },
+        &path,
+    )
+    .await;
+    live.restore(RestoreOptions::into_container(schema(dst)), &path)
+        .await;
+}
+
+/// A restored `SECURITY DEFINER` function keeps its `SET search_path` pin (audit lead 13).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs the Docker fixtures (scripts/fixtures-up.sh)"]
+async fn postgres_restore_keeps_routine_settings() {
+    let live = Live::connect("postgres", Engine::Postgres).await;
+    let src = format!("oxbase_bk_{}_l13", token());
+    let dst = format!("{src}_restored");
+    live.exec(&format!("CREATE SCHEMA {src}")).await;
+    live.exec(&format!(
+        "CREATE FUNCTION {src}.f() RETURNS text LANGUAGE sql SECURITY DEFINER \
+         SET search_path = pg_catalog, pg_temp AS 'SELECT lower(''A''::text)'"
+    ))
+    .await;
+    postgres_schema_restore(&live, &src, &dst).await;
+    let settings = live
+        .exec(&format!(
+            "SELECT pg_catalog.array_to_json(proconfig)::text FROM pg_catalog.pg_proc \
+             WHERE oid = '{dst}.f()'::regprocedure"
+        ))
+        .await;
+    for schema in [&src, &dst] {
+        live.exec(&format!("DROP SCHEMA {schema} CASCADE")).await;
+    }
+    assert_eq!(
+        settings,
+        vec![vec![Value::Text(
+            r#"["search_path=pg_catalog, pg_temp"]"#.to_owned()
+        )]]
+    );
+}

@@ -281,7 +281,7 @@ fn ident(name: &str) -> String {
 /// A string literal. Text with a backslash is written as an escape string (`E'a\\b'`), which
 /// reads the same whatever `standard_conforming_strings` is; other text through
 /// [`Quoting::quote_str`].
-fn literal(text: &str) -> String {
+pub(crate) fn literal(text: &str) -> String {
     if text.contains('\\') {
         format!("E'{}'", text.replace('\\', "\\\\").replace('\'', "''"))
     } else {
