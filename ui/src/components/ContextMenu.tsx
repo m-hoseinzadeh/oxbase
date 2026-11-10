@@ -57,16 +57,19 @@ export function ContextMenu({ x, y, label, items, onClose, closeAll }: ContextMe
     ref.current
       ?.querySelector<HTMLElement>('[role="menuitem"]:not([aria-disabled="true"])')
       ?.focus();
-    const onDown = (event: MouseEvent) => {
+    const onDown = (event: PointerEvent) => {
       // Clicks in this menu's submenus (other `.context-menu`s) are inside too.
       const target = event.target as Element | null;
       if (target?.closest?.(".context-menu")) return;
       if (!ref.current?.contains(target)) closeRef.current();
     };
-    // A submenu is closed with the menu that opened it.
-    if (!isSubmenu) document.addEventListener("mousedown", onDown);
+    // `pointerdown`, in the capture phase: the result grid (Glide) cancels pointerdown on its
+    // cells, so the browser sends no `mousedown` for a click in the grid, and other handlers
+    // may stop the event before it bubbles here. A submenu is closed with the menu that
+    // opened it.
+    if (!isSubmenu) document.addEventListener("pointerdown", onDown, true);
     return () => {
-      document.removeEventListener("mousedown", onDown);
+      document.removeEventListener("pointerdown", onDown, true);
       opener?.focus?.();
     };
   }, [isSubmenu]);
