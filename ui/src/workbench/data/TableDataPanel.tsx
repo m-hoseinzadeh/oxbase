@@ -20,7 +20,8 @@
  * - A status line under the grid: rows loaded (and the limit), selected rows, pending changes,
  *   load time.
  * - A foreign-key cell opens the referenced row in a new tab ("Open related row"); a tab opened
- *   that way starts filtered to it (`related`).
+ *   that way starts filtered to it (`related`). Foreign-key cells show a link icon that does the
+ *   same (1.5); when the foreign keys cannot be read, the cell menu says why.
  */
 import type { Item } from "@glideapps/glide-data-grid";
 import {
@@ -99,6 +100,8 @@ import {
   type GridCellTarget,
   type GridEditing,
   type GridKey,
+  type GridLinks,
+  type GridLinkTarget,
   ResultGrid,
 } from "../results/ResultGrid";
 import {
@@ -179,6 +182,17 @@ function relatedDraft(related: RelatedValue[] | undefined): FilterDraft {
 
 type View = "grid" | "form" | "json";
 
+/**
+ * Whether foreign key `fk` has column `name`. Exact first; then ignoring case, since SQL Server
+ * and MySQL compare column names without case and a catalog may spell them differently.
+ */
+export function fkColumnIndex(fk: ForeignKeyDef, name: string): number {
+  const exact = fk.columns.indexOf(name);
+  if (exact >= 0) return exact;
+  const lower = name.toLowerCase();
+  return fk.columns.findIndex((c) => c.toLowerCase() === lower);
+}
+
 const VIEWS: { id: View; label: string; icon: LucideIcon }[] = [
   { id: "grid", label: "Grid", icon: Table2 },
   { id: "form", label: "Form", icon: Rows3 },
@@ -237,6 +251,8 @@ export function TableDataPanel({ editorId, sessionId, table, related }: TableDat
   );
   /** The table's foreign keys ("Open related row"); empty until loaded, or without a designer. */
   const [foreignKeys, setForeignKeys] = useState<ForeignKeyDef[]>([]);
+  /** Why the foreign keys could not be read (shown in the cell menu). */
+  const [foreignKeysError, setForeignKeysError] = useState<string | null>(null);
   const gridBox = useRef<HTMLDivElement>(null);
   const [editability, setEditability] = useState<Editability | null>(null);
   const [editError, setEditError] = useState<string | null>(null);
@@ -361,8 +377,12 @@ export function TableDataPanel({ editorId, sessionId, table, related }: TableDat
     if (table.kind !== "table") return;
     let alive = true;
     designerLoad(sessionId, table).then(
-      (design) => alive && setForeignKeys(design.foreignKeys.map((f) => f.def)),
-      () => {},
+      (design) => {
+        if (!alive) return;
+        setForeignKeys(design.foreignKeys.map((f) => f.def));
+        setForeignKeysError(null);
+      },
+      (error) => alive && setForeignKeysError(toCommandError(error).message),
     );
     return () => {
       alive = false;
@@ -870,13 +890,22 @@ export function TableDataPanel({ editorId, sessionId, table, related }: TableDat
     });
 
     for (const fk of foreignKeys) {
-      if (!fk.columns.includes(name) || !row) continue;
+      if (fkColumnIndex(fk, name) < 0 || !row) continue;
       items.push({
         label: `Open related row in ${short(qualified(fk.ref_table))}`,
         icon: Link,
         separatorBefore: true,
         disabled: fk.columns.length === 1 && value === null,
         onSelect: () => void openRelated(fk, target),
+      });
+    }
+    if (foreignKeysError) {
+      items.push({
+        label: `Related rows: could not read the foreign keys (${short(foreignKeysError)})`,
+        icon: Link,
+        separatorBefore: true,
+        disabled: true,
+        onSelect: () => {},
       });
     }
 
@@ -923,7 +952,7 @@ export function TableDataPanel({ editorId, sessionId, table, related }: TableDat
   }
 
   /** Opens the row `fk` references from row `target.row` in a new, filtered tab. */
-  async function openRelated(fk: ForeignKeyDef, target: GridCellTarget) {
+  async function openRelated(fk: ForeignKeyDef, target: GridLinkTarget) {
     const row = gridRow(target.row, stored, applied, changes);
     if (!row) return;
     let values: (string | null)[];
@@ -941,7 +970,9 @@ export function TableDataPanel({ editorId, sessionId, table, related }: TableDat
         }
       }
       values = fk.columns.map((c) => {
-        const column = columns.find((x) => x.name === c);
+        const column =
+          columns.find((x) => x.name === c) ??
+          columns.find((x) => x.name.toLowerCase() === c.toLowerCase());
         const input = column ? knownInput(row, column) : undefined;
         if (input) return input.type === "text" ? input.text : null;
         return form?.fields.find((f) => f.column === c)?.text ?? null;
@@ -955,6 +986,25 @@ export function TableDataPanel({ editorId, sessionId, table, related }: TableDat
       related: fk.ref_columns.map((column, i) => ({ column, value: values[i] ?? null })),
     });
   }
+
+  const openRelatedRef = useRef(openRelated);
+  openRelatedRef.current = openRelated;
+  // The link icons of foreign-key cells: the first foreign key of the column opens.
+  const links = useMemo<GridLinks | undefined>(() => {
+    const byColumn = new Map<number, ForeignKeyDef>();
+    columns.forEach((column, index) => {
+      const fk = foreignKeys.find((f) => fkColumnIndex(f, column.name) >= 0);
+      if (fk) byColumn.set(index, fk);
+    });
+    if (byColumn.size === 0) return undefined;
+    return {
+      columns: new Set(byColumn.keys()),
+      open: (target) => {
+        const fk = byColumn.get(target.col);
+        if (fk) void openRelatedRef.current(fk, target);
+      },
+    };
+  }, [columns, foreignKeys]);
 
   /** The table data items of the grid's header menu: sort, filter. */
   function headerMenu(_col: number, column: { name: string }): MenuItem[] {
@@ -1511,6 +1561,7 @@ export function TableDataPanel({ editorId, sessionId, table, related }: TableDat
                 .join(".")}
               cellMenu={cellMenu}
               headerMenu={headerMenu}
+              links={links}
               onKey={onGridKey}
               onPasteCells={pasteCells}
               onPasteRows={pasteRows}

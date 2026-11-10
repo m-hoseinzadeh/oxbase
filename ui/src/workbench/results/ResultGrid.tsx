@@ -18,11 +18,16 @@
  *   pastes new rows (`onPasteCells`, `onPasteRows`);
  * - Ctrl/Cmd+click adds cell ranges or rows to the selection, Shift+click extends it;
  * - a preview of a cut-off value when the pointer rests on its cell.
+ *
+ * With `links` (table data, 1.5) the cells of the given columns (foreign keys) draw a link
+ * icon (./cellLinks); clicking it calls `links.open` with the cell.
  */
 import {
+  type CellClickedEventArgs,
   CompactSelection,
   DataEditor,
   type DataEditorRef,
+  type DrawCellCallback,
   type DrawHeaderCallback,
   type GridCell,
   GridCellKind,
@@ -65,6 +70,7 @@ import type { ColumnInfo, Engine } from "../../api";
 import { ContextMenu, type MenuItem, OPENS_SUBMENU } from "../../components/ContextMenu";
 import { ROW_HEIGHTS, useSettings } from "../../settings";
 import { normalizeColor, subscribeTheme } from "../theme-bridge";
+import { drawLinkIcon, hitsLinkIcon } from "./cellLinks";
 import {
   type CopiedText,
   type CopyNotify,
@@ -317,6 +323,21 @@ const OverlayEditor: ProvideEditorComponent<GridCell> = ({ initialValue, onFinis
   );
 };
 
+/** A cell's link icon was clicked (see `ResultGridProps.links`). */
+export interface GridLinkTarget {
+  row: number;
+  col: number;
+  /** The whole value: text, `null` (NULL) or `undefined` (not loaded). */
+  value: string | null | undefined;
+}
+
+/** Link icons in the cells of some columns (foreign keys of table data). */
+export interface GridLinks {
+  /** The columns whose cells show the icon. */
+  columns: ReadonlySet<number>;
+  open: (target: GridLinkTarget) => void;
+}
+
 /** Keys the grid hands to its caller (table data): mark for deletion, duplicate, revert. */
 export type GridKey = "delete" | "duplicate" | "revert";
 
@@ -372,6 +393,8 @@ export interface ResultGridProps {
   onPasteCells?: ((target: Item, values: readonly (readonly string[])[]) => void) | undefined;
   /** Ctrl+Shift+V or "Paste as new rows": each line becomes a new row from column `col`. */
   onPasteRows?: ((values: string[][], col: number) => void) | undefined;
+  /** 1.5: link icons in these columns' cells (foreign keys); see the module docs. */
+  links?: GridLinks | undefined;
 }
 
 const NO_SELECTION: GridSelection = {
@@ -396,6 +419,7 @@ export function ResultGrid({
   onKey,
   onPasteCells,
   onPasteRows,
+  links,
 }: ResultGridProps) {
   // The document column is always last, so the shown columns keep their page indexes.
   const columns = useMemo(() => visibleColumns(resultColumns), [resultColumns]);
@@ -638,6 +662,44 @@ export function ResultGrid({
       return value.isNull ? null : value.text;
     },
     [edit, pager, columns],
+  );
+
+  // Foreign-key cells: the link icon after the value (before a right-aligned one).
+  const linkColumns = links?.columns;
+  const linkable = useCallback(
+    (cell: GridCell, col: number) =>
+      linkColumns?.has(col) === true &&
+      cell.kind === GridCellKind.Text &&
+      cell.style !== "faded" &&
+      !(cell.copyData === NULL_COPY_TEXT && cell.displayData === "NULL"),
+    [linkColumns],
+  );
+  const drawCell = useCallback<DrawCellCallback>(
+    (args, drawContent) => {
+      drawContent();
+      const { cell, col, ctx, rect, theme: t } = args;
+      if (!linkable(cell, col)) return;
+      const alignRight = cell.kind === GridCellKind.Text && cell.contentAlign === "right";
+      drawLinkIcon(ctx, rect, alignRight, t.accentColor, t.bgCell);
+    },
+    [linkable],
+  );
+  const linksRef = useRef(links);
+  linksRef.current = links;
+  const onCellClicked = useCallback(
+    ([col, row]: Item, event: CellClickedEventArgs) => {
+      const open = linksRef.current?.open;
+      if (!open || event.isTouch || event.button !== 0) return;
+      if (event.shiftKey || event.ctrlKey || event.metaKey) return;
+      const cell = getCellContent([col, row]);
+      if (!linkable(cell, col)) return;
+      const alignRight = cell.kind === GridCellKind.Text && cell.contentAlign === "right";
+      const { width, height } = event.bounds;
+      if (!hitsLinkIcon(event.localEventX, event.localEventY, width, height, alignRight)) return;
+      event.preventDefault();
+      open({ row, col, value: valueAt(col, row) });
+    },
+    [getCellContent, linkable, valueAt],
   );
 
   /** The raw bytes of a stored binary cell (an image shows as the image), else `null`. */
@@ -970,6 +1032,7 @@ export function ResultGrid({
             rows={rowCount + (edit?.extraRows ?? 0)}
             getCellContent={getCellContent}
             drawHeader={drawHeader}
+            {...(links ? { drawCell, onCellClicked } : {})}
             onVisibleRegionChanged={onVisibleRegionChanged}
             onColumnResize={(_column, newSize, index) =>
               setWidths((current) => ({ ...current, [index]: newSize }))
