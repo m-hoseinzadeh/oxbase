@@ -16,15 +16,26 @@ on:
 
 # The action only reads PR metadata and writes the signatures file. It never checks out or runs
 # code from the pull request, so pull_request_target is safe here.
-permissions:
-  actions: write
-  contents: write
-  pull-requests: write
-  statuses: write
+#
+# Anyone can trigger this workflow, so each job gets only the token scopes it uses, and the
+# third-party action is pinned to a commit SHA (Dependabot updates the pin):
+# - cla: contents: write to commit signatures/cla.json to the `cla-signatures` branch,
+#   pull-requests: write for its PR comment, actions: read to find the failed CLA run to re-run.
+#   No statuses: write (the action sets no commit statuses) and no actions: write, so it cannot
+#   dispatch workflows (release.yml) or delete caches.
+# - rerun: after a signing or `recheck` comment, re-runs the failed pull_request_target CLA run
+#   so the PR check turns green. The action would do this itself with actions: write; here it is
+#   done with the runner's `gh` CLI, no third-party code. (The action still tries and logs a
+#   harmless "Error occurred when re-running the workflow".)
+permissions: {}
 
 jobs:
   cla:
     runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
+      pull-requests: write
     if: >-
       github.event_name == 'pull_request_target' ||
       (github.event.issue.pull_request &&
@@ -32,7 +43,7 @@ jobs:
         github.event.comment.body == 'I have read the CLA Document and I hereby sign the CLA'))
     steps:
       - name: CLA Assistant
-        uses: contributor-assistant/github-action@v2.6.1
+        uses: contributor-assistant/github-action@ca4a40a7d1004f18d9960b404b97e5f30a505a08 # v2.6.1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
@@ -41,3 +52,26 @@ jobs:
           branch: cla-signatures
           allowlist: m-hoseinzadeh,dependabot[bot],github-actions[bot],renovate[bot]
           lock-pullrequest-aftermerge: false
+
+  rerun:
+    needs: cla
+    if: github.event_name == 'issue_comment'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      pull-requests: read
+    steps:
+      - name: Re-run the failed CLA check of this pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          branch=$(gh pr view "$PR_NUMBER" --json headRefName --jq .headRefName)
+          run_id=$(gh run list --workflow cla.yml --event pull_request_target --branch "$branch" \
+            --limit 1 --json databaseId,conclusion --jq '.[] | select(.conclusion == "failure") | .databaseId')
+          if [ -n "$run_id" ]; then
+            gh run rerun "$run_id"
+          else
+            echo "No failed CLA run to re-run for $branch"
+          fi
