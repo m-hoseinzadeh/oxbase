@@ -36,6 +36,7 @@ vi.mock("../results/ResultGrid", async () => {
       onKey,
       onPasteCells,
       onPasteRows,
+      links,
     }: ResultGridProps) => {
       const [open, setOpen] = useState<[number, number] | null>(null);
       const [menu, setMenu] = useState<MenuItem[] | null>(null);
@@ -50,7 +51,10 @@ vi.mock("../results/ResultGrid", async () => {
       const isSelected = (r: number) =>
         selectedRows?.current === r || !!selectedRows?.ranges.some(([a, b]) => r >= a && r < b);
       return (
-        <div data-testid="grid">
+        <div data-testid="grid" data-links={[...(links?.columns ?? [])].join(",")}>
+          <button type="button" onClick={() => links?.open({ row: 1, col: 1, value: "name1" })}>
+            link 1 name
+          </button>
           <button
             type="button"
             onClick={() =>
@@ -881,6 +885,55 @@ describe("TableDataPanel", () => {
       },
     });
     setDockviewApi(null);
+  });
+
+  it("draws link icons in foreign-key columns (any case) and opens the row from one", async () => {
+    foreignKeys = [
+      {
+        // The catalog spells the column differently (SQL Server, MySQL compare without case).
+        columns: ["NAME"],
+        ref_table: { kind: "table", catalog: "app", schema: "public", name: "customers" },
+        ref_columns: ["code"],
+        on_delete: "no_action",
+        on_update: "no_action",
+        extras: {},
+      } as unknown as ForeignKeyDef,
+    ];
+    const addPanel = vi.fn();
+    setDockviewApi({ panels: [], addPanel } as never);
+    await renderPanel();
+    await waitFor(() => expect(screen.getByTestId("grid").dataset.links).toBe("1"));
+    fireEvent.click(screen.getByRole("button", { name: "link 1 name" }));
+    await waitFor(() => expect(addPanel).toHaveBeenCalledTimes(1));
+    expect(addPanel.mock.calls[0]?.[0]).toMatchObject({
+      params: { table: { name: "customers" }, related: [{ column: "code", value: "name1" }] },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "cell menu 1 name" }));
+    expect(
+      within(screen.getByTestId("grid-menu")).getByRole("button", {
+        name: "Open related row in public.customers",
+      }),
+    ).toBeInTheDocument();
+    setDockviewApi(null);
+  });
+
+  it("says in the cell menu why related rows are unavailable", async () => {
+    const base = tauriCore.invoke.getMockImplementation();
+    tauriCore.invoke.mockImplementation(async (cmd, args) => {
+      if (cmd === "designer_load") throw { category: "unsupported", message: "no fetcher" };
+      return base?.(cmd, args);
+    });
+    await renderPanel();
+    await waitFor(() => expect(calls("designer_load")).toHaveLength(1));
+    expect(screen.getByTestId("grid").dataset.links).toBe("");
+    await waitFor(() => {
+      fireEvent.click(screen.getByRole("button", { name: "cell menu 1 name" }));
+      expect(
+        within(screen.getByTestId("grid-menu")).getByRole("button", {
+          name: /could not read the foreign keys \(no fetcher\)/,
+        }),
+      ).toBeInTheDocument();
+    });
   });
 
   it("starts a related-rows tab filtered to them, the builders open", async () => {
