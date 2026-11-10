@@ -16,7 +16,7 @@
 import { type GridCell, GridCellKind, type Rectangle } from "@glideapps/glide-data-grid";
 import type { Table } from "apache-arrow";
 import type { ColumnInfo } from "../../api";
-import type { CellText, CopyColumn } from "./copyFormats";
+import { type CellText, type CopyColumn, toHtmlTable, toTsv } from "./copyFormats";
 import { type FormattedCell, formatCell } from "./format";
 import type { ResultPager } from "./pager";
 
@@ -271,4 +271,52 @@ export async function readSelection(
   const found = cellsForSelection(pager, columns, rowCount, rect, signal, notify);
   const cells = typeof found === "function" ? await found() : found;
   return cells.map((row) => row.map(cellText));
+}
+
+/** What a plain copy puts on the clipboard. */
+export interface CopiedText {
+  /** Tab-separated text (`text/plain`). */
+  text: string;
+  /** The same cells as an escaped HTML table (`text/html`, see `toHtmlTable`). */
+  html: string;
+}
+
+/**
+ * What plain Copy (Ctrl+C, the cell menu's Copy) writes for the selection's rectangles
+ * (`selectionRects`): selected columns side by side, else the ranges over the first one's
+ * columns one below the other. At once when every cell is cached (so a `copy` event can
+ * write it), else a promise that reads them from the core like Glide's copy, with the same
+ * limits; it rejects when that read fails (`notify` said why).
+ *
+ * Oxbase writes these itself: Glide's copy puts the cell text into its HTML table unescaped.
+ */
+export function copiedSelection(
+  pager: ResultPager,
+  columns: ColumnInfo[],
+  rowCount: number,
+  rects: Rectangle[],
+  notify: CopyNotify,
+): CopiedText | Promise<CopiedText> {
+  const first = rects[0];
+  if (!first) return { text: "", html: toHtmlTable([]) };
+  const sideBySide =
+    rects.length > 1 && rects.every((r) => r.y === first.y && r.height === first.height);
+  const parts = sideBySide
+    ? rects
+    : rects.filter((r) => r.x === first.x && r.width === first.width);
+  const signal = new AbortController().signal;
+  const found = parts.map((r) => cellsForSelection(pager, columns, rowCount, r, signal, notify));
+  const copied = (cells: CellArray[]): CopiedText => {
+    const blocks = cells.map((block) => block.map((row) => row.map(cellText)));
+    const rows = sideBySide
+      ? (blocks[0] ?? []).map((_, i) => blocks.flatMap((block) => block[i] ?? []))
+      : blocks.flat();
+    return { text: toTsv([], rows, false), html: toHtmlTable(rows) };
+  };
+  if (found.every((f): f is CellArray => typeof f !== "function")) return copied(found);
+  return (async () => {
+    const cells: CellArray[] = [];
+    for (const f of found) cells.push(typeof f === "function" ? await f() : f);
+    return copied(cells);
+  })();
 }

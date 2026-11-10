@@ -30,6 +30,37 @@ export function toTsv(columns: CopyColumn[], rows: CellText[][], withNames: bool
   return lines.join("\n");
 }
 
+/** `text` with the characters HTML gives a meaning (`&`, `<`, `>`, `"`, `'`) as entities. */
+export function escapeHtml(text: string): string {
+  return text
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
+/**
+ * The HTML table of a plain copy (the clipboard's `text/html`, which spreadsheets and rich
+ * editors paste): Glide's layout (each cell's exact value in `gdg-raw-value`, which Glide's own
+ * paste reads back; tabs as four spaces and runs of spaces kept for Excel and Google Sheets),
+ * but every value escaped, so a cell holding `a</td><td>b` or `<img src=...>` stays text.
+ */
+export function toHtmlTable(rows: CellText[][]): string {
+  const cell = (value: CellText) => {
+    const text = value ?? NULL_TEXT;
+    const shown = escapeHtml(text)
+      .replace(/\t/g, "    ")
+      .replace(/ {2,}/g, (spaces) => "<span> </span>".repeat(spaces.length));
+    return `<td gdg-raw-value="${escapeHtml(text)}" gdg-format="string">${shown}</td>`;
+  };
+  const body = rows.map((row) => `<tr>${row.map(cell).join("")}</tr>`).join("");
+  return (
+    '<style type="text/css"><!--br {mso-data-placement:same-cell;}--></style>' +
+    `<table><tbody>${body}</tbody></table>`
+  );
+}
+
 /** A number as it is, when it is a plain JSON / SQL number; else `null`. */
 function numberText(value: string): string | null {
   return /^-?(0|[1-9]\d*)(\.\d+)?([eE][+-]?\d+)?$/.test(value) ? value : null;

@@ -5,7 +5,9 @@ import type { ColumnInfo } from "../../api";
 import {
   type CellArray,
   COPY_CHUNK_ROWS,
+  type CopiedText,
   cellsForSelection,
+  copiedSelection,
   MAX_COPY_ROWS,
   NULL_COPY_TEXT,
 } from "./copy";
@@ -210,5 +212,64 @@ describe("cellsForSelection", () => {
     );
     await expect(resolve(result)).rejects.toThrow("run closed");
     expect(notify).toHaveBeenCalledWith("Copy failed: run closed");
+  });
+});
+
+describe("copiedSelection (audit lead 24)", () => {
+  const MARKUP = ["a</td><td>b", "<img src=https://example.invalid/p>", "x & 'y' \"z\""];
+  const MARKUP_COLUMNS: ColumnInfo[] = [{ name: "v", dataType: "Utf8", nullable: true }];
+
+  it("writes the cells as text and as an HTML table whose cell text stays text", async () => {
+    const fetch = vi.fn(async (offset: number, limit: number) => {
+      return new Table({ v: vectorFromArray(MARKUP.slice(offset, offset + limit), new Utf8()) });
+    });
+    const pager = new ResultPager(fetch, { pageSize: 100 });
+    pager.setRowCount(MARKUP.length);
+    const result = copiedSelection(
+      pager,
+      MARKUP_COLUMNS,
+      MARKUP.length,
+      [{ x: 0, y: 0, width: 1, height: MARKUP.length }],
+      vi.fn(),
+    );
+    expect(result).toBeInstanceOf(Promise);
+    const copied = await result;
+    expect(copied.text).toBe(`${MARKUP[0]}\n${MARKUP[1]}\n"x & 'y' ""z"""`);
+    expect(copied.html).not.toContain("<img");
+    expect(copied.html).toContain(">a&lt;/td&gt;&lt;td&gt;b</td>");
+    const table = new DOMParser().parseFromString(copied.html, "text/html");
+    const cells = [...table.querySelectorAll("td")];
+    expect(cells.map((td) => td.textContent)).toEqual(MARKUP);
+    expect(cells.map((td) => td.getAttribute("gdg-raw-value"))).toEqual(MARKUP);
+    expect(table.querySelectorAll("tr")).toHaveLength(MARKUP.length);
+    expect(table.querySelector("img")).toBeNull();
+  });
+
+  describe("with cached rows", () => {
+    beforeEach(() => {
+      vi.useFakeTimers();
+    });
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it("answers at once, selected columns side by side and NULL as NULL", async () => {
+      const pager = new ResultPager(backend(), { pageSize: 100 });
+      pager.setRowCount(MILLION);
+      pager.setVisible(0, 49);
+      for (let i = 0; i < 10; i += 1) await vi.advanceTimersByTimeAsync(30);
+      const copied = copiedSelection(
+        pager,
+        COLUMNS,
+        MILLION,
+        [
+          { x: 1, y: 0, width: 1, height: 2 },
+          { x: 0, y: 0, width: 1, height: 2 },
+        ],
+        vi.fn(),
+      );
+      expect(copied).not.toBeInstanceOf(Promise);
+      expect((copied as CopiedText).text).toBe(`${NULL_COPY_TEXT}\t0\n"line 1\nnext"\t1`);
+    });
   });
 });
