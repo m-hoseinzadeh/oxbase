@@ -12,7 +12,9 @@ use std::time::{Duration, Instant};
 use arrow_array::Array;
 use arrow_array_check::{column_i32, column_str};
 use futures::StreamExt;
-use oxbase_dialect::{DdlContext, DdlGenerator, DialectRegistry, Fetcher};
+use oxbase_dialect::{
+    BulkLoader, CatalogReader, CatalogScope, DdlContext, DdlGenerator, DialectRegistry, Fetcher,
+};
 use oxbase_driver::arrow::DataType;
 use oxbase_driver::{
     CancellationToken, ConnectParams, Connection, Driver, NoticeSeverity, PemSource, ResultItem,
@@ -23,6 +25,7 @@ use oxbase_net::ssh::{
     TunnelProvider,
 };
 use oxbase_pg::PgDriver;
+use oxbase_pg::dialect::{PgBulkLoader, PgCatalogReader};
 use oxbase_pg::dialect::{SETTINGS, SQL_STANDARD_BODY};
 use oxbase_types::{Endpoint, Engine, Error, ObjectDef, ObjectKind, ObjectRef, Script, Value};
 
@@ -1334,4 +1337,86 @@ async fn row_security_policies_and_view_options_are_kept() {
 
     drop_schemas(&*conn, &[src, tgt]).await;
     run(&*conn, &format!("DROP ROLE IF EXISTS {role}"), &[]).await;
+}
+
+/// The catalog SQL with qualified functions, `text`-cast names, `OPERATOR(pg_catalog.=)` and
+/// `generate_subscripts` key positions (audit lead 14) still reads what it read: a full and a
+/// scoped schema-cache read (a two-column foreign key in key order, comments, sequences), the
+/// tree fetchers, and the identity resync after a load with explicit keys.
+#[tokio::test]
+#[ignore = "needs the postgres fixture"]
+async fn qualified_catalog_queries_read_the_same() {
+    let f = fixture();
+    let conn = connect(&plain_params(&f)).await;
+    let schema = "oxbase_l14_cat";
+    fresh_schemas(&*conn, &[schema]).await;
+    for sql in [
+        format!("CREATE TABLE {schema}.p (a int, b int, PRIMARY KEY (a, b))"),
+        format!(
+            "CREATE TABLE {schema}.c (id serial PRIMARY KEY, x int, y int, \
+             FOREIGN KEY (y, x) REFERENCES {schema}.p (b, a))"
+        ),
+        format!("COMMENT ON TABLE {schema}.c IS 'child rows'"),
+        format!("INSERT INTO {schema}.p VALUES (1, 2)"),
+        format!("INSERT INTO {schema}.c (id, x, y) VALUES (41, 1, 2)"),
+    ] {
+        run(&*conn, &sql, &[]).await;
+    }
+    let scoped = CatalogScope {
+        schemas: Some(vec![schema.to_owned()]),
+        ..CatalogScope::full()
+    };
+    for scope in [CatalogScope::full(), scoped] {
+        let snap = PgCatalogReader
+            .read(&*conn, &scope, CancellationToken::new())
+            .await
+            .unwrap_or_else(|e| panic!("{scope:?}: {e}"));
+        let s = snap
+            .schemas
+            .iter()
+            .find(|s| s.name == schema)
+            .unwrap_or_else(|| panic!("{schema} missing in {scope:?}"));
+        let c = s.relations.iter().find(|r| r.name == "c").expect("table c");
+        assert_eq!(c.comment.as_deref(), Some("child rows"));
+        assert_eq!(c.foreign_keys.len(), 1, "{:?}", c.foreign_keys);
+        let fk = &c.foreign_keys[0];
+        assert_eq!(fk.columns, ["y", "x"]);
+        assert_eq!(fk.ref_table, "p");
+        assert_eq!(fk.ref_columns, ["b", "a"]);
+        assert_eq!(s.sequences, ["c_id_seq"]);
+        assert!(
+            snap.schemas.iter().all(|s| !s.system),
+            "system schemas are left out unless asked for"
+        );
+    }
+    let tables = fetcher(ObjectKind::Table)
+        .list(
+            &*conn,
+            &ObjectRef::schema(None, schema),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let names: Vec<&str> = tables.iter().map(|t| t.obj.name.as_str()).collect();
+    assert_eq!(names, ["c", "p"]);
+    let ObjectDef::Table(c) = load_def(&*conn, &ObjectRef::table(None, Some(schema), "c")).await
+    else {
+        panic!("c is not a table")
+    };
+    assert_eq!(c.comment.as_deref(), Some("child rows"));
+
+    // The explicit key 41 was loaded past the sequence: the resync moves it on.
+    let table = ObjectRef::table(None, Some(schema), "c");
+    for sql in PgBulkLoader.identity_resync(&table, &c.columns[..1]) {
+        run(&*conn, &sql, &[]).await;
+    }
+    assert_eq!(
+        text_of(
+            &*conn,
+            &format!("SELECT nextval('{schema}.c_id_seq')::text")
+        )
+        .await,
+        Some("42".to_owned())
+    );
+    drop_schemas(&*conn, &[schema]).await;
 }

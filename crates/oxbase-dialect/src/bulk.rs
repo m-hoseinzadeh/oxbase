@@ -414,8 +414,9 @@ pub trait BulkLoader: Send + Sync {
     /// M8: statements run after loads that wrote explicit values into the identity or
     /// auto-increment `columns` of `table`, so the next generated value follows the loaded ones.
     /// Default: none (MySQL, MariaDB, SQLite and SQL Server move their counters past explicit
-    /// values themselves). PostgreSQL (transfer stream): `SELECT setval(pg_get_serial_sequence(
-    /// '<table>', '<column>'), max(<column>)) FROM <table>` per column, names as literals and
+    /// values themselves). PostgreSQL (transfer stream): `SELECT pg_catalog.setval(
+    /// pg_catalog.pg_get_serial_sequence('<table>', '<column>')::pg_catalog.regclass,
+    /// pg_catalog.max(<column>)::pg_catalog.int8) FROM <table>` per column, names as literals and
     /// identifiers through `Quoting`.
     fn identity_resync(&self, table: &ObjectRef, columns: &[ColumnDef]) -> Vec<String> {
         let _ = (table, columns);
