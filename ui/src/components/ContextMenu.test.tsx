@@ -48,9 +48,23 @@ describe("ContextMenu", () => {
   it("keeps the menus open on a click inside the submenu, closes them outside", () => {
     const { onClose } = menu();
     fireEvent.mouseEnter(screen.getByRole("menuitem", { name: "Copy as" }));
-    fireEvent.mouseDown(screen.getByRole("menuitem", { name: "Markdown table" }));
+    fireEvent.pointerDown(screen.getByRole("menuitem", { name: "Markdown table" }));
     expect(onClose).not.toHaveBeenCalled();
-    fireEvent.mouseDown(document.body);
+    fireEvent.pointerDown(document.body);
     expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it("closes on a click in an element that cancels or stops the pointer event (the grid)", () => {
+    const { onClose } = menu();
+    const grid = document.createElement("canvas");
+    document.body.append(grid);
+    // Like Glide's cells: no `mousedown` follows, and the event does not bubble on.
+    grid.addEventListener("pointerdown", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+    });
+    fireEvent.pointerDown(grid, { button: 0 });
+    expect(onClose).toHaveBeenCalledTimes(1);
+    grid.remove();
   });
 });
