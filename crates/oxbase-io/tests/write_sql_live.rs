@@ -444,7 +444,8 @@ async fn mssql_dump_runs_on_sql_server() {
     let name = scratch_name();
     let create = format!(
         "CREATE TABLE [dbo].[{name}] (id int IDENTITY(1,1) PRIMARY KEY, name nvarchar(100), \
-         dt datetime, sdt smalldatetime, dt2 datetime2(7), bin varbinary(32), rv rowversion)"
+         dt datetime, sdt smalldatetime, dt2 datetime2(7), bin varbinary(32), rv rowversion, \
+         memo nvarchar(max))"
     );
     run(c.as_ref(), &create).await.unwrap();
     let mut table = TableDef::new(ObjectRef::table(None, Some("dbo"), name.clone()));
@@ -482,17 +483,24 @@ async fn mssql_dump_runs_on_sql_server() {
             "varbinary(32)",
         ),
         rv,
+        column("memo", DataType::Text, "nvarchar(max)"),
     ];
     // `datetime` keeps 1/300 s ticks: .003 and .997 are read as .003333 and .996667.
+    // Audit lead 21: `memo` holds lines sqlcmd and SSMS would read as a batch end or their
+    // commands, and a text of 9000 characters on 3000 lines (nested CONCATs, nvarchar(max)).
     let inserts = [
         format!(
-            "INSERT INTO [dbo].[{name}] (name, dt, sdt, dt2, bin) VALUES (N{TRICKY_SQL}, \
+            "INSERT INTO [dbo].[{name}] (name, dt, sdt, dt2, bin, memo) VALUES (N{TRICKY_SQL}, \
              '2024-01-02T10:00:00.003', '2024-01-02T10:00:00', \
-             '2024-01-02T10:00:00.1234567', 0x00ff5c27)"
+             '2024-01-02T10:00:00.1234567', 0x00ff5c27, \
+             REPLICATE(CAST(N'ab' AS nvarchar(max)) + NCHAR(10), 3000))"
         ),
         format!(
-            "INSERT INTO [dbo].[{name}] (name, dt, sdt, dt2, bin) VALUES (N'x', \
-             '2024-01-02T23:59:59.997', '2024-01-02T23:59:00', '0001-01-01T00:00:00', 0x)"
+            "INSERT INTO [dbo].[{name}] (name, dt, sdt, dt2, bin, memo) VALUES (N'x', \
+             '2024-01-02T23:59:59.997', '2024-01-02T23:59:00', '0001-01-01T00:00:00', 0x, \
+             N'a' + NCHAR(13) + NCHAR(10) + N'GO' + NCHAR(10) + N'SELECT 1/0' + NCHAR(10) + \
+             N'GO' + NCHAR(10) + N'!! echo oxbase_canary_os' + NCHAR(10) + N':setvar X 1' + \
+             NCHAR(10) + N'$(PATH)')"
         ),
         format!(
             "INSERT INTO [dbo].[{name}] (name, dt, sdt, dt2, bin) VALUES \
@@ -506,7 +514,10 @@ async fn mssql_dump_runs_on_sql_server() {
             table,
             inserts: &inserts,
             export: format!("SELECT * FROM [dbo].[{name}] ORDER BY id"),
-            compare: format!("SELECT id, name, dt, sdt, dt2, bin FROM [dbo].[{name}] ORDER BY id"),
+            compare: format!(
+                "SELECT id, name, dt, sdt, dt2, bin, memo, LEN(memo) FROM [dbo].[{name}] \
+                 ORDER BY id"
+            ),
             before_dump: &[],
             before_read: &[],
         },
@@ -516,4 +527,16 @@ async fn mssql_dump_runs_on_sql_server() {
     let text = result.unwrap();
     assert!(text.contains("AS datetime2(7))"), "{text}");
     assert!(text.contains("-- column rv left out"), "{text}");
+    // No line of a value is a line of the script.
+    for line in text.lines() {
+        let line = line.trim_start();
+        assert!(
+            !(line.starts_with("!!")
+                || line.starts_with(':')
+                || line.eq_ignore_ascii_case("go")
+                || line.starts_with("SELECT 1/0")),
+            "{line}"
+        );
+    }
+    assert!(!text.contains("$("), "{text}");
 }

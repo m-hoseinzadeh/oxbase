@@ -30,7 +30,11 @@
 //!   rendered with `Quoting::dump_literal` of [`oxbase_driver::cell_value`] (strings and
 //!   binary escaped by the target dialect: PostgreSQL standard strings / `'\x..'::bytea`,
 //!   MySQL backslashes, SQL Server `N'...'` / `0x..`; date-times in a form the target reads;
-//!   SQLite decimals quoted). Statements end with `;` (no `GO` lines). Explicit identity values
+//!   SQLite decimals quoted). SQL Server strings with a line break or `$(` are a `CONCAT` of
+//!   pieces without them (`CONCAT(N'a', NCHAR(10), N'b')`), and a name with a line break fails
+//!   the dump (`Unsupported`): sqlcmd and SSMS read a script line by line before the server
+//!   does, so a line of a value or name could end the batch (`GO`) or run as their command
+//!   (`!!`, `:r`). Statements end with `;` (no `GO` lines). Explicit identity values
 //!   follow `Quoting::dump_identity_insert`: SQL Server `SET IDENTITY_INSERT <table> ON` /
 //!   `OFF` around the inserts, PostgreSQL `OVERRIDING SYSTEM VALUE` for `GENERATED ALWAYS`.
 //! - Line ends `\n`, UTF-8 without BOM. Progress in bytes written.
