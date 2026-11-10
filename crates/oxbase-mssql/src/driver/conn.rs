@@ -203,6 +203,30 @@ fn tls_plan(params: &ConnectParams, settings: &Settings, host: &str) -> Result<T
     })
 }
 
+/// What a user can do about a login refused by [`check_password_destination`].
+const PASSWORD_HINT: &str = "use TLS mode verify_full (or verify_ca with the server's CA \
+     file), connect through SSH to the server's own machine, or, accepting the risk, tick \
+     \"Send the password to an unverified server\" in the connection's TLS settings";
+
+/// A SQL Server login (LOGIN7) carries the password itself, only obscured, so it goes only where
+/// [`TlsOptions::password_may_reach`](oxbase_types::TlsOptions::password_may_reach) allows: a
+/// verified certificate, a loopback server (through SSH: the bastion itself), or the user's
+/// explicit choice. Otherwise an unverified peer, such as an on-path attacker answering the
+/// PRELOGIN without encryption or presenting any certificate, would read it. Checked before any
+/// socket is opened; a login without a password reveals nothing and is not refused.
+fn check_password_destination(params: &ConnectParams, server: &Endpoint) -> Result<()> {
+    let has_password = params.password.as_ref().is_some_and(|p| !p.is_empty());
+    if !has_password || params.tls.password_may_reach(server) {
+        return Ok(());
+    }
+    Err(Error::auth(format!(
+        "SQL Server at {server}: the login was not sent, because a SQL Server login carries the \
+         password itself and the server's TLS certificate is not verified (TLS mode {}): \
+         {PASSWORD_HINT}",
+        params.tls.mode
+    )))
+}
+
 /// Opens a session (see the module docs of [`crate::driver`]).
 pub(crate) async fn connect(params: &ConnectParams) -> Result<MsSqlConnection> {
     if params.engine != Engine::MsSql {
@@ -240,6 +264,7 @@ pub(crate) async fn connect(params: &ConnectParams) -> Result<MsSqlConnection> {
     } else {
         server.to_string()
     };
+    check_password_destination(params, &server)?;
     let plan = tls_plan(params, &settings, &server.host)?;
     let timeout = params.connect_timeout.unwrap_or(DEFAULT_CONNECT_TIMEOUT);
     match tokio::time::timeout(
@@ -1192,6 +1217,39 @@ mod tests {
             let mut p = params();
             p.options.insert(key.into(), value.into());
             assert!(Settings::from_params(&p).is_err(), "{key}={value}");
+        }
+    }
+
+    #[test]
+    fn the_password_goes_only_to_a_verified_or_local_server() {
+        let remote = Endpoint::new("db.example", 1433);
+        for mode in [TlsMode::Disable, TlsMode::Prefer, TlsMode::Require] {
+            let p = params().with_tls(TlsOptions::new(mode));
+            let err = check_password_destination(&p, &remote).unwrap_err();
+            let Error::Auth { message } = &err else {
+                panic!("{mode}: expected an authentication error, got {err}");
+            };
+            assert!(message.contains("verify_full"), "{mode}: {message}");
+
+            let allowed =
+                params().with_tls(TlsOptions::new(mode).with_unverified_password_allowed(true));
+            assert!(
+                check_password_destination(&allowed, &remote).is_ok(),
+                "{mode}"
+            );
+            let local = Endpoint::new("127.0.0.1", 1433);
+            assert!(check_password_destination(&p, &local).is_ok(), "{mode}");
+            let no_password = ConnectParams::network(Engine::MsSql, "db.example")
+                .with_user("sa")
+                .with_tls(TlsOptions::new(mode));
+            assert!(
+                check_password_destination(&no_password, &remote).is_ok(),
+                "{mode}"
+            );
+        }
+        for mode in [TlsMode::VerifyCa, TlsMode::VerifyFull] {
+            let p = params().with_tls(TlsOptions::new(mode));
+            assert!(check_password_destination(&p, &remote).is_ok(), "{mode}");
         }
     }
 
