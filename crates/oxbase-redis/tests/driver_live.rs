@@ -937,7 +937,15 @@ async fn dedicated_and_pubsub_connections() {
 #[ignore = "needs the redis fixture and the SSH bastion"]
 async fn ssh_tunnel_plaintext_and_cancel() {
     let (tunnel, ssh, server) = bastion_tunnel("redis").await;
-    let p = through(params(), &tunnel, &ssh, &server);
+    // The bastion reaches `redis` over its network without TLS: AUTH would carry the password
+    // there unprotected, so it needs the user's explicit choice.
+    let Err(refused) = RedisConnection::connect(&through(params(), &tunnel, &ssh, &server)).await
+    else {
+        panic!("plaintext AUTH to a remote server was not refused");
+    };
+    assert!(matches!(refused, Error::Auth { .. }), "{refused}");
+    let mut p = through(params(), &tunnel, &ssh, &server);
+    p.tls.allow_unverified_password = true;
     let c = Arc::new(connect(&p).await);
     assert!(!c.tls_in_use());
     ping(c.as_ref()).await;

@@ -89,6 +89,14 @@ provider (`tls::crypto_provider()`).
   Unix socket); otherwise they fail with `Error::Auth` before anything is sent. SCRAM and MySQL
   fast authentication work in every mode. The switch is `password_disclosure` in the vendored
   `tokio-postgres` / `mysql_async` (vendor/<crate>/OXBASE.md).
+- Logins that always carry the password: SQL Server logins (LOGIN7) and Redis `AUTH` /
+  `HELLO ... AUTH` follow the same rule, checked before any socket is opened. For Redis the
+  password must be allowed for every server that would get it (sentinels with
+  `sentinel_auth = same`, the master they name, the cluster seeds).
+- The single rule is `TlsOptions::password_may_reach`. The profile's
+  `tls.allow_unverified_password` (the dialog's "Send the password to an unverified server",
+  off by default) is the user's explicit way around it for every engine. Changing it counts as a
+  destination change, so the saved password must be typed again.
 - `Connection::tls_in_use()` (a default method, `false`) must be overridden by every network
   driver to report whether the session is actually encrypted.
 
