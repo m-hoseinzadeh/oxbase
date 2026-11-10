@@ -7,7 +7,12 @@ import { getZoom, resetZoom } from "./zoom";
 
 describe("Settings window", () => {
   afterEach(() => {
-    updateSettings({ gridDensity: "default", filterOpen: false, sessionMode: "per_tab" });
+    updateSettings({
+      gridDensity: "default",
+      filterOpen: false,
+      sessionMode: "per_tab",
+      confirmQuit: true,
+    });
     setThemePreference("dark");
     resetZoom();
     localStorage.clear();
@@ -35,6 +40,8 @@ describe("Settings window", () => {
     expect(getSettings().filterOpen).toBe(true);
     fireEvent.change(within(dialog).getByLabelText("Sessions"), { target: { value: "per_run" } });
     expect(getSettings().sessionMode).toBe("per_run");
+    fireEvent.click(within(dialog).getByRole("checkbox", { name: "Ask before quitting Oxbase" }));
+    expect(getSettings().confirmQuit).toBe(false);
     // Remembered.
     expect(JSON.parse(localStorage.getItem("oxbase.settings") ?? "{}")).toMatchObject({
       gridDensity: "compact",

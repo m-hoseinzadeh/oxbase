@@ -102,6 +102,8 @@
     "allow-workspace-save",
     "allow-app-events-subscribe",
     "allow-app-close-ready",
+    "allow-app-close-wait",
+    "allow-app-close-cancel",
     "dialog:allow-open",
     "core:window:allow-set-theme",
     "core:webview:allow-set-webview-zoom"

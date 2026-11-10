@@ -208,6 +208,18 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
           </div>
         </fieldset>
 
+        <fieldset className="fieldset settings__group">
+          <legend>Quitting</legend>
+          <label className="checkbox">
+            <input
+              type="checkbox"
+              checked={settings.confirmQuit}
+              onChange={(e) => updateSettings({ confirmQuit: e.target.checked })}
+            />
+            Ask before quitting Oxbase
+          </label>
+        </fieldset>
+
         <section className="settings__group settings__shortcuts" aria-labelledby={`${id}-keys`}>
           <h3 className="settings__heading" id={`${id}-keys`}>
             Keyboard shortcuts

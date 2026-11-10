@@ -69,6 +69,10 @@ The workspace is kept a second after every change, and once more when the app cl
 crash loses at most the last second. Up to 200 tabs and 64 MB of unsaved text are kept. Other
 tabs (table data, designer, sync) are not kept.
 
+Closing the app asks first (**Quit Oxbase?**). The question says how many connections quitting
+closes and names every table tab whose pending changes were not applied, because those are lost.
+**Don't ask again**, or **Settings › Quitting › Ask before quitting Oxbase**, turns it off.
+
 ## Opening files from the operating system
 
 The installers register two file types:
@@ -105,6 +109,8 @@ Oxbase. Quit the installed app first, or the dev build hands its arguments to it
   `ui/src/workbench/documents/`.
 - Files opened by the system and quit requests reach the UI through a Tauri `Channel`
   (`app_events_subscribe`), so the webview needs no event permission. Quitting waits up to
-  3 seconds for the UI to keep the workspace.
+  3 seconds for the UI to keep the workspace. While the UI asks whether to quit, it calls
+  `app_close_wait`, which holds the close until the answer: `app_close_ready` quits and
+  `app_close_cancel` keeps the app open.
 - Recent files, file links and the workspace are JSON values in the app database's `settings`
   table (`documents.recent`, `documents.links`, `workspace`).

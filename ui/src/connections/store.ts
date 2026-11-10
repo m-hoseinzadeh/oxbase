@@ -53,6 +53,11 @@ export function refreshAll(): Promise<void> {
   return Promise.all([refreshProfiles(), refreshSessions()]).then(() => undefined);
 }
 
+/** The current state, outside React. */
+export function getConnections(): ConnectionsSnapshot {
+  return snapshot;
+}
+
 export function useConnections(): ConnectionsSnapshot {
   return useSyncExternalStore(subscribe, () => snapshot);
 }
