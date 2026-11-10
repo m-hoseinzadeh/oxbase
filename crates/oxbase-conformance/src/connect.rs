@@ -615,8 +615,8 @@ impl Ctx {
         let st = self.statements(e)?;
         let mut p = self.profile(e, false).await?;
         self.through_ssh(&mut p, &e.name, false).await?;
-        if e.engine == Engine::MsSql {
-            // Its login carries the password itself, and the bastion reaches the in-network
+        if matches!(e.engine, Engine::MsSql | Engine::Redis) {
+            // Their logins carry the password itself, and the bastion reaches the in-network
             // host without TLS: refused unless the user allows an unverified server.
             self.expect_refused(&p, "a password login over SSH without TLS", Refusal::Any)
                 .await?;

@@ -760,6 +760,32 @@ async fn open_single(
     })
 }
 
+/// What a user can do about a password refused by [`check_password_destination`].
+const PASSWORD_HINT: &str = "use TLS mode verify_full (or verify_ca with the server's CA \
+     file), connect through SSH to the server's own machine, or, accepting the risk, tick \
+     \"Send the password to an unverified server\" in the connection's TLS settings";
+
+/// `AUTH` (and `HELLO ... AUTH`) carries the password itself, so it goes only to servers that
+/// [`TlsOptions::password_may_reach`](oxbase_types::TlsOptions::password_may_reach) allows: a
+/// verified certificate, a loopback server (through SSH: the bastion itself), or the user's
+/// explicit choice. Otherwise an unverified peer, such as an on-path attacker answering in
+/// plaintext or presenting any certificate, would read it. `to` is every server the password
+/// would go to (the server, the sentinels with `sentinel_auth = same` and then the master they
+/// name, or the cluster seeds). Cluster nodes the seeds announce are not known in advance: with
+/// a verified certificate they are verified too, and loopback seeds are a cluster on this
+/// machine. A profile without a password reveals nothing and is not refused.
+fn check_password_destination(params: &ConnectParams, to: &[Endpoint]) -> Result<()> {
+    let has_password = params.password.as_ref().is_some_and(|p| !p.is_empty());
+    match to.iter().find(|e| !params.tls.password_may_reach(e)) {
+        Some(server) if has_password => Err(Error::auth(format!(
+            "Redis at {server}: the password was not sent, because AUTH carries it as it is and \
+             the server's TLS certificate is not verified (TLS mode {}): {PASSWORD_HINT}",
+            params.tls.mode
+        ))),
+        _ => Ok(()),
+    }
+}
+
 /// Connects in the profile's mode. Returns the opened link and, for standalone and sentinel,
 /// the server address side connections use.
 async fn open(params: &ConnectParams, options: &RedisOptions) -> Result<(Opened, Option<Address>)> {
@@ -770,6 +796,7 @@ async fn open(params: &ConnectParams, options: &RedisOptions) -> Result<(Opened,
             else {
                 return Err(Error::invalid_input("the Redis profile has no host"));
             };
+            check_password_destination(params, std::slice::from_ref(&server))?;
             let address = Address {
                 dial: dial_at,
                 server,
@@ -778,7 +805,11 @@ async fn open(params: &ConnectParams, options: &RedisOptions) -> Result<(Opened,
             Ok((opened, Some(address)))
         }
         RedisMode::Sentinel { master_name, auth } => {
+            if *auth == SentinelAuth::Same {
+                check_password_destination(params, &options.seeds)?;
+            }
             let master = resolve_master(params, options, master_name, *auth).await?;
+            check_password_destination(params, std::slice::from_ref(&master))?;
             let address = Address::direct(master);
             let opened = open_single(params, &address, options.protocol, db).await?;
             Ok((opened, Some(address)))
@@ -879,6 +910,7 @@ async fn open_cluster(params: &ConnectParams, options: &RedisOptions) -> Result<
         .first()
         .cloned()
         .ok_or_else(|| Error::invalid_input("the Redis profile has no host"))?;
+    check_password_destination(params, &options.seeds)?;
     let tls = &params.tls;
     let tls_mode = match tls.mode {
         TlsMode::Disable => None,
@@ -1174,6 +1206,59 @@ mod tests {
         assert_eq!(pairs[1].0, "id");
         assert_eq!(scalar_text(&pairs[1].1).as_deref(), Some("7"));
         assert_eq!(hello_pairs(Value::Nil), Vec::new());
+    }
+
+    #[test]
+    fn the_password_goes_only_to_verified_or_local_servers() {
+        use oxbase_types::TlsOptions;
+        let with = |mode| {
+            ConnectParams::network(oxbase_types::Engine::Redis, "h")
+                .with_password("Secret_Marker_123")
+                .with_tls(TlsOptions::new(mode))
+        };
+        let local = Endpoint::new("127.0.0.1", 6379);
+        let remote = Endpoint::new("redis.example", 6379);
+        for mode in [TlsMode::Disable, TlsMode::Prefer, TlsMode::Require] {
+            let err = check_password_destination(&with(mode), &[local.clone(), remote.clone()])
+                .unwrap_err();
+            let Error::Auth { message } = &err else {
+                panic!("{mode}: expected an authentication error, got {err}");
+            };
+            assert!(message.contains("redis.example:6379"), "{mode}: {message}");
+            assert!(message.contains("verify_full"), "{mode}: {message}");
+            assert!(!message.contains("Secret_Marker_123"), "{mode}: {message}");
+            assert!(check_password_destination(&with(mode), std::slice::from_ref(&local)).is_ok());
+
+            let mut allowed = with(mode);
+            allowed.tls.allow_unverified_password = true;
+            assert!(check_password_destination(&allowed, std::slice::from_ref(&remote)).is_ok());
+            let mut no_password = with(mode);
+            no_password.password = None;
+            assert!(
+                check_password_destination(&no_password, std::slice::from_ref(&remote)).is_ok()
+            );
+        }
+        for mode in [TlsMode::VerifyCa, TlsMode::VerifyFull] {
+            assert!(check_password_destination(&with(mode), std::slice::from_ref(&remote)).is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unverified_remote_server_never_sees_the_password() {
+        // A remote name reached through `dial_addr`, like a tunnel: refused before dialling.
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let params = ConnectParams::network(oxbase_types::Engine::Redis, "redis.example")
+            .with_port(6379)
+            .with_password("Secret_Marker_123")
+            .with_dial_addr(listener.local_addr().unwrap());
+        let Err(err) = Session::connect(&params).await else {
+            panic!("the connect was not refused");
+        };
+        assert!(matches!(err, Error::Auth { .. }), "{err}");
+        let accepted = tokio::time::timeout(Duration::from_millis(300), listener.accept()).await;
+        assert!(accepted.is_err(), "the client dialled the server");
     }
 
     #[test]
