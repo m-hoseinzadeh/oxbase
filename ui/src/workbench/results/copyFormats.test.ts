@@ -59,6 +59,22 @@ describe("copy formats", () => {
     expect(sqlLiteral("é", false, "mssql")).toBe("N'é'");
   });
 
+  it("escapes backslashes and NULs in MySQL and MariaDB strings (audit lead 22)", () => {
+    // Under the default sql_mode `\'` is an escaped quote: unescaped, this value would end the
+    // string and run DROP TABLE.
+    const breakout = "x\\'); DROP TABLE t; -- ";
+    for (const engine of ["mysql", "mariadb"] as const) {
+      expect(toSqlInsert("`d`.`t`", [{ name: "c", numeric: false }], [[breakout]], engine)).toBe(
+        "INSERT INTO `d`.`t` (`c`) VALUES ('x\\\\''); DROP TABLE t; -- ');",
+      );
+      expect(toInList(["a\\", "n\0ul", "o'k"], false, engine)).toBe("('a\\\\', 'n\\0ul', 'o''k')");
+    }
+    // Standard strings keep a backslash as it is.
+    expect(sqlLiteral("a\\b", false, "postgres")).toBe("'a\\b'");
+    expect(sqlLiteral("a\\b", false, "mssql")).toBe("N'a\\b'");
+    expect(sqlLiteral("a\\b", false, null)).toBe("'a\\b'");
+  });
+
   it("copies an IN list of the distinct values, without NULL", () => {
     expect(toInList(["3", "1", "3", null], true)).toBe("(3, 1)");
     expect(toInList(["a", "o'k"], false)).toBe("('a', 'o''k')");

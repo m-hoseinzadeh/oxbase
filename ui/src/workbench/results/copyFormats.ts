@@ -73,7 +73,15 @@ export function quoteIdent(name: string, engine: Engine | null | undefined): str
   return `"${name.replace(/"/g, '""')}"`;
 }
 
-/** A SQL literal: NULL, a number as it is (numeric columns), else a quoted string. */
+/**
+ * A SQL literal: NULL, a number as it is (numeric columns), else a quoted string.
+ *
+ * MySQL / MariaDB read a backslash in a string as an escape (the default `sql_mode`, which
+ * Oxbase's sessions and its MySQL splitter follow), so a backslash is doubled and a NUL is
+ * `\0`, as the core's dump literals write them (`BacktickQuoting::quote_str`): otherwise a
+ * value ending in `\` or holding `\'` would end the string early and the rest of it would run
+ * as SQL.
+ */
 export function sqlLiteral(
   value: CellText,
   numeric: boolean,
@@ -81,7 +89,12 @@ export function sqlLiteral(
 ): string {
   if (value === null) return "NULL";
   if (numeric && numberText(value) !== null) return value;
-  const quoted = `'${value.replace(/'/g, "''")}'`;
+  const backslashes = engine === "mysql" || engine === "mariadb";
+  // Backslashes first, so the backslash of a NUL's `\0` is not doubled.
+  const escaped = backslashes
+    ? value.replaceAll("\\", "\\\\").replaceAll("'", "''").replaceAll("\0", "\\0")
+    : value.replaceAll("'", "''");
+  const quoted = `'${escaped}'`;
   // SQL Server reads a plain '...' in the database's code page: N'...' keeps every character.
   return engine === "mssql" ? `N${quoted}` : quoted;
 }
