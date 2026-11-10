@@ -11,7 +11,10 @@
 //!
 //! A stored secret that is *sent* to a server (the database password and the SSH password) only
 //! ever goes where the saved profile sent it when it was stored: the same engine, server address,
-//! user, TLS settings, SSH server, SSH user and host-key policy ([`same_destination`]).
+//! user, TLS settings, SSH server, SSH user and host-key policy, and the same values of the
+//! engine options that pick other hosts or change how the secret is protected on the way
+//! ([`destination_options`]: Redis sentinel and cluster nodes, MongoDB hosts and SRV, ...)
+//! ([`same_destination`]).
 //!
 //! - [`save_profile`] refuses an edit that changes the destination unless those secrets are
 //!   typed again (`InvalidInput`), so a typo or a compromised front end cannot re-point a saved
@@ -97,9 +100,48 @@ fn is_own_key(id: Uuid, key: &SecretKey) -> bool {
         .is_some_and(|rest| rest.starts_with('/'))
 }
 
+/// The keys of `engine`'s profile options (`ConnectionProfile::options`) that are part of the
+/// destination: they add or choose the hosts the driver dials with the profile's credentials,
+/// or change how the password is protected on the way (like the TLS settings). Other options
+/// (batch sizes, timeouts, tree and shell settings, ...) are not.
+///
+/// - Redis: `mode`, `nodes` (more cluster nodes or sentinels), `master_name` (the sentinels
+///   name the master to dial) and `sentinel_auth` (whether the sentinels get the password).
+/// - MongoDB: `hosts`, `srv` (hosts from DNS), `replica_set` and `direct_connection` (which
+///   members are dialed), and `auth_mechanism` (`PLAIN` sends the password itself).
+/// - SQL Server: `instance` and `encrypt`.
+/// - PostgreSQL: `channel_binding` and `sslnegotiation`.
+///
+/// MySQL, MariaDB and SQLite have no such option, and neither has the SSH tunnel (its server,
+/// port, user and host-key policy are compared in [`same_destination`]).
+pub fn destination_options(engine: oxbase_store::Engine) -> &'static [&'static str] {
+    use oxbase_store::Engine;
+    match engine {
+        Engine::Redis => &[
+            oxbase_redis::options::MODE,
+            oxbase_redis::options::NODES,
+            oxbase_redis::options::MASTER_NAME,
+            oxbase_redis::options::SENTINEL_AUTH,
+        ],
+        Engine::MongoDb => &[
+            oxbase_mongo::options::HOSTS,
+            oxbase_mongo::options::SRV,
+            oxbase_mongo::options::REPLICA_SET,
+            oxbase_mongo::options::DIRECT_CONNECTION,
+            oxbase_mongo::options::AUTH_MECHANISM,
+        ],
+        Engine::MsSql => &[
+            oxbase_mssql::options::INSTANCE,
+            oxbase_mssql::options::ENCRYPT,
+        ],
+        Engine::Postgres => &["channel_binding", "sslnegotiation"],
+        Engine::MySql | Engine::MariaDb | Engine::Sqlite => &[],
+    }
+}
+
 /// Whether `candidate` sends its credentials to the same place, the same way, as the saved
-/// profile `saved`: same engine, server address, user and TLS settings, and the same SSH server,
-/// user and host-key policy.
+/// profile `saved`: same engine, server address, user and TLS settings, the same SSH server,
+/// user and host-key policy, and the same values of the engine's [`destination_options`].
 pub fn same_destination(saved: &ConnectionProfile, candidate: &ConnectionProfile) -> bool {
     let ssh_route = |p: &ConnectionProfile| {
         p.ssh.as_ref().map(|ssh| {
@@ -120,11 +162,15 @@ pub fn same_destination(saved: &ConnectionProfile, candidate: &ConnectionProfile
             p.tls.server_name.clone(),
         )
     };
+    let options_the_same = destination_options(saved.engine)
+        .iter()
+        .all(|key| saved.options.get(*key) == candidate.options.get(*key));
     saved.engine == candidate.engine
         && saved.address == candidate.address
         && saved.user == candidate.user
         && tls(saved) == tls(candidate)
         && ssh_route(saved) == ssh_route(candidate)
+        && options_the_same
 }
 
 /// Turns the keychain references for secrets that are *sent* to a server (the database password
@@ -183,8 +229,8 @@ pub fn normalize_secret_refs(profile: &mut ConnectionProfile) {
 /// Prepares a possibly edited, unsaved `profile` for a test connect: normalizes its keychain
 /// references and, unless it goes to the same destination as the saved profile with its id,
 /// turns the references for sent secrets into prompts ([`prompt_for_sent_secrets`]). A test of an
-/// edited profile with another server, user, TLS or SSH route therefore uses only values typed
-/// for that call.
+/// edited profile with another server, user, TLS or SSH route, or other destination options,
+/// therefore uses only values typed for that call.
 pub async fn restrict_to_saved_destination(
     repo: &dyn ProfileRepository,
     profile: &mut ConnectionProfile,
@@ -207,7 +253,8 @@ pub async fn restrict_to_saved_destination(
 ///   already be in the store (editing without retyping), otherwise this is `InvalidInput`.
 /// - Secrets sent to a server (database and SSH password) must be typed whenever the profile is
 ///   new or its destination changed ([`same_destination`]); a stored value is never carried over
-///   to another host, user, TLS or SSH route (`InvalidInput` asking to retype it).
+///   to another host, user, TLS or SSH route, or to other destination options such as Redis
+///   sentinel nodes or MongoDB hosts (`InvalidInput` asking to retype it).
 /// - Typed values for prompt-only slots are not stored.
 /// - Keychain entries (in the profile's own namespace) the previous version referred to and
 ///   this one does not are deleted (best effort).
@@ -238,8 +285,8 @@ pub async fn save_profile(
             Some(value) => to_store.push((key, value)),
             None if moved && is_sent(*slot) => {
                 return Err(Error::invalid_input(format!(
-                    "retype {}: the server, user, TLS or SSH settings changed, so the saved one \
-                     is not used",
+                    "retype {}: the server, user, TLS, SSH or host options changed, so the \
+                     saved one is not used",
                     slot_label(*slot)
                 )));
             }
@@ -800,6 +847,171 @@ mod tests {
                 password: SecretRef::Prompt
             })
         );
+    }
+
+    /// Profile options as `(key, value)` pairs.
+    type Options = &'static [(&'static str, &'static str)];
+
+    fn with_options(mut p: ConnectionProfile, options: &[(&str, &str)]) -> ConnectionProfile {
+        p.options.extend(
+            options
+                .iter()
+                .map(|(key, value)| ((*key).to_owned(), (*value).to_owned())),
+        );
+        p
+    }
+
+    /// A profile of `engine` saved with `options` and the stored password `MARKER`.
+    async fn saved_with_password(
+        repo: &MemoryProfileRepository,
+        store: &MemorySecretStore,
+        engine: Engine,
+        options: &[(&str, &str)],
+    ) -> ConnectionProfile {
+        let mut p = with_options(network_profile(), options);
+        p.engine = engine;
+        p.id = Uuid::now_v7();
+        p.password = Some(keychain("pending"));
+        normalize_secret_refs(&mut p);
+        save_profile(repo, store, p, &typed(Some(MARKER)))
+            .await
+            .unwrap()
+    }
+
+    /// Options that add or choose the hosts the driver dials (Redis sentinels and nodes,
+    /// MongoDB hosts, ...) or weaken how the password travels are part of the destination: an
+    /// edit of only those needs the password typed again, and a test of it is not given the
+    /// stored one.
+    #[tokio::test]
+    async fn options_that_pick_hosts_are_part_of_the_destination() {
+        let sentinel: Options = &[
+            ("mode", "sentinel"),
+            ("master_name", "m"),
+            ("nodes", "127.0.0.1:1"),
+            ("sentinel_auth", "same"),
+        ];
+        let cases: [(Engine, Options, Options); 9] = [
+            (Engine::Redis, &[], sentinel),
+            (
+                Engine::Redis,
+                &[],
+                &[("mode", "cluster"), ("nodes", "127.0.0.1:1")],
+            ),
+            (
+                Engine::Redis,
+                sentinel,
+                &[("nodes", "attacker.example:26379")],
+            ),
+            (Engine::Redis, sentinel, &[("master_name", "other")]),
+            (
+                Engine::MongoDb,
+                &[],
+                &[("hosts", "127.0.0.1:1"), ("direct_connection", "false")],
+            ),
+            (Engine::MongoDb, &[], &[("srv", "true")]),
+            (Engine::MongoDb, &[], &[("auth_mechanism", "PLAIN")]),
+            (Engine::MsSql, &[], &[("instance", "OTHER")]),
+            (Engine::Postgres, &[], &[("channel_binding", "disable")]),
+        ];
+        for (engine, before, edit) in cases {
+            let repo = MemoryProfileRepository::new();
+            let store = MemorySecretStore::new();
+            let saved = saved_with_password(&repo, &store, engine, before).await;
+            let moved = with_options(saved.clone(), edit);
+            assert!(!same_destination(&saved, &moved), "{engine}: {edit:?}");
+
+            let err = save_profile(&repo, &store, moved.clone(), &ProvidedSecrets::default())
+                .await
+                .unwrap_err();
+            assert_eq!(err.category(), ErrorCategory::InvalidInput, "{err}");
+            assert!(
+                err.to_string().contains("retype the database password"),
+                "{err}"
+            );
+            assert_eq!(repo.get(saved.id).await.unwrap().as_ref(), Some(&saved));
+
+            let mut tested = moved.clone();
+            restrict_to_saved_destination(&repo, &mut tested)
+                .await
+                .unwrap();
+            assert_eq!(
+                tested.password,
+                Some(SecretRef::Prompt),
+                "{engine}: {edit:?}"
+            );
+
+            // Typed again, the edit saves.
+            let resaved = save_profile(&repo, &store, moved, &typed(Some("retyped")))
+                .await
+                .unwrap();
+            let stored = store
+                .get(&resaved.secret_key(SecretSlot::Password))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(stored.expose(), "retyped");
+        }
+    }
+
+    /// Options that do not choose hosts (timeouts, batch sizes, tree and shell settings, ...)
+    /// keep the stored password.
+    #[tokio::test]
+    async fn other_option_edits_keep_the_stored_password() {
+        let cases: [(Engine, Options); 6] = [
+            (
+                Engine::Redis,
+                &[
+                    ("tree_scan_limit", "10"),
+                    ("namespace_separator", "/"),
+                    ("protocol", "resp2"),
+                ],
+            ),
+            (
+                Engine::MongoDb,
+                &[
+                    ("sample_size", "50"),
+                    ("shell_time_limit_ms", "0"),
+                    ("read_preference", "secondary"),
+                ],
+            ),
+            (
+                Engine::MsSql,
+                &[("batch_rows", "100"), ("application_intent", "read_only")],
+            ),
+            (
+                Engine::Postgres,
+                &[("options", "-c statement_timeout=5000")],
+            ),
+            (
+                Engine::MySql,
+                &[("batch_rows", "100"), ("utc_session", "off")],
+            ),
+            (Engine::MariaDb, &[("tinyint1_as_bool", "false")]),
+        ];
+        for (engine, edit) in cases {
+            let repo = MemoryProfileRepository::new();
+            let store = MemorySecretStore::new();
+            let saved = saved_with_password(&repo, &store, engine, &[]).await;
+            let mut edited = with_options(saved.clone(), edit);
+            edited.connect_timeout_secs = Some(5);
+            assert!(same_destination(&saved, &edited), "{engine}: {edit:?}");
+
+            let mut tested = edited.clone();
+            restrict_to_saved_destination(&repo, &mut tested)
+                .await
+                .unwrap();
+            assert_eq!(tested, edited, "{engine}: the keychain reference stays");
+
+            let resaved = save_profile(&repo, &store, edited, &ProvidedSecrets::default())
+                .await
+                .unwrap();
+            let stored = store
+                .get(&resaved.secret_key(SecretSlot::Password))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(stored.expose(), MARKER, "{engine}");
+        }
     }
 
     /// Whether the OS keychain tests are enabled (`OXBASE_KEYCHAIN_TESTS=1`). They also run only

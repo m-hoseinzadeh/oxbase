@@ -140,7 +140,10 @@ Invariants (the full list is in the module docs):
   `restrict_to_saved_destination` (before testing an edited profile) and `same_destination`.
   Keychain references are normalized to the profile's own keys. **Invariant:** a stored secret
   that is sent to a server (database password, SSH password) only goes to the destination it was
-  saved for (same engine, address, user, TLS settings, SSH host, port, user and host-key policy).
+  saved for (same engine, address, user, TLS settings, SSH host, port, user and host-key policy,
+  and the same values of the engine options that pick hosts or protect the password on the way:
+  `profiles::destination_options`, such as Redis `mode` / `nodes` / `master_name` /
+  `sentinel_auth` and MongoDB `hosts` / `srv` / `replica_set` / `direct_connection`).
   `save_profile` refuses an edit or a new profile that would reuse a stored one for another
   destination (`InvalidInput`: retype it); a test of an edited, unsaved profile uses only typed
   values for those slots. Key passphrases and key material are local and not affected.
