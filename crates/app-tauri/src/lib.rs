@@ -48,7 +48,8 @@
 //!   `document_save_as`, `document_set_link`, `saved_query_list`, `saved_query_create`,
 //!   `saved_query_rename`, `saved_query_delete`, `workspace_load` and `workspace_save`.
 //!   Desktop integration (1.3, `src/shell.rs`): files opened from the OS or the command line, one
-//!   running instance (`tauri-plugin-single-instance`), and quitting after the UI kept its
+//!   running instance (`tauri-plugin-single-instance`; on macOS `src/single_instance.rs`, a
+//!   per-user socket), and quitting after the UI kept its
 //!   workspace: `app_events_subscribe` (events through a `Channel`) and `app_close_ready`.
 //!   Guide: `docs/files.md`.
 //!
@@ -70,6 +71,8 @@ mod insight;
 mod nosql;
 mod profiles;
 mod shell;
+#[cfg(any(target_os = "macos", all(test, unix)))]
+mod single_instance;
 mod sync;
 mod transfer;
 mod workbench;
@@ -119,16 +122,30 @@ fn demo_arrow_page() -> Result<Response, String> {
         .map_err(|e| e.to_string())
 }
 
+/// A later launch handed over its command line (`argv`, the executable first) and working
+/// directory: open its files here.
+fn second_instance(app: &tauri::AppHandle, argv: Vec<String>, cwd: &str) {
+    let args = argv.into_iter().skip(1).map(std::ffi::OsString::from);
+    let paths = shell::paths_from_args(args, std::path::Path::new(cwd));
+    shell::focus_main(app);
+    app.state::<shell::ShellState>().receive(app, paths);
+}
+
 /// Builds and runs the Tauri application. Called from `main`.
 pub fn run() {
-    let app = tauri::Builder::default()
-        // First, so a second instance hands its files over before anything else starts.
-        .plugin(tauri_plugin_single_instance::init(|app, argv, cwd| {
-            let args = argv.into_iter().skip(1).map(std::ffi::OsString::from);
-            let paths = shell::paths_from_args(args, std::path::Path::new(&cwd));
-            shell::focus_main(app);
-            app.state::<shell::ShellState>().receive(app, paths);
-        }))
+    let builder = tauri::Builder::default();
+    // First, so a second instance hands its files over before anything else starts. On macOS
+    // the plugin meets at a fixed path in the shared /tmp, so Oxbase uses its own hand-over in a
+    // private per-user directory there (`single_instance`).
+    #[cfg(target_os = "macos")]
+    let builder = builder.plugin(single_instance::init(|app, argv, cwd| {
+        second_instance(app, argv, &cwd);
+    }));
+    #[cfg(not(target_os = "macos"))]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, argv, cwd| {
+        second_instance(app, argv, &cwd);
+    }));
+    let app = builder
         .plugin(tauri_plugin_dialog::init())
         .manage(shell::ShellState::new())
         .on_window_event(|window, event| {

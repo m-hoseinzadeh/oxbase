@@ -32,8 +32,6 @@ oxbase-designer.workspace = true
 tauri.workspace = true
 # Native file pickers (SQLite file, CA / client certificate / key files).
 tauri-plugin-dialog.workspace = true
-# 1.3: a second launch (double-clicking a file) hands its arguments to the running app.
-tauri-plugin-single-instance.workspace = true
 serde.workspace = true
 uuid.workspace = true
 arrow-array.workspace = true
@@ -43,6 +41,12 @@ arrow-ipc.workspace = true
 oxbase-io.workspace = true
 # M5: one-shot channel for the Rust-side native file dialogs.
 tokio.workspace = true
+
+# 1.3: a second launch (double-clicking a file) hands its arguments to the running app. macOS
+# uses src/single_instance.rs instead: the plugin's socket there is a fixed path in the shared
+# /tmp (audit lead 17).
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+tauri-plugin-single-instance.workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true
