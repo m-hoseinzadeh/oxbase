@@ -753,6 +753,33 @@ async fn data_sync(key: &'static str) {
         }
         _ => assert_eq!(session_statements, 0, "{key}: {all}"),
     }
+    // Audit lead 4: the literals are inlined with the dump rules, so the script carries the
+    // dump session that makes them read back as written.
+    match live.spell.engine {
+        Engine::Postgres => assert_eq!(
+            script.prologue,
+            ["SET standard_conforming_strings = on;"],
+            "{key}"
+        ),
+        Engine::MySql | Engine::MariaDb => {
+            assert!(
+                script.prologue.iter().any(|s| s == "SET NAMES utf8mb4;"),
+                "{key}: {:?}",
+                script.prologue
+            );
+            assert_eq!(
+                script.epilogue.last().map(String::as_str),
+                Some("SET sql_mode = @oxbase_sql_mode;"),
+                "{key}"
+            );
+        }
+        _ => assert!(
+            script.prologue.is_empty() && script.epilogue.is_empty(),
+            "{key}: {:?} {:?}",
+            script.prologue,
+            script.epilogue
+        ),
+    }
     let resyncs = all.contains("setval");
     assert!(
         script

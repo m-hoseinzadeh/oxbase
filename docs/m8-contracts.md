@@ -331,7 +331,9 @@ inserts / updates hold key + compared columns of the source row, deletes the key
 `data_statements(dialects, engine, version, target_table, key, op, rows)` → bound statements
 through the engine's `DmlWriter`. Order: deletes (children first), updates, inserts (parents
 first). `DataScriptOptions { inserts (true), updates (true), deletes (false), pairs, previewLimit
-(1000) }` → `DataScript { engine, statements, totalStatements, truncated, destructive, warnings }`.
+(1000) }` → `DataScript { engine, prologue, statements, epilogue, totalStatements, truncated,
+destructive, warnings }` (`prologue` / `epilogue`: the engine's SQL dump session around the
+inlined literals, not counted in `totalStatements`).
 `DataApplyOptions { script, batchStatements (1000), confirmDeletes }`: transactions of
 `batchStatements`, each statement must affect exactly one row (else the batch rolls back and
 the apply stops), then a re-compare of the applied pairs (`DataApplyReport { tables:

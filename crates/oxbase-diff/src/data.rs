@@ -1421,8 +1421,19 @@ impl Default for DataApplyOptions {
 #[serde(rename_all = "camelCase")]
 pub struct DataScript {
     pub engine: Engine,
+    /// Session statements for the text before `statements`, terminated: the engine's SQL dump
+    /// session (`Quoting::dump_session`), so a copied script reads its literals the way they
+    /// were written (PostgreSQL `standard_conforming_strings = on`, MySQL / MariaDB `sql_mode`
+    /// without `NO_BACKSLASH_ESCAPES` and `SET NAMES utf8mb4`). Not counted in
+    /// `total_statements`: the apply binds its values and does not run them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prologue: Vec<String>,
     /// The first `preview_limit` statements as SQL text with literals, terminated.
     pub statements: Vec<String>,
+    /// Session statements for the text after `statements` (undo the `prologue` where that is
+    /// possible), terminated.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub epilogue: Vec<String>,
     /// Every statement the apply would run.
     pub total_statements: u64,
     /// `statements` stops before `total_statements`.

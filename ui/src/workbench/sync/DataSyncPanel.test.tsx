@@ -81,6 +81,7 @@ async function renderPanel() {
     data_compare: () => "op-cmp",
     data_script: () => ({
       engine: "postgres",
+      prologue: ["SET standard_conforming_strings = on;"],
       statements: ["INSERT INTO m8_tgt.m8_data (id, name) VALUES (21, 'new row')", "UPDATE x"],
       totalStatements: 7,
       truncated: false,
@@ -197,6 +198,11 @@ describe("DataSyncPanel", () => {
     });
     expect(await screen.findByTestId("data-script")).toHaveTextContent(
       "INSERT INTO m8_tgt.m8_data (id, name) VALUES (21, 'new row');",
+    );
+    // Audit lead 4: the session the inlined literals need comes first.
+    expect(screen.getByTestId("data-script").textContent).toBe(
+      "SET standard_conforming_strings = on;\n" +
+        "INSERT INTO m8_tgt.m8_data (id, name) VALUES (21, 'new row');\nUPDATE x;",
     );
     expect(screen.getByTestId("data-script-status")).toHaveTextContent("7 statements");
   });
