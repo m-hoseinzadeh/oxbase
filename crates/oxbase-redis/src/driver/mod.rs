@@ -23,7 +23,8 @@
 //!   | `Disable` | TCP | `Tcp` |
 //!   | `Prefer` | an inline `PING` on a fresh socket: a RESP line (`+PONG`, `-NOAUTH ...`) means a plaintext port (kept, `tls_in_use() = false`); anything else: TLS without verification | the same probe on the first seed, then `Insecure` or `Tcp` |
 //!   | `Require` | TLS, any certificate | `Insecure` |
-//!   | `VerifyCa` | TLS, chain checked, any name | `Secure` + `danger_accept_invalid_hostnames` |
+//!   | `VerifyCa` + CA file | TLS, chain checked, any name | `Secure` + `danger_accept_invalid_hostnames` |
+//!   | `VerifyCa`, no CA file | as `VerifyFull` (platform roots: the name is checked too) | `Secure` |
 //!   | `VerifyFull` | TLS, chain and name checked | `Secure` |
 //!
 //!   Roots: `ca_cert` when set (only those CAs), else the platform store. Client certificate

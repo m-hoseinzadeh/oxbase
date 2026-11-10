@@ -972,7 +972,8 @@ impl ClusterSetup<'_> {
         }
         if let Some(mode) = self.tls_mode {
             builder = builder.tls(mode);
-            if self.params.tls.mode == TlsMode::VerifyCa {
+            // VerifyCa skips the name only with a CA file (oxbase_net::tls module docs).
+            if self.params.tls.mode == TlsMode::VerifyCa && !self.params.tls.verifies_hostname() {
                 builder = builder.danger_accept_invalid_hostnames(true);
             }
             if let Some(certs) = self.certificates.clone() {

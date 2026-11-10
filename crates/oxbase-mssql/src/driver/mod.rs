@@ -30,7 +30,7 @@
 //!   | `Disable` | `NOT_SUP` | plaintext | `REQ`: fail ("the server requires encryption"); `OFF`/`ON`: plaintext |
 //!   | `Prefer` | `ON` | plaintext (`tls_in_use() == false`) | TLS, certificate not checked |
 //!   | `Require` | `ON` | fail | TLS, certificate not checked |
-//!   | `VerifyCa` | `ON` | fail | TLS, chain checked, name not checked |
+//!   | `VerifyCa` | `ON` | fail | TLS, chain checked; name checked only without a CA file |
 //!   | `VerifyFull` | `ON` | fail | TLS, chain and name checked |
 //!
 //!   Strict: `Require` / `VerifyCa` / `VerifyFull` only (others are `InvalidInput`).

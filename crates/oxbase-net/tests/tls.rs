@@ -232,6 +232,107 @@ async fn verify_ca_checks_chain_but_not_name() {
     assert!(err.to_lowercase().contains("expired"), "{err}");
 }
 
+/// Set (to a directory holding `leaf.pem` / `leaf-key.pem`) in the child process of
+/// [`verify_ca_without_ca_file_checks_the_name`].
+const PLATFORM_CHILD_DIR: &str = "OXBASE_TEST_PLATFORM_ROOTS_DIR";
+
+/// `VerifyCa` without a CA file trusts the platform store, which holds every public CA, so it
+/// must check the host name as `VerifyFull` does: otherwise any publicly trusted certificate for
+/// any domain would pass. The platform store is replaced by a test CA through `SSL_CERT_FILE`
+/// (honoured by rustls-native-certs on every platform). The store is loaded once per process and
+/// the environment cannot be changed safely in-process, so the test re-runs itself in a child
+/// process with that variable set.
+#[test]
+fn verify_ca_without_ca_file_checks_the_name() {
+    if let Some(dir) = std::env::var_os(PLATFORM_CHILD_DIR) {
+        platform_roots_child(std::path::Path::new(&dir));
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let ca = Ca::new("Oxbase Platform Test CA");
+    let leaf = ca.issue(
+        &["attacker.example"],
+        ExtendedKeyUsagePurpose::ServerAuth,
+        false,
+    );
+    let roots = dir.path().join("roots.pem");
+    std::fs::write(&roots, &ca.pem).unwrap();
+    std::fs::write(dir.path().join("leaf.pem"), &leaf.cert_pem).unwrap();
+    std::fs::write(dir.path().join("leaf-key.pem"), &leaf.key_pem).unwrap();
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "verify_ca_without_ca_file_checks_the_name",
+            "--exact",
+            "--nocapture",
+            "--test-threads",
+            "1",
+        ])
+        .env(PLATFORM_CHILD_DIR, dir.path())
+        .env("SSL_CERT_FILE", &roots)
+        .env_remove("SSL_CERT_DIR")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "child failed:\n{stdout}\n{stderr}");
+    // The child really ran the test (not "0 passed" because of a filter mismatch).
+    assert!(stdout.contains("1 passed"), "{stdout}\n{stderr}");
+}
+
+fn platform_roots_child(dir: &std::path::Path) {
+    let leaf = Leaf {
+        cert_pem: std::fs::read_to_string(dir.join("leaf.pem")).unwrap(),
+        key_pem: std::fs::read_to_string(dir.join("leaf-key.pem")).unwrap(),
+    };
+    let server = server_config(&leaf, None);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let ca_mode = TlsOptions::new(TlsMode::VerifyCa);
+        assert!(ca_mode.verifies_hostname());
+        let cfg = tls::client_config(&ca_mode).unwrap();
+        // The chain passes (the test CA is the whole platform store here) ...
+        handshake(
+            cfg.clone(),
+            name(&ca_mode, "attacker.example"),
+            server.clone(),
+        )
+        .await
+        .unwrap();
+        // ... but a certificate for another domain is refused, exactly as under VerifyFull.
+        let err = handshake(cfg, name(&ca_mode, "db.internal"), server.clone())
+            .await
+            .unwrap_err();
+        assert!(err.to_lowercase().contains("name"), "{err}");
+        let full = TlsOptions::new(TlsMode::VerifyFull);
+        let err = handshake(
+            tls::client_config(&full).unwrap(),
+            name(&full, "db.internal"),
+            server.clone(),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_lowercase().contains("name"), "{err}");
+        // An unusable name is an error now that the name is checked.
+        assert!(tls::server_name(&ca_mode, "bad name!").is_err());
+
+        // With an explicit CA file VerifyCa stays chain-only.
+        let pinned = TlsOptions::new(TlsMode::VerifyCa).with_ca_cert(PemSource::Pem(
+            std::fs::read_to_string(std::env::var_os("SSL_CERT_FILE").unwrap()).unwrap(),
+        ));
+        assert!(!pinned.verifies_hostname());
+        handshake(
+            tls::client_config(&pinned).unwrap(),
+            name(&pinned, "db.internal"),
+            server,
+        )
+        .await
+        .unwrap();
+    });
+}
+
 #[tokio::test]
 async fn require_and_prefer_encrypt_without_verifying() {
     // Self-signed by an unknown CA, expired, wrong name: still accepted (insecure modes).

@@ -88,7 +88,7 @@ export const TLS_MODES: Array<{ value: TlsMode; label: string; help: string }> =
   {
     value: "verify_ca",
     label: "Verify certificate authority",
-    help: "Always encrypt and check that the server's certificate was issued by a trusted authority (the CA file below, or your system's trusted list). The host name in the certificate is not checked.",
+    help: "Always encrypt and check that the server's certificate was issued by the authority in the CA file below. The host name in the certificate is not checked. Without a CA file, your system's trusted list is used and the host name is checked too, as with Verify certificate and host name.",
   },
   {
     value: "verify_full",
@@ -781,7 +781,7 @@ export function ConnectionDialog({ profile, onClose, onSaved }: ConnectionDialog
             value={form.caCert}
             onChange={text("caCert")}
             onBrowse={() => void browse("caCert", "Choose a CA certificate", PEM_FILTERS)}
-            hint="The authority that signed the server's certificate. Without it, your system's trusted list is used."
+            hint="The authority that signed the server's certificate. Without it, your system's trusted list is used (and Verify certificate authority also checks the host name)."
           />
           {traits.clientCertificates ? (
             <>

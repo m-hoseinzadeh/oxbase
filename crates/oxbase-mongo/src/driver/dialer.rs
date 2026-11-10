@@ -417,17 +417,19 @@ async fn connect_upstream(
         shared.note_tls(false);
         return Ok(Upstream::Plain(tcp));
     };
+    // The profile's options without the name override (they still decide whether the name is
+    // checked: `VerifyCa` without a CA file checks it).
+    let mut options = setup.options.clone();
+    options.server_name = None;
     let name = if own {
         let host = shared
             .server_tls_name
             .clone()
             .unwrap_or_else(|| target.host.clone());
         // `server_tls_name` already applied the override.
-        oxbase_net::tls::server_name(&TlsOptions::new(setup.mode), &host)
+        oxbase_net::tls::server_name(&options, &host)
     } else {
         // `tls.server_name` overrides only the profile's own host.
-        let mut options = setup.options.clone();
-        options.server_name = None;
         oxbase_net::tls::server_name(&options, &target.host)
     }
     .map_err(|e| (REP_GENERAL_FAILURE, format!("TLS for {target}: {e}")))?;

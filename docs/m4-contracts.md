@@ -107,7 +107,7 @@ Rules (also in the `oxbase_mssql::driver` module docs):
    | `Disable` | `NOT_SUP` | plaintext | `REQ`: fail, "the server requires encryption"; else plaintext |
    | `Prefer` (default) | `ON` | plaintext, `tls_in_use() = false` | TLS, certificate not checked |
    | `Require` | `ON` | fail | TLS, not checked (`InsecureNoVerification`) |
-   | `VerifyCa` | `ON` | fail | TLS, chain and dates checked, any name |
+   | `VerifyCa` | `ON` | fail | TLS, chain and dates checked, any name (without a CA file the name is checked too, M1 §3) |
    | `VerifyFull` | `ON` | fail | TLS, chain, dates and name checked |
 
    Strict accepts `Require`, `VerifyCa`, `VerifyFull`; `Disable` / `Prefer` with strict are

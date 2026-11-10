@@ -87,7 +87,7 @@ registry source (`src/connection.rs`, `src/client.rs`, `src/io/dns.rs`, `src/aio
 |---|---|---|
 | rustls + ring | `tls-rustls` = `rustls` with **no** provider feature + `rustls-native-certs`; the config is built with `ClientConfig::builder()` (process default provider). `tls-native-tls` is separate. | `default-features = false, features = ["aio", "tokio-comp", "tokio-rustls-comp", "tls-rustls-insecure", "cluster-async", "sentinel", "acl", "streams"]`; oxbase installs ring as the process default (`oxbase_net::tls::install_default_crypto_provider`) before connecting. |
 | TLS server name vs dial address | `AsyncConnectionConfig::set_dns_resolver` / `ClusterClientBuilder::async_dns_resolver`: the client resolves every host through an `AsyncDNSResolver` it is given, while TLS uses the host name. | The client is built for the server host (or `tls.server_name`); the resolver maps that host and port to `dial_endpoint()` (the tunnel). `VerifyFull` therefore works through SSH. |
-| TLS modes | `TcpTls { insecure }` (`tls-rustls-insecure`), `danger_accept_invalid_hostnames` (chain only), `TlsCertificates { root_cert: PEM bytes, client_tls: PEM bytes }`. | Mapping table in the driver docs: `Prefer` = TLS then plain fallback, `Require` = insecure, `VerifyCa` = invalid hostnames accepted, `VerifyFull` = full; CA only from `ca_cert` when set, else the platform store (same as M1). |
+| TLS modes | `TcpTls { insecure }` (`tls-rustls-insecure`), `danger_accept_invalid_hostnames` (chain only), `TlsCertificates { root_cert: PEM bytes, client_tls: PEM bytes }`. | Mapping table in the driver docs: `Prefer` = TLS then plain fallback, `Require` = insecure, `VerifyCa` = invalid hostnames accepted (with a CA file; without one it is `VerifyFull`), `VerifyFull` = full; CA only from `ca_cert` when set, else the platform store (same as M1). |
 | Auth / ACL | `RedisConnectionInfo { username, password }`, `HELLO 3 AUTH` / `AUTH`. | Profile user (empty = `default`) and password. |
 | RESP3 | `ProtocolVersion::RESP3`, typed replies (`Map`, `Set`, `Double`, `Boolean`, `VerbatimString`, `BigNumber`, `Push`, `Attribute`). | `auto`: RESP3 on 6.0+, else RESP2 (§7.2). |
 | Cancel | No in-band cancel in RESP. | `CLIENT UNBLOCK <id> ERROR` (blocking commands) or `SCRIPT KILL` / `FUNCTION KILL` from a side connection; otherwise drop the reply and replace the multiplexed connection (warning notice). Never `CLIENT KILL`. |
@@ -360,7 +360,7 @@ holds a secret.
 | `srv` | `true`: `mongodb+srv://host` (**in M7**, not with SSH, other hosts or a port) |
 | `replica_set` | `replicaSet` |
 | `auth_source` | default `admin` (`$external` for X.509 / PLAIN) |
-| `auth_mechanism` | `SCRAM-SHA-256`, `SCRAM-SHA-1`, `MONGODB-X509`, `PLAIN` (PLAIN needs `VerifyCa` / `VerifyFull`); default negotiated |
+| `auth_mechanism` | `SCRAM-SHA-256`, `SCRAM-SHA-1`, `MONGODB-X509`, `PLAIN` (PLAIN needs `VerifyFull`, or `VerifyCa` with a CA file); default negotiated |
 | `direct_connection` | default: one host without a replica set; **always** with SSH (one host only) |
 | `read_preference` | `primary` (default) ... `nearest` |
 | `sample_size`, `shell_memory_mb`, `shell_time_limit_ms` | column inference sample (1000), shell memory (64 MiB), shell CPU per statement (10 s) |

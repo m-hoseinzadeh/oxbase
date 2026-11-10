@@ -72,7 +72,7 @@ pub enum AuthMechanism {
     /// The TLS client certificate is the credential (`$external`).
     X509,
     /// LDAP proxy auth (`$external`); the password goes to the server in the clear inside TLS,
-    /// so it requires `TlsMode::VerifyCa` or `VerifyFull`.
+    /// so it requires `TlsMode::VerifyFull`, or `VerifyCa` with a CA file.
     Plain,
 }
 
@@ -181,14 +181,17 @@ impl MongoOptions {
                 )));
             }
         };
-        if auth_mechanism == Some(AuthMechanism::Plain)
-            && !matches!(
-                params.tls.mode,
-                oxbase_types::TlsMode::VerifyCa | oxbase_types::TlsMode::VerifyFull
-            )
-        {
+        // The password may only go to an authenticated server: the full check, or the chain
+        // against the profile's own CA file (never VerifyCa against the platform store alone).
+        let authenticated = match params.tls.mode {
+            oxbase_types::TlsMode::VerifyFull => true,
+            oxbase_types::TlsMode::VerifyCa => params.tls.ca_cert.is_some(),
+            _ => false,
+        };
+        if auth_mechanism == Some(AuthMechanism::Plain) && !authenticated {
             return Err(Error::invalid_input(
-                "PLAIN sends the password itself: use TLS with certificate verification",
+                "PLAIN sends the password itself: use TLS mode verify_full, or verify_ca with a \
+                 CA file",
             ));
         }
         let auth_source = get(AUTH_SOURCE).map_or_else(
@@ -320,7 +323,14 @@ mod tests {
         assert_eq!(o.auth_source, "$external");
         p.options.insert(AUTH_MECHANISM.into(), "PLAIN".into());
         assert!(MongoOptions::from_params(&p).is_err());
-        p.tls.mode = TlsMode::VerifyFull;
+        // VerifyCa authenticates the server only against the profile's own CA file.
+        p.tls.mode = TlsMode::VerifyCa;
+        let err = MongoOptions::from_params(&p).unwrap_err();
+        assert_eq!(err.category(), oxbase_types::ErrorCategory::InvalidInput);
+        assert!(err.to_string().contains("CA file"), "{err}");
+        p.tls.ca_cert = Some(oxbase_types::PemSource::Pem("ca".into()));
+        assert!(MongoOptions::from_params(&p).is_ok());
+        p.tls = oxbase_types::TlsOptions::new(TlsMode::VerifyFull);
         assert!(MongoOptions::from_params(&p).is_ok());
         p.options.insert(AUTH_SOURCE.into(), "users".into());
         assert_eq!(MongoOptions::from_params(&p).unwrap().auth_source, "users");
