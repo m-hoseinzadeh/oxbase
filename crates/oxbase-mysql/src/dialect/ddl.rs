@@ -59,6 +59,7 @@
 use std::fmt::Write as _;
 
 use oxbase_dialect::compare::{CompareRules, diff_columns, diff_foreign_keys, diff_indexes};
+use oxbase_dialect::sql::{check_expression, check_one_expression};
 use oxbase_dialect::{BacktickQuoting, DdlContext, DdlGenerator, Quoting};
 use oxbase_types::{
     CheckDef, ColumnDef, DataType, Error, Extras, FkAction, ForeignKeyDef, IndexDef, ObjectDef,
@@ -487,7 +488,11 @@ impl Gen {
         }
         if let Some(generated) = &c.generated {
             s.push_str(" GENERATED ALWAYS AS (");
-            s.push_str(&generated.expression);
+            s.push_str(expression(
+                &generated.expression,
+                &format!("column {}: generation expression", c.name),
+                false,
+            )?);
             s.push_str(if generated.stored {
                 ") STORED"
             } else {
@@ -510,11 +515,19 @@ impl Gen {
             && let Some(default) = c.default.as_deref().filter(|d| !d.trim().is_empty())
         {
             s.push_str(" DEFAULT ");
-            s.push_str(default);
+            s.push_str(expression(
+                default,
+                &format!("column {}: default", c.name),
+                true,
+            )?);
         }
         if let Some(on_update) = text_extra(&c.extras, &ON_UPDATE_EXPRESSION) {
             s.push_str(" ON UPDATE ");
-            s.push_str(on_update);
+            s.push_str(expression(
+                on_update,
+                &format!("column {}: ON UPDATE", c.name),
+                true,
+            )?);
         }
         if c.auto_increment {
             s.push_str(" AUTO_INCREMENT");
@@ -553,7 +566,10 @@ impl Gen {
                         self.f.engine_name()
                     )));
                 }
-                format!("({})", part.name)
+                format!(
+                    "({})",
+                    expression(&part.name, &format!("index {} key", idx.name), false)?
+                )
             } else {
                 self.ident(&part.name)
             };
@@ -696,7 +712,11 @@ impl Gen {
             s.push(' ');
         }
         s.push_str("CHECK (");
-        s.push_str(&check.expression);
+        s.push_str(expression(
+            &check.expression,
+            &format!("check {}", label(check.name.as_deref())),
+            false,
+        )?);
         s.push(')');
         if check.extras.get(&ENFORCED) == Some(&Value::Bool(false)) {
             if self.f.mariadb {
@@ -1425,6 +1445,25 @@ fn text_extra<'a>(extras: &'a Extras, prop: &PropId) -> Option<&'a str> {
         Some(Value::Text(t)) if !t.trim().is_empty() => Some(t.as_str()),
         _ => None,
     }
+}
+
+/// `text` when it is one SQL expression that cannot end or extend the statement it is spliced
+/// into (`check_expression` with MySQL's lexing: no `;`, no comment, every string and quoted
+/// name closed, balanced parentheses), else `InvalidInput` naming `what`. Expressions come from
+/// the designer, from a source server's catalog (structure sync, transfer) or from a backup
+/// archive, so they are checked here like the PostgreSQL and SQL Server generators check
+/// theirs. `bare`: the text is not wrapped in parentheses where it goes (`DEFAULT x`,
+/// `ON UPDATE x`), so a `,` outside parentheses (another column or clause) is refused too.
+fn expression<'a>(text: &'a str, what: &str, bare: bool) -> Result<&'a str> {
+    let checked = if bare {
+        check_one_expression(&BacktickQuoting, text)
+    } else {
+        check_expression(&BacktickQuoting, text)
+    };
+    checked.map(|()| text).map_err(|e| match e {
+        Error::InvalidInput { message } => Error::invalid_input(format!("{what}: {message}")),
+        other => other,
+    })
 }
 
 /// `text` when it is a plain word (character set, collation, engine, row format names).

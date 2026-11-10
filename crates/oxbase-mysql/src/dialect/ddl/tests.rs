@@ -214,6 +214,47 @@ fn create_on_mariadb_and_old_servers() {
     assert!(err.to_string().contains("descending"), "{err}");
 }
 
+/// Defaults, `ON UPDATE`, generation and check expressions come from the designer, a source
+/// server's catalog or a backup archive: none of them can end the statement or add a clause.
+#[test]
+fn expressions_cannot_leave_their_place() {
+    let refused = |t: TableDef| {
+        let e = create(mysql(), "8.4.6", &ObjectDef::Table(t)).expect_err("should be refused");
+        assert!(matches!(e, Error::InvalidInput { .. }), "{e}");
+    };
+    for bad in [
+        "0); DROP TABLE `x`; --",
+        "0, DROP COLUMN `id`",
+        "0 /*!50000 , x int */",
+    ] {
+        let mut t = table();
+        t.columns[2].default = Some(bad.into());
+        refused(t);
+    }
+    let mut t = table();
+    t.columns[3]
+        .extras
+        .insert(ON_UPDATE_EXPRESSION, "CURRENT_TIMESTAMP, DROP COLUMN `id`");
+    refused(t);
+    let mut t = table();
+    t.checks[0].expression = "1)); DROP TABLE `x`; SELECT ((1".into();
+    refused(t);
+    let mut t = table();
+    let generated = t
+        .columns
+        .iter_mut()
+        .find(|c| c.generated.is_some())
+        .expect("the test table has a generated column");
+    if let Some(g) = generated.generated.as_mut() {
+        g.expression = "1) VIRTUAL; DROP TABLE `x`; SELECT (1".into();
+    }
+    refused(t);
+    // Ordinary expressions still pass.
+    let mut t = table();
+    t.columns[1].default = Some("'a,b;c -- d'".into());
+    assert!(create(mysql(), "8.4.6", &ObjectDef::Table(t)).is_ok());
+}
+
 #[test]
 fn refusals() {
     let check = |t: TableDef, g: MySqlDdl| {
