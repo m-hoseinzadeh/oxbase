@@ -44,7 +44,8 @@
 //!   transaction rolls back; the report says what stayed ([`TableReport::left_behind`]).
 //!
 //! After every table: the planned foreign keys ([`TablePlan::foreign_keys`]) run on the target
-//! (services), then `BulkLoader::identity_resync` statements.
+//! (services), then `BulkLoader::identity_resync` statements, then the row-level security and
+//! policies of created tables ([`PreparedTable::row_security`]).
 
 //!
 //! # How the run uses its transactions
@@ -198,6 +199,11 @@ pub struct PreparedTable {
     pub drop_created: Vec<ScriptStep>,
     /// The planned foreign keys (one script each), added after every table is loaded.
     pub foreign_keys: Vec<Script>,
+    /// Row-level security and policies of a table the run creates (the target's table
+    /// `alter` from the table as created without them): switched on after every table is
+    /// loaded, after the foreign keys and identity resyncs, so a policy that binds the owner
+    /// (`FORCE`) neither filters nor refuses the load. `None` when the table has none.
+    pub row_security: Option<Script>,
     /// The rows to copy (bound values).
     pub select: BoundStatement,
     /// The load columns (not skipped), in load order.
@@ -369,6 +375,7 @@ pub async fn prepare(inputs: PlanInputs<'_>, cancel: CancellationToken) -> Resul
         let mut ddl: Vec<ScriptStep> = Vec::new();
         let mut ddl_preview: Vec<String> = Vec::new();
         let mut drop_created = Vec::new();
+        let mut row_security = None;
         let creates = matches!(mode, TableMode::Create | TableMode::Replace);
         let definition = match (mode, &existing) {
             (TableMode::Create, Some(def)) => {
@@ -418,13 +425,31 @@ pub async fn prepare(inputs: PlanInputs<'_>, cancel: CancellationToken) -> Resul
                     }
                 }
                 if !def.columns.is_empty() {
-                    match generator.create(&ObjectDef::Table(def.clone()), &ddl_ctx) {
+                    // Row-level security (same-engine copies keep it) is switched on after the
+                    // load: the table is created without it.
+                    let bare = def.without_row_security();
+                    let created = bare.as_ref().unwrap_or(&def);
+                    match generator.create(&ObjectDef::Table(created.clone()), &ddl_ctx) {
                         Ok(script) => {
                             ddl_preview.push(script.to_sql(terminator));
                             table_warnings.extend(script.warnings.iter().cloned());
                             ddl.extend(script.ordered().cloned());
                         }
                         Err(e) => blocked.push(format!("{label}: {e}")),
+                    }
+                    if let Some(bare) = bare {
+                        match generator.alter(
+                            &ObjectDef::Table(bare),
+                            &ObjectDef::Table(def.clone()),
+                            &ddl_ctx,
+                        ) {
+                            Ok(script) => {
+                                ddl_preview.push(script.to_sql(terminator));
+                                table_warnings.extend(script.warnings.iter().cloned());
+                                row_security = Some(script);
+                            }
+                            Err(e) => blocked.push(format!("{label}: {e}")),
+                        }
                     }
                     if let Ok(script) = generator.drop_object(&target_ref, &ddl_ctx) {
                         drop_created = script.ordered().cloned().collect();
@@ -509,6 +534,7 @@ pub async fn prepare(inputs: PlanInputs<'_>, cancel: CancellationToken) -> Resul
             creates,
             drop_created,
             foreign_keys: Vec::new(),
+            row_security,
             select: src.select.clone(),
             columns: load_columns,
             identity_columns,

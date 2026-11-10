@@ -20,7 +20,7 @@ use oxbase_dialect::DialectRegistry;
 use oxbase_diff::{DiffStatus, SchemaSnapshot, StructureOptions, compare, sync_script};
 use oxbase_types::{
     ArgMode, ColumnDef, DataType, Engine, Extras, FkAction, ForeignKeyDef, ObjectDef, ObjectKind,
-    ObjectRef, PrimaryKeyDef, RoutineArg, RoutineDef, SequenceDef, ServerVersion, TableDef,
+    ObjectRef, PrimaryKeyDef, RoutineArg, RoutineDef, SequenceDef, ServerVersion, TableDef, Value,
     ViewDef, props,
 };
 use pretty_assertions::assert_eq;
@@ -537,4 +537,107 @@ fn collations_off_leave_character_sets_alone() {
         script.sql
     );
     assert!(!script.sql.contains("latin1"), "{}", script.sql);
+}
+
+fn policy(name: &str, using: &str) -> serde_json::Value {
+    serde_json::json!({
+        "name": name, "command": "all", "permissive": true, "roles": ["public"],
+        "using": using, "check": null,
+    })
+}
+
+fn secure(t: &mut TableDef, on: bool, policies: Vec<serde_json::Value>) {
+    t.extras.insert(props::ROW_SECURITY, on);
+    t.extras.insert(props::FORCE_ROW_SECURITY, false);
+    t.extras.insert(
+        props::POLICIES,
+        Value::Json(serde_json::Value::Array(policies)),
+    );
+}
+
+/// Row-level security and new policies come after every table, view and routine the script
+/// creates, so a policy may name a table created later or a view (audit lead 11); a policy
+/// that goes is dropped with its table's changes, before them.
+#[test]
+fn policies_wait_for_the_objects_they_name() {
+    let reg = registry();
+    let s = side(Engine::Postgres);
+    let id = || col("id", DataType::INT32, false);
+    // `accounts` sorts before `zz_members`, so it is created first.
+    let mut accounts = table(&s.source, "accounts", vec![id()]);
+    secure(
+        &mut accounts,
+        true,
+        vec![policy(
+            "by_member",
+            "(id IN (SELECT member_ids.id FROM m8_src.member_ids))",
+        )],
+    );
+    let members = table(&s.source, "zz_members", vec![id()]);
+    let view = ViewDef {
+        obj: s.source.child(ObjectKind::View, "member_ids"),
+        definition: "SELECT zz_members.id FROM m8_src.zz_members".into(),
+        columns: Vec::new(),
+        comment: None,
+        extras: Extras::new(),
+    };
+    let mut ledger = table(&s.source, "ledger", vec![id()]);
+    secure(
+        &mut ledger,
+        true,
+        vec![policy(
+            "mine",
+            "(id IN (SELECT zz_members.id FROM m8_src.zz_members))",
+        )],
+    );
+    let mut ledger_now = table(&s.target, "ledger", vec![id()]);
+    secure(&mut ledger_now, false, vec![policy("old", "true")]);
+    let source = snapshot(
+        &s,
+        true,
+        vec![
+            ObjectDef::Table(accounts),
+            ObjectDef::Table(members),
+            ObjectDef::Table(ledger),
+            ObjectDef::View(view),
+        ],
+    );
+    let target = snapshot(&s, false, vec![ObjectDef::Table(ledger_now)]);
+    let opts = options(false);
+    let diff = compare(&reg, &source, &target, &opts).unwrap();
+    let script = sync_script(&reg, &diff, &source, &target, &[], &opts).unwrap();
+    let sql: Vec<&str> = script.script.ordered().map(|s| s.sql.as_str()).collect();
+    let at = |what: &str, needle: &str| position(&sql, what, |s| s.contains(needle));
+    let accounts_table = at("creating accounts", "CREATE TABLE \"m8_tgt\".\"accounts\"");
+    let members_table = at(
+        "creating zz_members",
+        "CREATE TABLE \"m8_tgt\".\"zz_members\"",
+    );
+    let view = at(
+        "creating member_ids",
+        "CREATE VIEW \"m8_tgt\".\"member_ids\"",
+    );
+    let drop_old = at("dropping policy old", "DROP POLICY \"old\"");
+    let enable_accounts = at(
+        "enabling accounts",
+        "ALTER TABLE \"m8_tgt\".\"accounts\" ENABLE ROW LEVEL SECURITY",
+    );
+    let enable_ledger = at(
+        "enabling ledger",
+        "ALTER TABLE \"m8_tgt\".\"ledger\" ENABLE ROW LEVEL SECURITY",
+    );
+    let by_member = at("creating policy by_member", "CREATE POLICY \"by_member\"");
+    let mine = at("creating policy mine", "CREATE POLICY \"mine\"");
+    assert!(accounts_table < members_table, "{sql:#?}");
+    for late in [enable_accounts, enable_ledger, by_member, mine] {
+        assert!(members_table < late && view < late, "{sql:#?}");
+        assert!(drop_old < late, "{sql:#?}");
+    }
+    assert!(
+        !sql[accounts_table].contains("POLICY") && !sql[accounts_table].contains("ROW LEVEL"),
+        "{sql:#?}"
+    );
+    // The policy names the target's objects.
+    assert!(sql[by_member].contains("m8_tgt.member_ids"), "{sql:#?}");
+    assert!(sql[mine].contains("m8_tgt.zz_members"), "{sql:#?}");
 }

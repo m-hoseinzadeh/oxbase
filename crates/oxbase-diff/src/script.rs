@@ -33,6 +33,10 @@
 //!    stopped using them in their defaults).
 //! 7. Routines and views, materialized views in dependency order (a routine or view after the
 //!    routines and views it names), then triggers.
+//! 8. Row-level security (PostgreSQL `ENABLE` / `FORCE ROW LEVEL SECURITY`) and the policies to
+//!    create, of new and changed tables: a policy expression may name any table, view or
+//!    routine the script creates. Policies that go or change are dropped in step 5, with their
+//!    table's other changes.
 //!
 //! Dependencies between views and routines come from a token scan of their SQL for the names of
 //! compared objects (`oxbase_sql` tokens; the structure-sync stream) fed to
@@ -265,6 +269,8 @@ enum Phase {
     DropSequences,
     /// 7. Routines, views, triggers.
     Dependents,
+    /// 8. Row-level security, new and changed policies (they may name anything created).
+    RowSecurity,
 }
 
 /// The script of one item in one phase.
@@ -748,21 +754,30 @@ impl Planner<'_> {
             let Some((p, s)) = creates.iter().find(|(_, s)| s.obj == *table_ref) else {
                 continue;
             };
-            if self.native_fk {
-                let mut bare = (*s).clone();
-                let fks = std::mem::take(&mut bare.foreign_keys);
-                let script = self.create(&ObjectDef::Table(bare.clone()))?;
-                push(Phase::Tables, &p.id, script, false);
-                for fk in fks {
-                    fk_adds.push((p.id.clone(), bare.clone(), fk));
-                }
+            // Row-level security and policies come last (phase 8): created without them.
+            let mut created = s.without_row_security().unwrap_or_else(|| (*s).clone());
+            let fks = if self.native_fk {
+                std::mem::take(&mut created.foreign_keys)
             } else {
-                push(
-                    Phase::Tables,
-                    &p.id,
-                    self.create(&ObjectDef::Table((*s).clone()))?,
-                    false,
-                );
+                Vec::new()
+            };
+            push(
+                Phase::Tables,
+                &p.id,
+                self.create(&ObjectDef::Table(created.clone()))?,
+                false,
+            );
+            if created.extras != s.extras {
+                let mut secured = created.clone();
+                secured.extras.clone_from(&s.extras);
+                let script = self.alter(
+                    &ObjectDef::Table(created.clone()),
+                    &ObjectDef::Table(secured),
+                )?;
+                push(Phase::RowSecurity, &p.id, script, false);
+            }
+            for fk in fks {
+                fk_adds.push((p.id.clone(), created.clone(), fk));
             }
         }
         for (p, before, after, added) in altered {
@@ -776,12 +791,24 @@ impl Planner<'_> {
                 .collect();
             let ctx = self.ctx().with_table(&before).with_triggers(&kept);
             let ddl = self.ddl(ObjectKind::Table, &before.obj)?;
+            // Policies that go or change are dropped with the table's changes; the flags and
+            // the new or changed policies wait for phase 8.
+            let now = after.with_row_security_of(&before);
             let script = ddl.alter(
                 &ObjectDef::Table(before.clone()),
-                &ObjectDef::Table(after.clone()),
+                &ObjectDef::Table(now.clone().unwrap_or_else(|| after.clone())),
                 &ctx,
             )?;
             push(Phase::Tables, &p.id, script, false);
+            if let Some(now) = now {
+                let late_ctx = self.ctx().with_table(&now);
+                let script = ddl.alter(
+                    &ObjectDef::Table(now.clone()),
+                    &ObjectDef::Table(after.clone()),
+                    &late_ctx,
+                )?;
+                push(Phase::RowSecurity, &p.id, script, false);
+            }
             for fk in added {
                 fk_adds.push((p.id.clone(), after.clone(), fk));
             }
@@ -1162,6 +1189,7 @@ mod tests {
         assert!(Phase::Tables < Phase::AddForeignKeys);
         assert!(Phase::AddForeignKeys < Phase::DropSequences);
         assert!(Phase::DropSequences < Phase::Dependents);
+        assert!(Phase::Dependents < Phase::RowSecurity);
         let step = ScriptStep::new("x");
         assert_eq!(step.phase, StepPhase::Main);
     }

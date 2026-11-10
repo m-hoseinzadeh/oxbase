@@ -784,6 +784,52 @@ async fn postgres_to_postgres_another_schema() {
     .await;
 }
 
+/// A PostgreSQL → PostgreSQL copy keeps row-level security (`ENABLE`, `FORCE`) and its
+/// policies, switched on after the rows load (audit lead 11).
+#[tokio::test]
+#[ignore = "needs the Docker fixtures (scripts/fixtures-up.sh)"]
+async fn postgres_to_postgres_keeps_row_security() {
+    let live = Live::new();
+    let pg = live.open("postgres", Engine::Postgres, false).await;
+    let (s, t) = (format!("m8_t_r{}", token()), format!("m8_t_q{}", token()));
+    pg.exec(&pg_data(&s)).await;
+    pg.exec(&[
+        format!("ALTER TABLE {s}.m8_data ENABLE ROW LEVEL SECURITY"),
+        format!("ALTER TABLE {s}.m8_data FORCE ROW LEVEL SECURITY"),
+        format!("CREATE POLICY own ON {s}.m8_data USING (name = current_user)"),
+        format!("CREATE SCHEMA {t}"),
+    ])
+    .await;
+    let objects = vec![source_table(Some("oxbase_test"), Some(&s), "m8_data")];
+    let (_, report) = live
+        .run(request(
+            &pg,
+            &pg,
+            spec(objects, ObjectRef::schema(Some("oxbase_test"), t.clone())),
+        ))
+        .await;
+    assert_eq!(report.tables[0].status, TableStatus::Done, "{report:?}");
+    assert_eq!(report.tables[0].progress.rows_written, 4);
+    let state = |schema: &str| {
+        format!(
+            "SELECT c.relrowsecurity::text || ' ' || c.relforcerowsecurity::text || ' ' || \
+                    (SELECT pg_catalog.string_agg(p.polname::text || ' ' || \
+                            pg_catalog.pg_get_expr(p.polqual, p.polrelid), ', ') \
+                       FROM pg_catalog.pg_policy p WHERE p.polrelid = c.oid) \
+             FROM pg_catalog.pg_class c WHERE c.oid = '{schema}.m8_data'::regclass"
+        )
+    };
+    let source = canon(&pg.query(&state(&s)).await[0][0]);
+    let copied = canon(&pg.query(&state(&t)).await[0][0]);
+    pg.try_exec(&[
+        format!("DROP SCHEMA {s} CASCADE"),
+        format!("DROP SCHEMA {t} CASCADE"),
+    ])
+    .await;
+    assert!(source.starts_with("true true own"), "{source}");
+    assert_eq!(copied, source);
+}
+
 #[tokio::test]
 #[ignore = "needs the Docker fixtures (scripts/fixtures-up.sh)"]
 async fn mysql_to_postgres() {

@@ -22,7 +22,7 @@ use oxbase_transfer::{
 };
 use oxbase_types::{
     BoundStatement, ColumnDef, DataType, Engine, Error, FkAction, ForeignKeyDef, ObjectDef,
-    ObjectKind, ObjectRef, ObjectSummary, PrimaryKeyDef, Result, Script, TableDef,
+    ObjectKind, ObjectRef, ObjectSummary, PrimaryKeyDef, Result, Script, TableDef, Value, props,
 };
 use pretty_assertions::assert_eq;
 
@@ -640,4 +640,109 @@ async fn a_cancelled_copy_rolls_back() {
     assert_eq!(copy.report.progress.rows_committed, 0);
     assert_eq!(copy.report.left_behind, "rolled back: no table was created");
     assert!(copy.log.iter().any(|s| s == "ROLLBACK"), "{:?}", copy.log);
+}
+
+/// Writes `CREATE TABLE <name>` (`... SECURED` when the definition has row-level security or
+/// policies) and, for an alter that changes something, `SECURE <name>`: what the PostgreSQL
+/// cell turns into `ENABLE` / `FORCE ROW LEVEL SECURITY` and `CREATE POLICY`.
+struct SecuredDdl;
+
+impl DdlGenerator for SecuredDdl {
+    fn create(&self, d: &ObjectDef, _ctx: &DdlContext<'_>) -> Result<Script> {
+        let ObjectDef::Table(t) = d else {
+            return Ok(Script::new());
+        };
+        let secured = t.extras.get(&props::ROW_SECURITY) == Some(&Value::Bool(true))
+            || matches!(
+                t.extras.get(&props::POLICIES),
+                Some(Value::Json(serde_json::Value::Array(p))) if !p.is_empty()
+            );
+        Ok(Script::single(format!(
+            "CREATE TABLE {}{}",
+            t.obj.name,
+            if secured { " SECURED" } else { "" }
+        )))
+    }
+
+    fn alter(&self, old: &ObjectDef, new: &ObjectDef, _ctx: &DdlContext<'_>) -> Result<Script> {
+        Ok(if old == new {
+            Script::new()
+        } else {
+            Script::single(format!("SECURE {}", new.name()))
+        })
+    }
+
+    fn drop_object(&self, r: &ObjectRef, _ctx: &DdlContext<'_>) -> Result<Script> {
+        Ok(Script::single(format!("DROP TABLE {}", r.name)))
+    }
+}
+
+/// A same-engine copy keeps row-level security but switches it on after the load (audit lead
+/// 11): the table is created without it, and its alter to the full definition is the run's
+/// last step for the table (`PreparedTable::row_security`), after the rows.
+#[tokio::test]
+async fn row_security_is_switched_on_after_the_load() {
+    let mut id = column("id", DataType::INT32).not_null();
+    id.native_type = "integer".into();
+    let mut secured = table("accounts", vec![id.clone()], &[]);
+    secured.extras.insert(props::ROW_SECURITY, true);
+    secured.extras.insert(props::FORCE_ROW_SECURITY, true);
+    secured.extras.insert(
+        props::POLICIES,
+        Value::Json(serde_json::json!([{"name": "own", "using": "true"}])),
+    );
+    let mut plain = table("ledger", vec![id], &[]);
+    plain.extras.insert(props::ROW_SECURITY, false);
+    let mut reg = DialectRegistry::new();
+    oxbase_transfer::register(&mut reg);
+    reg.register_quoting(Engine::Postgres, Arc::new(PgQuoting))
+        .register_fetcher(
+            Engine::Postgres,
+            ObjectKind::Table,
+            Arc::new(Tables(vec![secured, plain])),
+        )
+        .register_ddl(Engine::Postgres, ObjectKind::Table, Arc::new(SecuredDdl));
+    let source = connect(Engine::Postgres, MockConfig::default()).await;
+    let target = connect(Engine::Postgres, MockConfig::default()).await;
+    let copy = |name: &str| SourceObject::Table {
+        table: ObjectRef::table(Some("db"), Some("src"), name),
+        target_name: Some(format!("{name}_copy")),
+        filter: None,
+    };
+    let spec = TransferSpec {
+        objects: vec![copy("accounts"), copy("ledger")],
+        target: ObjectRef::schema(Some("db"), "dst"),
+        options: TransferOptions::default(),
+        overrides: Vec::new(),
+    };
+    let prepared = prepare(
+        PlanInputs {
+            dialects: &reg,
+            source: source.as_ref(),
+            target: target.as_ref(),
+            spec: &spec,
+            same_server: false,
+        },
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    let steps =
+        |script: &Script| -> Vec<String> { script.steps.iter().map(|s| s.sql.clone()).collect() };
+    let accounts = &prepared.tables[0];
+    let ddl: Vec<&str> = accounts.ddl.iter().map(|s| s.sql.as_str()).collect();
+    assert_eq!(ddl, ["CREATE TABLE accounts_copy"], "created without it");
+    assert_eq!(
+        accounts.row_security.as_ref().map(steps),
+        Some(vec!["SECURE accounts_copy".to_owned()])
+    );
+    assert_eq!(
+        prepared.plan.tables[0].ddl,
+        ["CREATE TABLE accounts_copy;\n", "SECURE accounts_copy;\n"],
+        "the preview shows both"
+    );
+    let ledger = &prepared.tables[1];
+    assert_eq!(ledger.row_security.as_ref().map(steps), None);
+    let ddl: Vec<&str> = ledger.ddl.iter().map(|s| s.sql.as_str()).collect();
+    assert_eq!(ddl, ["CREATE TABLE ledger_copy"]);
 }

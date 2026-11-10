@@ -3,8 +3,9 @@
 //!
 //! # Statements
 //!
-//! - Views: `CREATE [MATERIALIZED] VIEW q [(columns)] AS <query>` (`WITH ... CHECK OPTION`,
-//!   materialized `WITH NO DATA` when not populated), `COMMENT ON`. An alter drops and creates.
+//! - Views: `CREATE [MATERIALIZED] VIEW q [(columns)] [WITH (security_barrier = true,
+//!   security_invoker = true)] AS <query>` (`WITH ... CHECK OPTION`, materialized `WITH NO
+//!   DATA` when not populated), `COMMENT ON`. An alter drops and creates.
 //! - Routines: built from the model (`CREATE FUNCTION q(args) RETURNS ... LANGUAGE ...
 //!   <volatility> [STRICT] [SECURITY DEFINER] [PARALLEL ...] [SET name TO value ...]
 //!   AS $body$...$body$`, the `SET` clauses from `proconfig` (`SETTINGS`); a SQL-standard
@@ -28,13 +29,14 @@ use std::fmt::Write as _;
 use oxbase_dialect::compare::normalize_ws;
 use oxbase_dialect::{DdlContext, DdlGenerator, PgQuoting, Quoting};
 use oxbase_types::{
-    ArgMode, Error, ObjectDef, ObjectKind, ObjectRef, Result, RoutineArg, RoutineDef, Script,
-    ScriptStep, SequenceDef, TriggerDef, TriggerEvent, TriggerLevel, TriggerTiming, Value, ViewDef,
-    props,
+    ArgMode, Error, ObjectDef, ObjectKind, ObjectRef, PropId, Result, RoutineArg, RoutineDef,
+    Script, ScriptStep, SequenceDef, ServerVersion, TriggerDef, TriggerEvent, TriggerLevel,
+    TriggerTiming, Value, ViewDef, props,
 };
 
 use super::ddl::literal;
-use super::fetch::{PARALLEL, SETTINGS, SQL_STANDARD_BODY};
+use super::fetch::{PARALLEL, SECURITY_BARRIER, SECURITY_INVOKER, SETTINGS, SQL_STANDARD_BODY};
+use super::sql::at_least;
 
 /// The kinds these cells cover.
 pub(crate) const KINDS: [ObjectKind; 6] = [
@@ -78,9 +80,9 @@ fn comment_text(comment: Option<&str>) -> Option<&str> {
 }
 
 impl DdlGenerator for PgSyncDdl {
-    fn create(&self, d: &ObjectDef, _ctx: &DdlContext<'_>) -> Result<Script> {
+    fn create(&self, d: &ObjectDef, ctx: &DdlContext<'_>) -> Result<Script> {
         match d {
-            ObjectDef::View(v) => Ok(create_view(v)),
+            ObjectDef::View(v) => create_view(v, ctx.version),
             ObjectDef::Routine(r) => create_routine(r, false),
             ObjectDef::Trigger(t) => create_trigger(t),
             ObjectDef::Sequence(s) => Ok(create_sequence(s)),
@@ -165,7 +167,32 @@ impl DdlGenerator for PgSyncDdl {
 
 // --- views ---------------------------------------------------------------------------------------
 
-fn create_view(v: &ViewDef) -> Script {
+/// The view options of `v` (`security_barrier`, `security_invoker`) that are on. A
+/// `security_invoker` view cannot be created before PostgreSQL 15: refused rather than created
+/// with the owner's rights.
+fn view_options(v: &ViewDef, version: &ServerVersion) -> Result<Vec<&'static str>> {
+    let on = |prop: &PropId| v.extras.get(prop) == Some(&Value::Bool(true));
+    let mut options = Vec::new();
+    if v.obj.kind != ObjectKind::View {
+        return Ok(options);
+    }
+    if on(&SECURITY_BARRIER) {
+        options.push("security_barrier = true");
+    }
+    if on(&SECURITY_INVOKER) {
+        if !at_least(version, 15) {
+            return Err(Error::unsupported(format!(
+                "view {} reads its tables with the querying user's rights (security_invoker), \
+                 which needs PostgreSQL 15 or newer (the server is {version})",
+                v.obj.name
+            )));
+        }
+        options.push("security_invoker = true");
+    }
+    Ok(options)
+}
+
+fn create_view(v: &ViewDef, version: &ServerVersion) -> Result<Script> {
     let materialized = v.obj.kind == ObjectKind::MatView;
     let keyword = if materialized {
         "MATERIALIZED VIEW"
@@ -176,6 +203,10 @@ fn create_view(v: &ViewDef) -> Script {
     if !v.columns.is_empty() {
         let columns: Vec<String> = v.columns.iter().map(|c| ident(c)).collect();
         let _ = write!(sql, " ({})", columns.join(", "));
+    }
+    let options = view_options(v, version)?;
+    if !options.is_empty() {
+        let _ = write!(sql, " WITH ({})", options.join(", "));
     }
     sql.push_str(" AS\n");
     sql.push_str(v.definition.trim().trim_end_matches(';').trim_end());
@@ -201,7 +232,7 @@ fn create_view(v: &ViewDef) -> Script {
             format!("Comment on {what} {}", v.obj.name),
         ));
     }
-    script
+    Ok(script)
 }
 
 // --- routines ------------------------------------------------------------------------------------
@@ -875,6 +906,53 @@ mod tests {
             ["DROP MATERIALIZED VIEW \"m8_tgt\".\"active_customers\""]
         );
         assert!(drop.is_destructive());
+    }
+
+    /// `security_barrier` and `security_invoker` come with the view (audit lead 11); an invoker
+    /// view is refused before PostgreSQL 15 rather than created with its owner's rights.
+    #[test]
+    fn view_security_options() {
+        let view = |extras: Extras| {
+            ObjectDef::View(ViewDef {
+                obj: schema().child(ObjectKind::View, "mine"),
+                definition: "SELECT 1 AS one".into(),
+                columns: Vec::new(),
+                comment: None,
+                extras,
+            })
+        };
+        let first = |def: &ObjectDef, version: &ServerVersion| {
+            PgSyncDdl
+                .create(def, &DdlContext::new(version))
+                .map(|s| s.steps[0].sql.clone())
+        };
+        let v18 = ctx_version();
+        let both = view(
+            Extras::new()
+                .with(SECURITY_BARRIER, true)
+                .with(SECURITY_INVOKER, true)
+                .with(props::CHECK_OPTION, "cascaded"),
+        );
+        assert_eq!(
+            first(&both, &v18).unwrap(),
+            "CREATE VIEW \"m8_tgt\".\"mine\" WITH (security_barrier = true, security_invoker = true) AS\nSELECT 1 AS one\n  WITH CASCADED CHECK OPTION"
+        );
+        let off = view(
+            Extras::new()
+                .with(SECURITY_BARRIER, false)
+                .with(SECURITY_INVOKER, false),
+        );
+        assert_eq!(
+            first(&off, &v18).unwrap(),
+            "CREATE VIEW \"m8_tgt\".\"mine\" AS\nSELECT 1 AS one"
+        );
+        let v14 = ServerVersion::new(14, 19, 0);
+        let e = first(&both, &v14).unwrap_err();
+        assert!(matches!(e, Error::Unsupported { .. }), "{e}");
+        assert_eq!(
+            first(&view(Extras::new().with(SECURITY_BARRIER, true)), &v14).unwrap(),
+            "CREATE VIEW \"m8_tgt\".\"mine\" WITH (security_barrier = true) AS\nSELECT 1 AS one"
+        );
     }
 
     fn function() -> RoutineDef {

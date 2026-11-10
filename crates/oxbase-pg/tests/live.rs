@@ -1163,3 +1163,175 @@ async fn definer_routines_keep_their_settings() {
     );
     drop_schemas(&*conn, &[src, tgt]).await;
 }
+
+/// Row-level security (`ENABLE` / `FORCE`), policies and the view options `security_barrier`
+/// and `security_invoker` are read, compared and written back (audit lead 11).
+#[tokio::test]
+#[ignore = "needs the postgres fixture"]
+async fn row_security_policies_and_view_options_are_kept() {
+    let f = fixture();
+    let conn = connect(&plain_params(&f)).await;
+    let (src, tgt, role) = ("oxbase_l11_src", "oxbase_l11_tgt", "oxbase_l11_tenant");
+    fresh_schemas(&*conn, &[src, tgt]).await;
+    run(
+        &*conn,
+        &format!(
+            "DO $do$ BEGIN CREATE ROLE {role} NOLOGIN; \
+             EXCEPTION WHEN duplicate_object THEN NULL; END $do$"
+        ),
+        &[],
+    )
+    .await;
+    for sql in [
+        format!("CREATE TABLE {src}.t (tenant text, v int)"),
+        format!("ALTER TABLE {src}.t ENABLE ROW LEVEL SECURITY"),
+        format!("ALTER TABLE {src}.t FORCE ROW LEVEL SECURITY"),
+        format!("CREATE POLICY own ON {src}.t USING (tenant = current_user)"),
+        format!(
+            "CREATE POLICY ins ON {src}.t AS RESTRICTIVE FOR INSERT TO {role} \
+             WITH CHECK (v > 0)"
+        ),
+        format!("CREATE TABLE {tgt}.plain (tenant text, v int)"),
+        format!(
+            "CREATE VIEW {src}.vi WITH (security_barrier = true, security_invoker = true) \
+             AS SELECT tenant, v FROM {src}.t"
+        ),
+    ] {
+        run(&*conn, &sql, &[]).await;
+    }
+    let table = |schema: &str, name: &str| ObjectRef::table(None, Some(schema), name);
+    let moved = |mut def: ObjectDef, name: &str| {
+        match &mut def {
+            ObjectDef::Table(t) => {
+                t.obj.schema = Some(tgt.to_owned());
+                t.obj.name = name.to_owned();
+            }
+            ObjectDef::View(v) => {
+                v.obj.schema = Some(tgt.to_owned());
+                v.definition = v.definition.replace(&format!("{src}."), &format!("{tgt}."));
+            }
+            other => panic!("{other:?}"),
+        }
+        def
+    };
+    let source_t = load_def(&*conn, &table(src, "t")).await;
+    let ObjectDef::Table(t) = &source_t else {
+        panic!("t is not a table")
+    };
+    assert_eq!(
+        t.extras.get(&oxbase_types::props::FORCE_ROW_SECURITY),
+        Some(&Value::Bool(true))
+    );
+    let view_ref = ObjectRef::schema(None, src).child(ObjectKind::View, "vi");
+    let source_vi = load_def(&*conn, &view_ref).await;
+
+    // Created on the target: the same flags, policies and options.
+    create_def(&*conn, &moved(source_t.clone(), "t")).await;
+    create_def(&*conn, &moved(source_vi.clone(), "vi")).await;
+    assert_eq!(
+        text_of(
+            &*conn,
+            &format!(
+                "SELECT c.relrowsecurity::text || ' ' || c.relforcerowsecurity::text \
+                 FROM pg_catalog.pg_class c WHERE c.oid = '{tgt}.t'::regclass"
+            )
+        )
+        .await
+        .as_deref(),
+        Some("true true")
+    );
+    let policies = |schema: &str| {
+        format!(
+            "SELECT pg_catalog.string_agg(p.polname::text || ' ' || p.polcmd::text || ' ' || \
+                    p.polpermissive::text || ' ' || \
+                    pg_catalog.array_to_json(p.polroles::regrole[]::text[])::text || ' ' || \
+                    COALESCE(pg_catalog.pg_get_expr(p.polqual, p.polrelid), '-') || ' ' || \
+                    COALESCE(pg_catalog.pg_get_expr(p.polwithcheck, p.polrelid), '-'), \
+                    ', ' ORDER BY p.polname) \
+             FROM pg_catalog.pg_policy p WHERE p.polrelid = '{schema}.t'::regclass"
+        )
+    };
+    let source_policies = text_of(&*conn, &policies(src)).await;
+    assert!(
+        source_policies
+            .as_deref()
+            .is_some_and(|p| p.contains("ins a false")),
+        "{source_policies:?}"
+    );
+    assert_eq!(text_of(&*conn, &policies(tgt)).await, source_policies);
+    assert_eq!(
+        text_of(
+            &*conn,
+            &format!(
+                "SELECT pg_catalog.array_to_json(c.reloptions)::text FROM pg_catalog.pg_class c \
+                 WHERE c.oid = '{tgt}.vi'::regclass"
+            )
+        )
+        .await
+        .as_deref(),
+        Some(r#"["security_barrier=true","security_invoker=true"]"#)
+    );
+
+    // The comparison sees them: equal after the create, different from a plain table.
+    let mut reg = DialectRegistry::new();
+    oxbase_pg::dialect::register(&mut reg);
+    let diff = |kind: ObjectKind, a: &ObjectDef, b: &ObjectDef| {
+        reg.comparator(Engine::Postgres, kind).unwrap().diff(a, b)
+    };
+    let target_t = load_def(&*conn, &table(tgt, "t")).await;
+    assert_eq!(
+        diff(ObjectKind::Table, &target_t, &moved(source_t.clone(), "t")),
+        []
+    );
+    let target_vi = load_def(
+        &*conn,
+        &ObjectRef::schema(None, tgt).child(ObjectKind::View, "vi"),
+    )
+    .await;
+    assert_eq!(
+        diff(ObjectKind::View, &target_vi, &moved(source_vi, "vi")),
+        []
+    );
+    let plain = load_def(&*conn, &table(tgt, "plain")).await;
+    let changes = diff(ObjectKind::Table, &plain, &moved(source_t.clone(), "plain"));
+    for prop in [
+        oxbase_types::props::ROW_SECURITY,
+        oxbase_types::props::FORCE_ROW_SECURITY,
+        oxbase_types::props::POLICIES,
+    ] {
+        assert!(
+            changes.iter().any(|d| d.prop.as_ref() == Some(&prop)),
+            "{prop}: {changes:?}"
+        );
+    }
+    // ... and the table's alter switches them on.
+    let version = conn.server_version().clone();
+    let script = generator(ObjectKind::Table)
+        .alter(
+            &plain,
+            &moved(source_t, "plain"),
+            &DdlContext::new(&version),
+        )
+        .unwrap();
+    for step in &script.steps {
+        collect(
+            conn.execute_one(&step.sql, CancellationToken::new())
+                .await
+                .unwrap_or_else(|e| panic!("{}: {e}", step.sql)),
+        )
+        .await
+        .unwrap();
+    }
+    let plain_after = load_def(&*conn, &table(tgt, "plain")).await;
+    assert_eq!(
+        diff(
+            ObjectKind::Table,
+            &plain_after,
+            &moved(load_def(&*conn, &table(src, "t")).await, "plain")
+        ),
+        []
+    );
+
+    drop_schemas(&*conn, &[src, tgt]).await;
+    run(&*conn, &format!("DROP ROLE IF EXISTS {role}"), &[]).await;
+}

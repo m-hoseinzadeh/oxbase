@@ -457,8 +457,8 @@ pub fn move_definition(engine: Engine, def: &mut ObjectDef, from: &Location, to:
 }
 
 /// Moves names inside the engine-native SQL text of `def` from `from` to `to`
-/// (`oxbase_diff::retarget_sql`): defaults, generated columns, checks and index predicates of
-/// a table; a view's query; a routine's body and definition; a trigger's condition, body and
+/// (`oxbase_diff::retarget_sql`): defaults, generated columns, checks, index predicates and
+/// row-level security policy expressions of a table; a view's query; a routine's body and definition; a trigger's condition, body and
 /// definition. Only called when the containers differ.
 pub(crate) fn retarget_text(engine: Engine, def: &mut ObjectDef, from: &Location, to: &Location) {
     let mv = |text: &mut String| *text = oxbase_diff::retarget_sql(engine, text, from, to);
@@ -485,6 +485,9 @@ pub(crate) fn retarget_text(engine: Engine, def: &mut ObjectDef, from: &Location
                         mv(&mut c.name);
                     }
                 }
+            }
+            for text in t.extras.policy_expressions_mut() {
+                mv(text);
             }
         }
         ObjectDef::View(v) => mv(&mut v.definition),

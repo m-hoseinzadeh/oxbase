@@ -39,6 +39,12 @@ pub const PARALLEL: PropId = PropId::from_static("parallel");
 /// server's deparse, not string content. Always reported, `false` for a quoted (`prosrc`) body,
 /// so the DDL quotes a body unless the catalog says it is a standard one.
 pub const SQL_STANDARD_BODY: PropId = PropId::from_static("sql_standard_body");
+/// Extra: a view checks its conditions before functions that might leak the rows they see
+/// (`WITH (security_barrier)`), a bool. Always reported for views.
+pub const SECURITY_BARRIER: PropId = PropId::from_static("security_barrier");
+/// Extra: a view reads its tables with the rights of the user who queries it, not its owner's
+/// (`WITH (security_invoker)`, PostgreSQL 15+), a bool. Reported for views on 15 and newer.
+pub const SECURITY_INVOKER: PropId = PropId::from_static("security_invoker");
 /// Extra: a routine's `SET` clauses (`pg_proc.proconfig`), a JSON array of `name=value` texts as
 /// the server stores them (`search_path=pg_catalog, pg_temp`). Always reported (`[]` when there
 /// are none), so a comparison sees a setting, such as the `search_path` pin of a
@@ -531,6 +537,13 @@ async fn load_table(cx: &Cx<'_>, obj: &ObjectRef) -> Result<ObjectDef> {
             def.extras.insert(prop, v);
         }
     }
+    // Always reported (off and empty included), so a comparison sees them change.
+    def.extras
+        .insert(props::ROW_SECURITY, head.flag("row_security")?);
+    def.extras
+        .insert(props::FORCE_ROW_SECURITY, head.flag("force_row_security")?);
+    def.extras
+        .insert(props::POLICIES, Value::Json(policies(cx, rel.oid).await?));
     def.columns = columns(cx, rel.oid)
         .await?
         .into_iter()
@@ -554,6 +567,38 @@ async fn load_table(cx: &Cx<'_>, obj: &ObjectRef) -> Result<ObjectDef> {
     Ok(ObjectDef::Table(def))
 }
 
+/// The row-level security policies of table `oid`, as [`props::POLICIES`] describes them.
+async fn policies(cx: &Cx<'_>, oid: i64) -> Result<serde_json::Value> {
+    let rows = cx.query(sql::TABLE_POLICIES, &[Value::Int(oid)]).await?;
+    let mut out = Vec::new();
+    for row in rows.iter() {
+        let command = match row.code("command")? {
+            "*" => "all",
+            "r" => "select",
+            "a" => "insert",
+            "w" => "update",
+            "d" => "delete",
+            other => {
+                return Err(Error::internal(format!("unknown policy command '{other}'")));
+            }
+        };
+        let roles: Vec<String> = match row.opt_str("roles")? {
+            Some(text) => serde_json::from_str(text)
+                .map_err(|e| Error::internal(format!("unreadable policy roles: {e}")))?,
+            None => Vec::new(),
+        };
+        out.push(serde_json::json!({
+            "name": row.string("name")?,
+            "command": command,
+            "permissive": row.flag("permissive")?,
+            "roles": roles,
+            "using": row.opt_string("using_expr")?,
+            "check": row.opt_string("check_expr")?,
+        }));
+    }
+    Ok(serde_json::Value::Array(out))
+}
+
 async fn load_view(cx: &Cx<'_>, obj: &ObjectRef) -> Result<ObjectDef> {
     let obj = cx.in_session_database(obj)?;
     let schema = schema_of(&obj)?;
@@ -573,6 +618,13 @@ async fn load_view(cx: &Cx<'_>, obj: &ObjectRef) -> Result<ObjectDef> {
     }
     if let Some(mode) = row.opt_string("check_option")? {
         extras.insert(props::CHECK_OPTION, mode);
+    }
+    if obj.kind == ObjectKind::View {
+        // Always reported, so a comparison sees them change; `security_invoker` exists from 15.
+        extras.insert(SECURITY_BARRIER, row.flag("security_barrier")?);
+        if sql::at_least(cx.version(), 15) {
+            extras.insert(SECURITY_INVOKER, row.flag("security_invoker")?);
+        }
     }
     if obj.kind == ObjectKind::MatView {
         extras.insert(props::POPULATED, row.flag("populated")?);

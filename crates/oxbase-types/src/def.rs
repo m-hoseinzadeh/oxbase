@@ -16,7 +16,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{DataType, Extras, ObjectKind, ObjectRef};
+use crate::props::{FORCE_ROW_SECURITY, POLICIES, ROW_SECURITY};
+use crate::{DataType, Extras, ObjectKind, ObjectRef, PropId, Value};
 
 /// A typed definition of one database object.
 ///
@@ -217,6 +218,67 @@ impl TableDef {
     /// Looks up a column by exact name.
     pub fn column(&self, name: &str) -> Option<&ColumnDef> {
         self.columns.iter().find(|c| c.name == name)
+    }
+
+    /// The table without its row-level security ([`ROW_SECURITY`], [`FORCE_ROW_SECURITY`]) and
+    /// policies ([`POLICIES`]), switched off and none: what is created first when they are
+    /// switched on later, by the table's `alter` to `self`, once its rows are loaded (a policy
+    /// that binds the owner would filter or refuse them) and the objects a policy names exist.
+    /// `None` when the table has none of them.
+    pub fn without_row_security(&self) -> Option<TableDef> {
+        let on = |prop: &PropId| self.extras.get(prop) == Some(&Value::Bool(true));
+        let policies = matches!(
+            self.extras.get(&POLICIES),
+            Some(Value::Json(serde_json::Value::Array(items))) if !items.is_empty()
+        );
+        if !on(&ROW_SECURITY) && !on(&FORCE_ROW_SECURITY) && !policies {
+            return None;
+        }
+        let mut bare = self.clone();
+        for prop in [ROW_SECURITY, FORCE_ROW_SECURITY] {
+            if bare.extras.contains(&prop) {
+                bare.extras.insert(prop, false);
+            }
+        }
+        if policies {
+            bare.extras
+                .insert(POLICIES, Value::Json(serde_json::Value::Array(Vec::new())));
+        }
+        Some(bare)
+    }
+
+    /// `self`, the new definition of an altered table, with the row-level security of
+    /// `before`: `before`'s flags, and only the policies both have unchanged. An alter from
+    /// `before` to it drops the policies that go or change; one from it to `self` then switches
+    /// the flags and creates the new and changed policies, which structure sync runs after
+    /// every table and view exists. `None` when that second alter would have nothing to do.
+    pub fn with_row_security_of(&self, before: &TableDef) -> Option<TableDef> {
+        let mut kept = self.clone();
+        for prop in [ROW_SECURITY, FORCE_ROW_SECURITY] {
+            match before.extras.get(&prop) {
+                Some(value) if self.extras.contains(&prop) => {
+                    kept.extras.insert(prop, value.clone());
+                }
+                _ => {
+                    kept.extras.remove(&prop);
+                }
+            }
+        }
+        match (before.extras.get(&POLICIES), self.extras.get(&POLICIES)) {
+            (
+                Some(Value::Json(serde_json::Value::Array(old))),
+                Some(Value::Json(serde_json::Value::Array(new))),
+            ) => {
+                let unchanged: Vec<serde_json::Value> =
+                    new.iter().filter(|p| old.contains(p)).cloned().collect();
+                kept.extras
+                    .insert(POLICIES, Value::Json(serde_json::Value::Array(unchanged)));
+            }
+            _ => {
+                kept.extras.remove(&POLICIES);
+            }
+        }
+        (kept != *self).then_some(kept)
     }
 }
 
@@ -681,10 +743,7 @@ mod tests {
         let def = ObjectDef::Table(t.clone());
         assert_eq!(def.kind(), ObjectKind::Table);
         assert_eq!(def.name(), "orders");
-        assert_eq!(
-            def.extras().get(&props::UNLOGGED),
-            Some(&crate::Value::Bool(true))
-        );
+        assert_eq!(def.extras().get(&props::UNLOGGED), Some(&Value::Bool(true)));
 
         let col = ObjectDef::Column {
             table: t.obj.clone(),
@@ -821,5 +880,54 @@ mod tests {
             serde_json::from_str(r#"{"name":"x","data_type":{"type":"bool"},"nullable":true}"#)
                 .unwrap();
         assert_eq!(old.identity, None);
+    }
+
+    fn secured(on: bool, policies: serde_json::Value) -> TableDef {
+        let mut t = TableDef::new(ObjectRef::table(None, Some("s"), "t"));
+        t.extras.insert(ROW_SECURITY, on);
+        t.extras.insert(FORCE_ROW_SECURITY, false);
+        t.extras.insert(POLICIES, Value::Json(policies));
+        t
+    }
+
+    /// Row-level security is split off so it can be switched on after the rows and after the
+    /// objects its policies name (audit lead 11).
+    #[test]
+    fn row_security_splits_off() {
+        let plain = secured(false, serde_json::json!([]));
+        assert_eq!(plain.without_row_security(), None);
+        assert_eq!(
+            TableDef::new(plain.obj.clone()).without_row_security(),
+            None,
+            "an archive written before row-level security was read"
+        );
+        let full = secured(true, serde_json::json!([{"name": "p", "using": "true"}]));
+        assert_eq!(full.without_row_security(), Some(plain.clone()));
+        let mut only_policies = TableDef::new(plain.obj.clone());
+        only_policies.extras.insert(
+            POLICIES,
+            Value::Json(serde_json::json!([{"name": "p", "using": "true"}])),
+        );
+        let bare = only_policies.without_row_security().unwrap();
+        assert_eq!(
+            bare.extras.get(&POLICIES),
+            Some(&Value::Json(serde_json::json!([])))
+        );
+        assert_eq!(bare.extras.get(&ROW_SECURITY), None);
+
+        // An alter keeps the policies both sides have unchanged and the old flags.
+        let p = serde_json::json!({"name": "p", "using": "true"});
+        let q_old = serde_json::json!({"name": "q", "using": "a = 1"});
+        let q_new = serde_json::json!({"name": "q", "using": "a = 2"});
+        let r = serde_json::json!({"name": "r", "using": "false"});
+        let before = secured(false, serde_json::json!([p.clone(), q_old]));
+        let after = secured(true, serde_json::json!([p.clone(), q_new, r]));
+        assert_eq!(
+            after.with_row_security_of(&before),
+            Some(secured(false, serde_json::json!([p.clone()])))
+        );
+        assert_eq!(before.with_row_security_of(&before), None);
+        let dropped_only = secured(false, serde_json::json!([p]));
+        assert_eq!(dropped_only.with_row_security_of(&before), None);
     }
 }
