@@ -317,21 +317,34 @@ samp {
   background: var(--color-selection-strong);
 }
 
-/* Thin, theme-aware scrollbars (WebKitGTK, WebView2 and WebKit all honour these). */
-* {
-  scrollbar-width: thin;
-  scrollbar-color: var(--color-scrollbar) transparent;
+/*
+ * Theme-aware scrollbars, wide enough to grab: a 14px track with a 10px thumb that grows to the
+ * full width under the pointer. Only the ::-webkit-scrollbar rules: WebKitGTK, WebView2 and
+ * WebKit all honour them, and WebView2 (Chromium) ignores them as soon as `scrollbar-width` or
+ * `scrollbar-color` is set, which drew thin native bars on Windows.
+ */
+::-webkit-scrollbar {
+  width: 14px;
+  height: 14px;
 }
 
-::-webkit-scrollbar {
-  width: 10px;
-  height: 10px;
+::-webkit-scrollbar-track {
+  background: transparent;
 }
 
 ::-webkit-scrollbar-thumb {
   background: var(--color-scrollbar);
   border: 2px solid transparent;
   border-radius: 8px;
+  background-clip: padding-box;
+  min-height: 32px;
+  min-width: 32px;
+}
+
+::-webkit-scrollbar-thumb:hover,
+::-webkit-scrollbar-thumb:active {
+  background: var(--color-fg-faint);
+  border-width: 1px;
   background-clip: padding-box;
 }
 
