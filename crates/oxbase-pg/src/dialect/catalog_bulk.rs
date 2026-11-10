@@ -13,6 +13,13 @@
 //! With both lists NULL the read is a full one. A list is matched with `strpos` on lower-cased
 //! text, which can only ever match *more* than asked for (another case of the same name): the
 //! cache merges what comes back, so an extra relation is simply refreshed too.
+//!
+//! Functions are `pg_catalog`-qualified and `name` values cast to `text` before a function or
+//! operator gets them, and the `oid` of a catalog is compared with `OPERATOR(pg_catalog.=)`:
+//! PostgreSQL prefers an overload whose argument types match exactly wherever it is on the
+//! `search_path`, so `replace(name, ...)` or `oid = regclass` would run another role's
+//! `public.replace(name, text, text)` or `public.=(oid, regclass)` as the Oxbase user
+//! (CVE-2018-1058 class; `sql.rs` has the same rule).
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -28,31 +35,37 @@ use oxbase_types::{
 use super::rows::query;
 use super::sql::at_least;
 
-/// The scope filter on a schema-level object in namespace `n`.
+/// The scope filter on a schema-level object in namespace `n` (functions `pg_catalog`-qualified
+/// and `name` values cast to `text` first, see the module docs).
 macro_rules! schema_filter {
     () => {
         "(($2::text IS NULL AND $3::text IS NULL) \
-           OR strpos(lower($2::text), lower('\"' || replace(n.nspname, '\"', '\"\"') || '\"')) > 0) \
-         AND n.nspname !~ '^pg_(toast_)?temp_' AND n.nspname !~ '^pg_toast' \
+           OR pg_catalog.strpos(pg_catalog.lower($2::text), pg_catalog.lower('\"' || \
+                pg_catalog.replace(n.nspname::pg_catalog.text, '\"', '\"\"') || '\"')) > 0) \
+         AND n.nspname::pg_catalog.text !~ '^pg_(toast_)?temp_' \
+         AND n.nspname::pg_catalog.text !~ '^pg_toast' \
          AND ($1::bool OR n.nspname NOT IN ('pg_catalog', 'information_schema') \
-              OR strpos(lower(coalesce($2::text, '')), \
-                        lower('\"' || replace(n.nspname, '\"', '\"\"') || '\"')) > 0)"
+              OR pg_catalog.strpos(pg_catalog.lower(coalesce($2::text, '')), pg_catalog.lower('\"' || \
+                pg_catalog.replace(n.nspname::pg_catalog.text, '\"', '\"\"') || '\"')) > 0)"
     };
 }
 
-/// The scope filter on relation `c` in namespace `n`.
+/// The scope filter on relation `c` in namespace `n` (written like `schema_filter!`).
 macro_rules! relation_filter {
     () => {
         "(($2::text IS NULL AND $3::text IS NULL) \
-           OR strpos(lower($2::text), lower('\"' || replace(n.nspname, '\"', '\"\"') || '\"')) > 0 \
-           OR strpos(lower($3::text), lower('\"' || replace(n.nspname, '\"', '\"\"') || '\".\"' \
-                     || replace(c.relname, '\"', '\"\"') || '\"')) > 0) \
-         AND n.nspname !~ '^pg_(toast_)?temp_' AND n.nspname !~ '^pg_toast' \
+           OR pg_catalog.strpos(pg_catalog.lower($2::text), pg_catalog.lower('\"' || \
+                pg_catalog.replace(n.nspname::pg_catalog.text, '\"', '\"\"') || '\"')) > 0 \
+           OR pg_catalog.strpos(pg_catalog.lower($3::text), pg_catalog.lower('\"' || \
+                pg_catalog.replace(n.nspname::pg_catalog.text, '\"', '\"\"') || '\".\"' || \
+                pg_catalog.replace(c.relname::pg_catalog.text, '\"', '\"\"') || '\"')) > 0) \
+         AND n.nspname::pg_catalog.text !~ '^pg_(toast_)?temp_' \
+         AND n.nspname::pg_catalog.text !~ '^pg_toast' \
          AND ($1::bool OR n.nspname NOT IN ('pg_catalog', 'information_schema') \
-              OR strpos(lower(coalesce($2::text, '')), \
-                        lower('\"' || replace(n.nspname, '\"', '\"\"') || '\"')) > 0 \
-              OR strpos(lower(coalesce($3::text, '')), \
-                        lower('\"' || replace(n.nspname, '\"', '\"\"') || '\".')) > 0)"
+              OR pg_catalog.strpos(pg_catalog.lower(coalesce($2::text, '')), pg_catalog.lower('\"' || \
+                pg_catalog.replace(n.nspname::pg_catalog.text, '\"', '\"\"') || '\"')) > 0 \
+              OR pg_catalog.strpos(pg_catalog.lower(coalesce($3::text, '')), pg_catalog.lower('\"' || \
+                pg_catalog.replace(n.nspname::pg_catalog.text, '\"', '\"\"') || '\".')) > 0)"
     };
 }
 
@@ -85,7 +98,8 @@ const RELATIONS: &str = concat!(
      FROM pg_catalog.pg_class c \
      JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
      LEFT JOIN pg_catalog.pg_description d ON d.objoid = c.oid \
-          AND d.classoid = 'pg_catalog.pg_class'::pg_catalog.regclass AND d.objsubid = 0 \
+          AND d.classoid OPERATOR(pg_catalog.=) 'pg_catalog.pg_class'::pg_catalog.regclass::pg_catalog.oid \
+          AND d.objsubid = 0 \
      WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f', 'S') AND ",
     relation_filter!()
 );
@@ -104,8 +118,9 @@ const COLUMNS: &str = concat!(
     " ORDER BY c.oid, a.attnum LIMIT $4::int8"
 );
 
-/// Multi-argument `unnest` is grammar (`ROWS FROM`), not a function: it cannot be
-/// schema-qualified.
+/// Key positions come from `pg_catalog.generate_subscripts` (a multi-argument `unnest` is
+/// grammar for `ROWS FROM (unnest(...), ...)` and cannot be schema-qualified, so an
+/// `unnest(smallint[])` elsewhere on the `search_path` would be picked over the polymorphic one).
 const FOREIGN_KEYS: &str = concat!(
     "SELECT n.nspname::text AS schema_name, c.relname::text AS rel, con.oid::int8 AS id, \
             rn.nspname::text AS ref_schema, rc.relname::text AS ref_table, \
@@ -115,12 +130,13 @@ const FOREIGN_KEYS: &str = concat!(
      JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
      JOIN pg_catalog.pg_class rc ON rc.oid = con.confrelid \
      JOIN pg_catalog.pg_namespace rn ON rn.oid = rc.relnamespace \
-     CROSS JOIN LATERAL unnest(con.conkey, con.confkey) WITH ORDINALITY AS k(attnum, refnum, ord) \
-     JOIN pg_catalog.pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = k.attnum \
-     JOIN pg_catalog.pg_attribute ra ON ra.attrelid = con.confrelid AND ra.attnum = k.refnum \
+     CROSS JOIN LATERAL pg_catalog.generate_subscripts(con.conkey, 1) AS k(i) \
+     JOIN pg_catalog.pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = con.conkey[k.i] \
+     JOIN pg_catalog.pg_attribute ra \
+       ON ra.attrelid = con.confrelid AND ra.attnum = con.confkey[k.i] \
      WHERE con.contype = 'f' AND ",
     relation_filter!(),
-    " ORDER BY con.oid, k.ord"
+    " ORDER BY con.oid, k.i"
 );
 
 /// Routines, PostgreSQL 11+ (`prokind`).
@@ -470,6 +486,47 @@ mod tests {
             "PostgreSQL 10 has no prokind"
         );
         assert_eq!(routines_sql(&ServerVersion::new(18, 0, 0)), ROUTINES);
+    }
+
+    /// Calls and operators cannot be taken over through the `search_path` (audit lead 14).
+    #[test]
+    fn functions_are_qualified_and_names_cast() {
+        for sql in [
+            SETTINGS,
+            SEARCH_PATH,
+            DATABASES,
+            SCHEMAS,
+            RELATIONS,
+            COLUMNS,
+            FOREIGN_KEYS,
+            ROUTINES,
+            ROUTINES_10,
+            TYPES,
+        ] {
+            for name in [
+                "replace",
+                "strpos",
+                "lower",
+                "unnest",
+                "generate_subscripts",
+            ] {
+                let call = format!("{name}(");
+                for (at, _) in sql.match_indices(&call) {
+                    let before = &sql[..at];
+                    let longer = before
+                        .chars()
+                        .last()
+                        .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
+                    assert!(
+                        longer || before.ends_with("pg_catalog."),
+                        "unqualified {name}() in {sql}"
+                    );
+                }
+            }
+            assert!(!sql.contains("replace(n.nspname,"), "{sql}");
+            assert!(!sql.contains("nspname !~"), "{sql}");
+            assert!(!sql.contains("::pg_catalog.regclass AND"), "{sql}");
+        }
     }
 
     #[test]

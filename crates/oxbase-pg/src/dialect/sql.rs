@@ -9,8 +9,15 @@
 //! `pg_catalog.format_type(...)`), so objects of the same name in a schema the session
 //! `search_path` lists before `pg_catalog` are not picked up instead. Type names in casts and
 //! operators are still resolved through the `search_path`, where `pg_catalog` comes first unless
-//! the user explicitly lists it later. Columns of PostgreSQL-internal types (`name`, `"char"`,
-//! `oid`) are cast to `text` / `int8` so the driver returns plain `Utf8` / `Int64` columns.
+//! the user explicitly lists it later; that only settles ties, though: PostgreSQL prefers a
+//! function or operator whose argument types match more exactly wherever it is on the path, so
+//! an operator whose operands would need an implicit cast to match the `pg_catalog` one is
+//! written so they match exactly (`nspname::pg_catalog.text !~ ...`, `reltuples >=
+//! 0::pg_catalog.float4`) or named outright (`classid OPERATOR(pg_catalog.=)
+//! '...'::pg_catalog.regclass::pg_catalog.oid`); otherwise another role's `public.=(oid,
+//! regclass)` would run as the Oxbase user (CVE-2018-1058 class). Columns of PostgreSQL-internal
+//! types (`name`, `"char"`, `oid`) are cast to `text` / `int8` so the driver returns plain `Utf8`
+//! / `Int64` columns.
 //!
 //! Supported servers: PostgreSQL 10 and newer. Version-dependent pieces: `prokind` (11+,
 //! procedures), `indnkeyatts` and `conparentid` (11+, `INCLUDE` columns, partition constraint
@@ -53,7 +60,7 @@ SELECT n.nspname::text AS name, \
        pg_catalog.obj_description(n.oid, 'pg_namespace') AS comment, \
        (n.oid = pg_catalog.pg_my_temp_schema()) AS is_temp \
 FROM pg_catalog.pg_namespace n \
-WHERE n.nspname !~ '^pg_(toast_)?temp_' OR n.oid = pg_catalog.pg_my_temp_schema() \
+WHERE n.nspname::pg_catalog.text !~ '^pg_(toast_)?temp_' OR n.oid = pg_catalog.pg_my_temp_schema() \
 ORDER BY n.nspname";
 
 /// One schema by name (`$1`).
@@ -71,13 +78,13 @@ macro_rules! relations {
         concat!(
             "SELECT c.relname::text AS name, ",
             "pg_catalog.obj_description(c.oid, 'pg_class') AS comment, ",
-            "CASE WHEN c.reltuples >= 0 THEN c.reltuples::int8 END AS row_estimate, ",
+            "CASE WHEN c.reltuples >= 0::pg_catalog.float4 THEN c.reltuples::int8 END AS row_estimate, ",
             "c.relkind::text AS relkind, ",
             "c.relispartition AS is_partition, ",
             "c.relpersistence::text AS persistence, ",
             "c.relispopulated AS populated, ",
             "EXISTS (SELECT 1 FROM pg_catalog.pg_depend d ",
-            "WHERE d.classid = 'pg_catalog.pg_class'::regclass AND d.objid = c.oid ",
+            "WHERE d.classid OPERATOR(pg_catalog.=) 'pg_catalog.pg_class'::pg_catalog.regclass::pg_catalog.oid AND d.objid = c.oid ",
             "AND d.deptype = 'e') AS extension_member ",
             "FROM pg_catalog.pg_class c ",
             "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace ",
@@ -102,7 +109,7 @@ pub(crate) const SEQUENCES: &str = relations!("'S'");
 pub(crate) const RELATION: &str = "\
 SELECT c.oid::int8 AS oid, c.relkind::text AS relkind, \
        EXISTS (SELECT 1 FROM pg_catalog.pg_depend d \
-                WHERE d.classid = 'pg_catalog.pg_class'::regclass AND d.objid = c.oid \
+                WHERE d.classid OPERATOR(pg_catalog.=) 'pg_catalog.pg_class'::pg_catalog.regclass::pg_catalog.oid AND d.objid = c.oid \
                   AND d.deptype = 'e') AS extension_member \
 FROM pg_catalog.pg_class c \
 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
@@ -164,8 +171,8 @@ macro_rules! columns {
             "AND k.contype = 'p' AND a.attnum = ANY (k.conkey)) AS in_primary_key, ",
             "EXISTS (SELECT 1 FROM pg_catalog.pg_depend dep ",
             "JOIN pg_catalog.pg_class sq ON sq.oid = dep.objid AND sq.relkind = 'S' ",
-            "WHERE dep.classid = 'pg_catalog.pg_class'::regclass ",
-            "AND dep.refclassid = 'pg_catalog.pg_class'::regclass ",
+            "WHERE dep.classid OPERATOR(pg_catalog.=) 'pg_catalog.pg_class'::pg_catalog.regclass::pg_catalog.oid ",
+            "AND dep.refclassid OPERATOR(pg_catalog.=) 'pg_catalog.pg_class'::pg_catalog.regclass::pg_catalog.oid ",
             "AND dep.refobjid = a.attrelid AND dep.refobjsubid = a.attnum ",
             "AND dep.deptype = 'a') AS owns_sequence, ",
             "idseq.seqstart AS identity_start, ",
@@ -178,8 +185,8 @@ macro_rules! columns {
             "LEFT JOIN LATERAL (SELECT s.seqstart, s.seqincrement ",
             "FROM pg_catalog.pg_depend dep ",
             "JOIN pg_catalog.pg_sequence s ON s.seqrelid = dep.objid ",
-            "WHERE dep.classid = 'pg_catalog.pg_class'::regclass ",
-            "AND dep.refclassid = 'pg_catalog.pg_class'::regclass ",
+            "WHERE dep.classid OPERATOR(pg_catalog.=) 'pg_catalog.pg_class'::pg_catalog.regclass::pg_catalog.oid ",
+            "AND dep.refclassid OPERATOR(pg_catalog.=) 'pg_catalog.pg_class'::pg_catalog.regclass::pg_catalog.oid ",
             "AND dep.refobjid = a.attrelid AND dep.refobjsubid = a.attnum ",
             "AND dep.deptype = 'i' LIMIT 1) idseq ON true ",
             "WHERE a.attrelid = $1 AND a.attnum > 0 AND NOT a.attisdropped ",
@@ -389,7 +396,7 @@ macro_rules! routines {
             "pg_catalog.pg_get_function_identity_arguments(p.oid) AS signature, ",
             "pg_catalog.obj_description(p.oid, 'pg_proc') AS comment, ",
             "EXISTS (SELECT 1 FROM pg_catalog.pg_depend d ",
-            "WHERE d.classid = 'pg_catalog.pg_proc'::regclass AND d.objid = p.oid ",
+            "WHERE d.classid OPERATOR(pg_catalog.=) 'pg_catalog.pg_proc'::pg_catalog.regclass::pg_catalog.oid AND d.objid = p.oid ",
             "AND d.deptype = 'e') AS extension_member ",
             "FROM pg_catalog.pg_proc p ",
             "JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace ",
@@ -478,8 +485,8 @@ FROM pg_catalog.pg_class c \
 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
 JOIN pg_catalog.pg_sequence s ON s.seqrelid = c.oid \
 LEFT JOIN pg_catalog.pg_depend dep \
-       ON dep.classid = 'pg_catalog.pg_class'::regclass AND dep.objid = c.oid \
-      AND dep.refclassid = 'pg_catalog.pg_class'::regclass AND dep.refobjsubid > 0 \
+       ON dep.classid OPERATOR(pg_catalog.=) 'pg_catalog.pg_class'::pg_catalog.regclass::pg_catalog.oid AND dep.objid = c.oid \
+      AND dep.refclassid OPERATOR(pg_catalog.=) 'pg_catalog.pg_class'::pg_catalog.regclass::pg_catalog.oid AND dep.refobjsubid > 0 \
       AND dep.deptype IN ('a', 'i') \
 LEFT JOIN pg_catalog.pg_class own_c ON own_c.oid = dep.refobjid \
 LEFT JOIN pg_catalog.pg_namespace own_n ON own_n.oid = own_c.relnamespace \
@@ -515,7 +522,7 @@ SELECT t.typname::text AS name, \
        pg_catalog.obj_description(t.oid, 'pg_type') AS comment, \
        t.typtype::text AS typtype, \
        EXISTS (SELECT 1 FROM pg_catalog.pg_depend d \
-                WHERE d.classid = 'pg_catalog.pg_type'::regclass AND d.objid = t.oid \
+                WHERE d.classid OPERATOR(pg_catalog.=) 'pg_catalog.pg_type'::pg_catalog.regclass::pg_catalog.oid AND d.objid = t.oid \
                   AND d.deptype = 'e') AS extension_member \
 FROM pg_catalog.pg_type t \
 JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace \
@@ -765,6 +772,32 @@ mod tests {
                     assert!(qualified, "unqualified {name}() in {sql}");
                 }
             }
+        }
+    }
+
+    /// Operators whose `pg_catalog` match needs an implicit cast lose to an exact overload
+    /// elsewhere on the `search_path` (audit lead 14): `oid` compared with a `regclass`
+    /// constant goes through `OPERATOR(pg_catalog.=)`, a `name` matched with a pattern is cast
+    /// to `text` first.
+    #[test]
+    fn operators_cannot_be_taken_over_through_the_search_path() {
+        for sql in ALL {
+            assert!(!sql.contains("::regclass"), "unqualified regclass in {sql}");
+            for (at, _) in sql.match_indices("'::pg_catalog.regclass") {
+                let before = &sql[..at];
+                let quote = before.rfind('\'').unwrap();
+                assert!(
+                    before[..quote].ends_with("OPERATOR(pg_catalog.=) "),
+                    "a regclass constant compared with a plain operator in {sql}"
+                );
+            }
+            for (at, _) in sql.match_indices(" !~ ") {
+                assert!(
+                    sql[..at].ends_with("::pg_catalog.text"),
+                    "a pattern matched against a non-text value in {sql}"
+                );
+            }
+            assert!(!sql.contains("reltuples >= 0 "), "{sql}");
         }
     }
 

@@ -107,9 +107,12 @@ impl BulkLoader for PgBulkLoader {
     }
 
     /// M8: moves the sequence behind each `serial` / identity column past the loaded values:
-    /// `SELECT setval(pg_get_serial_sequence('<table>', '<column>'), max(<column>)) FROM
-    /// <table>` (no change on an empty table or a column without a sequence: `setval` and
-    /// `pg_get_serial_sequence` return NULL for NULL input).
+    /// `SELECT pg_catalog.setval(pg_catalog.pg_get_serial_sequence('<table>',
+    /// '<column>')::pg_catalog.regclass, pg_catalog.max(<column>)::pg_catalog.int8) FROM <table>`
+    /// (no change on an empty table or a column without a sequence: `setval` and
+    /// `pg_get_serial_sequence` return NULL for NULL input). Qualified, with the arguments
+    /// cast to `setval`'s own types: an unqualified `setval` with a `text` argument would
+    /// prefer another role's `public.setval(text, bigint)` (CVE-2018-1058 class).
     fn identity_resync(&self, table: &ObjectRef, columns: &[ColumnDef]) -> Vec<String> {
         let q = PgQuoting;
         let qualified = q.qualify(table);
@@ -117,7 +120,8 @@ impl BulkLoader for PgBulkLoader {
             .iter()
             .map(|c| {
                 format!(
-                    "SELECT setval(pg_get_serial_sequence({}, {}), max({})) FROM {qualified}",
+                    "SELECT pg_catalog.setval(pg_catalog.pg_get_serial_sequence({}, {})::pg_catalog.regclass, \
+                     pg_catalog.max({})::pg_catalog.int8) FROM {qualified}",
                     q.quote_str(&qualified),
                     q.quote_str(&c.name),
                     q.quote_ident(&c.name)
@@ -488,7 +492,8 @@ mod tests {
         assert_eq!(
             PgBulkLoader.identity_resync(&table, &[id]),
             vec![
-                "SELECT setval(pg_get_serial_sequence('\"s\".\"T\"', 'Id'), max(\"Id\")) FROM \
+                "SELECT pg_catalog.setval(pg_catalog.pg_get_serial_sequence('\"s\".\"T\"', \
+                 'Id')::pg_catalog.regclass, pg_catalog.max(\"Id\")::pg_catalog.int8) FROM \
                  \"s\".\"T\""
                     .to_owned()
             ]
