@@ -58,6 +58,10 @@
       "minimumSystemVersion": "13.0"
     },
     "windows": {
+      "webviewInstallMode": {
+        "type": "embedBootstrapper",
+        "silent": true
+      },
       "nsis": {
         "template": "windows/installer.nsi",
         "installerIcon": "icons/icon.ico",
