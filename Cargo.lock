@@ -156,7 +156,7 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "app-tauri"
-version = "1.4.1"
+version = "1.5.0"
 dependencies = [
  "arrow-array",
  "arrow-ipc",
@@ -4371,11 +4371,11 @@ dependencies = [
 
 [[package]]
 name = "oxbase-ai"
-version = "1.4.1"
+version = "1.5.0"
 
 [[package]]
 name = "oxbase-backup"
-version = "1.4.1"
+version = "1.5.0"
 dependencies = [
  "arrow-array",
  "arrow-ipc",
@@ -4402,18 +4402,18 @@ dependencies = [
 
 [[package]]
 name = "oxbase-bi"
-version = "1.4.1"
+version = "1.5.0"
 
 [[package]]
 name = "oxbase-cli"
-version = "1.4.1"
+version = "1.5.0"
 dependencies = [
  "clap",
 ]
 
 [[package]]
 name = "oxbase-conformance"
-version = "1.4.1"
+version = "1.5.0"
 dependencies = [
  "arrow-array",
  "arrow-cast",
@@ -4439,7 +4439,7 @@ dependencies = [
 
 [[package]]
 name = "oxbase-designer"
-version = "1.4.1"
+version = "1.5.0"
 dependencies = [
  "oxbase-dialect",
  "oxbase-types",
@@ -4450,7 +4450,7 @@ dependencies = [
 
 [[package]]
 name = "oxbase-dialect"
-version = "1.4.1"
+version = "1.5.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -4468,7 +4468,7 @@ dependencies = [
 
 [[package]]
 name = "oxbase-diff"
-version = "1.4.1"
+version = "1.5.0"
 dependencies = [
  "arrow-array",
  "arrow-ipc",
@@ -4494,7 +4494,7 @@ dependencies = [
 
 [[package]]
 name = "oxbase-driver"
-version = "1.4.1"
+version = "1.5.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -4510,7 +4510,7 @@ dependencies = [
 
 [[package]]
 name = "oxbase-insight"
-version = "1.4.1"
+version = "1.5.0"
 dependencies = [
  "oxbase-dialect",
  "oxbase-mssql",
@@ -4529,7 +4529,7 @@ dependencies = [
 
 [[package]]
 name = "oxbase-io"
-version = "1.4.1"
+version = "1.5.0"
 dependencies = [
  "arrow-array",
  "arrow-cast",
@@ -4564,15 +4564,15 @@ dependencies = [
 
 [[package]]
 name = "oxbase-jobs"
-version = "1.4.1"
+version = "1.5.0"
 
 [[package]]
 name = "oxbase-model"
-version = "1.4.1"
+version = "1.5.0"
 
 [[package]]
 name = "oxbase-mongo"
-version = "1.4.1"
+version = "1.5.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -4601,7 +4601,7 @@ dependencies = [
 
 [[package]]
 name = "oxbase-mssql"
-version = "1.4.1"
+version = "1.5.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -4627,7 +4627,7 @@ dependencies = [
 
 [[package]]
 name = "oxbase-mysql"
-version = "1.4.1"
+version = "1.5.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -4651,7 +4651,7 @@ dependencies = [
 
 [[package]]
 name = "oxbase-net"
-version = "1.4.1"
+version = "1.5.0"
 dependencies = [
  "async-trait",
  "futures",
@@ -4674,7 +4674,7 @@ dependencies = [
 
 [[package]]
 name = "oxbase-pg"
-version = "1.4.1"
+version = "1.5.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -4700,7 +4700,7 @@ dependencies = [
 
 [[package]]
 name = "oxbase-redis"
-version = "1.4.1"
+version = "1.5.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -4725,7 +4725,7 @@ dependencies = [
 
 [[package]]
 name = "oxbase-schema-cache"
-version = "1.4.1"
+version = "1.5.0"
 dependencies = [
  "oxbase-dialect",
  "oxbase-sql",
@@ -4736,7 +4736,7 @@ dependencies = [
 
 [[package]]
 name = "oxbase-services"
-version = "1.4.1"
+version = "1.5.0"
 dependencies = [
  "arrow-array",
  "arrow-ipc",
@@ -4776,7 +4776,7 @@ dependencies = [
 
 [[package]]
 name = "oxbase-sql"
-version = "1.4.1"
+version = "1.5.0"
 dependencies = [
  "oxbase-types",
  "pretty_assertions",
@@ -4784,7 +4784,7 @@ dependencies = [
 
 [[package]]
 name = "oxbase-sqlite"
-version = "1.4.1"
+version = "1.5.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -4802,7 +4802,7 @@ dependencies = [
 
 [[package]]
 name = "oxbase-store"
-version = "1.4.1"
+version = "1.5.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -4820,7 +4820,7 @@ dependencies = [
 
 [[package]]
 name = "oxbase-transfer"
-version = "1.4.1"
+version = "1.5.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -4841,7 +4841,7 @@ dependencies = [
 
 [[package]]
 name = "oxbase-types"
-version = "1.4.1"
+version = "1.5.0"
 dependencies = [
  "chrono",
  "pretty_assertions",

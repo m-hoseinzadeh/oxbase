@@ -68,7 +68,7 @@ default-members = [
 exclude = ["vendor"]
 
 [workspace.package]
-version = "1.4.1"
+version = "1.5.0"
 edition = "2024"
 # tauri 2.12 requires 1.90; arrow 60 requires 1.88.
 rust-version = "1.90"
@@ -103,31 +103,31 @@ todo = "warn"
 
 [workspace.dependencies]
 # --- internal crates (path + version so `x.workspace = true` works) ---
-oxbase-types = { path = "crates/oxbase-types", version = "1.4.1" }
-oxbase-driver = { path = "crates/oxbase-driver", version = "1.4.1" }
-oxbase-dialect = { path = "crates/oxbase-dialect", version = "1.4.1" }
-oxbase-pg = { path = "crates/oxbase-pg", version = "1.4.1" }
-oxbase-mysql = { path = "crates/oxbase-mysql", version = "1.4.1" }
-oxbase-sqlite = { path = "crates/oxbase-sqlite", version = "1.4.1" }
-oxbase-mssql = { path = "crates/oxbase-mssql", version = "1.4.1" }
-oxbase-mongo = { path = "crates/oxbase-mongo", version = "1.4.1" }
-oxbase-redis = { path = "crates/oxbase-redis", version = "1.4.1" }
-oxbase-net = { path = "crates/oxbase-net", version = "1.4.1" }
-oxbase-sql = { path = "crates/oxbase-sql", version = "1.4.1" }
-oxbase-insight = { path = "crates/oxbase-insight", version = "1.4.1" }
-oxbase-schema-cache = { path = "crates/oxbase-schema-cache", version = "1.4.1" }
-oxbase-designer = { path = "crates/oxbase-designer", version = "1.4.1" }
-oxbase-diff = { path = "crates/oxbase-diff", version = "1.4.1" }
-oxbase-transfer = { path = "crates/oxbase-transfer", version = "1.4.1" }
-oxbase-io = { path = "crates/oxbase-io", version = "1.4.1" }
-oxbase-backup = { path = "crates/oxbase-backup", version = "1.4.1" }
-oxbase-model = { path = "crates/oxbase-model", version = "1.4.1" }
-oxbase-bi = { path = "crates/oxbase-bi", version = "1.4.1" }
-oxbase-ai = { path = "crates/oxbase-ai", version = "1.4.1" }
-oxbase-jobs = { path = "crates/oxbase-jobs", version = "1.4.1" }
-oxbase-store = { path = "crates/oxbase-store", version = "1.4.1" }
-oxbase-services = { path = "crates/oxbase-services", version = "1.4.1" }
-oxbase-conformance = { path = "crates/oxbase-conformance", version = "1.4.1" }
+oxbase-types = { path = "crates/oxbase-types", version = "1.5.0" }
+oxbase-driver = { path = "crates/oxbase-driver", version = "1.5.0" }
+oxbase-dialect = { path = "crates/oxbase-dialect", version = "1.5.0" }
+oxbase-pg = { path = "crates/oxbase-pg", version = "1.5.0" }
+oxbase-mysql = { path = "crates/oxbase-mysql", version = "1.5.0" }
+oxbase-sqlite = { path = "crates/oxbase-sqlite", version = "1.5.0" }
+oxbase-mssql = { path = "crates/oxbase-mssql", version = "1.5.0" }
+oxbase-mongo = { path = "crates/oxbase-mongo", version = "1.5.0" }
+oxbase-redis = { path = "crates/oxbase-redis", version = "1.5.0" }
+oxbase-net = { path = "crates/oxbase-net", version = "1.5.0" }
+oxbase-sql = { path = "crates/oxbase-sql", version = "1.5.0" }
+oxbase-insight = { path = "crates/oxbase-insight", version = "1.5.0" }
+oxbase-schema-cache = { path = "crates/oxbase-schema-cache", version = "1.5.0" }
+oxbase-designer = { path = "crates/oxbase-designer", version = "1.5.0" }
+oxbase-diff = { path = "crates/oxbase-diff", version = "1.5.0" }
+oxbase-transfer = { path = "crates/oxbase-transfer", version = "1.5.0" }
+oxbase-io = { path = "crates/oxbase-io", version = "1.5.0" }
+oxbase-backup = { path = "crates/oxbase-backup", version = "1.5.0" }
+oxbase-model = { path = "crates/oxbase-model", version = "1.5.0" }
+oxbase-bi = { path = "crates/oxbase-bi", version = "1.5.0" }
+oxbase-ai = { path = "crates/oxbase-ai", version = "1.5.0" }
+oxbase-jobs = { path = "crates/oxbase-jobs", version = "1.5.0" }
+oxbase-store = { path = "crates/oxbase-store", version = "1.5.0" }
+oxbase-services = { path = "crates/oxbase-services", version = "1.5.0" }
+oxbase-conformance = { path = "crates/oxbase-conformance", version = "1.5.0" }
 
 # --- async runtime ---
 tokio = { version = "1.54.1", features = ["full"] }
