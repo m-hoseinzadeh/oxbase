@@ -95,6 +95,8 @@ impl Drop for LiveGuard {
 struct ServerHandler {
     authorized: Arc<Vec<PublicKey>>,
     _live: LiveGuard,
+    /// `direct-tcpip` channels ever requested, on every session.
+    forwards: Arc<AtomicUsize>,
 }
 
 impl server::Handler for ServerHandler {
@@ -138,6 +140,7 @@ impl server::Handler for ServerHandler {
         reply: server::ChannelOpenHandle,
         _session: &mut server::Session,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        self.forwards.fetch_add(1, Ordering::SeqCst);
         let target = format!("{host_to_connect}:{port_to_connect}");
         tokio::spawn(async move {
             match TcpStream::connect(target).await {
@@ -159,6 +162,8 @@ struct TestServer {
     live: Arc<AtomicUsize>,
     /// Sessions ever accepted.
     total: Arc<AtomicUsize>,
+    /// `direct-tcpip` channels ever requested.
+    forwards: Arc<AtomicUsize>,
     handles: Arc<Mutex<Vec<server::Handle>>>,
     _task: AbortOnDrop,
 }
@@ -186,9 +191,11 @@ impl TestServer {
         let addr = listener.local_addr().unwrap();
         let live = Arc::new(AtomicUsize::new(0));
         let total = Arc::new(AtomicUsize::new(0));
+        let forwards = Arc::new(AtomicUsize::new(0));
         let handles = Arc::new(Mutex::new(Vec::new()));
         let task = {
             let (live, total, handles) = (live.clone(), total.clone(), handles.clone());
+            let forwards = forwards.clone();
             tokio::spawn(async move {
                 let mut sessions = tokio::task::JoinSet::new();
                 while let Ok((tcp, _)) = listener.accept().await {
@@ -196,6 +203,7 @@ impl TestServer {
                     let handler = ServerHandler {
                         authorized: authorized.clone(),
                         _live: LiveGuard::new(&live),
+                        forwards: forwards.clone(),
                     };
                     let (config, handles) = (config.clone(), handles.clone());
                     sessions.spawn(async move {
@@ -211,6 +219,7 @@ impl TestServer {
             addr,
             live,
             total,
+            forwards,
             handles,
             _task: AbortOnDrop(task),
         }
@@ -342,6 +351,64 @@ async fn password_tunnel_forwards_concurrent_connections_and_closes_on_drop() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert!(refused, "listener still accepting after drop");
+}
+
+/// Another local process (standing in for another local user): connects to the tunnel, sends
+/// `ping` and reports whether the connection was `closed`, `reset`, `echoed` or timed out.
+#[cfg(unix)]
+const FOREIGN_CLIENT: &str = r"
+import socket, sys
+s = socket.create_connection(('127.0.0.1', int(sys.argv[1])), timeout=10)
+try:
+    s.sendall(b'ping')
+    data = s.recv(4)
+    print('closed' if data == b'' else 'echoed')
+except socket.timeout:
+    print('timeout')
+except ConnectionError:
+    print('reset')
+";
+
+#[cfg(unix)]
+#[tokio::test]
+async fn connections_from_other_processes_are_refused() {
+    let server = TestServer::start().await;
+    let (echo, _echo) = echo_server().await;
+    let provider = RusshTunnelProvider::new();
+    let tunnel = open(&provider, &server.ssh(password()), &echo)
+        .await
+        .unwrap();
+    let local = tunnel.local_addr();
+    // This process's own connections are forwarded.
+    round_trip(local, b"own").await;
+    assert_eq!(server.forwards.load(Ordering::SeqCst), 1);
+
+    let out = tokio::time::timeout(
+        Duration::from_secs(30),
+        tokio::process::Command::new("python3")
+            .arg("-c")
+            .arg(FOREIGN_CLIENT)
+            .arg(local.port().to_string())
+            .output(),
+    )
+    .await
+    .expect("the other process did not finish")
+    .expect("python3 runs the other process");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{stdout} {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        matches!(stdout.trim(), "closed" | "reset"),
+        "another process got: {stdout}"
+    );
+    // No channel was opened for it, and the tunnel still serves this process.
+    assert_eq!(server.forwards.load(Ordering::SeqCst), 1);
+    assert!(!tunnel.is_closed());
+    round_trip(local, b"still").await;
+    assert_eq!(server.forwards.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]

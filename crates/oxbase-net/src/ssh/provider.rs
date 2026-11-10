@@ -176,7 +176,8 @@ impl TunnelProvider for RusshTunnelProvider {
         if cancel.is_cancelled() {
             return Err(Error::Cancelled);
         }
-        // Loopback only: the forwarded port must never be reachable from other machines.
+        // Loopback only: the forwarded port must never be reachable from other machines. Other
+        // local processes can reach it, so `forward` serves only this process's connections.
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
         let local_addr = listener.local_addr()?;
         let closed = session.dead.child_token();
@@ -819,6 +820,15 @@ async fn accept_loop(
     debug!(target = %target, "SSH tunnel stopped accepting");
 }
 
+/// Whether the connection `tcp`, accepted from `peer`, was opened by this process (see
+/// `ssh/peer.rs`).
+async fn opened_here(tcp: &TcpStream, peer: SocketAddr) -> std::io::Result<bool> {
+    let listener = tcp.local_addr()?;
+    tokio::task::spawn_blocking(move || super::peer::opened_by_this_process(peer, listener))
+        .await
+        .map_err(std::io::Error::other)?
+}
+
 async fn forward(
     mut tcp: TcpStream,
     peer: SocketAddr,
@@ -826,6 +836,19 @@ async fn forward(
     target: Endpoint,
     closed: CancellationToken,
 ) {
+    // Only this process's own (driver) connections ride on the SSH session; anything else is
+    // closed before a channel opens.
+    match opened_here(&tcp, peer).await {
+        Ok(true) => {}
+        Ok(false) => {
+            warn!(target = %target, peer = %peer, "SSH tunnel refused a local connection from another process");
+            return;
+        }
+        Err(e) => {
+            warn!(target = %target, peer = %peer, error = %e, "SSH tunnel refused a local connection it could not attribute to this process");
+            return;
+        }
+    }
     let _ = tcp.set_nodelay(true);
     let opened = {
         // Hold the session only while opening: the channel keeps working on its own, and the

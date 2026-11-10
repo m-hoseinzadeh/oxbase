@@ -4662,12 +4662,14 @@ dependencies = [
  "rustls",
  "rustls-native-certs",
  "serde",
+ "socket2",
  "tempfile",
  "tokio",
  "tokio-rustls",
  "tokio-util",
  "toml 1.1.8+spec-1.1.0",
  "tracing",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
