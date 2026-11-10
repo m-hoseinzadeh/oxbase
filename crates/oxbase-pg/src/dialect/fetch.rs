@@ -34,6 +34,11 @@ pub const NO_INHERIT: PropId = PropId::from_static("no_inherit");
 pub const MATCH_TYPE: PropId = PropId::from_static("match_type");
 /// Extra: a routine's parallel safety (`safe`, `restricted`, `unsafe`).
 pub const PARALLEL: PropId = PropId::from_static("parallel");
+/// Extra: a routine's body is a SQL-standard body (`RETURN ...` / `BEGIN ATOMIC ... END`,
+/// PostgreSQL 14+): the server keeps it parsed (`pg_proc.prosqlbody`) and its text is the
+/// server's deparse, not string content. Always reported, `false` for a quoted (`prosrc`) body,
+/// so the DDL quotes a body unless the catalog says it is a standard one.
+pub const SQL_STANDARD_BODY: PropId = PropId::from_static("sql_standard_body");
 /// Extra: database `LC_CTYPE`.
 pub const CTYPE: PropId = PropId::from_static("ctype");
 /// Extra: the kind of a user-defined type (`enum`, `composite`, `domain`, `range`,
@@ -763,7 +768,11 @@ async fn load_routine(cx: &Cx<'_>, obj: &ObjectRef) -> Result<ObjectDef> {
         def.returns = row.opt_string("returns")?;
     }
     def.language = row.opt_string("language")?;
-    def.body = match row.opt_string("sql_body")? {
+    // Where the body comes from decides how it is written back (`SQL_STANDARD_BODY`): a
+    // quoted body's text may start with `RETURN` too.
+    let sql_body = row.opt_string("sql_body")?;
+    def.extras.insert(SQL_STANDARD_BODY, sql_body.is_some());
+    def.body = match sql_body {
         Some(body) => Some(body),
         None => row.opt_string("src")?,
     };

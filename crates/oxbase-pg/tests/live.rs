@@ -6,11 +6,13 @@
 //! Connection details come from `tests/fixtures.toml` (`$OXBASE_FIXTURES`).
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arrow_array::Array;
 use arrow_array_check::{column_i32, column_str};
 use futures::StreamExt;
+use oxbase_dialect::{DdlContext, DdlGenerator, DialectRegistry, Fetcher};
 use oxbase_driver::arrow::DataType;
 use oxbase_driver::{
     CancellationToken, ConnectParams, Connection, Driver, NoticeSeverity, PemSource, ResultItem,
@@ -21,7 +23,8 @@ use oxbase_net::ssh::{
     TunnelProvider,
 };
 use oxbase_pg::PgDriver;
-use oxbase_types::{Endpoint, Engine, Error, Value};
+use oxbase_pg::dialect::SQL_STANDARD_BODY;
+use oxbase_types::{Endpoint, Engine, Error, ObjectDef, ObjectKind, ObjectRef, Script, Value};
 
 struct Fixture {
     host: String,
@@ -900,4 +903,160 @@ async fn rollback_open_transaction_reports_and_ends_an_open_transaction() {
         "aborted"
     );
     conn.close().await.unwrap();
+}
+
+// --- Catalog to DDL round trips (security audit regressions) -------------------------------------
+
+fn fetcher(kind: ObjectKind) -> Arc<dyn Fetcher> {
+    let mut reg = DialectRegistry::new();
+    oxbase_pg::dialect::register(&mut reg);
+    reg.fetcher(Engine::Postgres, kind)
+        .unwrap_or_else(|e| panic!("{kind}: {e}"))
+}
+
+fn generator(kind: ObjectKind) -> Arc<dyn DdlGenerator> {
+    let mut reg = DialectRegistry::new();
+    oxbase_pg::dialect::register(&mut reg);
+    reg.ddl(Engine::Postgres, kind)
+        .unwrap_or_else(|e| panic!("{kind}: {e}"))
+}
+
+/// Drops (with everything in them) and creates the scratch `schemas`.
+async fn fresh_schemas(conn: &dyn Connection, schemas: &[&str]) {
+    for schema in schemas {
+        run(
+            conn,
+            &format!("DROP SCHEMA IF EXISTS {schema} CASCADE"),
+            &[],
+        )
+        .await;
+        run(conn, &format!("CREATE SCHEMA {schema}"), &[]).await;
+    }
+}
+
+async fn drop_schemas(conn: &dyn Connection, schemas: &[&str]) {
+    for schema in schemas {
+        run(
+            conn,
+            &format!("DROP SCHEMA IF EXISTS {schema} CASCADE"),
+            &[],
+        )
+        .await;
+    }
+}
+
+/// `obj` (in the session's database) as the registered fetcher reads it.
+async fn load_def(conn: &dyn Connection, obj: &ObjectRef) -> ObjectDef {
+    fetcher(obj.kind)
+        .load(conn, obj, CancellationToken::new())
+        .await
+        .unwrap_or_else(|e| panic!("load {obj}: {e}"))
+}
+
+/// The registered generator's `create` script for `def`, each step run with `execute_one` the
+/// way structure sync and restore run them.
+async fn create_def(conn: &dyn Connection, def: &ObjectDef) -> Script {
+    let version = conn.server_version().clone();
+    let script = generator(def.kind())
+        .create(def, &DdlContext::new(&version))
+        .unwrap_or_else(|e| panic!("create {}: {e}", def.object_ref()));
+    for step in &script.steps {
+        let stream = conn
+            .execute_one(&step.sql, CancellationToken::new())
+            .await
+            .unwrap_or_else(|e| panic!("{}: {e}", step.sql));
+        collect(stream)
+            .await
+            .unwrap_or_else(|e| panic!("{}: {e}", step.sql));
+    }
+    script
+}
+
+/// The text column of the one row `sql` returns.
+async fn text_of(conn: &dyn Connection, sql: &str) -> Option<String> {
+    let out = run(conn, sql, &[]).await;
+    column_str(&out.result_sets[0].batches[0], 0).remove(0)
+}
+
+/// A quoted `LANGUAGE sql` body whose text starts with `RETURN` (stored with
+/// `check_function_bodies = off`) is written back quoted, so the statement after its `;` never
+/// runs on the target; a real SQL-standard body stays inline (audit lead 12).
+#[tokio::test]
+#[ignore = "needs the postgres fixture"]
+async fn quoted_sql_bodies_that_start_with_return_stay_quoted() {
+    let f = fixture();
+    let conn = connect(&plain_params(&f)).await;
+    let (src, tgt) = ("oxbase_l12_src", "oxbase_l12_tgt");
+    fresh_schemas(&*conn, &[src, tgt]).await;
+    let quoted = format!("RETURN 1; CREATE TABLE {tgt}.oxbase_probe (x int)");
+    run(&*conn, "SET check_function_bodies = off", &[]).await;
+    run(
+        &*conn,
+        &format!("CREATE FUNCTION {src}.f() RETURNS int LANGUAGE sql AS $q${quoted}$q$"),
+        &[],
+    )
+    .await;
+    run(&*conn, "RESET check_function_bodies", &[]).await;
+    run(
+        &*conn,
+        &format!("CREATE FUNCTION {src}.g() RETURNS int LANGUAGE sql RETURN 2"),
+        &[],
+    )
+    .await;
+
+    // Written to the target the way a sync or a pg_dump-style restore runs (bodies unchecked).
+    run(&*conn, "SET check_function_bodies = off", &[]).await;
+    for (name, standard) in [("f", false), ("g", true)] {
+        let obj = ObjectRef::schema(None, src)
+            .child(ObjectKind::Function, name)
+            .with_signature("");
+        let mut def = load_def(&*conn, &obj).await;
+        let ObjectDef::Routine(routine) = &mut def else {
+            panic!("{name} is not a routine")
+        };
+        assert_eq!(
+            routine.extras.get(&SQL_STANDARD_BODY),
+            Some(&Value::Bool(standard)),
+            "{name}"
+        );
+        routine.obj.schema = Some(tgt.to_owned());
+        let script = create_def(&*conn, &def).await;
+        assert_eq!(
+            script.steps[0].sql.contains("\nAS $body$"),
+            !standard,
+            "{}",
+            script.steps[0].sql
+        );
+    }
+    run(&*conn, "RESET check_function_bodies", &[]).await;
+
+    assert_eq!(
+        text_of(
+            &*conn,
+            &format!("SELECT pg_catalog.to_regclass('{tgt}.oxbase_probe')::text")
+        )
+        .await,
+        None,
+        "the statement inside the quoted body must not run"
+    );
+    assert_eq!(
+        text_of(
+            &*conn,
+            &format!("SELECT prosrc FROM pg_catalog.pg_proc WHERE oid = '{tgt}.f()'::regprocedure")
+        )
+        .await,
+        Some(quoted)
+    );
+    assert_eq!(
+        text_of(
+            &*conn,
+            &format!(
+                "SELECT (prosqlbody IS NOT NULL)::text FROM pg_catalog.pg_proc \
+                 WHERE oid = '{tgt}.g()'::regprocedure"
+            )
+        )
+        .await,
+        Some("true".to_owned())
+    );
+    drop_schemas(&*conn, &[src, tgt]).await;
 }
